@@ -11,13 +11,22 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from app.api import projects as projects_api
 from app.api import system, ws
 from app.core.config import settings
-from app.core.errors import AppError, ErrorCode, app_error_handler, unhandled_error_handler
+from app.core.errors import (
+    AppError,
+    ErrorCode,
+    app_error_handler,
+    unhandled_error_handler,
+    validation_error_handler,
+)
 from app.core.logging import get_logger, setup_logging
+from app.services.projects import projects
 
 log = get_logger("main")
 
@@ -36,6 +45,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         handshake=settings.require_handshake,
     )
     yield
+    # 关闭所有工程库：SQLite WAL 需要正常 dispose 才会把 -wal 合并回主文件
+    await projects.close_all()
     log.info("backend.stopped")
 
 
@@ -74,9 +85,11 @@ def create_app() -> FastAPI:
         return await call_next(request)
 
     app.add_exception_handler(AppError, app_error_handler)
+    app.add_exception_handler(RequestValidationError, validation_error_handler)
     app.add_exception_handler(Exception, unhandled_error_handler)
 
     app.include_router(system.router, prefix=API_PREFIX)
+    app.include_router(projects_api.router, prefix=API_PREFIX)
     app.include_router(ws.router, prefix=API_PREFIX)
     return app
 

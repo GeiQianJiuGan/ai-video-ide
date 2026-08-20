@@ -2,6 +2,9 @@
 
 工程数据库路径由 -x db=<path> 传入，因为每个工程各有一个 project.db：
     alembic -x db=D:/works/my_film/project.db upgrade head
+
+后端进程内调用（打开工程时自动升级）走 Config.set_main_option("aivs_db", ...)，
+因为 -x 只有命令行入口才会填充 cmd_opts。
 """
 
 from __future__ import annotations
@@ -11,23 +14,21 @@ from logging.config import fileConfig
 from sqlalchemy import create_engine, pool
 
 from alembic import context
+from app.persistence import models  # noqa: F401  —— 导入以填充 Base.metadata
 from app.persistence.db import Base
 
-# noqa: F401 —— 导入模型模块以填充 Base.metadata（M1 起生效）
-try:  # pragma: no cover
-    from app.persistence import models  # noqa: F401
-except ImportError:  # M0 阶段还没有模型
-    pass
-
 config = context.config
-if config.config_file_name is not None:
+# 进程内调用时不要重配日志：fileConfig 会禁用已存在的 logger（uvicorn / sqlalchemy）。
+if config.config_file_name is not None and not config.attributes.get("aivs_embedded"):
     fileConfig(config.config_file_name)
 
 target_metadata = Base.metadata
 
 
 def _db_url() -> str:
-    db_path = context.get_x_argument(as_dictionary=True).get("db")
+    db_path = context.get_x_argument(as_dictionary=True).get("db") or config.get_main_option(
+        "aivs_db", None
+    )
     if not db_path:
         raise SystemExit("缺少工程数据库路径：alembic -x db=<工程目录>/project.db upgrade head")
     return f"sqlite:///{db_path}"

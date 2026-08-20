@@ -45,6 +45,8 @@ class ErrorCode(StrEnum):
 _STATUS = {
     ErrorCode.NOT_FOUND: 404,
     ErrorCode.CONFLICT: 409,
+    # schema 不匹配本质上也是冲突：文件在那里，但和当前应用对不上
+    ErrorCode.SCHEMA_MISMATCH: 409,
     ErrorCode.VALIDATION_ERROR: 422,
     ErrorCode.UNAUTHORIZED: 401,
     ErrorCode.COMFY_OFFLINE: 503,
@@ -96,6 +98,19 @@ def not_found(what: str, ident: str) -> AppError:
 async def app_error_handler(_: Request, exc: Exception) -> JSONResponse:
     assert isinstance(exc, AppError)
     return JSONResponse(status_code=exc.status_code, content={"error": exc.to_dict()})
+
+
+async def validation_error_handler(_: Request, exc: Exception) -> JSONResponse:
+    """FastAPI 的请求校验错误也要变成同一种结构，前端只需要认一种错误形状。"""
+    raw = getattr(exc, "errors", lambda: [])()
+    lines = [f"{'.'.join(str(p) for p in e.get('loc', ()))}: {e.get('msg', '')}" for e in raw]
+    err = AppError(
+        ErrorCode.VALIDATION_ERROR,
+        "请求参数不合法",
+        "；".join(lines) or str(exc),
+        ["按提示修正对应字段后重试"],
+    )
+    return JSONResponse(status_code=422, content={"error": err.to_dict()})
 
 
 async def unhandled_error_handler(_: Request, exc: Exception) -> JSONResponse:
