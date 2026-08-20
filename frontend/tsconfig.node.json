@@ -1,0 +1,18 @@
+{
+  // @vue/tsconfig@0.7 未提供 tsconfig.node.json，tsconfig.lib.json 又只是「输出 d.ts」的
+  // 片段（不含 target/skipLibCheck），单独继承它会退回 target: ES5 并全量检查 node_modules。
+  // 所以这里继承通用基座 tsconfig.json，再补 Node 侧选项。
+  "extends": "@vue/tsconfig/tsconfig.json",
+  "include": ["vite.config.ts", "eslint.config.js"],
+  "compilerOptions": {
+    "noEmit": true,
+    "composite": true,
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.node.tsbuildinfo",
+    // vite 自带的 importGlob.d.ts 引用了 Worker，必须带上 DOM。
+    "lib": ["ESNext", "DOM"],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "allowJs": true,
+    "types": ["node"]
+  }
+}

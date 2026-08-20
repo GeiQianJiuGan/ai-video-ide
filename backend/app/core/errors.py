@@ -1,0 +1,108 @@
+"""结构化错误契约。
+
+硬约束：绝不静默失败。任何失败都必须携带 code / title / detail / suggestions，
+让 UI 能直接把「为什么失败、怎么修」摆在用户面前。
+"""
+
+from __future__ import annotations
+
+from enum import StrEnum
+from typing import Any
+
+from fastapi import Request
+from fastapi.responses import JSONResponse
+
+
+class ErrorCode(StrEnum):
+    # 生成链路
+    WORKFLOW_ERROR = "WORKFLOW_ERROR"
+    MISSING_ASSET = "MISSING_ASSET"
+    MISSING_INPUT = "MISSING_INPUT"
+    MISSING_CAPABILITY = "MISSING_CAPABILITY"
+    INVALID_WORKFLOW = "INVALID_WORKFLOW"
+    DEPENDENCY_CYCLE = "DEPENDENCY_CYCLE"
+    UPSTREAM_NOT_READY = "UPSTREAM_NOT_READY"
+    CONTEXT_INCOMPLETE = "CONTEXT_INCOMPLETE"
+    # 外部依赖
+    COMFY_OFFLINE = "COMFY_OFFLINE"
+    COMFY_NODE_MISSING = "COMFY_NODE_MISSING"
+    COMFY_LOST = "COMFY_LOST"
+    GPU_OOM = "GPU_OOM"
+    FFMPEG_ERROR = "FFMPEG_ERROR"
+    FFMPEG_MISSING = "FFMPEG_MISSING"
+    LLM_UNAVAILABLE = "LLM_UNAVAILABLE"
+    LLM_INVALID_OUTPUT = "LLM_INVALID_OUTPUT"
+    # 系统
+    DISK_FULL = "DISK_FULL"
+    SCHEMA_MISMATCH = "SCHEMA_MISMATCH"
+    NOT_FOUND = "NOT_FOUND"
+    CONFLICT = "CONFLICT"
+    VALIDATION_ERROR = "VALIDATION_ERROR"
+    UNAUTHORIZED = "UNAUTHORIZED"
+    INTERNAL = "INTERNAL"
+
+
+_STATUS = {
+    ErrorCode.NOT_FOUND: 404,
+    ErrorCode.CONFLICT: 409,
+    ErrorCode.VALIDATION_ERROR: 422,
+    ErrorCode.UNAUTHORIZED: 401,
+    ErrorCode.COMFY_OFFLINE: 503,
+    ErrorCode.LLM_UNAVAILABLE: 503,
+    ErrorCode.INTERNAL: 500,
+}
+
+
+class AppError(Exception):
+    """所有业务错误的唯一基类。"""
+
+    def __init__(
+        self,
+        code: ErrorCode,
+        title: str,
+        detail: str = "",
+        suggestions: list[str] | None = None,
+        related_ids: dict[str, Any] | None = None,
+        status_code: int | None = None,
+    ) -> None:
+        super().__init__(title)
+        self.code = code
+        self.title = title
+        self.detail = detail
+        self.suggestions = suggestions or []
+        self.related_ids = related_ids or {}
+        self.status_code = status_code or _STATUS.get(code, 400)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "code": self.code.value,
+            "title": self.title,
+            "detail": self.detail,
+            "suggestions": self.suggestions,
+            "related_ids": self.related_ids,
+        }
+
+
+def not_found(what: str, ident: str) -> AppError:
+    return AppError(
+        ErrorCode.NOT_FOUND,
+        f"{what}不存在",
+        f"未找到 id 为 {ident} 的{what}。",
+        ["确认 id 是否正确", "刷新列表后重试"],
+        {"id": ident},
+    )
+
+
+async def app_error_handler(_: Request, exc: Exception) -> JSONResponse:
+    assert isinstance(exc, AppError)
+    return JSONResponse(status_code=exc.status_code, content={"error": exc.to_dict()})
+
+
+async def unhandled_error_handler(_: Request, exc: Exception) -> JSONResponse:
+    err = AppError(
+        ErrorCode.INTERNAL,
+        "内部错误",
+        f"{type(exc).__name__}: {exc}",
+        ["查看后端日志 .runtime/logs", "如可复现请附带日志反馈"],
+    )
+    return JSONResponse(status_code=500, content={"error": err.to_dict()})

@@ -1,0 +1,46 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# ---- Node ----
+node_modules/
+dist/
+dist-ssr/
+.vite/
+*.local
+
+# ---- Rust / Tauri ----
+target/
+tauri/gen/
+
+# ---- 运行时产物 ----
+*.log
+logs/
+.runtime/
+*.db
+*.db-shm
+*.db-wal
+
+# ---- 工程数据（用户项目目录，不入库） ----
+/projects/
+/sandbox/
+
+# ---- 捆绑二进制 ----
+bin/ffmpeg*
+bin/ffprobe*
+tauri/bin/aivs-backend*
+backend/dist/
+
+# ---- IDE / OS ----
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.DS_Store
+Thumbs.db

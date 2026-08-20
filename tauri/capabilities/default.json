@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "桌面壳最小权限：不启用 shell / fs / http 插件，后端进程由 Rust 侧直接托管，前端只能通过回环 HTTP 访问后端。",
+  "windows": ["main", "boot-error"],
+  "permissions": ["core:default"]
+}

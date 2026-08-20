@@ -1,0 +1,109 @@
+@import 'tailwindcss';
+
+/* ─────────────────────────────────────────────────────────────
+   Design Token —— 组件库路线：reka-ui 提供行为，外观 100% 自研。
+   高信息密度专业桌面软件：三层背景 + 单一强调色 + 状态色。
+   参考 docs/02-功能开发文档.md §7
+   ───────────────────────────────────────────────────────────── */
+@theme {
+  /* 背景三层：画布 / 面板 / 抬起 */
+  --color-base-0: #111316;
+  --color-base-1: #17191d;
+  --color-base-2: #1e2126;
+  --color-base-3: #262a31;
+
+  /* 边框 */
+  --color-line-1: #2a2f37;
+  --color-line-2: #363c46;
+
+  /* 前景四级 */
+  --color-fg-1: #e6e9ee;
+  --color-fg-2: #a8b0bd;
+  --color-fg-3: #6f7885;
+  --color-fg-4: #4c545f;
+
+  /* 单一强调色（青绿） */
+  --color-accent: #2dd4bf;
+  --color-accent-hi: #5eead4;
+  --color-accent-dim: #134e4a;
+
+  /* 状态色：与 Shot / Job 状态一一对应 */
+  --color-st-draft: #6f7885;
+  --color-st-queued: #60a5fa;
+  --color-st-running: #fbbf24;
+  --color-st-done: #34d399;
+  --color-st-failed: #f87171;
+  --color-st-review: #fb923c;
+
+  /* 字体：界面用系统 UI 字体，数值/时间码用等宽 */
+  --font-ui: 'Inter var', 'Segoe UI', -apple-system, 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  --font-mono: 'JetBrains Mono', 'Cascadia Code', ui-monospace, monospace;
+
+  /* 密度：行高 28px 是全局基准 */
+  --spacing-row: 1.75rem; /* 28px */
+  --spacing-rail: 3rem; /* 48px Activity Bar */
+  --spacing-statusbar: 1.5rem; /* 24px */
+
+  --text-2xs: 0.6875rem; /* 11px 徽标 */
+  --text-xs: 0.75rem; /* 12px 次要文本 */
+  --text-sm: 0.8125rem; /* 13px 正文基准 */
+
+  --radius-xs: 2px;
+  --radius-sm: 3px;
+  --radius-md: 5px;
+}
+
+@layer base {
+  html,
+  body,
+  #app {
+    height: 100%;
+  }
+
+  body {
+    font-family: var(--font-ui);
+    font-size: var(--text-sm);
+    line-height: 1.45;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* 时间码与数值等宽对齐，避免跳动 */
+  .tnum,
+  input[type='number'] {
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* 细滚动条，贴合专业软件观感 */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--color-line-2) transparent;
+  }
+  *::-webkit-scrollbar {
+    width: 9px;
+    height: 9px;
+  }
+  *::-webkit-scrollbar-thumb {
+    background: var(--color-line-2);
+    border-radius: 9px;
+    border: 2px solid transparent;
+    background-clip: content-box;
+  }
+  *::-webkit-scrollbar-thumb:hover {
+    background: var(--color-fg-4);
+    background-clip: content-box;
+  }
+
+  /* 焦点可见：无障碍要求全键盘可达 */
+  :focus-visible {
+    outline: 1px solid var(--color-accent);
+    outline-offset: 1px;
+  }
+
+  /* 文本输入区恢复可选中（body 全局 select-none 是为了拖拽体验） */
+  input,
+  textarea,
+  [contenteditable='true'],
+  .selectable {
+    user-select: text;
+  }
+}
