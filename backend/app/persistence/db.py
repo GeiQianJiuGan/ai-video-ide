@@ -11,7 +11,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from sqlalchemy import event, text
+from sqlalchemy import MetaData, event, text
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -67,9 +67,11 @@ class Database:
                 await session.rollback()
                 raise
 
-    async def create_all(self) -> None:
+    async def create_all(self, metadata: MetaData | None = None) -> None:
+        """建表。默认建工程表；素材库传自己的 metadata（它不在 Base 上，见 models_library）。"""
+        target = metadata if metadata is not None else Base.metadata
         async with self.engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
+            await conn.run_sync(target.create_all)
 
     async def ping(self) -> bool:
         async with self.read() as s:

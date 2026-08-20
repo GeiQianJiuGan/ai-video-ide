@@ -35,6 +35,20 @@ PREFIX = {
     "asset_ref": "arf",
     "export_record": "exp",
     "request": "req",
+    # --- 应用级素材库（独立目录 + library.db，不属于任何工程） ---
+    "library": "lib",
+    "library_asset": "las",
+    "library_asset_ref": "lar",
+    "library_character": "lch",
+    "library_appearance": "lap",
+    "library_sheet": "lsh",
+    "library_location": "llc",
+    "library_location_variant": "lvr",
+    "library_location_reference": "llr",
+    "library_prop": "lpp",
+    "library_prop_reference": "lpr",
+    "library_tag": "ltg",
+    "library_tag_link": "ltl",
 }
 
 

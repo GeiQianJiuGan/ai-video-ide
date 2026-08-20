@@ -33,6 +33,9 @@ class Character(Base):
     background: Mapped[str | None] = mapped_column(Text)
     voice_desc: Mapped[str | None] = mapped_column(Text)
     notes: Mapped[str | None] = mapped_column(Text)
+    #: 从应用级素材库采用而来时记下库里那行的 id。只是出处，不是外键——
+    #: 采用是单向复制，工程运行期完全不依赖库在不在（见 services/adopt.py）。
+    origin_library_id: Mapped[str | None] = mapped_column(String(40))
     created_at: Mapped[str] = mapped_column(String(40), nullable=False, default=utc_now)
     updated_at: Mapped[str] = mapped_column(String(40), nullable=False, default=utc_now)
 

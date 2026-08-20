@@ -20,6 +20,8 @@ class Location(Base):
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     description: Mapped[str | None] = mapped_column(Text)
     notes: Mapped[str | None] = mapped_column(Text)
+    #: 从应用级素材库采用而来时记下库里那行的 id，只是出处（见 services/adopt.py）。
+    origin_library_id: Mapped[str | None] = mapped_column(String(40))
     created_at: Mapped[str] = mapped_column(String(40), nullable=False, default=utc_now)
     updated_at: Mapped[str] = mapped_column(String(40), nullable=False, default=utc_now)
 
@@ -68,6 +70,8 @@ class Prop(Base):
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     description: Mapped[str | None] = mapped_column(Text)
     notes: Mapped[str | None] = mapped_column(Text)
+    #: 从应用级素材库采用而来时记下库里那行的 id，只是出处（见 services/adopt.py）。
+    origin_library_id: Mapped[str | None] = mapped_column(String(40))
     created_at: Mapped[str] = mapped_column(String(40), nullable=False, default=utc_now)
     updated_at: Mapped[str] = mapped_column(String(40), nullable=False, default=utc_now)
 

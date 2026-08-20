@@ -1,8 +1,13 @@
 /**
  * 功能注册表 —— 界面的唯一真源。
  *
- * Activity Bar、首页、命令面板、功能页四处共用这一份定义。
+ * Activity Bar、项目管理页、命令面板、功能页四处共用这一份定义。
  * 任何新功能只在这里登记一次，四处同时出现，绝不会「导航里有、页面里没有」。
+ *
+ * scope 把功能分成两类，这是入口不再杂乱的根据：
+ *   app     —— 不需要打开工程就有意义（项目管理、素材库）；
+ *   project —— 必须先打开一个工程（其余全部）。没打开工程时它们干脆不出现，
+ *              而不是画成一排灰色的锁。
  *
  * 字段刻意写成「用户视角」：purpose 说的是能拿到什么结果，不是它是什么组件。
  */
@@ -12,8 +17,10 @@ import {
   Boxes,
   Clapperboard,
   Film,
+  FolderTree,
   Gauge,
   Images,
+  Library,
   LayoutGrid,
   ListVideo,
   MapPinned,
@@ -24,7 +31,8 @@ import {
 
 export type Milestone = 'M0' | 'M1' | 'M2' | 'M3' | 'M4' | 'M5' | 'M6'
 export type Requirement = 'backend' | 'comfyui' | 'ffmpeg' | 'llm'
-export type GroupId = 'asset' | 'story' | 'generate' | 'assemble'
+export type Scope = 'app' | 'project'
+export type GroupId = 'app' | 'asset' | 'story' | 'generate' | 'assemble'
 
 export interface FeatureGroup {
   id: GroupId
@@ -34,6 +42,7 @@ export interface FeatureGroup {
 }
 
 export const GROUPS: FeatureGroup[] = [
+  { id: 'app', title: '工作台', question: '做哪一部片子、从哪里取素材' },
   { id: 'asset', title: '素材层', question: '谁出场、在哪里、用什么道具' },
   { id: 'story', title: '叙事层', question: '讲什么故事、怎么切成镜头' },
   { id: 'generate', title: '生成层', question: '用哪套 Workflow 把镜头做出来' },
@@ -54,11 +63,12 @@ export interface ActionSpec {
 
 export interface Feature {
   id: string
-  /** 路由 name，全部挂在 /p/:pid 下。 */
+  /** 路由 name。scope 为 project 的挂在 /p/:pid 下，app 的挂在顶层。 */
   route: string
   title: string
   /** 一句话说清「用它能拿到什么」。 */
   purpose: string
+  scope: Scope
   group: GroupId
   icon: Component
   milestone: Milestone
@@ -72,7 +82,55 @@ export interface Feature {
   outcome: string[]
 }
 
-export const FEATURES: Feature[] = [
+/** 登记时不写 scope——它由下面两张表决定，避免登记在项目表里却标成 app 这种自相矛盾。 */
+type FeatureDef = Omit<Feature, 'scope'>
+
+/** 不需要打开工程就有意义的功能。 */
+const APP_DEFS: FeatureDef[] = [
+  {
+    id: 'projects',
+    route: 'projects',
+    title: '项目管理',
+    purpose: '新建或打开一个工程目录——所有创作都从这里开始',
+    group: 'app',
+    icon: FolderTree,
+    milestone: 'M1',
+    ready: true,
+    requires: ['backend'],
+    panels: {
+      main: { title: '项目', body: '新建 / 打开工程目录，最近打开列表' },
+    },
+    actions: [
+      { label: '新建项目', hint: '选一个空文件夹，落一份 project.db', primary: true },
+      { label: '打开已有工程', hint: '选中含 project.aivs.json 的目录' },
+    ],
+    outcome: ['一个自包含的工程目录，可整体拷走换机继续'],
+  },
+  {
+    id: 'library',
+    route: 'library',
+    title: '素材库',
+    purpose: '跨项目复用的素材与角色 / 地点 / 道具预设，采用到当前项目里',
+    group: 'app',
+    icon: Library,
+    milestone: 'M1',
+    ready: true,
+    requires: ['backend'],
+    panels: {
+      left: { title: '分类与标签', body: '素材 / 角色 / 地点 / 道具，按标签筛选' },
+      main: { title: '素材网格', body: '库内文件的缩略图与尺寸、大小' },
+      right: { title: '采用到项目', body: '复制进当前工程的 assets/，并记下出处；采用后互不影响' },
+    },
+    actions: [
+      { label: '选择素材库目录', hint: '库是一个独立目录，位置由你决定', primary: true },
+      { label: '采用到当前项目', hint: '复制一份副本进工程，工程保持自包含' },
+    ],
+    outcome: ['换一部片子不用从零重建角色与素材', '工程里拿到的是可再改的副本'],
+  },
+]
+
+/** 必须先打开一个工程才有意义的功能。 */
+const PROJECT_DEFS: FeatureDef[] = [
   {
     id: 'dashboard',
     route: 'dashboard',
@@ -356,7 +414,12 @@ export const FEATURES: Feature[] = [
   },
 ]
 
-/** 核心链路节点。首页把它画成一条可点击的流水线，让「系统怎么工作」自解释。 */
+export const FEATURES: Feature[] = [
+  ...APP_DEFS.map((f) => ({ ...f, scope: 'app' as const })),
+  ...PROJECT_DEFS.map((f) => ({ ...f, scope: 'project' as const })),
+]
+
+/** 核心链路节点。项目概览页把它画成一条可点击的流水线，让「系统怎么工作」自解释。 */
 export interface ChainNode {
   label: string
   /** 点进去落到哪个功能；null 表示这是系统内部产物，没有独立页面。 */
@@ -393,8 +456,11 @@ export function featuresOf(group: GroupId): Feature[] {
   return FEATURES.filter((f) => f.group === group)
 }
 
-/** Activity Bar 顺序：按创作流程走，而不是按字母。 */
-export const NAV_ORDER = [
+/** 应用级导航：没打开工程时左栏只有这些。 */
+export const APP_NAV = ['projects', 'library'] as const
+
+/** 项目内导航顺序：按创作流程走，而不是按字母。 */
+export const PROJECT_NAV = [
   'dashboard',
   'characters',
   'locations',
@@ -407,12 +473,19 @@ export const NAV_ORDER = [
   'assets',
 ] as const
 
-export const NAV_FEATURES: Feature[] = NAV_ORDER.map((id) =>
-  FEATURES.find((f) => f.id === id),
-).filter((f): f is Feature => f !== undefined)
+function pick(ids: readonly string[]): Feature[] {
+  return ids
+    .map((id) => FEATURES.find((f) => f.id === id))
+    .filter((f): f is Feature => f !== undefined)
+}
+
+export const APP_NAV_FEATURES: Feature[] = pick(APP_NAV)
+export const PROJECT_NAV_FEATURES: Feature[] = pick(PROJECT_NAV)
 
 /** Activity Bar 只有 48px 宽，需要更短的标签；tooltip 里给全名与作用。 */
 export const NAV_LABEL: Record<string, string> = {
+  projects: '项目',
+  library: '素材库',
   dashboard: '概览',
   characters: '角色',
   locations: '场景',

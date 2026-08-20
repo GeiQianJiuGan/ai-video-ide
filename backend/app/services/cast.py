@@ -14,7 +14,7 @@ from app.core.ids import new_id
 from app.events.bus import Channel, bus
 from app.persistence.models import utc_now
 from app.persistence.models_cast import INHERITABLE, Appearance, Character, SheetVersion
-from app.services.base import as_dict, db_of, fetch, fetch_all
+from app.services.base import as_dict, db_of, fetch, fetch_all, require_name
 
 CHARACTER_FIELDS = (
     "name",
@@ -85,21 +85,19 @@ class CastService:
             by_char[a.character_id] = by_char.get(a.character_id, 0) + 1
         return [{**as_dict(c), "appearance_count": by_char.get(c.id, 0)} for c in chars]
 
-    async def create_character(self, pid: str, patch: dict[str, Any]) -> dict[str, Any]:
-        name = str(patch.get("name") or "").strip()
-        if not name:
-            raise AppError(
-                ErrorCode.VALIDATION_ERROR,
-                "角色需要一个名字",
-                "名字是角色的唯一必填项，其余都可以之后再补。",
-                ["填一个名字，例如「林昭」"],
-            )
+    async def create_character(
+        self, pid: str, patch: dict[str, Any], *, origin_library_id: str | None = None
+    ) -> dict[str, Any]:
+        """建角色。origin_library_id 只在「从素材库采用」时传（见 services/adopt.py），
+        它是出处而不是外键——采用是单向复制，之后两边各改各的。"""
+        name = require_name(patch.get("name"), "角色", "林昭")
         db = db_of(pid)
         now = utc_now()
         row = Character(
             id=new_id("character"),
             **{k: patch.get(k) for k in CHARACTER_FIELDS if k != "name"},
             name=name,
+            origin_library_id=origin_library_id,
             created_at=now,
             updated_at=now,
         )

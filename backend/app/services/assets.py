@@ -20,7 +20,15 @@ from app.core.ids import new_id
 from app.events.bus import Channel, bus
 from app.persistence.models import utc_now
 from app.persistence.models_world import Asset, AssetRef
-from app.services.base import as_dict, db_of, dump_json, fetch, fetch_all, project_of
+from app.services.base import (
+    as_dict,
+    db_of,
+    dump_json,
+    fetch,
+    fetch_all,
+    load_json,
+    project_of,
+)
 
 #: 资产类型 → 存放子目录。generations/ 只放生成物，手动素材一律进 assets/。
 KIND_DIR = {
@@ -73,80 +81,110 @@ def kind_of_suffix(suffix: str) -> str:
     return "other"
 
 
+# --- 落盘公共件：素材库（services/library.py）复用同一套，不复制第二遍 ---
+
+
+def ensure_dir(target: Path, what: str = "资产目录") -> Path:
+    """建目录，失败时区分「磁盘满」与其他，绝不静默。"""
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise AppError(
+            ErrorCode.DISK_FULL if exc.errno == 28 else ErrorCode.VALIDATION_ERROR,
+            f"无法创建{what}",
+            f"{target}: {type(exc).__name__}: {exc}",
+            ["确认磁盘可写且空间充足"],
+        ) from exc
+    return target
+
+
+def content_name(sha1: str, suffix: str) -> str:
+    """文件名 = 内容 sha1 前缀 + 后缀。改内容必然换名字，缓存与去重都靠它。"""
+    return f"{sha1[:12]}{suffix or '.bin'}"
+
+
+def require_bytes(data: bytes, filename: str) -> str:
+    """空文件不许登记；顺手把 sha1 算出来。"""
+    if not data:
+        raise AppError(
+            ErrorCode.VALIDATION_ERROR,
+            "文件是空的",
+            f"{filename} 长度为 0 字节。",
+            ["确认选中的文件没有损坏", "重新导出后再上传"],
+        )
+    return hashlib.sha1(data).hexdigest()
+
+
+def write_file(target: Path, data: bytes) -> None:
+    try:
+        target.write_bytes(data)
+    except OSError as exc:
+        raise AppError(
+            ErrorCode.DISK_FULL if exc.errno == 28 else ErrorCode.VALIDATION_ERROR,
+            "资产写入失败",
+            f"{target}: {type(exc).__name__}: {exc}",
+            ["确认磁盘空间充足", "确认目录未被安全软件锁定"],
+        ) from exc
+
+
+def source_file(src: str) -> Path:
+    """把用户给的路径变成一个确实存在的文件，否则结构化报错。"""
+    path = Path(src.strip().strip('"')).expanduser()  # noqa: ASYNC240 - 本地磁盘元数据，开销可忽略
+    if not path.is_file():
+        raise AppError(
+            ErrorCode.NOT_FOUND,
+            "文件不存在",
+            f"{path} 不存在或不是文件。",
+            ["确认路径拼写正确", "确认文件没有被移动或删除"],
+            {"path": str(path)},
+        )
+    return path
+
+
+def sha1_of_file(path: Path) -> str:
+    try:
+        return hashlib.sha1(path.read_bytes()).hexdigest()
+    except OSError as exc:
+        raise AppError(
+            ErrorCode.VALIDATION_ERROR,
+            "文件无法读取",
+            f"{path}: {type(exc).__name__}: {exc}",
+            ["确认文件未被其他程序占用"],
+        ) from exc
+
+
 class AssetService:
     def _target_dir(self, pid: str, kind: str) -> Path:
         proj = project_of(pid)
         rel = KIND_DIR.get(kind, "assets/uploads")
-        target = proj.dir / rel
-        try:
-            target.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            raise AppError(
-                ErrorCode.DISK_FULL if exc.errno == 28 else ErrorCode.VALIDATION_ERROR,
-                "无法创建资产目录",
-                f"{target}: {type(exc).__name__}: {exc}",
-                ["确认磁盘可写且空间充足"],
-            ) from exc
-        return target
+        return ensure_dir(proj.dir / rel)
 
     async def register_bytes(
         self, pid: str, kind: str, filename: str, data: bytes, source: str = "manual"
     ) -> dict[str, Any]:
         """把上传的字节落盘并登记。同内容重复上传直接复用已有资产。"""
-        if not data:
-            raise AppError(
-                ErrorCode.VALIDATION_ERROR,
-                "文件是空的",
-                f"{filename} 长度为 0 字节。",
-                ["确认选中的文件没有损坏", "重新导出后再上传"],
-            )
-        sha1 = hashlib.sha1(data).hexdigest()
+        sha1 = require_bytes(data, filename)
         existing = await self.by_sha1(pid, sha1)
         if existing is not None:
             return existing
 
-        suffix = Path(filename).suffix or ".bin"
-        target = self._target_dir(pid, kind) / f"{sha1[:12]}{suffix}"
-        try:
-            target.write_bytes(data)
-        except OSError as exc:
-            raise AppError(
-                ErrorCode.DISK_FULL if exc.errno == 28 else ErrorCode.VALIDATION_ERROR,
-                "资产写入失败",
-                f"{target}: {type(exc).__name__}: {exc}",
-                ["确认磁盘空间充足", "确认目录未被安全软件锁定"],
-            ) from exc
+        target = self._target_dir(pid, kind) / content_name(sha1, Path(filename).suffix)
+        write_file(target, data)
         return await self._insert(pid, kind, target, sha1, source, filename)
 
     async def register_path(
         self, pid: str, kind: str, src: str, source: str = "manual", copy: bool = True
     ) -> dict[str, Any]:
-        """登记磁盘上已有的文件（桌面端选文件走这条）。"""
-        path = Path(src.strip().strip('"')).expanduser()  # noqa: ASYNC240 - 本地磁盘元数据，开销可忽略
-        if not path.is_file():
-            raise AppError(
-                ErrorCode.NOT_FOUND,
-                "文件不存在",
-                f"{path} 不存在或不是文件。",
-                ["确认路径拼写正确", "确认文件没有被移动或删除"],
-                {"path": str(path)},
-            )
-        try:
-            data_sha = hashlib.sha1(path.read_bytes()).hexdigest()
-        except OSError as exc:
-            raise AppError(
-                ErrorCode.VALIDATION_ERROR,
-                "文件无法读取",
-                f"{path}: {type(exc).__name__}: {exc}",
-                ["确认文件未被其他程序占用"],
-            ) from exc
+        """登记磁盘上已有的文件（桌面端选文件、从素材库采用都走这条）。"""
+        path = source_file(src)
+        data_sha = sha1_of_file(path)
         existing = await self.by_sha1(pid, data_sha)
         if existing is not None:
             return existing
 
         target = path
         if copy:
-            target = self._target_dir(pid, kind) / f"{data_sha[:12]}{path.suffix}"
+            target = self._target_dir(pid, kind) / content_name(data_sha, path.suffix)
             shutil.copy2(path, target)
         return await self._insert(pid, kind, target, data_sha, source, path.name)
 
@@ -182,6 +220,24 @@ class AssetService:
         async with db.read() as session:
             row = (await session.execute(select(Asset).where(Asset.sha1 == sha1))).scalars().first()
         return as_dict(row) if row else None
+
+    async def merge_meta(self, pid: str, asset_id: str, patch: dict[str, Any]) -> dict[str, Any]:
+        """往已登记资产的 meta_json 上补字段。
+
+        「从素材库采用」要记出处，但采用可能命中 sha1 去重（文件早就在工程里了），
+        那时候没有新行可写。所以出处统一在这里补，新登记和去重命中走同一条路。
+        """
+        db = db_of(pid)
+        await fetch(db, Asset, asset_id, "资产")
+        async with db.write() as session:
+            row = await session.get(Asset, asset_id)
+            assert row is not None
+            meta = load_json(row.meta_json, {})
+            if not isinstance(meta, dict):
+                meta = {}
+            meta.update(patch)
+            row.meta_json = dump_json(meta)
+            return as_dict(row)
 
     # --- 引用关系 ---
 

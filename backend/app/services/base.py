@@ -10,13 +10,16 @@ import json
 from typing import Any, TypeVar
 
 from sqlalchemy import inspect, select
+from sqlalchemy.orm import DeclarativeBase
 from sqlalchemy.sql import ColumnElement
 
 from app.core.errors import AppError, ErrorCode
-from app.persistence.db import Base, Database
+from app.persistence.db import Database
 from app.services.projects import OpenProject, projects
 
-T = TypeVar("T", bound=Base)
+#: 绑到 DeclarativeBase 而不是工程侧的 Base：素材库有自己的 LibraryBase，
+#: 但取行、转字典、写补丁这些事一模一样，不该有第二套 helper。
+T = TypeVar("T", bound=DeclarativeBase)
 
 
 def project_of(pid: str) -> OpenProject:
@@ -27,7 +30,7 @@ def db_of(pid: str) -> Database:
     return projects.get(pid).db
 
 
-def as_dict(row: Base) -> dict[str, Any]:
+def as_dict(row: DeclarativeBase) -> dict[str, Any]:
     """ORM 行 → 字典。列名即字段名，前后端共用同一套口径。"""
     mapper = inspect(type(row)).mapper
     return {col.key: getattr(row, col.key) for col in mapper.column_attrs}
@@ -45,6 +48,19 @@ def load_json(raw: str | None, fallback: Any) -> Any:
 
 def dump_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False)
+
+
+def require_name(raw: Any, what: str, example: str) -> str:
+    """名字是绝大多数实体的唯一必填项。空名字要报错，且要给出一个像样的例子。"""
+    name = str(raw or "").strip()
+    if not name:
+        raise AppError(
+            ErrorCode.VALIDATION_ERROR,
+            f"{what}需要一个名字",
+            f"名字是{what}的唯一必填项，其余都可以之后再补。",
+            [f"填一个名字，例如「{example}」"],
+        )
+    return name
 
 
 async def fetch(db: Database, model: type[T], ident: str, what: str) -> T:
@@ -78,7 +94,7 @@ async def fetch_all(
         return list((await session.execute(stmt)).scalars().all())
 
 
-def assign(row: Base, patch: dict[str, Any], allowed: tuple[str, ...]) -> list[str]:
+def assign(row: DeclarativeBase, patch: dict[str, Any], allowed: tuple[str, ...]) -> list[str]:
     """把补丁写进行，返回真正变化的字段名。未列入 allowed 的字段一律忽略。"""
     changed: list[str] = []
     for key, value in patch.items():

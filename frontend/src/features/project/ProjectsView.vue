@@ -3,18 +3,20 @@
  * 起始页：项目的新建 / 打开 / 最近列表。
  *
  * 一个项目 = 磁盘上一个自包含目录。这里的三条硬要求：
- *   1. 目录由用户自己填绝对路径——后端只监听回环，不做文件浏览器；
+ *   1. 目录用后端提供的目录浏览器选（浏览器拿不到绝对路径），也允许手输兜底；
  *   2. 失败必须看得见：结构化错误连 suggestions 一起画出来，绝不静默；
  *   3. 最近列表里目录不在了的条目不隐藏，标成「目录不存在」并给「忘记」动作。
  */
 import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { FolderOpen, FolderPlus, RefreshCw, Trash2 } from '@lucide/vue'
+import { FolderOpen, FolderPlus, FolderSearch, RefreshCw, Trash2 } from '@lucide/vue'
 import AppPanel from '@/shared/ui/AppPanel.vue'
 import AppButton from '@/shared/ui/AppButton.vue'
 import AppBadge from '@/shared/ui/AppBadge.vue'
 import EmptyState from '@/shared/ui/EmptyState.vue'
+import DirPicker from '@/shared/ui/DirPicker.vue'
 import type { DurationUnit } from '@/shared/api/projects'
+import { REQUIREMENT_LABEL } from '@/app/features'
 import { useProjectStore } from '@/stores/project'
 import { useSystemStore } from '@/stores/system'
 
@@ -22,6 +24,28 @@ const sys = useSystemStore()
 const proj = useProjectStore()
 const router = useRouter()
 const connected = computed(() => sys.health !== null)
+
+/**
+ * 环境自检条：从原来的工作台首页搬到这里。
+ * 「能不能开工」必须在开工的那一页回答——后端没连上时新建和打开都会失败，
+ * 与其点下去再报错，不如一进来就看见。
+ */
+const readiness = computed(() => [
+  {
+    key: 'backend',
+    label: '后端服务',
+    ok: sys.health !== null,
+    detail: sys.health ? `v${sys.health.version} · schema ${sys.health.schema_version}` : '未连接',
+    hint: '未连接时无法新建或打开项目，请先启动 backend。',
+  },
+  ...sys.deps.map((d) => ({
+    key: d.name,
+    label: REQUIREMENT_LABEL[d.name],
+    ok: d.ok,
+    detail: d.detail,
+    hint: d.hint,
+  })),
+])
 
 const form = ref({
   dir: '',
@@ -32,6 +56,22 @@ const form = ref({
   duration_unit: 'frames' as DurationUnit,
 })
 const openDir = ref('')
+
+/** 两个路径输入框共用一个目录选择器，picking 记住这次选的是哪一个。 */
+const picking = ref<'create' | 'open' | null>(null)
+const pickerStart = computed(() =>
+  picking.value === 'create' ? form.value.dir : picking.value === 'open' ? openDir.value : '',
+)
+
+function browse(target: 'create' | 'open'): void {
+  picking.value = target
+}
+
+function picked(path: string): void {
+  if (picking.value === 'create') form.value.dir = path
+  else if (picking.value === 'open') openDir.value = path
+  picking.value = null
+}
 
 const canCreate = computed(
   () =>
@@ -97,17 +137,42 @@ onMounted(() => void proj.refreshRecent())
       </p>
     </section>
 
+    <AppPanel title="能不能开工" class="mt-2">
+      <template #actions>
+        <AppButton size="sm" variant="ghost" @click="sys.refresh()">
+          <RefreshCw :size="10" />重新自检
+        </AppButton>
+      </template>
+      <ul class="divide-line-1 divide-y">
+        <li v-for="r in readiness" :key="r.key" class="flex items-start gap-2 px-3 py-1.5">
+          <span
+            class="mt-1.5 size-1.5 shrink-0 rounded-full"
+            :class="r.ok ? 'bg-st-done' : 'bg-st-failed'"
+          />
+          <div class="min-w-0 flex-1">
+            <p class="text-fg-1 text-xs">{{ r.label }} — {{ r.detail }}</p>
+            <p v-if="!r.ok && r.hint" class="text-fg-4 text-2xs">{{ r.hint }}</p>
+          </div>
+        </li>
+      </ul>
+    </AppPanel>
+
     <div class="mt-2 grid gap-2 lg:grid-cols-2">
       <AppPanel title="新建项目">
         <form class="space-y-2 p-3" @submit.prevent="create">
           <label class="block">
             <span class="text-fg-3 text-2xs">工程目录（绝对路径，不存在会被创建）</span>
-            <input
-              v-model="form.dir"
-              type="text"
-              placeholder="E:/aivs/我的片子"
-              class="border-line-1 bg-base-2 text-fg-1 placeholder:text-fg-4 focus:border-accent/60 mt-0.5 h-row w-full rounded-sm border px-2 font-mono text-xs outline-none"
-            />
+            <div class="mt-0.5 flex items-center gap-1.5">
+              <input
+                v-model="form.dir"
+                type="text"
+                placeholder="E:/aivs/我的片子"
+                class="border-line-1 bg-base-2 text-fg-1 placeholder:text-fg-4 focus:border-accent/60 h-row min-w-0 flex-1 rounded-sm border px-2 font-mono text-xs outline-none"
+              />
+              <AppButton title="浏览本机文件夹" @click="browse('create')">
+                <FolderSearch :size="12" />浏览…
+              </AppButton>
+            </div>
           </label>
           <label class="block">
             <span class="text-fg-3 text-2xs">项目名称</span>
@@ -165,9 +230,6 @@ onMounted(() => void proj.refreshRecent())
             <AppButton type="submit" variant="primary" :disabled="!canCreate">
               <FolderPlus :size="12" />{{ proj.busy ? '创建中…' : '新建项目' }}
             </AppButton>
-            <AppButton variant="ghost" @click="sys.refresh()">
-              <RefreshCw :size="12" />重新自检
-            </AppButton>
             <AppBadge tone="accent">POST /projects</AppBadge>
           </div>
           <p class="text-fg-4 text-2xs">目录里若已有别的工程会被拒绝，一个字节都不会被覆盖。</p>
@@ -178,12 +240,17 @@ onMounted(() => void proj.refreshRecent())
         <form class="space-y-2 p-3" @submit.prevent="open(openDir)">
           <label class="block">
             <span class="text-fg-3 text-2xs">工程目录（内含 project.aivs.json）</span>
-            <input
-              v-model="openDir"
-              type="text"
-              placeholder="E:/aivs/我的片子"
-              class="border-line-1 bg-base-2 text-fg-1 placeholder:text-fg-4 focus:border-accent/60 mt-0.5 h-row w-full rounded-sm border px-2 font-mono text-xs outline-none"
-            />
+            <div class="mt-0.5 flex items-center gap-1.5">
+              <input
+                v-model="openDir"
+                type="text"
+                placeholder="E:/aivs/我的片子"
+                class="border-line-1 bg-base-2 text-fg-1 placeholder:text-fg-4 focus:border-accent/60 h-row min-w-0 flex-1 rounded-sm border px-2 font-mono text-xs outline-none"
+              />
+              <AppButton title="浏览本机文件夹" @click="browse('open')">
+                <FolderSearch :size="12" />浏览…
+              </AppButton>
+            </div>
           </label>
           <AppButton type="submit" :disabled="!connected || proj.busy || openDir.trim() === ''">
             <FolderOpen :size="12" />打开项目
@@ -264,5 +331,14 @@ onMounted(() => void proj.refreshRecent())
         </li>
       </ul>
     </AppPanel>
+
+    <DirPicker
+      :open="picking !== null"
+      :start="pickerStart"
+      :title="picking === 'create' ? '选择新工程要放在哪个文件夹' : '选择已有的工程目录'"
+      :confirm-label="picking === 'create' ? '在这里新建' : '选择这个工程'"
+      @update:open="picking = $event ? picking : null"
+      @pick="picked"
+    />
   </div>
 </template>

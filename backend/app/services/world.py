@@ -21,23 +21,11 @@ from app.persistence.models_world import (
     PropReference,
 )
 from app.services.assets import assets
-from app.services.base import as_dict, db_of, fetch, fetch_all
+from app.services.base import as_dict, db_of, fetch, fetch_all, require_name
 
 LOCATION_FIELDS = ("name", "description", "notes")
 VARIANT_FIELDS = ("name", "time_of_day", "weather", "lighting", "description")
 PROP_FIELDS = ("name", "description", "notes")
-
-
-def _require_name(raw: Any, what: str, example: str) -> str:
-    name = str(raw or "").strip()
-    if not name:
-        raise AppError(
-            ErrorCode.VALIDATION_ERROR,
-            f"{what}需要一个名字",
-            f"名字是{what}的唯一必填项。",
-            [f"填一个名字，例如「{example}」"],
-        )
-    return name
 
 
 class WorldService:
@@ -64,14 +52,19 @@ class WorldService:
             for loc in locs
         ]
 
-    async def create_location(self, pid: str, patch: dict[str, Any]) -> dict[str, Any]:
+    async def create_location(
+        self, pid: str, patch: dict[str, Any], *, origin_library_id: str | None = None
+    ) -> dict[str, Any]:
+        """建地点。origin_library_id 只在「从素材库采用」时传，是出处不是外键
+        （见 services/adopt.py）。"""
         db = db_of(pid)
         now = utc_now()
         row = Location(
             id=new_id("location"),
-            name=_require_name(patch.get("name"), "地点", "城南旧宅"),
+            name=require_name(patch.get("name"), "地点", "城南旧宅"),
             description=patch.get("description"),
             notes=patch.get("notes"),
+            origin_library_id=origin_library_id,
             created_at=now,
             updated_at=now,
         )
@@ -120,7 +113,7 @@ class WorldService:
         row = LocationVariant(
             id=new_id("location_variant"),
             location_id=lid,
-            name=_require_name(patch.get("name"), "变体", "雨夜"),
+            name=require_name(patch.get("name"), "变体", "雨夜"),
             **{k: patch.get(k) for k in VARIANT_FIELDS if k != "name"},
             created_at=now,
             updated_at=now,
@@ -216,14 +209,19 @@ class WorldService:
             )
         return out
 
-    async def create_prop(self, pid: str, patch: dict[str, Any]) -> dict[str, Any]:
+    async def create_prop(
+        self, pid: str, patch: dict[str, Any], *, origin_library_id: str | None = None
+    ) -> dict[str, Any]:
+        """建道具。origin_library_id 只在「从素材库采用」时传，是出处不是外键
+        （见 services/adopt.py）。"""
         db = db_of(pid)
         now = utc_now()
         row = Prop(
             id=new_id("prop"),
-            name=_require_name(patch.get("name"), "道具", "油纸伞"),
+            name=require_name(patch.get("name"), "道具", "油纸伞"),
             description=patch.get("description"),
             notes=patch.get("notes"),
+            origin_library_id=origin_library_id,
             created_at=now,
             updated_at=now,
         )

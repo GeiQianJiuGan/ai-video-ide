@@ -18,7 +18,10 @@ from fastapi.responses import JSONResponse
 from app.api import assets as assets_api
 from app.api import cast as cast_api
 from app.api import context as context_api
+from app.api import files as files_api
+from app.api import fs as fs_api
 from app.api import generation as generation_api
+from app.api import library as library_api
 from app.api import overview as overview_api
 from app.api import projects as projects_api
 from app.api import story as story_api
@@ -35,12 +38,26 @@ from app.core.errors import (
     validation_error_handler,
 )
 from app.core.logging import get_logger, setup_logging
+from app.services.library import library
 from app.services.projects import projects
 
 log = get_logger("main")
 
 API_PREFIX = "/api/v1"
 PUBLIC_PATHS = {"/api/v1/health", "/docs", "/openapi.json", "/redoc"}
+
+
+def _authorized(request: Request) -> bool:
+    """握手校验。
+
+    正常情况只认 X-AIVS-Token 头。但 <img src> / <video src> 没法带自定义头，
+    所以文件读取端点额外接受 ?token=——和 /ws 的做法一致，且仅限只读的 GET。
+    """
+    if request.headers.get("X-AIVS-Token") == settings.handshake_token:
+        return True
+    if request.method == "GET" and "/files/" in request.url.path:
+        return request.query_params.get("token") == settings.handshake_token
+    return False
 
 
 @asynccontextmanager
@@ -56,6 +73,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     yield
     # 关闭所有工程库：SQLite WAL 需要正常 dispose 才会把 -wal 合并回主文件
     await projects.close_all()
+    # 素材库同理。shutdown 只 dispose，不忘记库的位置——下次启动还要打开它
+    await library.shutdown()
     log.info("backend.stopped")
 
 
@@ -82,7 +101,7 @@ def create_app() -> FastAPI:
             settings.require_handshake
             and request.url.path.startswith("/api")
             and request.url.path not in PUBLIC_PATHS
-            and request.headers.get("X-AIVS-Token") != settings.handshake_token
+            and not _authorized(request)
         ):
             err = AppError(
                 ErrorCode.UNAUTHORIZED,
@@ -98,10 +117,13 @@ def create_app() -> FastAPI:
     app.add_exception_handler(Exception, unhandled_error_handler)
 
     app.include_router(system.router, prefix=API_PREFIX)
+    app.include_router(fs_api.router, prefix=API_PREFIX)
     app.include_router(projects_api.router, prefix=API_PREFIX)
     app.include_router(cast_api.router, prefix=API_PREFIX)
     app.include_router(world_api.router, prefix=API_PREFIX)
     app.include_router(assets_api.router, prefix=API_PREFIX)
+    app.include_router(files_api.router, prefix=API_PREFIX)
+    app.include_router(library_api.router, prefix=API_PREFIX)
     app.include_router(workflows_api.router, prefix=API_PREFIX)
     app.include_router(story_api.router, prefix=API_PREFIX)
     app.include_router(context_api.router, prefix=API_PREFIX)

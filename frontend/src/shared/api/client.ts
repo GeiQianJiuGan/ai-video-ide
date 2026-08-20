@@ -76,16 +76,18 @@ function networkError(cause: unknown): ApiError {
 }
 
 async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
+  const form = body instanceof FormData
   const headers: Record<string, string> = { Accept: 'application/json' }
   if (endpoint.token) headers['X-AIVS-Token'] = endpoint.token
-  if (body !== undefined) headers['Content-Type'] = 'application/json'
+  // multipart 的 Content-Type 必须由浏览器带 boundary 生成，写死就传不上去
+  if (body !== undefined && !form) headers['Content-Type'] = 'application/json'
 
   let resp: Response
   try {
     resp = await fetch(`${endpoint.baseUrl}${path}`, {
       method,
       headers,
-      body: body === undefined ? undefined : JSON.stringify(body),
+      body: body === undefined ? undefined : form ? (body as FormData) : JSON.stringify(body),
     })
   } catch (cause) {
     throw networkError(cause)
@@ -118,4 +120,15 @@ export const api = {
   put: <T>(path: string, body?: unknown) => request<T>('PUT', path, body ?? {}),
   patch: <T>(path: string, body?: unknown) => request<T>('PATCH', path, body ?? {}),
   del: <T>(path: string) => request<T>('DELETE', path),
+  /**
+   * 上传文件（multipart）。不能走 request()——它会把 body 序列化成 JSON，
+   * 而且 Content-Type 必须由浏览器自己带 boundary，手写就传不上去。
+   * 错误处理与 request() 完全一致，失败同样是 ApiError。
+   */
+  upload: <T>(path: string, file: File, fields: Record<string, string> = {}) => {
+    const form = new FormData()
+    form.append('file', file, file.name)
+    for (const [k, v] of Object.entries(fields)) if (v) form.append(k, v)
+    return request<T>('POST', path, form)
+  },
 }

@@ -20,9 +20,15 @@ const feature = computed(() => featureByRoute(route.name as string | undefined))
 const place = computed(() => {
   if (feature.value) return feature.value.title
   if (route.name === 'settings') return '设置'
-  if (route.name === 'projects') return '项目管理'
   return '工作台'
 })
+
+/**
+ * 项目段只在项目内页面显示。
+ * 站在项目管理页 / 素材库 / 设置里说「未打开项目 ›」是噪音——
+ * 那些页面本来就不需要工程。
+ */
+const showProject = computed(() => feature.value?.scope !== 'app' && route.name !== 'settings')
 
 /** 面包屑上显示的是人看得懂的项目名；工程还没加载出来时退回 pid。 */
 const projectLabel = computed(() => {
@@ -48,10 +54,12 @@ const projectTitle = computed(() =>
     <span class="text-fg-4">|</span>
 
     <nav class="flex min-w-0 items-center gap-1">
-      <span class="text-fg-3 truncate" :class="!projectId && 'text-fg-4'" :title="projectTitle">
-        {{ projectLabel }}
-      </span>
-      <ChevronRight :size="12" class="text-fg-4 shrink-0" />
+      <template v-if="showProject">
+        <span class="text-fg-3 truncate" :class="!projectId && 'text-fg-4'" :title="projectTitle">
+          {{ projectLabel }}
+        </span>
+        <ChevronRight :size="12" class="text-fg-4 shrink-0" />
+      </template>
       <span class="text-fg-1 truncate">{{ place }}</span>
     </nav>
 

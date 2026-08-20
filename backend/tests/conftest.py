@@ -18,6 +18,7 @@ from app.core.config import settings
 from app.main import create_app
 from app.persistence.db import Database
 from app.services.generation import generation
+from app.services.library import library as library_service
 from app.services.projects import projects
 
 
@@ -39,12 +40,15 @@ async def clean_runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Asyn
     monkeypatch.setattr(settings, "runtime_dir", tmp_path / "runtime")
     settings.runtime_dir.mkdir(parents=True, exist_ok=True)
     await projects.close_all()
+    # 素材库同样是应用级状态：进程里只有一个，不关掉会被下一个测试看见
+    await library_service.shutdown()
     yield
     for pid in list(generation._pumps):  # 别把调度任务泄漏到下一个测试
         await generation.stop_pump(pid)
     generation._paused.clear()
     generation._cancelled.clear()
     await projects.close_all()
+    await library_service.shutdown()
 
 
 @pytest.fixture
@@ -72,6 +76,21 @@ def pid(project: dict[str, Any]) -> str:
 @pytest.fixture
 def project_dir(tmp_path: Path) -> Path:
     return tmp_path / "film"
+
+
+@pytest.fixture
+def library_dir(tmp_path: Path) -> Path:
+    return tmp_path / "素材库"
+
+
+@pytest.fixture
+def library(client: TestClient, library_dir: Path) -> dict[str, Any]:
+    """配置一个空目录当素材库。素材库是应用级的，不属于任何工程。"""
+    resp = client.post("/api/v1/library/configure", json={"dir": str(library_dir)})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["configured"] is True
+    return dict(body["library"])
 
 
 def error_of(resp: Any) -> dict[str, Any]:
@@ -148,6 +167,22 @@ def upload_png(client: TestClient, pid: str, kind: str = "upload", name: str = "
     resp = client.post(
         f"/api/v1/projects/{pid}/assets/upload",
         data={"kind": kind},
+        files={"file": (name, PNG_1PX + name.encode(), "image/png")},
+    )
+    assert resp.status_code == 201, resp.text
+    return str(resp.json()["id"])
+
+
+def lib_png(
+    client: TestClient, kind: str = "upload", name: str = "lib.png", title: str | None = None
+) -> str:
+    """往素材库上传一张 1×1 PNG，返回库内 asset_id。内容缀上文件名以避开 sha1 去重。"""
+    data: dict[str, str] = {"kind": kind}
+    if title is not None:
+        data["title"] = title
+    resp = client.post(
+        "/api/v1/library/assets/upload",
+        data=data,
         files={"file": (name, PNG_1PX + name.encode(), "image/png")},
     )
     assert resp.status_code == 201, resp.text
