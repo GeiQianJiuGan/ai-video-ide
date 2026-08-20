@@ -5,8 +5,10 @@ withDefaults(
     variant?: 'default' | 'primary' | 'ghost' | 'danger'
     size?: 'sm' | 'md'
     disabled?: boolean
+    /** 表单里的提交按钮要显式声明，否则回车提交不了。 */
+    type?: 'button' | 'submit'
   }>(),
-  { variant: 'default', size: 'md', disabled: false },
+  { variant: 'default', size: 'md', disabled: false, type: 'button' },
 )
 
 const VARIANT = {
@@ -21,7 +23,7 @@ const SIZE = { sm: 'h-5 px-1.5 text-2xs', md: 'h-row px-2.5 text-xs' } as const
 
 <template>
   <button
-    type="button"
+    :type="type"
     :disabled="disabled"
     class="inline-flex shrink-0 items-center gap-1.5 rounded-sm border transition-colors disabled:cursor-not-allowed disabled:opacity-40"
     :class="[VARIANT[variant], SIZE[size]]"

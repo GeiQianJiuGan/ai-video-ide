@@ -238,33 +238,35 @@ def test_open_rejects_manifest_from_newer_app(client: TestClient, tmp_path: Path
 def test_open_old_project_upgrades_and_reports(
     client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """旧工程被新版本应用打开：自动升级，并明确报出 schema 1 → 2。"""
+    """旧工程被新版本应用打开：自动升级，并明确报出 schema N → N+1。"""
     target = tmp_path / "my_film"
     created = make_project(client, target)
-    assert created["schema_version"] == 1
+    born = created["schema_version"]
+    assert born == settings.schema_version
     client.post(f"/api/v1/projects/{created['id']}/close")
 
-    monkeypatch.setattr(settings, "schema_version", 2)
+    monkeypatch.setattr(settings, "schema_version", born + 1)
     resp = client.post("/api/v1/projects/open", json={"dir": str(target)})
     assert resp.status_code == 200, resp.text
     opened = resp.json()
-    assert opened["migrated_from"] == 1
-    assert opened["schema_version"] == 2
+    assert opened["migrated_from"] == born
+    assert opened["schema_version"] == born + 1
 
     manifest = json.loads((target / MANIFEST_NAME).read_text(encoding="utf-8"))
-    assert manifest["schema_version"] == 2, "升级后必须回写清单，否则下次又当旧工程处理"
+    assert manifest["schema_version"] == born + 1, "升级后必须回写清单，否则下次又当旧工程处理"
     with sqlite3.connect(target / DB_NAME) as conn:
-        assert conn.execute("SELECT schema_version FROM project").fetchone()[0] == 2
+        assert conn.execute("SELECT schema_version FROM project").fetchone()[0] == born + 1
 
 
 def test_migration_announced_over_websocket(
     client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """状态条上那行「工程已升级 schema 1 → 2」的数据来源。"""
+    """状态条上那行「工程已升级 schema N → N+1」的数据来源。"""
     target = tmp_path / "my_film"
     created = make_project(client, target)
+    born = created["schema_version"]
     client.post(f"/api/v1/projects/{created['id']}/close")
-    monkeypatch.setattr(settings, "schema_version", 2)
+    monkeypatch.setattr(settings, "schema_version", born + 1)
 
     with client.websocket_connect("/api/v1/ws?channels=system") as socket:
         assert socket.receive_json()["event"] == "system.connected"
@@ -274,8 +276,8 @@ def test_migration_announced_over_websocket(
             msg = socket.receive_json()
             events[msg["event"]] = msg["payload"]
     assert "project.opened" in events
-    assert events["project.migrated"]["from"] == 1
-    assert events["project.migrated"]["to"] == 2
+    assert events["project.migrated"]["from"] == born
+    assert events["project.migrated"]["to"] == born + 1
 
 
 # --- 最近打开 ---

@@ -5,19 +5,24 @@
  * 四条边都是常驻的应用外壳，主区只换内容——这样任何时候都能看出
  * 「我在哪个项目、哪个功能里、系统状态如何、还能去哪」。
  */
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { RouterView, useRoute } from 'vue-router'
 import ActivityBar from './ActivityBar.vue'
 import StatusBar from './StatusBar.vue'
 import TitleBar from './TitleBar.vue'
 import CommandPalette from '@/shared/ui/CommandPalette.vue'
+import { useProjectStore } from '@/stores/project'
 import { useSystemStore } from '@/stores/system'
 
 const sys = useSystemStore()
+const proj = useProjectStore()
 const route = useRoute()
 const paletteOpen = ref(false)
 
 const pid = computed(() => (route.params.pid as string | undefined) ?? null)
+
+// 刷新页面或直接深链接进来时，路由只带着 pid，工程信息要自己补齐
+watch(pid, (id) => void (id ? proj.ensure(id) : null), { immediate: true })
 
 function onKeydown(e: KeyboardEvent): void {
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {

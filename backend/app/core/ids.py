@@ -13,6 +13,7 @@ PREFIX = {
     "location_variant": "var",
     "location_reference": "lrf",
     "prop": "prp",
+    "prop_reference": "prf",
     "story": "sty",
     "scene": "scn",
     "shot": "sht",
@@ -29,6 +30,10 @@ PREFIX = {
     "subtitle": "sub",
     "clip": "clp",
     "import_session": "imp",
+    "shot_cast": "scs",
+    "shot_prop": "spp",
+    "asset_ref": "arf",
+    "export_record": "exp",
     "request": "req",
 }
 

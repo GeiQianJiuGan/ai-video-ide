@@ -15,8 +15,17 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from app.api import assets as assets_api
+from app.api import cast as cast_api
+from app.api import context as context_api
+from app.api import generation as generation_api
+from app.api import overview as overview_api
 from app.api import projects as projects_api
+from app.api import story as story_api
 from app.api import system, ws
+from app.api import timeline as timeline_api
+from app.api import workflows as workflows_api
+from app.api import world as world_api
 from app.core.config import settings
 from app.core.errors import (
     AppError,
@@ -90,6 +99,15 @@ def create_app() -> FastAPI:
 
     app.include_router(system.router, prefix=API_PREFIX)
     app.include_router(projects_api.router, prefix=API_PREFIX)
+    app.include_router(cast_api.router, prefix=API_PREFIX)
+    app.include_router(world_api.router, prefix=API_PREFIX)
+    app.include_router(assets_api.router, prefix=API_PREFIX)
+    app.include_router(workflows_api.router, prefix=API_PREFIX)
+    app.include_router(story_api.router, prefix=API_PREFIX)
+    app.include_router(context_api.router, prefix=API_PREFIX)
+    app.include_router(generation_api.router, prefix=API_PREFIX)
+    app.include_router(timeline_api.router, prefix=API_PREFIX)
+    app.include_router(overview_api.router, prefix=API_PREFIX)
     app.include_router(ws.router, prefix=API_PREFIX)
     return app
 

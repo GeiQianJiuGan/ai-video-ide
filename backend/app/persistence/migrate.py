@@ -27,7 +27,7 @@ ALEMBIC_DIR = BACKEND_ROOT / "alembic"
 
 #: 每个 revision 落地后工程处于哪个 schema 版本。新增迁移必须在这里登记，
 #: 否则打开旧工程时无法向用户显示「schema X → Y」。
-REVISION_SCHEMA: dict[str, int] = {"0001_project": 1}
+REVISION_SCHEMA: dict[str, int] = {"0001_project": 1, "0002_domain": 2}
 
 
 def _config(db_path: Path) -> Config:

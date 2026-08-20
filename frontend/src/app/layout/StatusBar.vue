@@ -1,9 +1,11 @@
 <script setup lang="ts">
 /** 底部状态条：后端 / ComfyUI / FFmpeg / LLM / WS 连接状态。常驻，24px 高。 */
 import { computed } from 'vue'
+import { useProjectStore } from '@/stores/project'
 import { useSystemStore } from '@/stores/system'
 
 const sys = useSystemStore()
+const proj = useProjectStore()
 
 const backendLabel = computed(() =>
   sys.health ? `后端 v${sys.health.version} · schema ${sys.health.schema_version}` : '后端未连接',
@@ -45,6 +47,18 @@ const DEP_LABEL: Record<string, string> = {
       <span class="size-1.5 rounded-full" :class="depColor(dep.ok)" />
       {{ DEP_LABEL[dep.name] ?? dep.name }}
     </span>
+
+    <!-- schema 升级必须被看见：工程文件被改写过，用户有权知道 -->
+    <button
+      v-if="proj.migration"
+      type="button"
+      class="text-st-running hover:text-fg-1 flex items-center gap-1"
+      title="点击关闭这条提示"
+      @click="proj.dismissMigration()"
+    >
+      «{{ proj.migration.projectName }}» 已升级 schema {{ proj.migration.from }} →
+      {{ proj.migration.to }}
+    </button>
 
     <span class="ml-auto flex items-center gap-1.5" :title="wsLabel">
       <span

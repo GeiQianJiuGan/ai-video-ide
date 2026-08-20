@@ -8,11 +8,13 @@ import { computed } from 'vue'
 import { useRoute } from 'vue-router'
 import { ChevronRight, Command, Film } from '@lucide/vue'
 import { featureByRoute } from '@/app/features'
+import { useProjectStore } from '@/stores/project'
 
 const props = defineProps<{ projectId: string | null }>()
 const emit = defineEmits<{ openPalette: [] }>()
 
 const route = useRoute()
+const proj = useProjectStore()
 const feature = computed(() => featureByRoute(route.name as string | undefined))
 
 const place = computed(() => {
@@ -22,7 +24,17 @@ const place = computed(() => {
   return '工作台'
 })
 
-const projectLabel = computed(() => (props.projectId ? props.projectId : '未打开项目'))
+/** 面包屑上显示的是人看得懂的项目名；工程还没加载出来时退回 pid。 */
+const projectLabel = computed(() => {
+  if (!props.projectId) return '未打开项目'
+  if (proj.current?.id === props.projectId) return proj.current.name
+  return props.projectId
+})
+
+/** 悬停能看到工程在磁盘上的位置——「这是哪个项目」不能只靠名字猜。 */
+const projectTitle = computed(() =>
+  proj.current?.id === props.projectId ? proj.current.dir : '未打开任何工程',
+)
 </script>
 
 <template>
@@ -36,7 +48,9 @@ const projectLabel = computed(() => (props.projectId ? props.projectId : '未打
     <span class="text-fg-4">|</span>
 
     <nav class="flex min-w-0 items-center gap-1">
-      <span class="text-fg-3 truncate" :class="!projectId && 'text-fg-4'">{{ projectLabel }}</span>
+      <span class="text-fg-3 truncate" :class="!projectId && 'text-fg-4'" :title="projectTitle">
+        {{ projectLabel }}
+      </span>
       <ChevronRight :size="12" class="text-fg-4 shrink-0" />
       <span class="text-fg-1 truncate">{{ place }}</span>
     </nav>

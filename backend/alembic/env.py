@@ -14,7 +14,7 @@ from logging.config import fileConfig
 from sqlalchemy import create_engine, pool
 
 from alembic import context
-from app.persistence import models  # noqa: F401  —— 导入以填充 Base.metadata
+from app.persistence import all_models  # noqa: F401  —— 导入以填充 Base.metadata
 from app.persistence.db import Base
 
 config = context.config
