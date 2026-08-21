@@ -33,7 +33,7 @@ AI Video Studio（`aivs`）：桌面端优先的 AI 原生长视频制作工作�
   （应用级设置 → provider 适配层 → 衔接与编排 → 场景工作台 → 幕流程图 → AI 协作栏）——
   17 个 service（cast / world / assets / workflows / story / context / generation / timeline /
   overview / projects / library / adopt / fsbrowse / appsettings / frames / sequence / director）
-  + 18 个 router（含 `/ws`），214 passed / 1 skipped。
+  + 18 个 router（含 `/ws`），238 passed / 1 skipped。
 - **前端也全部接上了后端**：`app/features.ts` 里 15 个功能都是 `ready: true`，
   `/p/:pid` 下不再有外壳页。`shared/ui/FeatureView.vue`（按注册表画工作区骨架与能力锁）
   暂时没人用，留给下一个「登记了但还没接后端」的功能——那种情况先挂它，绝不给假界面。
@@ -277,6 +277,21 @@ kind / priority / included / reason；人工覆写记在 `shot.context_overrides
   **settings.json → 环境变量 → 默认**，每个字段回一个 `source` 让 UI 标出「来自配置文件 /
   环境变量」。`POST /settings/probe` 分别探 LLM 与视频服务。**API key 永不回明文**：只回
   `masked` + `has_value`，前端只在用户真的输入了才提交那个字段。
+- **LLM 协议适配层**（`app/ai/llm/protocols.py`，`client.py` 只按设置选一个协议再转调）：与
+  provider 适配层同一个思路——**业务层只有 OpenAI 那套内部规范形状**（`messages` / `tools` /
+  `tool_calls`），四种方言（`openai_compatible` / `anthropic` / `gemini` / `ollama`）的差异全部
+  下沉到这一个文件里。三条不许绕的规矩：
+  - **协议表是唯一真源**：默认地址 / 要不要密钥 / 支不支持工具 / 模型列表从哪来都写在
+    `BY_NAME` 里，`GET /settings` 把它投影成 `llm_protocols[]` 给前端画界面——加一个协议
+    只改这一个 dict，前端一行不动；
+  - **密钥只走请求头**（`authorization` / `x-api-key` / `x-goog-api-key`），**任何协议都不把它
+    放进 URL**——进了 URL 就会跟着日志和四要素错误一起漏出去（Gemini 刻意不用 `?key=`）；
+  - **不支持工具不等于用不了**：`supports_tools=False` 的端（Ollama）退化成一次性
+    `complete_json()`，提案形状完全一样，错误建议里必须写明这一点。
+  「自动获取模型」是 `POST /settings/models`：带上**还没保存**的协议 / 地址 / 密钥先列一遍，
+  **绝不落盘**（不然得先存一份可能是错的配置）；`current_present=false` 表示连得上但这个端上
+  没有当前模型。所有出网请求走 `protocols._client(timeout)` 这唯一出口——
+  `tests/test_llm_protocols.py` 就是靠 monkeypatch 它把 24 个用例全部关在机器里跑。
 - **老的「Workflow 管理」是高级 / 兼容路径**：页面与代码原样保留（`features.ts` 里
   `advanced: true`、不进 `PROJECT_NAV`），`GenerationService._execute` 默认走 provider，
   只有 `job.workflow_id` 非空时才走 `apply_bindings` 那一支。
@@ -333,5 +348,7 @@ kind / priority / included / reason；人工覆写记在 `shot.context_overrides
 ## 文档
 
 `docs/01` 架构与选型 · `docs/02` 模块规格与 M0–M6 里程碑 · `docs/03` 全量表结构 + REST/WS 契约
-+ 落盘规范 + 测试清单 · `docs/04` Step 1–9 与完成标准。service / api 的 docstring 里写的
-「Step N」对应 `docs/04`；改接口或表结构时同步 `docs/03`。
++ 落盘规范 + 测试清单 · `docs/04` Step 1–9 与完成标准 · `docs/05` 三种调用方式与模型端要
+准备什么（`AIVS_*` 节点标题约定、http_api 合同、最小验收清单）。service / api 的 docstring
+里写的「Step N」对应 `docs/04`；改接口或表结构时同步 `docs/03`，改生成层的入口约定或适配器
+时同步 `docs/05`。

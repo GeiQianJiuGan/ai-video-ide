@@ -1,13 +1,15 @@
 /**
  * 设置 store（Step 1）。
  *
- * 与其它 store 同构（`busy` + `lastError` + 动作后重拉），但有两处专门的取舍：
+ * 与其它 store 同构（`busy` + `lastError` + 动作后重拉），但有三处专门的取舍：
  *
  *   1. **草稿与已保存分开**：输入框绑在 `draft` 上，只有「保存」时才把**改过的键**
  *      提交给后端。密钥字段的草稿初始为空串，空串意味着「没动」——因为后端根本不回明文，
  *      不这样做会在第一次保存时把用户的密钥清掉。
  *   2. **探测失败不是异常流程**：连不上 LLM / 视频服务是常态（服务没起、地址写错），
  *      所以两块各存一份 `probe` 结果或错误，页面把 suggestions 显示出来，而不是一个红叉。
+ *   3. **自动获取用的是草稿里那份配置**：先取模型再保存，比「先存一份可能是错的配置」顺。
+ *      这些覆盖只随那一次请求走，后端不落盘（见 `settingsApi.models`）。
  */
 
 import { defineStore } from 'pinia'
@@ -15,6 +17,8 @@ import { computed, ref } from 'vue'
 import { ApiError } from '@/shared/api/client'
 import {
   settingsApi,
+  type LlmProtocolRow,
+  type ModelListing,
   type PresetListing,
   type ProbeResult,
   type SettingField,
@@ -26,6 +30,14 @@ import {
 export interface ProbeState {
   busy: boolean
   result: ProbeResult | null
+  error: ApiError | null
+}
+
+/** 「自动获取」的状态。`key` 记的是给哪一项取的，页面只在那一项下面展开列表。 */
+export interface FetchState {
+  key: string
+  busy: boolean
+  listing: ModelListing | null
   error: ApiError | null
 }
 
@@ -54,12 +66,20 @@ export const useSettingsStore = defineStore('settings', () => {
     llm: emptyProbe(),
     video: emptyProbe(),
   })
+  const fetched = ref<FetchState>({ key: '', busy: false, listing: null, error: null })
 
   const fields = computed(() => snapshot.value?.fields ?? [])
   const groups = computed(() => snapshot.value?.groups ?? [])
   const providers = computed(() => snapshot.value?.providers ?? [])
   const llm = computed(() => snapshot.value?.llm ?? null)
+  const llmProtocols = computed(() => snapshot.value?.llm_protocols ?? [])
   const path = computed(() => snapshot.value?.path ?? '')
+
+  /** 草稿里选中的那个协议的能力说明（默认地址 / 要不要密钥 / 支不支持工具）。 */
+  const draftProtocol = computed<LlmProtocolRow | null>(() => {
+    const name = String(draft.value['llm.provider'] ?? '')
+    return llmProtocols.value.find((p) => p.name === name) ?? null
+  })
 
   const byKey = computed<Record<string, SettingField>>(() =>
     Object.fromEntries(fields.value.map((f) => [f.key, f])),
@@ -151,6 +171,44 @@ export const useSettingsStore = defineStore('settings', () => {
     await setOne(key, null)
   }
 
+  /**
+   * 自动获取某一项的候选取值（`field.fetch` 非空的那些，当前只有 LLM 模型）。
+   *
+   * 用的是**草稿里**的协议与地址：用户常常是「改完地址就想看看有哪些模型」。
+   * 密钥只在真敲了新的时候才带上——没敲就让后端沿用已保存的那把（它不回明文）。
+   */
+  async function fetchOptions(field: SettingField): Promise<boolean> {
+    if (!field.fetch) return false
+    fetched.value = { key: field.key, busy: true, listing: null, error: null }
+    const typedKey = String(draft.value['llm.api_key'] ?? '')
+    try {
+      const listing = await settingsApi.models(field.fetch as 'llm', {
+        provider: String(draft.value['llm.provider'] ?? ''),
+        base_url: String(draft.value['llm.base_url'] ?? ''),
+        ...(typedKey ? { api_key: typedKey } : {}),
+      })
+      fetched.value = { key: field.key, busy: false, listing, error: null }
+      return true
+    } catch (err) {
+      fetched.value = {
+        key: field.key,
+        busy: false,
+        listing: null,
+        error: err instanceof ApiError ? err : null,
+      }
+      return false
+    }
+  }
+
+  /** 从列表里挑一个：只改草稿，让「未保存」标记照常出现——存不存是用户的事。 */
+  function pickOption(key: string, id: string): void {
+    draft.value[key] = id
+  }
+
+  function clearFetched(): void {
+    fetched.value = { key: '', busy: false, listing: null, error: null }
+  }
+
   async function probe(what: 'llm' | 'video'): Promise<boolean> {
     probes.value[what] = { busy: true, result: null, error: null }
     try {
@@ -196,10 +254,13 @@ export const useSettingsStore = defineStore('settings', () => {
     lastError,
     savedAt,
     probes,
+    fetched,
     fields,
     groups,
     providers,
     llm,
+    llmProtocols,
+    draftProtocol,
     path,
     byKey,
     dirty,
@@ -214,6 +275,9 @@ export const useSettingsStore = defineStore('settings', () => {
     setOne,
     clear,
     probe,
+    fetchOptions,
+    pickOption,
+    clearFetched,
     savePreset,
     uploadPreset,
     removePreset,

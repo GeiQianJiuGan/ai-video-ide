@@ -28,7 +28,7 @@ API = "/api/v1"
 
 def use_fake_llm(monkeypatch: pytest.MonkeyPatch, rounds: list[dict[str, Any]]) -> list[int]:
     """把 LLM 换成一串预先写好的回合。返回一个计数器，方便断言真的被调了几轮。"""
-    monkeypatch.setattr(settings, "llm_provider", "openai")
+    monkeypatch.setattr(settings, "llm_provider", "openai_compatible")
     monkeypatch.setattr(settings, "llm_model", "fake-model")
     monkeypatch.setattr(settings, "llm_base_url", "http://127.0.0.1:9/v1")
     calls: list[int] = []

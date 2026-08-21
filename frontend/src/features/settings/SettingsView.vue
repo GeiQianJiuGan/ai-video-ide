@@ -2,16 +2,28 @@
 /**
  * 设置页：可写配置 + 外部依赖状态。
  *
- * 三条约定写在这里，因为它们是「绝不静默失败」在配置页的具体样子：
+ * 四条约定写在这里，因为它们是「绝不静默失败」在配置页的具体样子：
  *
  *   1. 每一项都标出**值是从哪来的**（配置文件 / 环境变量 / 默认）——排查时唯一有用的信息；
  *   2. 「测试连接」失败显示后端给的四要素错误，**不是一个红叉**；
- *   3. API Key 输入框永远是空的（后端不回明文），敲了才提交；要清除有专门的按钮。
+ *   3. API Key 输入框永远是空的（后端不回明文），敲了才提交；要清除有专门的按钮；
+ *   4. **「自动获取」是按 `field.fetch` 画的**，不在这里硬编码「模型这一项特殊」；协议的
+ *      默认地址 / 要不要密钥 / 支不支持工具也全部来自后端的协议表，前端不抄一份。
  *
  * 旧的 Workflow 绑定页降级成了高级/兼容路径，入口收在最后的折叠区里。
  */
 import { onMounted, ref } from 'vue'
-import { ChevronRight, PlugZap, RefreshCw, RotateCcw, Save, Trash2, Upload } from '@lucide/vue'
+import {
+  Check,
+  ChevronRight,
+  Download,
+  PlugZap,
+  RefreshCw,
+  RotateCcw,
+  Save,
+  Trash2,
+  Upload,
+} from '@lucide/vue'
 import AppPanel from '@/shared/ui/AppPanel.vue'
 import AppButton from '@/shared/ui/AppButton.vue'
 import AppBadge from '@/shared/ui/AppBadge.vue'
@@ -54,6 +66,18 @@ function tone(field: SettingField): 'accent' | 'neutral' {
   return field.source === 'file' ? 'accent' : 'neutral'
 }
 
+/** 没选协议时按不动这个按钮——理由写进 tooltip，不画一个点了没反应的按钮。 */
+function canFetch(): boolean {
+  const proto = cfg.draftProtocol
+  return Boolean(proto && proto.name !== 'none')
+}
+
+function fetchTitle(): string {
+  const proto = cfg.draftProtocol
+  if (!proto || proto.name === 'none') return '先在上面选一个协议，再来自动获取模型列表'
+  return `列出 ${proto.label} 上可用的模型（${proto.models_hint}）`
+}
+
 async function onPickPreset(ev: Event): Promise<void> {
   const input = ev.target as HTMLInputElement
   const file = input.files?.[0]
@@ -90,6 +114,21 @@ async function pastePreset(): Promise<void> {
       <p class="text-fg-4 border-line-1 border-b px-3 py-1.5 text-2xs">
         {{ GROUP_HINT[group.id] }}
       </p>
+      <!-- 协议的能力说明来自后端的协议表：加一个协议不用改这一页 -->
+      <p
+        v-if="group.id === 'llm' && cfg.draftProtocol && cfg.draftProtocol.name !== 'none'"
+        class="text-fg-3 border-line-1 border-b px-3 py-1.5 text-2xs"
+      >
+        {{ cfg.draftProtocol.label }} ·
+        <span class="font-mono">{{ cfg.draftProtocol.default_base_url || '无默认地址' }}</span>
+        （地址留空即用它）·
+        {{ cfg.draftProtocol.needs_key ? '需要 API Key' : '不需要 API Key（本机端）' }} ·
+        {{
+          cfg.draftProtocol.supports_tools
+            ? '支持多轮工具调用'
+            : '不支持工具调用 —— AI 协作会退化成一次性产出提案，提案形状完全一样'
+        }}
+      </p>
 
       <ul class="divide-line-1 divide-y">
         <li v-for="field in cfg.fieldsOf(group.id)" :key="field.key" class="px-3 py-1.5">
@@ -102,7 +141,9 @@ async function pastePreset(): Promise<void> {
               class="border-line-1 bg-base-2 text-fg-1 focus:border-accent/60 h-5 min-w-40 border px-1 text-2xs outline-none"
               @change="cfg.setOne(field.key, ($event.target as HTMLSelectElement).value)"
             >
-              <option v-for="c in field.choices" :key="c" :value="c">{{ c }}</option>
+              <option v-for="(c, i) in field.choices" :key="c" :value="c">
+                {{ field.choice_labels[i] || c }}
+              </option>
             </select>
 
             <input
@@ -122,6 +163,17 @@ async function pastePreset(): Promise<void> {
               @keyup.enter="cfg.save()"
             />
 
+            <AppButton
+              v-if="field.fetch"
+              size="sm"
+              :disabled="!canFetch() || cfg.fetched.busy || cfg.busy"
+              :title="fetchTitle()"
+              @click="cfg.fetchOptions(field)"
+            >
+              <Download :size="10" />
+              {{ cfg.fetched.busy && cfg.fetched.key === field.key ? '获取中…' : '自动获取' }}
+            </AppButton>
+
             <AppBadge :tone="tone(field)">{{ SOURCE_LABEL[field.source] }}</AppBadge>
             <AppBadge v-if="cfg.isDirty(field.key)" tone="warn">未保存</AppBadge>
             <AppButton
@@ -135,6 +187,54 @@ async function pastePreset(): Promise<void> {
             </AppButton>
           </div>
           <p v-if="field.impact" class="text-fg-4 mt-0.5 pl-22 text-2xs">{{ field.impact }}</p>
+
+          <!-- 自动获取的结果：挑一个只是填进输入框，手打照旧可用 -->
+          <div v-if="cfg.fetched.key === field.key" class="mt-1 pl-22">
+            <ErrorPanel :error="cfg.fetched.error" @dismiss="cfg.clearFetched()" />
+            <div v-if="cfg.fetched.listing" class="border-line-1 bg-base-2 border">
+              <p class="text-fg-4 border-line-1 flex gap-2 border-b px-1.5 py-1 text-2xs">
+                <span class="text-fg-2">
+                  {{ cfg.fetched.listing.label }} · {{ cfg.fetched.listing.count }} 个模型
+                </span>
+                <span class="min-w-0 flex-1 truncate font-mono">
+                  {{ cfg.fetched.listing.target }}
+                </span>
+              </p>
+              <p
+                v-if="cfg.fetched.listing.current_present === false"
+                class="text-st-failed border-line-1 border-b px-1.5 py-1 text-2xs"
+              >
+                连得上，但这个端上没有
+                <span class="font-mono">{{ cfg.fetched.listing.current }}</span>
+                —— 现在这样调用时才会失败，从下面挑一个。
+              </p>
+              <ul class="max-h-40 overflow-auto">
+                <li v-for="m in cfg.fetched.listing.items" :key="m.id">
+                  <button
+                    class="hover:bg-base-3 flex w-full items-center gap-1.5 px-1.5 py-1 text-left text-2xs"
+                    @click="cfg.pickOption(field.key, m.id)"
+                  >
+                    <Check
+                      :size="10"
+                      :class="
+                        String(cfg.draft[field.key] ?? '') === m.id ? 'text-accent' : 'opacity-0'
+                      "
+                    />
+                    <span class="text-fg-1">{{ m.label }}</span>
+                    <span v-if="m.label !== m.id" class="text-fg-4 truncate font-mono">
+                      {{ m.id }}
+                    </span>
+                  </button>
+                </li>
+                <li v-if="!cfg.fetched.listing.items.length" class="text-fg-4 px-1.5 py-1 text-2xs">
+                  这个端一个模型都没列出来。自建端有时不提供列表——直接把模型名填进上面的输入框。
+                </li>
+              </ul>
+              <p class="text-fg-4 border-line-1 border-t px-1.5 py-1 text-2xs">
+                挑一个只是填进输入框，记得点下面的「保存」。列不出来的模型直接手打也一样能用。
+              </p>
+            </div>
+          </div>
         </li>
       </ul>
 

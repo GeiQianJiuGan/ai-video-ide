@@ -4,10 +4,14 @@
  *
  * 原来采用只能在素材库页做（选中一条 → 采用到当前项目），于是在角色页想加一个
  * 库里已有的角色，得先跳出去、选中、采用、再跳回来。这个组件把那趟往返省掉。
+ * 现在它还是**唯一**的往返：素材库属于应用级导航，打开工程后左栏里没有它，
+ * 项目内要取库里的东西一律从这个框走（`kind: 'asset'` 就是原来素材库页上那个
+ * 「采用到当前项目」，搬进了资产库页）。
  *
  * 它只负责「挑哪一条」，动手仍然交给 AdoptDialog（先出账单再复制，顺序不能颠倒）。
  * 三态：
- *   1. 库没配置 —— **不是错误**，画引导 + 跳素材库页的按钮；
+ *   1. 库没配置 —— **不是错误**，画引导 + 跳素材库页的按钮（那会离开工程的工作区，
+ *      但工程不关，左栏会出现「返回工程」）；
  *   2. 库里这一类是空的 —— 画空状态，说清去哪儿建；
  *   3. 有内容 —— 列出来选一条。
  */
@@ -21,15 +25,15 @@ import EmptyState from '@/shared/ui/EmptyState.vue'
 import ErrorPanel from '@/shared/ui/ErrorPanel.vue'
 import AdoptDialog from './AdoptDialog.vue'
 import { libraryFileUrl } from '@/shared/api/files'
-import type { AdoptResult } from '@/shared/api/library'
+import { humanBytes, LIBRARY_KIND_LABEL, type AdoptResult } from '@/shared/api/library'
 import { useLibraryStore } from '@/stores/library'
 
 const props = defineProps<{
   open: boolean
   /** 采用到哪个工程。 */
   pid: string
-  /** 挑哪一类预设。与项目页一一对应，不给「随便挑」。 */
-  kind: 'character' | 'location' | 'prop'
+  /** 挑哪一类。与项目页一一对应，不给「随便挑」。 */
+  kind: 'asset' | 'character' | 'location' | 'prop'
 }>()
 
 const emit = defineEmits<{ 'update:open': [boolean]; adopted: [AdoptResult] }>()
@@ -40,7 +44,7 @@ const router = useRouter()
 /** 选中要采用的那一条；交给 AdoptDialog 后由它出账单。 */
 const picked = ref('')
 
-const KIND_LABEL = { character: '角色', location: '地点', prop: '道具' } as const
+const KIND_LABEL = { asset: '素材文件', character: '角色', location: '地点', prop: '道具' } as const
 
 interface Row {
   id: string
@@ -48,6 +52,8 @@ interface Row {
   /** 副标题：形象 / 变体 / 参考图的数量，让人知道会带进来什么。 */
   detail: string
   thumb: string
+  /** 库里的文件已经不在磁盘上：仍然列出来但不能采用，藏起来只会让人以为库空了。 */
+  missing?: boolean
 }
 
 const assetById = computed(() => new Map(lib.assets.map((a) => [a.id, a])))
@@ -60,6 +66,21 @@ function thumbOf(assetId: string | null | undefined): string {
 }
 
 const rows = computed<Row[]>(() => {
+  if (props.kind === 'asset') {
+    return lib.assets.map((a) => ({
+      id: a.id,
+      name: a.title || a.path.split('/').pop() || a.id,
+      detail: [
+        LIBRARY_KIND_LABEL[a.kind as keyof typeof LIBRARY_KIND_LABEL] ?? a.kind,
+        humanBytes(a.size_bytes),
+        a.width && a.height ? `${a.width}×${a.height}` : '',
+      ]
+        .filter(Boolean)
+        .join(' · '),
+      thumb: a.missing ? '' : libraryFileUrl(a.path),
+      missing: a.missing,
+    }))
+  }
   if (props.kind === 'character') {
     return lib.characters.map((c) => ({
       id: c.id,
@@ -144,17 +165,25 @@ function onAdopted(result: AdoptResult): void {
           <!-- 态 2：库里这一类还是空的 -->
           <EmptyState
             v-else-if="rows.length === 0"
-            :title="`素材库里还没有${KIND_LABEL[kind]}预设`"
-            body="先去素材库页建一条并挂上参考图，之后每一部片子都能直接采用它，不用从零重建。"
+            :title="`素材库里还没有${KIND_LABEL[kind]}`"
+            :body="
+              kind === 'asset'
+                ? '先去素材库页上传几个文件，之后每一部片子都能直接采用它们，不用重复导入。'
+                : '先去素材库页建一条并挂上参考图，之后每一部片子都能直接采用它，不用从零重建。'
+            "
           >
-            <AppButton variant="primary" @click="goLibrary()">去素材库页新建</AppButton>
+            <AppButton variant="primary" @click="goLibrary()">
+              {{ kind === 'asset' ? '去素材库页上传' : '去素材库页新建' }}
+            </AppButton>
           </EmptyState>
 
           <!-- 态 3：挑一条 -->
           <ul v-else class="divide-line-1 divide-y">
             <li v-for="row in rows" :key="row.id">
               <button
-                class="hover:bg-base-2 flex w-full items-center gap-2 px-2 py-1.5 text-left"
+                class="hover:bg-base-2 flex w-full items-center gap-2 px-2 py-1.5 text-left disabled:opacity-50"
+                :disabled="row.missing"
+                :title="row.missing ? '这个文件在库目录里找不到了，采用无法进行' : row.name"
                 @click="picked = row.id"
               >
                 <span
@@ -172,7 +201,8 @@ function onAdopted(result: AdoptResult): void {
                   <span class="text-fg-1 block truncate text-xs">{{ row.name }}</span>
                   <span class="text-fg-4 block truncate text-2xs">{{ row.detail }}</span>
                 </span>
-                <AppBadge tone="accent">采用</AppBadge>
+                <AppBadge v-if="row.missing" tone="fail">文件不见了</AppBadge>
+                <AppBadge v-else tone="accent">采用</AppBadge>
               </button>
             </li>
           </ul>

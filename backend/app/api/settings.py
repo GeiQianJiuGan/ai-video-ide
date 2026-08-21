@@ -25,6 +25,15 @@ class ProbeIn(BaseModel):
     what: str = Field("llm", description="llm | video")
 
 
+class ModelsIn(BaseModel):
+    """自动获取取值。协议 / 地址 / 密钥可以带上「还没保存」的那份，先试再存。"""
+
+    what: str = Field("llm", description="llm")
+    provider: str | None = None
+    base_url: str | None = None
+    api_key: str | None = None
+
+
 @router.get("/settings")
 async def read() -> dict[str, Any]:
     return {**app_settings.snapshot(), "providers": registry.listing()}
@@ -39,6 +48,21 @@ async def patch(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
 @router.post("/settings/probe")
 async def probe(payload: ProbeIn) -> dict[str, Any]:
     return await app_settings.probe(payload.what)
+
+
+@router.post("/settings/models")
+async def models(payload: ModelsIn) -> dict[str, Any]:
+    """列出这个端有哪些模型，省得手抄模型名。
+
+    密钥的空串按「没填」处理——前端只在用户真的敲了新密钥时才提交它，
+    否则这里要沿用已保存的那把（照 `GET /settings` 永不回明文的规矩）。
+    """
+    return await app_settings.models(
+        payload.what,
+        provider=payload.provider or None,
+        base_url=payload.base_url,
+        api_key=payload.api_key or None,
+    )
 
 
 # --- 生成预设（模型端那份图的本地副本） ---

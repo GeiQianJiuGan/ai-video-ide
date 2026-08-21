@@ -97,6 +97,17 @@ const dialogOpen = computed(
 const pageError = computed(() => (dialogOpen.value ? null : lib.lastError))
 
 const pid = computed(() => proj.current?.id ?? '')
+/**
+ * 采用按钮的说明。素材库是**应用级**页面，左栏里只有没打开工程时才有它；
+ * 这里还能采用，是因为「工程还开着，只是人跑到库里来了」。
+ * 真没打开工程时别只说「先打开一个工程」——要说清去哪儿打开，
+ * 以及工程内本来就有更近的入口（各页的「从素材库采用」）。
+ */
+const adoptHint = computed(() =>
+  pid.value
+    ? `采用到《${proj.current?.name ?? pid.value}》· 单向复制，之后两边各改各的`
+    : '先回「项目」页打开一个工程。打开之后，工程内各页的「从素材库采用」也能直接取库里的东西，不必来这儿',
+)
 const assetById = computed(() => new Map(lib.assets.map((a) => [a.id, a])))
 
 const visibleAssets = computed(() =>
@@ -434,7 +445,7 @@ onMounted(() => void lib.refresh())
                 <AppButton
                   size="sm"
                   :disabled="!pid || a.missing"
-                  :title="pid ? '采用到当前项目' : '先打开一个工程'"
+                  :title="a.missing ? '这个文件在库目录里找不到了' : adoptHint"
                   @click="askAdopt('asset', a.id)"
                 >
                   采用
@@ -469,7 +480,12 @@ onMounted(() => void lib.refresh())
               <span class="text-fg-1 min-w-0 flex-1 truncate">{{ c.name }}</span>
               <AppBadge v-for="t in c.tags" :key="t.id" tone="accent">{{ t.name }}</AppBadge>
               <AppBadge>{{ c.appearances.length }} 个形象</AppBadge>
-              <AppButton size="sm" :disabled="!pid" @click="askAdopt('character', c.id)">
+              <AppButton
+                size="sm"
+                :disabled="!pid"
+                :title="adoptHint"
+                @click="askAdopt('character', c.id)"
+              >
                 采用
               </AppButton>
               <AppButton size="sm" variant="ghost" @click="lib.deletePreset('character', c.id)">
@@ -521,7 +537,12 @@ onMounted(() => void lib.refresh())
               <AppButton size="sm" @click="startVariant(l.id, l.name)">
                 <Plus :size="10" />变体
               </AppButton>
-              <AppButton size="sm" :disabled="!pid" @click="askAdopt('location', l.id)">
+              <AppButton
+                size="sm"
+                :disabled="!pid"
+                :title="adoptHint"
+                @click="askAdopt('location', l.id)"
+              >
                 采用
               </AppButton>
               <AppButton size="sm" variant="ghost" @click="lib.deletePreset('location', l.id)">
@@ -571,7 +592,14 @@ onMounted(() => void lib.refresh())
             <AppButton size="sm" @click="startAttach('prop', p.id, p.name)">
               <ImagePlus :size="10" />挂参考图
             </AppButton>
-            <AppButton size="sm" :disabled="!pid" @click="askAdopt('prop', p.id)">采用</AppButton>
+            <AppButton
+              size="sm"
+              :disabled="!pid"
+              :title="adoptHint"
+              @click="askAdopt('prop', p.id)"
+            >
+              采用
+            </AppButton>
             <AppButton size="sm" variant="ghost" @click="lib.deletePreset('prop', p.id)">
               <Trash2 :size="10" />
             </AppButton>

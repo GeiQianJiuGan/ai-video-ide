@@ -479,6 +479,7 @@ const PROJECT_DEFS: FeatureDef[] = [
     },
     actions: [
       { label: '扫描孤儿资产', hint: '找出没有任何引用的文件，回收磁盘', primary: true },
+      { label: '从素材库采用', hint: '把库里的文件复制一份进工程，先出账单再动手' },
       { label: '定位引用来源', hint: '从文件跳到使用它的镜头' },
     ],
     outcome: ['磁盘占用可控', '删文件之前先知道会破坏什么'],
@@ -529,7 +530,14 @@ export function featuresOf(group: GroupId): Feature[] {
   return FEATURES.filter((f) => f.group === group)
 }
 
-/** 应用级导航：没打开工程时左栏只有这些。 */
+/**
+ * 应用级导航：没打开工程时左栏只有这些。
+ *
+ * 打开工程后它们**消失**——两级互斥。混在同一条栏里的时候，「项目」看着像个页面，
+ * 点下去却是退出当前工程，那是个随时会踩到的地雷。现在退出只有一个显式入口：
+ * 左栏顶上的「← 项目列表」。工程内要取库里的东西走各页的「从素材库采用」
+ * （角色 / 地点 / 道具在各自的页面，素材文件在资产库页），不必掉出工程再回来。
+ */
 export const APP_NAV = ['projects', 'library'] as const
 
 /**

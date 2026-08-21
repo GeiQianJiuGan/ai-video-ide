@@ -28,6 +28,13 @@ export interface SettingField {
   label: string
   kind: SettingKind
   choices: string[]
+  /** 与 `choices` 一一对应的人话标签。空数组表示直接显示 `choices` 里的值。 */
+  choice_labels: string[]
+  /**
+   * 非空表示这一项的取值**可以自动获取**（值就是 `POST /settings/models` 的 `what`）。
+   * 页面照它画那个「自动获取」按钮——不在前端硬编码「模型这一项特殊」。
+   */
+  fetch: string
   /** 这项配错了会导致什么做不出来。后端给的文案，前端不重写一遍。 */
   impact: string
   source: SettingSource
@@ -42,12 +49,30 @@ export interface SettingGroup {
   title: string
 }
 
-/** `llm.status()` 的形状，与状态栏里那份一致。 */
+/** `llm.status()` 的形状，与协作栏里那份一致。 */
 export interface LlmStatus {
   provider: string
   configured: boolean
-  detail: string
-  model?: string
+  /** 协议的人话名（`不使用（手动模式）` / `Anthropic Claude` …）。 */
+  label: string
+  model?: string | null
+  /** false 表示这个端不支持 function calling，AI 协作会退化成一次性产出提案。 */
+  supports_tools: boolean
+  hint: string
+}
+
+/**
+ * 一个 LLM 协议的能力说明。**协议表是后端的唯一真源**：默认地址、要不要密钥、
+ * 支不支持工具都从这里读，前端不抄一份「Anthropic 的地址长这样」。
+ */
+export interface LlmProtocolRow {
+  name: string
+  label: string
+  default_base_url: string
+  supports_tools: boolean
+  needs_key: boolean
+  /** 模型列表从哪来，例如 `GET https://api.openai.com/v1/models`。 */
+  models_hint: string
 }
 
 /** 一种调用方式。`legacy` 的是旧的 Workflow 绑定路径，只作兼容保留。 */
@@ -62,7 +87,25 @@ export interface SettingsSnapshot {
   groups: SettingGroup[]
   fields: SettingField[]
   llm: LlmStatus
+  llm_protocols: LlmProtocolRow[]
   providers: ProviderRow[]
+}
+
+/** 一个可自动获取的取值。`label` 是给人看的（display_name / 体积），`id` 才是要存的。 */
+export interface ModelOption {
+  id: string
+  label: string
+}
+
+/** 「自动获取」的结果。`current_present === false` 是一条真警告：连得上但模型不在。 */
+export interface ModelListing {
+  provider: string
+  label: string
+  target: string
+  count: number
+  items: ModelOption[]
+  current: string | null
+  current_present: boolean | null
 }
 
 /** 「测试连接」成功时的形状。失败是 ApiError，页面照常显示 suggestions。 */
@@ -97,6 +140,15 @@ export const settingsApi = {
   get: () => api.get<SettingsSnapshot>('/settings'),
   patch: (patch: SettingsPatch) => api.patch<SettingsSnapshot>('/settings', patch),
   probe: (what: 'llm' | 'video') => api.post<ProbeResult>('/settings/probe', { what }),
+  /**
+   * 自动获取某一项的候选取值（当前只有 LLM 模型）。
+   *
+   * 协议 / 地址 / 密钥可以带上**还没保存**的那份：让用户先看到模型列表再决定存什么，
+   * 而不是先存一份可能是错的配置。后端不会把它们写进 settings.json。
+   * `api_key` 留空表示「沿用已保存的那把」——密钥不回明文，所以没敲就别提交。
+   */
+  models: (what: 'llm', over: { provider?: string; base_url?: string; api_key?: string } = {}) =>
+    api.post<ModelListing>('/settings/models', { what, ...over }),
   presets: () => api.get<PresetListing>('/settings/presets'),
   savePreset: (name: string, graph: string) =>
     api.post<PresetRow>('/settings/presets', { name, graph }),

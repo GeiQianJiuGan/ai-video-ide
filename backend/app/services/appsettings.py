@@ -22,17 +22,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import httpx
-
 from app.ai.llm import client as llm
+from app.ai.llm import protocols as llm_protocols
 from app.core.config import Settings, settings
 from app.core.errors import AppError, ErrorCode
 from app.core.logging import get_logger
 from app.persistence.models import utc_now
 
 log = get_logger("appsettings")
-
-PROBE_TIMEOUT = httpx.Timeout(10.0, connect=5.0)
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,8 +42,13 @@ class FieldSpec:
     label: str
     kind: str = "str"  # str | int | float | bool | secret | enum
     choices: tuple[str, ...] = ()
+    #: 与 choices 一一对应的人话标签。空表示直接显示 choices 里的值。
+    choice_labels: tuple[str, ...] = ()
     #: 这个字段配错了会导致什么做不出来。UI 直接显示，不在前端重写一遍。
     impact: str = ""
+    #: 非空表示这个字段的取值**可以自动获取**（值就是 `POST /settings/models` 的 what）。
+    #: 设置页照它画那个「自动获取」按钮，不在前端硬编码「模型这一项特殊」。
+    fetch: str = ""
 
 
 #: 分组只影响配置页怎么摆，不影响存储结构。
@@ -65,11 +67,20 @@ FIELDS: tuple[FieldSpec, ...] = (
         "llm",
         "协议",
         "enum",
-        ("none", "openai_compatible", "ollama"),
+        # 协议表是唯一真源（app/ai/llm/protocols.py）：加一个协议不用改这里。
+        tuple(llm_protocols.names()),
+        tuple(llm_protocols.labels()),
         "none 时 AI 协作栏不可用；手动编排不受影响。",
     ),
     FieldSpec("llm.base_url", "llm_base_url", "llm", "地址", impact="留空则用协议的默认地址。"),
-    FieldSpec("llm.model", "llm_model", "llm", "模型", impact="没有模型名时视为未配置。"),
+    FieldSpec(
+        "llm.model",
+        "llm_model",
+        "llm",
+        "模型",
+        impact="没有模型名时视为未配置。",
+        fetch="llm",
+    ),
     FieldSpec("llm.api_key", "llm_api_key", "llm", "API Key", "secret"),
     FieldSpec(
         "video.provider",
@@ -78,6 +89,7 @@ FIELDS: tuple[FieldSpec, ...] = (
         "调用方式",
         "enum",
         ("comfy_preset", "http_api", "comfy_workflow"),
+        ("ComfyUI 预设（默认）", "通用 REST API", "ComfyUI 工作流绑定（兼容）"),
         "comfy_preset 走模型端保存的图；http_api 走通用合同；comfy_workflow 是旧的绑定路径。",
     ),
     FieldSpec(
@@ -212,6 +224,8 @@ class AppSettingsService:
                     "label": spec.label,
                     "kind": spec.kind,
                     "choices": list(spec.choices),
+                    "choice_labels": list(spec.choice_labels),
+                    "fetch": spec.fetch,
                     "impact": spec.impact,
                     "source": self._source_of(spec.key, overrides),
                     "value": None if secret else value,
@@ -224,6 +238,9 @@ class AppSettingsService:
             "groups": [{"id": gid, "title": title} for gid, title in GROUPS],
             "fields": fields,
             "llm": llm.status(),
+            #: 每个协议的默认地址 / 要不要密钥 / 支不支持工具——设置页照它给提示，
+            #: 不在前端抄一份「Anthropic 的地址长这样」。
+            "llm_protocols": llm_protocols.listing(),
         }
 
     async def patch(self, patch: dict[str, Any]) -> dict[str, Any]:
@@ -249,12 +266,12 @@ class AppSettingsService:
         log.info("appsettings.patched", keys=sorted(patch))
         return self.snapshot()
 
-    # --- 探测 ---
+    # --- 探测与自动获取 ---
 
     async def probe(self, what: str) -> dict[str, Any]:
         """配置页的「测试连接」。失败一律是四要素错误，不是一个红叉。"""
         if what == "llm":
-            return await self._probe_llm()
+            return await llm.probe()
         if what == "video":
             from app.generation.providers import registry
 
@@ -266,54 +283,27 @@ class AppSettingsService:
             ["用 llm 或 video"],
         )
 
-    async def _probe_llm(self) -> dict[str, Any]:
-        llm.require_configured()
-        base = settings.llm_base_url.rstrip("/")
-        if settings.llm_provider == "ollama":
-            url = f"{base or 'http://127.0.0.1:11434'}/api/tags"
-            headers: dict[str, str] = {}
-        else:
-            url = f"{base or 'https://api.openai.com/v1'}/models"
-            headers = (
-                {"Authorization": f"Bearer {settings.llm_api_key}"} if settings.llm_api_key else {}
+    async def models(
+        self,
+        what: str,
+        provider: str | None = None,
+        base_url: str | None = None,
+        api_key: str | None = None,
+    ) -> dict[str, Any]:
+        """自动获取某个字段的候选取值（当前只有 LLM 模型）。
+
+        协议 / 地址 / 密钥可以是**还没保存**的那份：让用户先看到模型列表再决定存什么，
+        而不是先存一份可能是错的配置。这些覆盖不落盘。
+        """
+        if what != "llm":
+            raise AppError(
+                ErrorCode.VALIDATION_ERROR,
+                "这一项没有可自动获取的取值",
+                f"what={what}",
+                ["当前只有 llm（模型列表）支持自动获取"],
+                {"what": what},
             )
-        try:
-            async with httpx.AsyncClient(timeout=PROBE_TIMEOUT) as http:
-                resp = await http.get(url, headers=headers)
-                resp.raise_for_status()
-                data = resp.json()
-        except httpx.HTTPError as exc:
-            raise AppError(
-                ErrorCode.LLM_UNAVAILABLE,
-                "LLM 服务连不上",
-                f"{url}：{type(exc).__name__}: {exc}",
-                [
-                    "确认地址与端口正确（本机服务通常是 127.0.0.1）",
-                    "确认 API Key 与协议匹配",
-                    "AI 协作不可用时手动编排仍能走完全程",
-                ],
-                {"url": url},
-            ) from exc
-        except ValueError as exc:
-            raise AppError(
-                ErrorCode.LLM_INVALID_OUTPUT,
-                "LLM 服务返回的不是 JSON",
-                f"{url}：{type(exc).__name__}: {exc}",
-                ["确认这个地址是 OpenAI 兼容 / Ollama 接口，而不是网页"],
-                {"url": url},
-            ) from exc
-        names = _model_names(data)
-        found = settings.llm_model in names if names else None
-        return {
-            "ok": True,
-            "target": url,
-            "model_count": len(names),
-            "model_present": found,
-            "detail": (
-                f"连通 · {len(names)} 个模型"
-                + ("" if found is not False else f"，但其中没有 {settings.llm_model}——调用时会失败")
-            ),
-        }
+        return await llm.list_models(provider=provider, base_url=base_url, api_key=api_key)
 
 
 def _coerce(spec: FieldSpec, raw: Any) -> Any:
@@ -340,19 +330,6 @@ def _coerce(spec: FieldSpec, raw: Any) -> Any:
             {"key": spec.key},
         ) from exc
     return value
-
-
-def _model_names(data: Any) -> list[str]:
-    """OpenAI 兼容与 Ollama 的模型列表长得不一样，这里只取名字。"""
-    if isinstance(data, dict):
-        rows = data.get("data") or data.get("models") or []
-        if isinstance(rows, list):
-            return [
-                str(r.get("id") or r.get("name") or "")
-                for r in rows
-                if isinstance(r, dict) and (r.get("id") or r.get("name"))
-            ]
-    return []
 
 
 app_settings = AppSettingsService()

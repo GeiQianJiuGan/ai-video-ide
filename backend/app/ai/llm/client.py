@@ -2,210 +2,123 @@
 
 硬约束：LLM 不是必选项。默认 provider = none，此时任何 AI 入口都返回
 LLM_UNAVAILABLE 这一条结构化错误，并在建议里指出手动路径同样能走完全程。
+
+**协议差异不在这里**——它们全在 `protocols.py`（openai_compatible / anthropic /
+gemini / ollama）。这一层只做三件事：判断「配没配」、按设置挑一个协议、把调用转过去。
+所以支持一个新协议不需要碰这个文件，上层（`ai/director/agent.py`、`services/*`）
+更不需要知道对面是谁。
 """
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
-import httpx
-
+from app.ai.llm import protocols
 from app.core.config import settings
 from app.core.errors import AppError, ErrorCode
 from app.core.logging import get_logger
 
 log = get_logger("llm")
-TIMEOUT = httpx.Timeout(120.0, connect=5.0)
+
+#: 兼容旧引用：截花括号解析 JSON 的实现搬到了 protocols（适配器都要用它）。
+_parse_json_object = protocols.parse_json_object
 
 
 def status() -> dict[str, Any]:
     """给「LLM 未配置 · 手动模式同样可以走完全部流程」那行灰字用。"""
-    configured = settings.llm_provider != "none" and bool(settings.llm_model)
+    proto = protocols.get()
+    configured = proto is not None and bool(settings.llm_model)
     return {
         "configured": configured,
         "provider": settings.llm_provider,
+        "label": proto.label if proto else protocols.NONE_LABEL,
         "model": settings.llm_model or None,
+        #: 不支持工具的端会退化成一次性产出提案，界面上要说清这件事。
+        "supports_tools": bool(proto and proto.supports_tools),
         "hint": (
-            f"已配置 {settings.llm_provider} · {settings.llm_model}"
-            if configured
+            f"已配置 {proto.label} · {settings.llm_model}"
+            if configured and proto
             else "LLM 未配置 · 手动模式同样可以走完全部流程"
         ),
     }
 
 
 def require_configured() -> None:
-    if not status()["configured"]:
+    """三种「没配好」分开说：没选协议 / 协议名不认识 / 选了协议但没挑模型。"""
+    proto = protocols.require()  # none 与不认识的名字在这里各报各的
+    if not settings.llm_model:
         raise AppError(
             ErrorCode.LLM_UNAVAILABLE,
-            "LLM 未配置",
-            f"当前 provider = {settings.llm_provider}，没有可用的模型。",
+            "还没有选模型",
+            f"协议是 {proto.label}，但没有模型名——没有模型名视为未配置。",
             [
-                "用「手动添加 Scene」走手动路径——数据结构与 AI 路径完全一致",
-                "或设置 AIVS_LLM_PROVIDER / AIVS_LLM_BASE_URL / AIVS_LLM_MODEL 后重试",
+                "在设置页的「模型」旁点「自动获取」，从列表里挑一个",
+                "或直接填模型名（自建端的模型不一定列得出来）",
+                "手动路径不依赖 LLM，随时可以走完全程",
             ],
+            {"provider": proto.name},
         )
-
-
-def _parse_json_object(text: str) -> dict[str, Any]:
-    """模型爱在 JSON 外面裹一层解释文字，这里只截取最外层花括号。"""
-    start, end = text.find("{"), text.rfind("}")
-    if start >= 0 and end > start:
-        text = text[start : end + 1]
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError as exc:
-        raise AppError(
-            ErrorCode.LLM_INVALID_OUTPUT,
-            "LLM 返回的不是合法 JSON",
-            f"{exc.msg}（截断预览：{text[:200]}）",
-            ["重试一次", "换一个更擅长结构化输出的模型", "或改用手动拆解"],
-        ) from exc
-    if not isinstance(data, dict):
-        raise AppError(
-            ErrorCode.LLM_INVALID_OUTPUT,
-            "LLM 返回的结构不对",
-            "期望一个 JSON 对象。",
-            ["重试一次", "或改用手动拆解"],
-        )
-    return data
 
 
 def supports_tools() -> bool:
     """这个端能不能走 function calling。
 
-    Ollama 的 `/api/chat` 对 tools 的支持随模型而异（很多本地模型压根不吐 tool_calls），
-    与其在那儿转六轮空圈，不如退化成一次性 `complete_json()` 产出 ops 数组——
-    两条路产出的提案形状完全一样，用户审阅时看不出区别。
+    不能的话上层退化成一次性 `complete_json()` 产出 ops 数组——两条路产出的提案
+    形状完全一样，用户审阅时看不出区别（见 `ai/director/agent.py` 的注释）。
+    Ollama 的 `/api/chat` 对 tools 的支持随模型而异，统一算作不支持。
     """
-    return settings.llm_provider not in ("none", "ollama")
+    proto = protocols.get()
+    return bool(proto and proto.supports_tools)
 
 
 async def complete_tools(
     messages: list[dict[str, Any]], tools: list[dict[str, Any]]
 ) -> dict[str, Any]:
-    """OpenAI 兼容的 function calling **一轮**。循环由调用方控制（见 ai/director/agent.py）。
+    """function calling **一轮**。循环由调用方控制（见 ai/director/agent.py）。
 
-    返回归一后的形状 `{content, tool_calls: [{id, name, arguments}]}`——
-    调用方不需要知道 OpenAI 的响应长什么样。
+    入参与返回都是 OpenAI 形状（`{content, tool_calls: [{id, name, arguments}]}`），
+    翻译成对面认的样子是适配器的事。
     """
     require_configured()
-    if not supports_tools():
-        raise AppError(
-            ErrorCode.LLM_UNAVAILABLE,
-            "这个 LLM 端不支持工具调用",
-            f"provider = {settings.llm_provider}，只有 OpenAI 兼容端支持 function calling。",
-            [
-                "换一个 OpenAI 兼容的服务地址",
-                "或继续用它——不支持工具时会自动退化成一次性产出提案",
-            ],
-        )
-    base = settings.llm_base_url.rstrip("/") or "https://api.openai.com/v1"
-    headers = {"Content-Type": "application/json"}
-    if settings.llm_api_key:
-        headers["Authorization"] = f"Bearer {settings.llm_api_key}"
-    try:
-        async with httpx.AsyncClient(timeout=TIMEOUT) as http:
-            resp = await http.post(
-                f"{base}/chat/completions",
-                headers=headers,
-                json={
-                    "model": settings.llm_model,
-                    "messages": messages,
-                    "tools": tools,
-                    "tool_choice": "auto",
-                },
-            )
-            resp.raise_for_status()
-            message = resp.json()["choices"][0]["message"]
-    except httpx.HTTPError as exc:
-        raise AppError(
-            ErrorCode.LLM_UNAVAILABLE,
-            "LLM 请求失败",
-            f"{type(exc).__name__}: {exc}",
-            ["确认服务地址与网络可达", "或在流程图上手动加一幕——手动路径不依赖 LLM"],
-        ) from exc
-    except (KeyError, IndexError, ValueError) as exc:
-        raise AppError(
-            ErrorCode.LLM_INVALID_OUTPUT,
-            "LLM 响应格式不认识",
-            f"{type(exc).__name__}: {exc}",
-            ["确认 provider 设置与实际服务匹配", "或在流程图上手动加一幕"],
-        ) from exc
-    calls = []
-    for raw in message.get("tool_calls") or []:
-        fn = raw.get("function") or {}
-        args = fn.get("arguments")
-        if isinstance(args, str):
-            try:
-                args = json.loads(args or "{}")
-            except json.JSONDecodeError as exc:
-                raise AppError(
-                    ErrorCode.LLM_INVALID_OUTPUT,
-                    "工具参数不是合法 JSON",
-                    f"{fn.get('name')}: {exc.msg}（预览：{str(args)[:200]}）",
-                    ["重试一次", "换一个更擅长工具调用的模型", "或手动编排"],
-                ) from exc
-        calls.append(
-            {
-                "id": str(raw.get("id") or ""),
-                "name": str(fn.get("name") or ""),
-                "arguments": args if isinstance(args, dict) else {},
-            }
-        )
-    return {"content": message.get("content"), "tool_calls": calls}
+    proto = protocols.require()
+    return await proto.complete_tools(protocols.config(), messages, tools)
 
 
 async def complete_json(system: str, user: str) -> dict[str, Any]:
-    """要求模型返回 JSON 对象。只支持 OpenAI 兼容协议与 Ollama。"""
+    """要求模型返回一个 JSON 对象。没有 JSON 模式的端靠提示 + 截花括号兜住。"""
     require_configured()
-    provider = settings.llm_provider
-    base = settings.llm_base_url.rstrip("/")
-    try:
-        async with httpx.AsyncClient(timeout=TIMEOUT) as http:
-            if provider == "ollama":
-                resp = await http.post(
-                    f"{base or 'http://127.0.0.1:11434'}/api/chat",
-                    json={
-                        "model": settings.llm_model,
-                        "stream": False,
-                        "format": "json",
-                        "messages": [
-                            {"role": "system", "content": system},
-                            {"role": "user", "content": user},
-                        ],
-                    },
-                )
-                resp.raise_for_status()
-                return _parse_json_object(resp.json()["message"]["content"])
-            headers = {"Content-Type": "application/json"}
-            if settings.llm_api_key:
-                headers["Authorization"] = f"Bearer {settings.llm_api_key}"
-            resp = await http.post(
-                f"{base or 'https://api.openai.com/v1'}/chat/completions",
-                headers=headers,
-                json={
-                    "model": settings.llm_model,
-                    "response_format": {"type": "json_object"},
-                    "messages": [
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": user},
-                    ],
-                },
-            )
-            resp.raise_for_status()
-            return _parse_json_object(resp.json()["choices"][0]["message"]["content"])
-    except httpx.HTTPError as exc:
-        raise AppError(
-            ErrorCode.LLM_UNAVAILABLE,
-            "LLM 请求失败",
-            f"{type(exc).__name__}: {exc}",
-            ["确认服务地址与网络可达", "或改用手动拆解——手动路径不依赖 LLM"],
-        ) from exc
-    except (KeyError, IndexError, ValueError) as exc:
-        raise AppError(
-            ErrorCode.LLM_INVALID_OUTPUT,
-            "LLM 响应格式不认识",
-            f"{type(exc).__name__}: {exc}",
-            ["确认 provider 设置与实际服务匹配", "或改用手动拆解"],
-        ) from exc
+    proto = protocols.require()
+    return await proto.complete_json(protocols.config(), system, user)
+
+
+async def list_models(
+    provider: str | None = None,
+    base_url: str | None = None,
+    api_key: str | None = None,
+) -> dict[str, Any]:
+    """设置页的「自动获取模型」。
+
+    允许传入**还没保存**的协议 / 地址 / 密钥：不然用户得先存一份可能是错的配置
+    才能看到模型列表。这些覆盖只用于这一次请求，不写回 settings.json。
+    """
+    cfg = protocols.config(provider=provider, base_url=base_url, api_key=api_key)
+    proto = protocols.require(cfg.provider)
+    items = await proto.list_models(cfg)
+    ids = {row["id"] for row in items}
+    log.info("llm.models", provider=cfg.provider, count=len(items))
+    return {
+        "provider": cfg.provider,
+        "label": proto.label,
+        "target": proto.models_url(cfg),
+        "count": len(items),
+        "items": items,
+        "current": cfg.model or None,
+        "current_present": (cfg.model in ids) if cfg.model and ids else None,
+    }
+
+
+async def probe() -> dict[str, Any]:
+    """设置页的「测试连接」：连通性 + 「你填的那个模型在不在」。"""
+    require_configured()
+    proto = protocols.require()
+    return await proto.probe(protocols.config())

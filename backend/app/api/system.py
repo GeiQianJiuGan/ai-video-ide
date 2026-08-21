@@ -9,6 +9,7 @@ import httpx
 from fastapi import APIRouter
 from pydantic import BaseModel
 
+from app.ai.llm import protocols as llm_protocols
 from app.core import ffmpeg as ffmpeg_tool
 from app.core.config import settings
 from app.core.logging import get_logger
@@ -94,19 +95,29 @@ async def _probe_comfy() -> DepStatus:
 
 
 def _probe_llm() -> DepStatus:
-    if settings.llm_provider == "none":
+    """只看「配没配齐」，不发请求——依赖体检要快，真连一次是设置页的「测试连接」。"""
+    if settings.llm_provider in ("", "none"):
         return DepStatus(
             name="llm",
             ok=True,
             detail="未配置（Manual 模式）",
             hint="LLM 不是必选项。配置后可启用 AI Director 的剧本拆解与 Prompt 润色。",
         )
-    ready = bool(settings.llm_base_url or settings.llm_api_key)
+    proto = llm_protocols.get()
+    if proto is None:
+        return DepStatus(
+            name="llm",
+            ok=False,
+            detail=f"不认识的协议 {settings.llm_provider}",
+            hint=f"在设置页重新选择协议，可用的是：{'、'.join(llm_protocols.names())}。",
+        )
+    # Ollama 这类本机端不要密钥，别把「没填 Key」当成没配好。
+    ready = bool(settings.llm_model) and (bool(settings.llm_api_key) or not proto.needs_key)
     return DepStatus(
         name="llm",
         ok=ready,
-        detail=f"{settings.llm_provider} · {settings.llm_model or '未指定模型'}",
-        hint="" if ready else "缺少 base_url 或 api_key。",
+        detail=f"{proto.label} · {settings.llm_model or '未指定模型'}",
+        hint="" if ready else "缺少模型名或 API Key——在设置页点「自动获取」列出可用模型再挑一个。",
     )
 
 

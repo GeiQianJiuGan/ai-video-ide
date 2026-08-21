@@ -14,13 +14,14 @@
  */
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { Image as ImageIcon, RefreshCw, Search, Trash2 } from '@lucide/vue'
+import { Image as ImageIcon, Library, RefreshCw, Search, Trash2 } from '@lucide/vue'
 import AppPanel from '@/shared/ui/AppPanel.vue'
 import AppButton from '@/shared/ui/AppButton.vue'
 import AppBadge from '@/shared/ui/AppBadge.vue'
 import EmptyState from '@/shared/ui/EmptyState.vue'
 import ErrorPanel from '@/shared/ui/ErrorPanel.vue'
 import FeatureHeader from '@/shared/ui/FeatureHeader.vue'
+import LibraryPickDialog from '@/features/library/LibraryPickDialog.vue'
 import { fileUrl } from '@/shared/api/files'
 import {
   ASSET_KIND_LABEL,
@@ -81,6 +82,17 @@ watch(pid, reload)
 
 const confirmForce = ref('')
 
+/**
+ * 「从素材库采用」原来长在素材库页上（选中一条 → 采用到当前项目）。素材库属于应用级
+ * 导航，打开工程后左栏里没有它，所以那个动作搬到这儿来——工程内取库里的文件，
+ * 入口就在这份总账上，不需要先掉出工程再回来。
+ */
+const pickLibrary = ref(false)
+
+async function onAdopted(): Promise<void> {
+  await reload()
+}
+
 async function doRemove(assetId: string, force: boolean): Promise<void> {
   const ok = await store.remove(pid.value, assetId, force)
   if (ok) confirmForce.value = ''
@@ -105,6 +117,14 @@ function goOwner(ownerKind: string, ownerId: string): void {
         @click="store.scanOrphans(pid).catch(() => {})"
       >
         <Search :size="10" />扫描孤儿资产
+      </AppButton>
+      <AppButton
+        size="sm"
+        :disabled="store.busy"
+        title="从应用级素材库复制一个文件进这个工程。先出账单再复制，之后两边各改各的"
+        @click="pickLibrary = true"
+      >
+        <Library :size="10" />从素材库采用
       </AppButton>
       <span class="text-fg-3 tnum text-2xs">
         {{ store.assets.length }} 个文件 · {{ humanBytes(store.totalBytes) }}
@@ -317,5 +337,7 @@ function goOwner(ownerKind: string, ownerId: string): void {
         </div>
       </AppPanel>
     </div>
+
+    <LibraryPickDialog v-model:open="pickLibrary" :pid="pid" kind="asset" @adopted="onAdopted()" />
   </div>
 </template>

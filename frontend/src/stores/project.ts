@@ -95,6 +95,20 @@ export const useProjectStore = defineStore('project', () => {
     }
   }
 
+  /**
+   * 离开这个工程的工作区（Activity Bar 上的「← 项目列表」）。
+   *
+   * 刻意**不调 close**：后端的 `close` 关掉 SQLite 连接却不停这个工程的 pump，
+   * 正在跑的生成会断在半路。用户说的「退出项目」指的是「我不在这儿看了」，
+   * 不是「把机器上正在做的活停掉」——所以这里只忘掉前端持有的那份引用，
+   * 已入队的任务照旧跑完，从最近列表点回来就接着看。
+   */
+  function leave(): void {
+    current.value = null
+    migration.value = null
+    void refreshRecent()
+  }
+
   async function close(): Promise<void> {
     const pid = current.value?.id
     if (!pid) return
@@ -135,6 +149,7 @@ export const useProjectStore = defineStore('project', () => {
     create,
     open,
     ensure,
+    leave,
     close,
     forget,
     dismissMigration,

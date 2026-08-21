@@ -32,25 +32,14 @@ interface Entry {
  * 候选项按 scope 组装，与 Activity Bar 同一套规则：
  * 应用级功能永远列出；项目内功能只在打开了工程时才出现——
  * 列一堆点了没反应的条目，比不列更让人困惑。所以这里没有 disabled 态。
+ *
+ * 打开工程时**项目内的排在前面**，应用级那两条排后面并写明「会离开这个工程的工作区」：
+ * 左栏里它们此刻是藏起来的（两级互斥），面板里仍然搜得到，但不能让人不知道
+ * 点下去会掉出工程——那正是这次要修掉的那个惊吓。
  */
 const entries = computed<Entry[]>(() => {
-  const list: Entry[] = [
-    ...APP_NAV_FEATURES.map((f) => ({
-      key: f.id,
-      title: f.title,
-      desc: f.purpose,
-      badge: f.ready ? '可用' : f.milestone,
-      go: () => void router.push({ name: f.route }),
-    })),
-    {
-      key: 'settings',
-      title: '设置与环境自检',
-      desc: 'FFmpeg / ComfyUI / LLM 状态与修复建议',
-      badge: '可用',
-      go: () => void router.push('/settings'),
-    },
-  ]
   const pid = props.projectId
+  const list: Entry[] = []
   if (pid) {
     list.push(
       ...PROJECT_NAV_FEATURES.map((f) => ({
@@ -70,6 +59,22 @@ const entries = computed<Entry[]>(() => {
       })),
     )
   }
+  list.push(
+    ...APP_NAV_FEATURES.map((f) => ({
+      key: f.id,
+      title: f.title,
+      desc: pid ? `${f.purpose}（会离开这个工程的工作区）` : f.purpose,
+      badge: f.ready ? '可用' : f.milestone,
+      go: () => void router.push({ name: f.route }),
+    })),
+    {
+      key: 'settings',
+      title: '设置与环境自检',
+      desc: 'FFmpeg / ComfyUI / LLM 状态与修复建议',
+      badge: '可用',
+      go: () => void router.push('/settings'),
+    },
+  )
   const q = query.value.trim().toLowerCase()
   if (!q) return list
   return list.filter((e) => (e.title + e.desc).toLowerCase().includes(q))
