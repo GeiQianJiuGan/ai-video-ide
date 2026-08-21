@@ -31,6 +31,7 @@ REVISION_SCHEMA: dict[str, int] = {
     "0001_project": 1,
     "0002_domain": 2,
     "0003_library_origin": 3,
+    "0004_scene_flow": 4,
 }
 
 

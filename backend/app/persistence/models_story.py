@@ -59,6 +59,10 @@ class Shot(Base):
     index_no: Mapped[int] = mapped_column(Integer, nullable=False, default=0, index=True)
     title: Mapped[str] = mapped_column(String(200), nullable=False, default="")
     description: Mapped[str | None] = mapped_column(Text)
+    #: shot（导演排的戏）/ transition（两幕之间那段 1~2s 的转场，由 SceneLink 生成）。
+    #: 见 `persistence/models_flow.py::SHOT_KINDS`——转场镜头也是正常镜头，一样有版本、
+    #: 一样进时间线，只是它不是人排出来的，界面上要能区分。
+    kind: Mapped[str] = mapped_column(String(20), nullable=False, default="shot")
 
     #: 时长，单位由工程的 duration_unit 决定（frames 或 seconds）
     duration: Mapped[float] = mapped_column(Float, nullable=False, default=4.0)

@@ -97,13 +97,18 @@ watch(
               <span class="tnum">{{ humanBytes(plan.total_bytes) }}</span>
               ）进
             </p>
-            <p class="text-fg-2 border-line-1 bg-base-2 truncate border px-2 py-1 font-mono text-2xs">
+            <p
+              class="text-fg-2 border-line-1 bg-base-2 truncate border px-2 py-1 font-mono text-2xs"
+            >
               {{ plan.project_dir }}
             </p>
             <p v-if="plan.reuse_count > 0" class="text-fg-3 text-2xs">
               另有 {{ plan.reuse_count }} 个文件工程里已经有了（内容相同），不会再占一份空间。
             </p>
-            <p v-if="plan.missing_count > 0" class="text-st-failed flex items-center gap-1 text-2xs">
+            <p
+              v-if="plan.missing_count > 0"
+              class="text-st-failed flex items-center gap-1 text-2xs"
+            >
               <FileWarning :size="11" />
               {{ plan.missing_count }} 个文件在库目录里找不到了，采用无法进行。
             </p>

@@ -7,11 +7,10 @@
 from __future__ import annotations
 
 import asyncio
-import shutil
 from pathlib import Path
 from typing import Any
 
-from app.core.config import settings
+from app.core import ffmpeg as ffmpeg_tool
 from app.core.errors import AppError, ErrorCode
 from app.core.ids import new_id
 from app.core.logging import get_logger
@@ -437,20 +436,8 @@ class TimelineService:
     # --- 导出 ---
 
     def _ffmpeg(self) -> str:
-        found = shutil.which(settings.ffmpeg_path) or (
-            settings.ffmpeg_path if Path(settings.ffmpeg_path).is_file() else None
-        )
-        if not found:
-            raise AppError(
-                ErrorCode.FFMPEG_MISSING,
-                "找不到 FFmpeg",
-                f"当前配置 ffmpeg_path = {settings.ffmpeg_path}，在 PATH 里也没找到。",
-                [
-                    "安装 FFmpeg 并加入 PATH",
-                    "或用 AIVS_FFMPEG_PATH 指向可执行文件的绝对路径",
-                ],
-            )
-        return found
+        """内置副本优先；找不到时 `require` 会带着「怎么拿到」抛出来。"""
+        return ffmpeg_tool.require("ffmpeg")
 
     async def ensure_proxy(self, pid: str, asset_id: str) -> dict[str, Any]:
         """为预览生成 720p 代理。代理只用于播放，导出永远走原始素材。"""

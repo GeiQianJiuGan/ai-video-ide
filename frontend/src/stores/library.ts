@@ -148,7 +148,10 @@ export const useLibraryStore = defineStore('library', () => {
   }
 
   /** 建角色 / 地点 / 道具预设。库侧只要一个名字，其余字段进去再补。 */
-  async function createPreset(kind: 'character' | 'location' | 'prop', name: string): Promise<void> {
+  async function createPreset(
+    kind: 'character' | 'location' | 'prop',
+    name: string,
+  ): Promise<void> {
     busy.value = true
     try {
       if (kind === 'character') await libraryApi.createCharacter({ name })

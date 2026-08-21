@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import asyncio
-import shutil
 from typing import Any
 
 import httpx
 from fastapi import APIRouter
 from pydantic import BaseModel
 
+from app.core import ffmpeg as ffmpeg_tool
 from app.core.config import settings
 from app.core.logging import get_logger
 
@@ -41,24 +41,35 @@ async def health() -> Health:
 
 
 async def _probe_ffmpeg() -> DepStatus:
-    exe = shutil.which(settings.ffmpeg_path)
-    if not exe:
+    """探 FFmpeg。内置副本是设计上的默认来源，所以 detail 里要写清用的是哪一份。"""
+    found = ffmpeg_tool.locate("ffmpeg")
+    if not found.path:
+        detail = (
+            f"配置指向的 {found.configured_missing} 不存在"
+            if found.configured_missing
+            else "内置副本与 PATH 里都没有"
+        )
         return DepStatus(
             name="ffmpeg",
             ok=False,
-            detail=f"未找到可执行文件：{settings.ffmpeg_path}",
-            hint=(
-                "安装 FFmpeg 并加入 PATH，或在 Settings 中指定绝对路径。"
-                "抽帧、代理转码与导出均依赖它。"
-            ),
+            detail=detail,
+            hint=(f"{ffmpeg_tool.FETCH_HINT}；抽帧、代理转码与导出都依赖它，其余功能不受影响。"),
         )
+    where = ffmpeg_tool.SOURCE_LABEL.get(found.source or "", "")
     try:
         proc = await asyncio.create_subprocess_exec(
-            exe, "-version", stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+            found.path,
+            "-version",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
         )
         out, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
         first = out.decode(errors="replace").splitlines()[0] if out else ""
-        return DepStatus(name="ffmpeg", ok=proc.returncode == 0, detail=first or exe)
+        return DepStatus(
+            name="ffmpeg",
+            ok=proc.returncode == 0,
+            detail=f"{where} · {first or found.path}",
+        )
     except (TimeoutError, OSError) as exc:
         return DepStatus(name="ffmpeg", ok=False, detail=f"{type(exc).__name__}: {exc}")
 

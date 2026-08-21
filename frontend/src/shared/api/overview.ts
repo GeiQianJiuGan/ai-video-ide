@@ -93,7 +93,16 @@ export interface CapabilityRow {
 
 export interface EnvironmentStatus {
   comfy: { online: boolean; base_url: string; detail: string }
-  ffmpeg: { available: boolean; path: string; detail: string; impact: string | null }
+  ffmpeg: {
+    available: boolean
+    path: string
+    /** 用的是哪一份：`bundled` 内置 / `path` 系统 PATH / `configured` 配置指定。 */
+    source: string
+    detail: string
+    impact: string | null
+    /** 缺失时怎么拿到内置副本；可用时是空串。 */
+    hint: string
+  }
   gpu: {
     available: boolean
     name?: string | null

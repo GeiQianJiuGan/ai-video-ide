@@ -71,6 +71,91 @@ def _parse_json_object(text: str) -> dict[str, Any]:
     return data
 
 
+def supports_tools() -> bool:
+    """这个端能不能走 function calling。
+
+    Ollama 的 `/api/chat` 对 tools 的支持随模型而异（很多本地模型压根不吐 tool_calls），
+    与其在那儿转六轮空圈，不如退化成一次性 `complete_json()` 产出 ops 数组——
+    两条路产出的提案形状完全一样，用户审阅时看不出区别。
+    """
+    return settings.llm_provider not in ("none", "ollama")
+
+
+async def complete_tools(
+    messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """OpenAI 兼容的 function calling **一轮**。循环由调用方控制（见 ai/director/agent.py）。
+
+    返回归一后的形状 `{content, tool_calls: [{id, name, arguments}]}`——
+    调用方不需要知道 OpenAI 的响应长什么样。
+    """
+    require_configured()
+    if not supports_tools():
+        raise AppError(
+            ErrorCode.LLM_UNAVAILABLE,
+            "这个 LLM 端不支持工具调用",
+            f"provider = {settings.llm_provider}，只有 OpenAI 兼容端支持 function calling。",
+            [
+                "换一个 OpenAI 兼容的服务地址",
+                "或继续用它——不支持工具时会自动退化成一次性产出提案",
+            ],
+        )
+    base = settings.llm_base_url.rstrip("/") or "https://api.openai.com/v1"
+    headers = {"Content-Type": "application/json"}
+    if settings.llm_api_key:
+        headers["Authorization"] = f"Bearer {settings.llm_api_key}"
+    try:
+        async with httpx.AsyncClient(timeout=TIMEOUT) as http:
+            resp = await http.post(
+                f"{base}/chat/completions",
+                headers=headers,
+                json={
+                    "model": settings.llm_model,
+                    "messages": messages,
+                    "tools": tools,
+                    "tool_choice": "auto",
+                },
+            )
+            resp.raise_for_status()
+            message = resp.json()["choices"][0]["message"]
+    except httpx.HTTPError as exc:
+        raise AppError(
+            ErrorCode.LLM_UNAVAILABLE,
+            "LLM 请求失败",
+            f"{type(exc).__name__}: {exc}",
+            ["确认服务地址与网络可达", "或在流程图上手动加一幕——手动路径不依赖 LLM"],
+        ) from exc
+    except (KeyError, IndexError, ValueError) as exc:
+        raise AppError(
+            ErrorCode.LLM_INVALID_OUTPUT,
+            "LLM 响应格式不认识",
+            f"{type(exc).__name__}: {exc}",
+            ["确认 provider 设置与实际服务匹配", "或在流程图上手动加一幕"],
+        ) from exc
+    calls = []
+    for raw in message.get("tool_calls") or []:
+        fn = raw.get("function") or {}
+        args = fn.get("arguments")
+        if isinstance(args, str):
+            try:
+                args = json.loads(args or "{}")
+            except json.JSONDecodeError as exc:
+                raise AppError(
+                    ErrorCode.LLM_INVALID_OUTPUT,
+                    "工具参数不是合法 JSON",
+                    f"{fn.get('name')}: {exc.msg}（预览：{str(args)[:200]}）",
+                    ["重试一次", "换一个更擅长工具调用的模型", "或手动编排"],
+                ) from exc
+        calls.append(
+            {
+                "id": str(raw.get("id") or ""),
+                "name": str(fn.get("name") or ""),
+                "arguments": args if isinstance(args, dict) else {},
+            }
+        )
+    return {"content": message.get("content"), "tool_calls": calls}
+
+
 async def complete_json(system: str, user: str) -> dict[str, Any]:
     """要求模型返回 JSON 对象。只支持 OpenAI 兼容协议与 Ollama。"""
     require_configured()

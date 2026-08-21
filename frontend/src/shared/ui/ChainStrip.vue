@@ -32,7 +32,8 @@ const pid = computed(() => (route.params.pid as string | undefined) ?? null)
       </template>
     </div>
     <p class="text-fg-4 border-line-1 border-t px-3 py-2 text-2xs">
-      业务层不绑定任何具体视频模型：差异全部下沉到 Workflow Adapter。生成版本永不覆盖。
+      业务层不绑定任何具体视频模型：差异全部下沉到生成适配层（provider）。模型端的图由模型端维护，
+      本工具只按约定注入入口参数。生成版本永不覆盖。
     </p>
   </AppPanel>
 </template>

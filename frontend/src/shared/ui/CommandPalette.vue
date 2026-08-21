@@ -11,7 +11,7 @@ import { useRouter } from 'vue-router'
 import { DialogContent, DialogOverlay, DialogPortal, DialogRoot, DialogTitle } from 'reka-ui'
 import { Search } from '@lucide/vue'
 import AppBadge from './AppBadge.vue'
-import { APP_NAV_FEATURES, PROJECT_NAV_FEATURES } from '@/app/features'
+import { APP_NAV_FEATURES, PROJECT_ADVANCED_FEATURES, PROJECT_NAV_FEATURES } from '@/app/features'
 
 const props = defineProps<{ open: boolean; projectId: string | null }>()
 const emit = defineEmits<{ 'update:open': [boolean] }>()
@@ -58,6 +58,14 @@ const entries = computed<Entry[]>(() => {
         title: f.title,
         desc: f.purpose,
         badge: f.ready ? '可用' : f.milestone,
+        go: () => void router.push({ name: f.route, params: { pid } }),
+      })),
+      // 高级 / 兼容路径不进左栏，但搜得到——已经配好的东西必须还能进去
+      ...PROJECT_ADVANCED_FEATURES.map((f) => ({
+        key: f.id,
+        title: f.title,
+        desc: f.purpose,
+        badge: '高级',
         go: () => void router.push({ name: f.route, params: { pid } }),
       })),
     )

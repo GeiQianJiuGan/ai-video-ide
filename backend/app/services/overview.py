@@ -6,10 +6,9 @@
 
 from __future__ import annotations
 
-import shutil
 from typing import Any
 
-from app.core.config import settings
+from app.core import ffmpeg as ffmpeg_tool
 from app.generation.comfy.client import comfy
 from app.persistence.models_cast import Appearance, Character, SheetVersion
 from app.persistence.models_edit import ExportRecord, TimelineClip
@@ -341,7 +340,7 @@ class OverviewService:
     async def environment(self, pid: str | None = None) -> dict[str, Any]:
         """状态条要的东西：ComfyUI、FFmpeg、GPU/显存、LLM。缺什么都要说清影响。"""
         ping = await comfy.ping()
-        ffmpeg_found = shutil.which(settings.ffmpeg_path)
+        found = ffmpeg_tool.locate("ffmpeg")
         gpu: dict[str, Any] = {"available": False, "detail": "未能读取（需要 ComfyUI 在线）"}
         if ping["online"]:
             try:
@@ -363,10 +362,22 @@ class OverviewService:
         return {
             "comfy": ping,
             "ffmpeg": {
-                "available": bool(ffmpeg_found),
-                "path": ffmpeg_found or settings.ffmpeg_path,
-                "detail": "已就绪" if ffmpeg_found else "找不到可执行文件，导出会失败",
-                "impact": None if ffmpeg_found else "无法导出成片；其余功能不受影响。",
+                "available": found.available,
+                "path": found.path or "",
+                # 来源单独一个字段（UI 拿它当徽标），detail 就留给「具体是哪一个文件」——
+                # 那是排查「为什么用的不是我以为的那份」时唯一有用的信息。
+                "source": found.source or "",
+                "detail": (
+                    found.path
+                    if found.available
+                    else (
+                        f"配置指向的 {found.configured_missing} 不存在"
+                        if found.configured_missing
+                        else "还没有内置副本，PATH 里也没有；导出会失败"
+                    )
+                ),
+                "impact": None if found.available else "无法导出成片；其余功能不受影响。",
+                "hint": "" if found.available else ffmpeg_tool.FETCH_HINT,
             },
             "gpu": gpu,
             "capabilities": capabilities,

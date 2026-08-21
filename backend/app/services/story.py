@@ -436,18 +436,23 @@ class StoryService:
                     and apps[c.appearance_id].character_id in chars
                 ]
                 issues = []
-                if not scene.location_variant_id or scene.location_variant_id not in variants:
-                    issues.append("缺少地点变体，Context 不完整")
-                if not names:
-                    issues.append("没有出场角色")
-                if not (shot.prompt or shot.description):
-                    issues.append("没有 prompt 也没有画面描述")
+                # 转场镜头不过上下文门槛（它没有出场角色也不需要地点变体），
+                # 所以那几条对它不算问题——列出来只会变成永远消不掉的黄色感叹号。
+                if shot.kind != "transition":
+                    if not scene.location_variant_id or scene.location_variant_id not in variants:
+                        issues.append("缺少地点变体，Context 不完整")
+                    if not names:
+                        issues.append("没有出场角色")
+                    if not (shot.prompt or shot.description):
+                        issues.append("没有 prompt 也没有画面描述")
                 current = versions.get(shot.current_version_id or "")
                 cards.append(
                     {
                         "id": shot.id,
                         "index_no": shot.index_no,
                         "title": shot.title,
+                        # 转场是系统按衔接补出来的，界面上要能和导演排的戏区分开
+                        "kind": shot.kind,
                         "duration": shot.duration,
                         "status": shot.status,
                         "camera": shot.camera,

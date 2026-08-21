@@ -13,11 +13,7 @@ import { api } from './client'
 
 /** 库能收的素材类型。生成物与代理流属于工程，库里不收。 */
 export type LibraryKind =
-  | 'character_sheet'
-  | 'location_reference'
-  | 'prop_reference'
-  | 'audio'
-  | 'upload'
+  'character_sheet' | 'location_reference' | 'prop_reference' | 'audio' | 'upload'
 
 export const LIBRARY_KIND_LABEL: Record<LibraryKind, string> = {
   character_sheet: '角色表',

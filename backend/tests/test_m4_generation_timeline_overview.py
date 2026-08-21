@@ -15,8 +15,10 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import pytest
 from fastapi.testclient import TestClient
 
+from app.core import ffmpeg as ffmpeg_tool
 from tests.conftest import error_of, ready_workflow, upload_png
 
 # --- 公共脚手架 ---
@@ -116,10 +118,21 @@ def test_version_of_unknown_shot_is_a_structured_404(client: TestClient, pid: st
 # --- Step 7：入队门槛 ---
 
 
+def use_legacy_workflow_path(client: TestClient) -> None:
+    """把调用方式切回旧的节点绑定路径（兼容选项）。
+
+    默认路径是生成适配层，它不需要工作流——「没绑工作流」不再是入队门槛。
+    只有这条兼容路径仍然要求先有一份已校验的工作流，所以要测它就得先显式选它。
+    """
+    resp = client.patch("/api/v1/settings", json={"video.provider": "comfy_workflow"})
+    assert resp.status_code == 200, resp.text
+
+
 def test_generate_without_a_workflow_names_the_missing_capability(
     client: TestClient, pid: str
 ) -> None:
     pause(client, pid)
+    use_legacy_workflow_path(client)
     scene = make_scene(client, pid)
     shot = make_shot(client, pid, scene["id"])
     resp = client.post(f"/api/v1/projects/{pid}/shots/{shot['id']}/generate", json={})
@@ -129,6 +142,24 @@ def test_generate_without_a_workflow_names_the_missing_capability(
     assert "image2video" in err["title"]
     assert "图生视频" in err["detail"], "能力不可用必须说出影响，而不是只说名字"
     assert err["related_ids"]["capability"] == "image2video"
+
+
+def test_default_path_needs_no_workflow_but_still_gates_on_context(
+    client: TestClient, pid: str
+) -> None:
+    """默认走适配层：门槛从「有没有绑工作流」变成「上下文齐不齐」。"""
+    pause(client, pid)
+    scene = make_scene(client, pid)
+    shot = make_shot(client, pid, scene["id"])
+    resp = client.post(f"/api/v1/projects/{pid}/shots/{shot['id']}/generate", json={})
+    assert resp.status_code == 400
+    assert error_of(resp)["code"] == "CONTEXT_INCOMPLETE"
+
+    forced = client.post(
+        f"/api/v1/projects/{pid}/shots/{shot['id']}/generate", json={"check_context": False}
+    )
+    assert forced.status_code == 201, forced.text
+    assert forced.json()["workflow_id"] is None, "适配层路径不该给任务塞一个工作流"
 
 
 def test_generate_gate_on_incomplete_context_can_be_bypassed(client: TestClient, pid: str) -> None:
@@ -198,6 +229,7 @@ def test_upstream_dependency_waits_with_an_explicit_reason(client: TestClient, p
 
 def test_scene_generate_reports_every_skipped_shot(client: TestClient, pid: str) -> None:
     pause(client, pid)
+    use_legacy_workflow_path(client)
     scene = make_scene(client, pid)
     make_shot(client, pid, scene["id"], title="A")
     make_shot(client, pid, scene["id"], title="B")
@@ -511,7 +543,7 @@ def test_export_preflight_names_missing_source_files_before_ffmpeg(
 
 
 def test_export_reports_the_missing_ffmpeg_and_writes_no_phantom_record(
-    client: TestClient, pid: str
+    client: TestClient, pid: str, no_ffmpeg: None
 ) -> None:
     assembled(client, pid, 3.0)
     resp = client.get(f"/api/v1/projects/{pid}/export/command")
@@ -519,6 +551,7 @@ def test_export_reports_the_missing_ffmpeg_and_writes_no_phantom_record(
     err = error_of(resp)
     assert err["code"] == "FFMPEG_MISSING"
     assert "找不到 FFmpeg" in err["title"]
+    assert any("fetch_ffmpeg.py" in s for s in err["suggestions"]), "第一步该是拿到内置副本"
     assert any("AIVS_FFMPEG_PATH" in s for s in err["suggestions"])
 
     resp = client.post(f"/api/v1/projects/{pid}/export", json={})
@@ -527,8 +560,19 @@ def test_export_reports_the_missing_ffmpeg_and_writes_no_phantom_record(
     assert client.get(f"/api/v1/projects/{pid}/exports").json() == [], "预检失败不该留下导出记录"
 
 
+def test_export_command_uses_the_bundled_ffmpeg(client: TestClient, pid: str) -> None:
+    """内置副本在场时，预检命令里写的就是它——不去碰系统 PATH。"""
+    found = ffmpeg_tool.locate("ffmpeg")
+    if not found.available:
+        pytest.skip("这台机器上还没有内置副本：先跑 scripts/fetch_ffmpeg.py")
+    assembled(client, pid, 3.0)
+    plan = client.get(f"/api/v1/projects/{pid}/export/command").json()
+    assert plan["command"].startswith(found.path or "<none>")
+    assert found.source in {"bundled", "path", "configured"}
+
+
 def test_proxy_needs_ffmpeg_and_says_when_the_source_is_gone(
-    client: TestClient, pid: str, project_dir: Path
+    client: TestClient, pid: str, project_dir: Path, no_ffmpeg: None
 ) -> None:
     asset_id = upload_png(client, pid, "generated_video", "proxy.png")
     resp = client.post(f"/api/v1/projects/{pid}/assets/{asset_id}/proxy")
@@ -662,11 +706,14 @@ def test_continuity_reports_every_kind_it_can_see(client: TestClient, pid: str) 
     assert waiting["title"] == "等待 Shot 1 出片"
 
 
-def test_environment_states_what_is_missing_and_what_it_costs(client: TestClient, pid: str) -> None:
+def test_environment_states_what_is_missing_and_what_it_costs(
+    client: TestClient, pid: str, no_ffmpeg: None
+) -> None:
     env = client.get(f"/api/v1/projects/{pid}/overview/environment").json()
     assert "online" in env["comfy"], "ComfyUI 在不在都要有明确答复"
-    assert env["ffmpeg"]["available"] is False, "本机 PATH 里没有 FFmpeg"
+    assert env["ffmpeg"]["available"] is False, "内置副本与 PATH 都被掏空了"
     assert env["ffmpeg"]["impact"] == "无法导出成片；其余功能不受影响。"
+    assert "fetch_ffmpeg.py" in env["ffmpeg"]["hint"], "缺了要说怎么补"
     matrix = env["capabilities"]["capabilities"]
     assert [c["capability"] for c in matrix] == [
         "text2image",
@@ -681,6 +728,18 @@ def test_environment_states_what_is_missing_and_what_it_costs(client: TestClient
 
     globally = client.get("/api/v1/environment").json()
     assert globally["capabilities"] is None, "没打开工程时不该谈能力矩阵"
+
+
+def test_environment_says_which_ffmpeg_it_will_use(client: TestClient, pid: str) -> None:
+    """在场时也要说清用的是哪一份：内置和「你机器上那份」排查方向不同。"""
+    found = ffmpeg_tool.locate("ffmpeg")
+    if not found.available:
+        pytest.skip("这台机器上还没有内置副本：先跑 scripts/fetch_ffmpeg.py")
+    env = client.get(f"/api/v1/projects/{pid}/overview/environment").json()["ffmpeg"]
+    assert env["available"] is True
+    assert env["source"] == found.source
+    assert env["path"] == found.path
+    assert env["impact"] is None
 
 
 def test_workflow_health_lists_status_per_capability(client: TestClient, pid: str) -> None:

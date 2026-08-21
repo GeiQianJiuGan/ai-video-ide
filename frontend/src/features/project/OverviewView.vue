@@ -56,6 +56,13 @@ const STATUS_COLOR: Record<string, string> = {
 
 const SEVERITY_TONE = { error: 'fail', warning: 'warn', info: 'neutral' } as const
 
+/** 「内置」和「你机器上那份」不是一回事：版本不同，出问题时排查方向也不同。 */
+const FFMPEG_SOURCE: Record<string, string> = {
+  bundled: '内置',
+  path: '系统 PATH',
+  configured: '配置指定',
+}
+
 function reload(): void {
   if (pid.value) void ov.load(pid.value)
 }
@@ -306,7 +313,11 @@ function duration(sec: number): string {
                 <div class="flex items-center gap-1.5">
                   <span class="text-fg-2 text-2xs">FFmpeg</span>
                   <AppBadge :tone="ov.environment.ffmpeg.available ? 'ok' : 'warn'">
-                    {{ ov.environment.ffmpeg.available ? '可用' : '缺失' }}
+                    {{
+                      ov.environment.ffmpeg.available
+                        ? FFMPEG_SOURCE[ov.environment.ffmpeg.source] || '可用'
+                        : '缺失'
+                    }}
                   </AppBadge>
                 </div>
                 <p class="text-fg-4 mt-px text-2xs break-words">
@@ -314,6 +325,9 @@ function duration(sec: number): string {
                 </p>
                 <p v-if="ov.environment.ffmpeg.impact" class="text-fg-3 mt-px text-2xs">
                   {{ ov.environment.ffmpeg.impact }}
+                </p>
+                <p v-if="ov.environment.ffmpeg.hint" class="text-fg-2 mt-0.5 text-2xs break-words">
+                  {{ ov.environment.ffmpeg.hint }}
                 </p>
               </div>
               <div>

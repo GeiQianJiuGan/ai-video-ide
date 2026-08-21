@@ -35,6 +35,8 @@ KIND_DIR = {
     "character_sheet": "assets/character_sheets",
     "location_reference": "assets/locations",
     "prop_reference": "assets/props",
+    #: 从视频里抽出来的单帧（真末帧续接靠它），见 services/frames.py
+    "frame": "assets/frames",
     "audio": "assets/audio",
     "upload": "assets/uploads",
     "generated_image": "generations/images",

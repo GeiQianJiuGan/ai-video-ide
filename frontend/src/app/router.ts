@@ -5,13 +5,14 @@ import { createRouter, createWebHistory, type RouteRecordRaw } from 'vue-router'
  * 都必须在这里出现，否则导航会指向不存在的页面。
  *
  * 入口是项目管理页（scope: 'app'）——没打开工程时项目内页面根本不出现，
- * 而不是画一排灰锁。项目内页面统一渲染 FeatureView：它按注册表把工作区骨架、
- * 工具栏动作、能力锁画出来。功能真正实现时，把对应条目换成实页面即可。
+ * 而不是画一排灰锁。
+ *
+ * 现在每条路由都指向真页面：注册表里 13 个功能全部 `ready: true`。
+ * `shared/ui/FeatureView.vue`（按注册表画工作区骨架与能力锁）暂时没有人用，
+ * 留着给下一个「登记了但还没接后端」的功能——那种情况先挂它，绝不给假界面。
  */
-const FeatureView = () => import('@/shared/ui/FeatureView.vue')
 
 const projectRoutes: RouteRecordRaw[] = [
-  // 概览与素材层三页已接后端；其余仍走注册表骨架（FeatureView）
   {
     path: '',
     name: 'dashboard',
@@ -28,13 +29,49 @@ const projectRoutes: RouteRecordRaw[] = [
     component: () => import('@/features/world/LocationsView.vue'),
   },
   { path: 'props', name: 'props', component: () => import('@/features/world/PropsView.vue') },
-  { path: 'story', name: 'story', component: FeatureView },
-  { path: 'storyboard', name: 'storyboard', component: FeatureView },
-  { path: 'shot/:sid?', name: 'shot', component: FeatureView },
-  { path: 'workflows', name: 'workflows', component: FeatureView },
-  { path: 'queue', name: 'queue', component: FeatureView },
-  { path: 'timeline', name: 'timeline', component: FeatureView },
-  { path: 'assets', name: 'assets', component: FeatureView },
+  { path: 'story', name: 'story', component: () => import('@/features/story/StoryView.vue') },
+  {
+    path: 'storyboard',
+    name: 'storyboard',
+    component: () => import('@/features/story/StoryboardView.vue'),
+  },
+  {
+    path: 'shot/:sid?',
+    name: 'shot',
+    component: () => import('@/features/story/ShotView.vue'),
+  },
+  // 两级场景系统：flow 是第一级（整片一张图），scene 是第二级（一幕的工作台）。
+  // scene 不进导航——它只从流程图上点节点进来，所以 URL 里必须带 sid。
+  {
+    path: 'flow',
+    name: 'flow',
+    component: () => import('@/features/flow/FlowView.vue'),
+  },
+  {
+    path: 'scene/:sid',
+    name: 'scene',
+    component: () => import('@/features/flow/SceneWorkbench.vue'),
+  },
+  {
+    path: 'workflows',
+    name: 'workflows',
+    component: () => import('@/features/workflow/WorkflowsView.vue'),
+  },
+  {
+    path: 'queue',
+    name: 'queue',
+    component: () => import('@/features/generation/QueueView.vue'),
+  },
+  {
+    path: 'timeline',
+    name: 'timeline',
+    component: () => import('@/features/timeline/TimelineView.vue'),
+  },
+  {
+    path: 'assets',
+    name: 'assets',
+    component: () => import('@/features/assets/AssetsView.vue'),
+  },
 ]
 
 const routes: RouteRecordRaw[] = [

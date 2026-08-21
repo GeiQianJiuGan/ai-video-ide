@@ -89,6 +89,19 @@ fn bundled_sidecar() -> Option<PathBuf> {
     candidate.is_file().then_some(candidate)
 }
 
+/// 随应用分发的二进制（ffmpeg / ffprobe）所在目录。
+///
+/// Tauri 的 externalBin 会把 `bin/ffmpeg-<triple>` 装成主程序旁边的 `ffmpeg`，
+/// 所以这个目录就是主程序目录。开发期没有这些文件，后端自己会回退到 `<repo>/bin`
+/// （见 backend/app/core/ffmpeg.py），所以这里找不到就不注入，让后端去回退。
+fn bundle_dir() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?.to_path_buf();
+    dir.join(format!("ffmpeg{}", EXE_SUFFIX))
+        .is_file()
+        .then_some(dir)
+}
+
 /// 开发期回退：直接用解释器跑源码树里的 backend。
 fn dev_backend_dir() -> Option<PathBuf> {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -173,6 +186,10 @@ pub fn launch(runtime_dir: &Path) -> Result<(Supervisor, Endpoint), BootError> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(stderr_sink));
+    // 内置 FFmpeg：告诉后端去哪找，用户不必自己装（找不到时不注入，后端回退到 <repo>/bin）。
+    if let Some(dir) = bundle_dir() {
+        cmd.env("AIVS_BUNDLE_DIR", dir);
+    }
 
     let mut child = cmd.spawn().map_err(|e| {
         BootError::new(

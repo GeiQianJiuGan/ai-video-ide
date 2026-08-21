@@ -37,6 +37,23 @@ PRIORITY = {
 DEFAULT_REF_LIMIT = 4
 
 
+def _extracted_frame(assets: Any, from_asset_id: str | None) -> str | None:
+    """找一找这段视频的末帧是不是已经抽过了（frames.extract 会把出处记进 meta）。"""
+    if not from_asset_id:
+        return None
+    for asset in assets:
+        if asset.kind != "frame":
+            continue
+        meta = load_json(asset.meta_json, {})
+        if (
+            isinstance(meta, dict)
+            and meta.get("from_asset_id") == from_asset_id
+            and meta.get("at") == "end"
+        ):
+            return str(asset.id)
+    return None
+
+
 class ContextService:
     async def resolve(self, pid: str, shot_id: str) -> dict[str, Any]:
         db = db_of(pid)
@@ -123,7 +140,10 @@ class ContextService:
                 }
             )
 
-        # 3. 上游镜头末帧：连续性的来源
+        # 3. 上游镜头末帧：连续性的来源。
+        #    注意这里指的是**抽出来的那张图**，不是上游那整段视频——模型端拿一段视频当
+        #    首帧是用不了的。抽帧要起 FFmpeg 进程，所以不在这条只读路径上做：还没抽的时候
+        #    先标 pending_extract，真正抽取发生在入队前（services/generation.py）。
         if shot.prev_shot_id:
             prev = next((s for s in await fetch_all(db, Shot) if s.id == shot.prev_shot_id), None)
             version = None
@@ -136,17 +156,29 @@ class ContextService:
                     ),
                     None,
                 )
-            ready = version is not None and version.asset_id is not None
+            source_asset = version.asset_id if version else None
+            ready = source_asset is not None
+            frame = _extracted_frame(assets.values(), source_asset) if ready else None
             items.append(
                 {
                     "key": f"prev_frame:{shot.prev_shot_id}",
                     "kind": "prev_frame",
                     "label": f"Shot {prev.index_no if prev else '?'} 末帧",
                     "priority": PRIORITY["prev_frame"],
-                    "asset_id": version.asset_id if version else None,
+                    "asset_id": frame or source_asset,
                     "source_id": shot.prev_shot_id,
                     "eligible": ready,
-                    "reason": "用于保持连续性" if ready else "上游镜头还没有当前版本，末帧不存在",
+                    "pending_extract": bool(ready and frame is None),
+                    "from_asset_id": source_asset,
+                    "reason": (
+                        "已抽取的上游末帧，用于保持连续性"
+                        if frame
+                        else (
+                            "上游已出片，生成前会从它抽取末帧"
+                            if ready
+                            else "上游镜头还没有当前版本，末帧不存在"
+                        )
+                    ),
                 }
             )
 
@@ -239,9 +271,25 @@ class ContextService:
             "resolved_at": utc_now(),
         }
 
+    async def ensure_frames(self, pid: str, shot_id: str) -> dict[str, Any]:
+        """把「生成前会抽取」那些条目真的抽出来，然后重新出账单。
+
+        单独一个方法而不是塞进 `resolve`：resolve 是只读的、UI 会频繁调，
+        起 FFmpeg 进程不该发生在那条路径上。入队前调这个。
+        """
+        ctx = await self.resolve(pid, shot_id)
+        pending = [i for i in ctx["items"] if i.get("pending_extract") and i.get("from_asset_id")]
+        if not pending:
+            return ctx
+        from app.services.frames import frames  # 延迟导入：context 不该在模块级依赖 FFmpeg 层
+
+        for item in pending:
+            await frames.extract(pid, str(item["from_asset_id"]), "end")
+        return await self.resolve(pid, shot_id)
+
     async def require_complete(self, pid: str, shot_id: str) -> dict[str, Any]:
         """生成前的门槛：上下文不完整就明确拒绝，而不是生成一张废图。"""
-        ctx = await self.resolve(pid, shot_id)
+        ctx = await self.ensure_frames(pid, shot_id)
         if not ctx["complete"]:
             raise AppError(
                 ErrorCode.CONTEXT_INCOMPLETE,

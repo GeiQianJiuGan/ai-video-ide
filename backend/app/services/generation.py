@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import Any
 
 from app.core.config import settings
@@ -20,11 +21,14 @@ from app.core.ids import new_id
 from app.core.logging import get_logger
 from app.events.bus import Channel, bus
 from app.generation.comfy.client import comfy, outputs_of
+from app.generation.providers import registry
+from app.generation.providers.base import TaskState, VideoRequest
 from app.persistence.models import utc_now
 from app.persistence.models_gen import GenerationVersion, Job, Workflow
 from app.persistence.models_story import Scene, Shot
+from app.persistence.models_world import Asset
 from app.services.assets import assets
-from app.services.base import as_dict, db_of, dump_json, fetch, fetch_all, load_json
+from app.services.base import as_dict, db_of, dump_json, fetch, fetch_all, load_json, project_of
 from app.services.context import context
 from app.services.workflows import apply_bindings, parse_graph, workflows
 
@@ -52,11 +56,18 @@ class GenerationService:
         priority: int = 100,
         workflow_id: str | None = None,
         check_context: bool = True,
+        first_frame_asset_id: str | None = None,
+        last_frame_asset_id: str | None = None,
+        extra: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         db = db_of(pid)
         shot = await fetch(db, Shot, shot_id, "镜头")
         capability = kind or ("first_last_frame" if shot.prev_shot_id else "image2video")
-        workflow = await workflows.resolve(pid, capability, workflow_id or shot.workflow_id)
+        # 走适配层时不需要工作流：模型端那份图由模型端维护（预设 / 通用 REST 合同）。
+        # 只有旧的 comfy_workflow 兼容路径才必须先解析出一份已校验的工作流。
+        workflow = None
+        if registry.is_legacy() or workflow_id or shot.workflow_id:
+            workflow = await workflows.resolve(pid, capability, workflow_id or shot.workflow_id)
         if check_context:
             await context.require_complete(pid, shot_id)
         snapshot = await context.snapshot(pid, shot_id)
@@ -76,7 +87,7 @@ class GenerationService:
             priority=priority,
             depends_on=depends_on,
             wait_reason=wait_reason,
-            workflow_id=workflow.id,
+            workflow_id=workflow.id if workflow else None,
             params_json=dump_json(
                 {
                     "prompt": shot.prompt or shot.description or "",
@@ -85,6 +96,9 @@ class GenerationService:
                     "steps": shot.steps,
                     "duration": shot.duration,
                     "context": snapshot,
+                    "first_frame_asset_id": first_frame_asset_id,
+                    "last_frame_asset_id": last_frame_asset_id,
+                    "extra": extra or {},
                 }
             ),
             created_at=utc_now(),
@@ -347,7 +361,152 @@ class GenerationService:
         bus.emit(Channel.ERROR, "job.failed", {"id": job_id, **err.to_dict()}, project_id=pid)
 
     async def _execute(self, pid: str, job: Job, params: dict[str, Any]) -> dict[str, Any]:
-        """提交给 ComfyUI 并等结果。这是唯一知道 ComfyUI 存在的地方。"""
+        """跑一次生成。
+
+        两条路：**默认走生成适配层**（`app/generation/providers/*`，本工具不维护模型端的图），
+        旧的节点绑定路径只在「设置里选了 comfy_workflow 且这个任务确实绑了工作流」时才走
+        ——它是兼容选项，不是主路。产物登记与 `add_version` 两条路完全共用。
+        """
+        if registry.is_legacy() and job.workflow_id:
+            filename, data, workflow_id = await self._run_legacy(pid, job, params)
+        else:
+            filename, data, workflow_id = await self._run_provider(pid, job, params)
+        kind = (
+            "generated_video"
+            if filename.lower().endswith((".mp4", ".webm", ".mov", ".gif"))
+            else "generated_image"
+        )
+        asset = await assets.register_bytes(pid, kind, filename, data, source="generated")
+        return await self.add_version(
+            pid,
+            job.shot_id,
+            asset_id=asset["id"],
+            kind="video" if kind == "generated_video" else "image",
+            workflow_id=workflow_id,
+            params={k: v for k, v in params.items() if k != "context"},
+            context_snapshot=params.get("context"),
+            source="generated",
+        )
+
+    async def _run_provider(
+        self, pid: str, job: Job, params: dict[str, Any]
+    ) -> tuple[str, bytes, str | None]:
+        """默认路径：把请求交给适配器，轮询到出片。service 层不认识任何具体模型。"""
+        provider = registry.provider()
+        first, last = await self._frames_of(pid, job, params)
+        mode = "flf" if last is not None else "i2v"
+        if mode == "i2v" and first is None:
+            raise AppError(
+                ErrorCode.MISSING_INPUT,
+                "这个镜头还没有首帧",
+                "本轮只做图生视频（R2V），必须有一张首帧图才能生成。",
+                [
+                    "在场景工作台里给它挑一张首帧（角色表 / 地点参考 / 上传的图都行）",
+                    "或把上一幕的衔接改成「续接末帧」，让上一幕的末帧当它的首帧",
+                ],
+                {"shot_id": job.shot_id},
+            )
+        req = VideoRequest(
+            mode=mode,
+            prompt=str(params.get("prompt") or ""),
+            negative=str(params.get("negative_prompt") or ""),
+            first_frame=first,
+            last_frame=last,
+            duration=float(params.get("duration") or 4.0),
+            seed=params.get("seed"),
+            extra=params.get("extra") or {},
+        )
+        task_id = await provider.submit(req, client_id=f"aivs-{pid}")
+        state = TaskState("queued")
+        for tick in range(POLL_LIMIT):
+            self._require_not_cancelled(job.id)
+            state = await provider.poll(task_id)
+            if state.status == "done":
+                break
+            if state.status == "failed":
+                raise AppError(
+                    ErrorCode.WORKFLOW_ERROR,
+                    "生成失败",
+                    state.detail or "服务端报告任务失败。",
+                    [
+                        "展开原始报错查看服务端给的信息",
+                        "在设置页「测试连接」确认服务与预设仍然可用",
+                        "调低并发生成数后重试（显存不足时常见）",
+                    ],
+                    {"task_id": task_id, "raw": str(state.raw)[:2000]},
+                )
+            if tick % 5 == 0:
+                bus.emit(
+                    Channel.JOB,
+                    "job.progress",
+                    {
+                        "id": job.id,
+                        "progress": max(state.progress, min(0.95, tick / 120)),
+                        "detail": state.detail,
+                    },
+                    project_id=pid,
+                )
+            await asyncio.sleep(POLL_INTERVAL)
+        else:
+            raise AppError(
+                ErrorCode.WORKFLOW_ERROR,
+                "等生成结果超时",
+                f"等了 {POLL_LIMIT} 次仍未完成（最后状态：{state.detail or state.status}）。",
+                ["确认服务端仍在跑这个任务", "重试该任务", "或调大设置里的单次超时"],
+                {"task_id": task_id},
+            )
+        filename, data = await provider.fetch(task_id)
+        return filename, data, None
+
+    async def _frames_of(
+        self, pid: str, job: Job, params: dict[str, Any]
+    ) -> tuple[Path | None, Path | None]:
+        """定首帧与末帧：显式指定优先，其次用上下文账单里那张图。
+
+        这里只挑「哪张图」，不管模型怎么用它——差异在适配器里。
+
+        有一处不能用入队时冻结的那份账单：**要接上游末帧的镜头**。那张图在入队的时刻
+        还不存在（上游还没出片），所以对这种镜头在真正要跑的时候重新结一次账并按需抽帧
+        ——否则会拿一段视频、或者随便一张角色表去当首帧。
+        """
+        db = db_of(pid)
+        proj = project_of(pid)
+        explicit_first = params.get("first_frame_asset_id")
+        explicit_last = params.get("last_frame_asset_id")
+        included = [i for i in (params.get("context") or {}).get("included") or []]
+        if not explicit_first:
+            shot = await fetch(db, Shot, job.shot_id, "镜头")
+            if shot.prev_shot_id:
+                fresh = await context.ensure_frames(pid, job.shot_id)
+                included = [i for i in fresh["items"] if i.get("included")]
+            prev = next(
+                (i for i in included if i.get("kind") == "prev_frame" and i.get("asset_id")),
+                None,
+            )
+            fallback = next((i for i in included if i.get("asset_id")), None)
+            explicit_first = (prev or fallback or {}).get("asset_id")
+
+        async def resolve(asset_id: str | None) -> Path | None:
+            if not asset_id:
+                return None
+            asset = await fetch(db, Asset, asset_id, "资产")
+            return proj.dir / asset.path
+
+        return await resolve(explicit_first), await resolve(explicit_last)
+
+    def _require_not_cancelled(self, job_id: str) -> None:
+        if job_id in self._cancelled:
+            raise AppError(
+                ErrorCode.WORKFLOW_ERROR,
+                "任务已取消",
+                "在等待生成结果时被取消。",
+                ["需要的话重新入队"],
+            )
+
+    async def _run_legacy(
+        self, pid: str, job: Job, params: dict[str, Any]
+    ) -> tuple[str, bytes, str | None]:
+        """兼容路径：旧的 Workflow 节点绑定。保留是为了老工程还能跑，不再演进。"""
         db = db_of(pid)
         workflow = await fetch(db, Workflow, job.workflow_id or "", "工作流")
         graph = parse_graph(workflow.api_json)
@@ -364,13 +523,7 @@ class GenerationService:
 
         history: dict[str, Any] = {}
         for tick in range(POLL_LIMIT):
-            if job.id in self._cancelled:
-                raise AppError(
-                    ErrorCode.WORKFLOW_ERROR,
-                    "任务已取消",
-                    "在等待 ComfyUI 结果时被取消。",
-                    ["需要的话重新入队"],
-                )
+            self._require_not_cancelled(job.id)
             history = await comfy.history(prompt_id)
             if history:
                 break
@@ -396,22 +549,7 @@ class GenerationService:
             )
         chosen = files[-1]
         data = await comfy.download(chosen["filename"], chosen["subfolder"], chosen["type"])
-        kind = (
-            "generated_video"
-            if chosen["filename"].lower().endswith((".mp4", ".webm", ".mov", ".gif"))
-            else "generated_image"
-        )
-        asset = await assets.register_bytes(pid, kind, chosen["filename"], data, source="generated")
-        return await self.add_version(
-            pid,
-            job.shot_id,
-            asset_id=asset["id"],
-            kind="video" if kind == "generated_video" else "image",
-            workflow_id=workflow.id,
-            params={k: v for k, v in params.items() if k != "context"},
-            context_snapshot=params.get("context"),
-            source="generated",
-        )
+        return chosen["filename"], data, workflow.id
 
     # --- 版本（只增不改） ---
 

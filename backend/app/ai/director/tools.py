@@ -1,0 +1,473 @@
+"""AI 导演的工具箱。
+
+工具分成两类，这条界线是整个 agent 的安全边界：
+
+  - **读工具**（`list_*` / `get_scene`）**立刻执行**。它们没有副作用，模型需要先看清
+    这个工程里已经有谁、有哪些地点、现在几幕，才可能提出像样的建议。
+  - **写工具**（`add_scene` / `set_link` / …）**永远不落库**，只被翻译成一条**提案**
+    塞进缓冲区。数据库是用户的，改它必须经过用户逐条点头（照
+    `story.propose_breakdown` / `apply_breakdown` 的老规矩）。
+
+提案条目的形状固定为 `{op, target, temp_id, before, after, why, warnings}`：
+
+  - `op` 就是写工具名；用户在界面上丢弃一条时，前端把它改成 `"reject"`，
+    `services/director.py::apply` 只落 `op != "reject"` 的条目；
+  - `before` 是现在库里长什么样（update / delete 才有），`after` 是提案要改成什么——
+    有这两半，前端才能画出真正的 Diff 而不是「模型说它要改点东西」；
+  - `warnings` 是「这条能落，但有点不对」（比如角色名对不上任何角色）。
+    对不上就写出来，绝不静默丢掉。
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from app.core.errors import AppError, ErrorCode
+from app.persistence.models_flow import LINK_MODES
+from app.services.cast import cast
+from app.services.sequence import sequence
+from app.services.story import story
+from app.services.world import world
+
+#: 工具白名单。模型只能调这里面的东西——名字不在这张表里直接报错，
+#: 不去猜「它大概是想调 add_scene」。
+TOOLS: dict[str, dict[str, Any]] = {
+    "list_characters": {
+        "kind": "read",
+        "desc": "列出工程里所有角色及其形象（形象 id 是给镜头挂人用的）。",
+        "params": {},
+    },
+    "list_locations": {
+        "kind": "read",
+        "desc": "列出所有地点及其变体（白天 / 雨夜等），变体 id 用来钉住一幕的地点。",
+        "params": {},
+    },
+    "list_props": {"kind": "read", "desc": "列出所有道具。", "params": {}},
+    "list_scenes": {
+        "kind": "read",
+        "desc": "列出现有的幕（含顺序、地点、镜头数）与幕之间的衔接方式。",
+        "params": {},
+    },
+    "get_scene": {
+        "kind": "read",
+        "desc": "看某一幕的细节：它的镜头清单、每个镜头的时长与出场角色。",
+        "params": {"scene_id": {"type": "string", "description": "幕 id"}},
+        "required": ["scene_id"],
+    },
+    "add_scene": {
+        "kind": "write",
+        "desc": "提议加一幕。可以顺带给出这一幕的镜头清单。",
+        "params": {
+            "title": {"type": "string", "description": "这一幕的标题"},
+            "summary": {"type": "string", "description": "一两句剧情概要"},
+            "time_of_day": {"type": "string", "description": "白天 / 黄昏 / 雨夜等"},
+            "location_variant_id": {"type": "string", "description": "地点变体 id，可留空"},
+            "shots": {
+                "type": "array",
+                "description": "这一幕的镜头，按时间顺序",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string"},
+                        "description": {"type": "string"},
+                        "duration": {"type": "number", "description": "秒，常用 3~6"},
+                        "prompt": {"type": "string"},
+                        "character_names": {"type": "array", "items": {"type": "string"}},
+                    },
+                },
+            },
+            "why": {"type": "string", "description": "为什么要加这一幕"},
+        },
+        "required": ["title"],
+    },
+    "update_scene": {
+        "kind": "write",
+        "desc": "提议改一幕的标题 / 概要 / 时间 / 地点变体。",
+        "params": {
+            "scene_id": {"type": "string"},
+            "title": {"type": "string"},
+            "summary": {"type": "string"},
+            "time_of_day": {"type": "string"},
+            "location_variant_id": {"type": "string"},
+            "why": {"type": "string"},
+        },
+        "required": ["scene_id"],
+    },
+    "set_scene_prompt": {
+        "kind": "write",
+        "desc": "提议改这一幕全部镜头的画面描述（prompt）。",
+        "params": {
+            "scene_id": {"type": "string"},
+            "prompt": {"type": "string", "description": "喂给视频模型的画面描述"},
+            "why": {"type": "string"},
+        },
+        "required": ["scene_id", "prompt"],
+    },
+    "set_scene_cast": {
+        "kind": "write",
+        "desc": "提议把一批角色设为这一幕全部镜头的出场角色（整幕覆盖，不是追加）。",
+        "params": {
+            "scene_id": {"type": "string"},
+            "character_names": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "角色名；用默认形象。也可以直接给 appearance_ids",
+            },
+            "appearance_ids": {"type": "array", "items": {"type": "string"}},
+            "why": {"type": "string"},
+        },
+        "required": ["scene_id"],
+    },
+    "set_scene_props": {
+        "kind": "write",
+        "desc": "提议把一批道具设为这一幕全部镜头出现的道具（整幕覆盖）。",
+        "params": {
+            "scene_id": {"type": "string"},
+            "prop_names": {"type": "array", "items": {"type": "string"}},
+            "prop_ids": {"type": "array", "items": {"type": "string"}},
+            "why": {"type": "string"},
+        },
+        "required": ["scene_id"],
+    },
+    "set_link": {
+        "kind": "write",
+        "desc": (
+            "提议两幕之间怎么接：cut 硬切 / transition 生成 1~2 秒转场 / "
+            "tail_frame 上一幕真末帧当下一幕首帧。"
+        ),
+        "params": {
+            "from_scene_id": {"type": "string"},
+            "to_scene_id": {"type": "string"},
+            "mode": {"type": "string", "enum": list(LINK_MODES)},
+            "duration": {"type": "number", "description": "转场秒数，0.5~4，只有 transition 用"},
+            "prompt": {"type": "string", "description": "转场的画面描述"},
+            "why": {"type": "string"},
+        },
+        "required": ["from_scene_id", "to_scene_id", "mode"],
+    },
+    "reorder_scenes": {
+        "kind": "write",
+        "desc": "提议重排幕的顺序。order 要给出全部幕 id。",
+        "params": {
+            "order": {"type": "array", "items": {"type": "string"}},
+            "why": {"type": "string"},
+        },
+        "required": ["order"],
+    },
+    "delete_scene": {
+        "kind": "write",
+        "desc": "提议删掉一幕（它的镜头与版本会一起没，所以 why 要写清楚）。",
+        "params": {"scene_id": {"type": "string"}, "why": {"type": "string"}},
+        "required": ["scene_id"],
+    },
+}
+
+READ_TOOLS = tuple(name for name, spec in TOOLS.items() if spec["kind"] == "read")
+WRITE_TOOLS = tuple(name for name, spec in TOOLS.items() if spec["kind"] == "write")
+
+
+def tool_specs() -> list[dict[str, Any]]:
+    """OpenAI 兼容的 tools 数组。只在这里拼一次，别在 agent 里再抄一份。"""
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": spec["desc"],
+                "parameters": {
+                    "type": "object",
+                    "properties": spec["params"],
+                    "required": spec.get("required", []),
+                },
+            },
+        }
+        for name, spec in TOOLS.items()
+    ]
+
+
+# --- 读工具：立刻执行，没有副作用 ---
+
+
+async def run_read(pid: str, name: str, args: dict[str, Any]) -> Any:
+    """执行一个读工具。返回值直接回给模型，所以只给它需要的字段——
+    把整张表塞回去只会挤爆上下文，还让它更容易挑错 id。"""
+    if name == "list_characters":
+        out = []
+        for char in await cast.list_characters(pid):
+            apps = await cast.list_appearances(pid, char["id"])
+            out.append(
+                {
+                    "id": char["id"],
+                    "name": char["name"],
+                    "appearances": [
+                        {
+                            "id": a["id"],
+                            "name": a["name"],
+                            "is_default": bool(a.get("is_default")),
+                            "has_sheet": bool(a.get("current_sheet")),
+                        }
+                        for a in apps
+                    ],
+                }
+            )
+        return out
+    if name == "list_locations":
+        return [
+            {
+                "id": loc["id"],
+                "name": loc["name"],
+                "variants": [{"id": v["id"], "name": v["name"]} for v in loc["variants"]],
+            }
+            for loc in await world.list_locations(pid)
+        ]
+    if name == "list_props":
+        return [{"id": p["id"], "name": p["name"]} for p in await world.list_props(pid)]
+    if name == "list_scenes":
+        scenes = await story.list_scenes(pid)
+        links = await sequence.list_links(pid)
+        return {
+            "scenes": [
+                {
+                    "id": s["id"],
+                    "index_no": s["index_no"],
+                    "title": s["title"],
+                    "summary": s["summary"],
+                    "time_of_day": s["time_of_day"],
+                    "location_variant_id": s["location_variant_id"],
+                    "location": s["location_variant_name"],
+                    "shot_count": s["shot_count"],
+                }
+                for s in scenes
+            ],
+            "links": [
+                {
+                    "from_scene_id": link["from_scene_id"],
+                    "to_scene_id": link["to_scene_id"],
+                    "mode": link["mode"],
+                    "duration": link["duration"],
+                }
+                for link in links
+            ],
+        }
+    if name == "get_scene":
+        sid = str(args.get("scene_id") or "")
+        lane = next((la for la in await story.storyboard(pid) if la["id"] == sid), None)
+        if lane is None:
+            raise AppError(
+                ErrorCode.NOT_FOUND,
+                "没有这一幕",
+                f"scene_id = {sid or '（空）'}。",
+                ["先调 list_scenes 拿到正确的 id"],
+            )
+        return lane
+    raise AppError(
+        ErrorCode.VALIDATION_ERROR,
+        "不认识这个工具",
+        f"{name} 不在工具白名单里。",
+        [f"可用的工具：{'、'.join(TOOLS)}"],
+    )
+
+
+# --- 写工具：只翻译成提案，永不落库 ---
+
+
+def _clean(args: dict[str, Any], keys: tuple[str, ...]) -> dict[str, Any]:
+    """只留模型真的给了的字段。给了 None 等于没给——不能把已有的概要清空。"""
+    return {k: args[k] for k in keys if args.get(k) is not None}
+
+
+async def _resolve_appearances(pid: str, args: dict[str, Any]) -> tuple[list[dict], list[str]]:
+    """角色名 / 形象 id → 形象。对不上的名字进 warnings，不静默丢。"""
+    picked: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    chars = await run_read(pid, "list_characters", {})
+    by_app = {a["id"]: (c, a) for c in chars for a in c["appearances"]}
+    for aid in args.get("appearance_ids") or []:
+        hit = by_app.get(str(aid))
+        if hit is None:
+            warnings.append(f"形象 id {aid} 不存在，这一条会被忽略")
+            continue
+        char, app = hit
+        picked.append({"appearance_id": app["id"], "label": f"{char['name']} · {app['name']}"})
+    for raw in args.get("character_names") or []:
+        name = str(raw).strip()
+        char = next((c for c in chars if c["name"] == name), None) or next(
+            (c for c in chars if name and (name in c["name"] or c["name"] in name)), None
+        )
+        if char is None or not char["appearances"]:
+            warnings.append(f"「{name}」对不上任何角色，先在角色工作台建一个")
+            continue
+        app = next((a for a in char["appearances"] if a["is_default"]), char["appearances"][0])
+        picked.append({"appearance_id": app["id"], "label": f"{char['name']} · {app['name']}"})
+    seen: set[str] = set()
+    unique = [p for p in picked if not (p["appearance_id"] in seen or seen.add(p["appearance_id"]))]
+    return unique, warnings
+
+
+async def _resolve_props(pid: str, args: dict[str, Any]) -> tuple[list[dict], list[str]]:
+    props = await world.list_props(pid)
+    picked: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    for pid_raw in args.get("prop_ids") or []:
+        hit = next((p for p in props if p["id"] == str(pid_raw)), None)
+        if hit is None:
+            warnings.append(f"道具 id {pid_raw} 不存在，这一条会被忽略")
+            continue
+        picked.append({"prop_id": hit["id"], "label": hit["name"]})
+    for raw in args.get("prop_names") or []:
+        name = str(raw).strip()
+        hit = next((p for p in props if p["name"] == name), None) or next(
+            (p for p in props if name and (name in p["name"] or p["name"] in name)), None
+        )
+        if hit is None:
+            warnings.append(f"「{name}」对不上任何道具，先在道具库建一个")
+            continue
+        picked.append({"prop_id": hit["id"], "label": hit["name"]})
+    seen: set[str] = set()
+    return [p for p in picked if not (p["prop_id"] in seen or seen.add(p["prop_id"]))], warnings
+
+
+async def _scene(pid: str, sid: str) -> dict[str, Any]:
+    """按 id 取一幕。取不到就报错回给模型——它可以重新调 list_scenes 拿对的 id，
+    这比编一条指向不存在的幕的提案好。"""
+    hit = next((s for s in await story.list_scenes(pid) if s["id"] == str(sid)), None)
+    if hit is None:
+        raise AppError(
+            ErrorCode.NOT_FOUND,
+            "没有这一幕",
+            f"scene_id = {sid or '（空）'}。",
+            ["先调 list_scenes 拿到正确的 id"],
+        )
+    return hit
+
+
+async def to_op(pid: str, name: str, args: dict[str, Any], temp_no: int) -> dict[str, Any]:
+    """把一次写工具调用翻译成一条提案。**这里绝不碰数据库的写路径。**"""
+    if name not in WRITE_TOOLS:
+        raise AppError(
+            ErrorCode.VALIDATION_ERROR,
+            "不认识这个工具",
+            f"{name} 不是写工具。",
+            [f"可用的写工具：{'、'.join(WRITE_TOOLS)}"],
+        )
+    why = str(args.get("why") or "").strip()
+    op: dict[str, Any] = {
+        "op": name,
+        "target": "link" if name == "set_link" else "scene",
+        "temp_id": f"op{temp_no}",
+        "before": None,
+        "after": {},
+        "why": why,
+        "warnings": [],
+    }
+
+    if name == "add_scene":
+        shots: list[dict[str, Any]] = []
+        for raw in args.get("shots") or []:
+            if not isinstance(raw, dict):
+                continue
+            picked, warn = await _resolve_appearances(
+                pid, {"character_names": raw.get("character_names")}
+            )
+            op["warnings"].extend(warn)
+            shots.append(
+                {
+                    "title": str(raw.get("title") or f"镜头 {len(shots) + 1}"),
+                    "description": raw.get("description"),
+                    "duration": float(raw.get("duration") or 4.0),
+                    "prompt": raw.get("prompt"),
+                    "cast": picked,
+                }
+            )
+        op["after"] = {
+            **_clean(args, ("title", "summary", "time_of_day", "location_variant_id")),
+            "shots": shots,
+        }
+        return op
+
+    if name == "update_scene":
+        row = await _scene(pid, args.get("scene_id", ""))
+        keys = ("title", "summary", "time_of_day", "location_variant_id")
+        op["scene_id"] = row["id"]
+        op["before"] = {k: row[k] for k in keys}
+        op["after"] = _clean(args, keys)
+        return op
+
+    if name == "set_scene_prompt":
+        row = await _scene(pid, args.get("scene_id", ""))
+        op["scene_id"] = row["id"]
+        op["before"] = {"title": row["title"], "shot_count": row["shot_count"]}
+        op["after"] = {"prompt": str(args.get("prompt") or "")}
+        return op
+
+    if name == "set_scene_cast":
+        row = await _scene(pid, args.get("scene_id", ""))
+        picked, warn = await _resolve_appearances(pid, args)
+        op["scene_id"] = row["id"]
+        op["before"] = {"title": row["title"], "shot_count": row["shot_count"]}
+        op["after"] = {"cast": picked}
+        op["warnings"].extend(warn)
+        return op
+
+    if name == "set_scene_props":
+        row = await _scene(pid, args.get("scene_id", ""))
+        picked, warn = await _resolve_props(pid, args)
+        op["scene_id"] = row["id"]
+        op["before"] = {"title": row["title"], "shot_count": row["shot_count"]}
+        op["after"] = {"props": picked}
+        op["warnings"].extend(warn)
+        return op
+
+    if name == "set_link":
+        head = await _scene(pid, args.get("from_scene_id", ""))
+        tail = await _scene(pid, args.get("to_scene_id", ""))
+        mode = str(args.get("mode") or "")
+        if mode not in LINK_MODES:
+            raise AppError(
+                ErrorCode.VALIDATION_ERROR,
+                "未知的衔接方式",
+                f"{mode or '（空）'} 不在 {'、'.join(LINK_MODES)} 里。",
+                ["mode 只能是 cut / transition / tail_frame"],
+            )
+        existing = next(
+            (
+                link
+                for link in await sequence.list_links(pid)
+                if link["from_scene_id"] == head["id"] and link["to_scene_id"] == tail["id"]
+            ),
+            None,
+        )
+        op["before"] = (
+            {"mode": existing["mode"], "duration": existing["duration"]} if existing else None
+        )
+        op["after"] = {
+            "from_scene_id": head["id"],
+            "to_scene_id": tail["id"],
+            "from_title": head["title"],
+            "to_title": tail["title"],
+            "mode": mode,
+            **_clean(args, ("duration", "prompt")),
+        }
+        return op
+
+    if name == "reorder_scenes":
+        rows = await story.list_scenes(pid)
+        known = {s["id"]: s for s in rows}
+        order = [str(i) for i in args.get("order") or [] if str(i) in known]
+        missing = [s["id"] for s in rows if s["id"] not in order]
+        if missing:
+            op["warnings"].append(f"有 {len(missing)} 幕没出现在新顺序里，会按原顺序排在后面")
+        op["before"] = {"order": [f"{s['index_no']}. {s['title']}" for s in rows]}
+        op["after"] = {
+            "order": order + missing,
+            "titles": [known[i]["title"] for i in order + missing],
+        }
+        return op
+
+    row = await _scene(pid, args.get("scene_id", ""))  # delete_scene
+    op["scene_id"] = row["id"]
+    op["before"] = {"title": row["title"], "shot_count": row["shot_count"]}
+    op["after"] = None
+    if row["shot_count"]:
+        op["warnings"].append(f"这一幕下有 {row['shot_count']} 个镜头，删掉后它们的版本一起没")
+    return op

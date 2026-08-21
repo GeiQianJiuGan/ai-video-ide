@@ -14,9 +14,12 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
+from app.core import ffmpeg as ffmpeg_tool
 from app.core.config import settings
+from app.generation.providers import registry as provider_registry
 from app.main import create_app
 from app.persistence.db import Database
+from app.services.appsettings import app_settings
 from app.services.generation import generation
 from app.services.library import library as library_service
 from app.services.projects import projects
@@ -39,6 +42,10 @@ async def db(tmp_path: Path) -> Database:
 async def clean_runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[None]:
     monkeypatch.setattr(settings, "runtime_dir", tmp_path / "runtime")
     settings.runtime_dir.mkdir(parents=True, exist_ok=True)
+    # settings.json 也是应用级状态，且它的覆盖是写进 settings 单例的：
+    # 不在这里重新 apply 一遍，上一个测试改过的调用方式会跟到下一个测试里。
+    app_settings.apply()
+    provider_registry.reset()
     await projects.close_all()
     # 素材库同样是应用级状态：进程里只有一个，不关掉会被下一个测试看见
     await library_service.shutdown()
@@ -91,6 +98,18 @@ def library(client: TestClient, library_dir: Path) -> dict[str, Any]:
     body = resp.json()
     assert body["configured"] is True
     return dict(body["library"])
+
+
+@pytest.fixture
+def no_ffmpeg(monkeypatch: pytest.MonkeyPatch) -> None:
+    """把 FFmpeg 从查找结果里彻底拿掉。
+
+    应用现在自带 FFmpeg（`bin/` 或安装包里），所以「缺 FFmpeg 时怎么报错」不能再靠
+    「这台机器上恰好没装」来触发——否则同一套测试在开发机与 CI 上结论相反。
+    这里同时掏空内置目录与 PATH，让缺失变成一个确定的条件。
+    """
+    monkeypatch.setattr(ffmpeg_tool, "bundle_dirs", lambda: [])
+    monkeypatch.setattr(ffmpeg_tool.shutil, "which", lambda _name: None)
 
 
 def error_of(resp: Any) -> dict[str, Any]:

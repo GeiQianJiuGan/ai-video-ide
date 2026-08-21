@@ -33,11 +33,16 @@ def _offline(exc: Exception) -> AppError:
 
 class ComfyClient:
     def __init__(self, base_url: str | None = None) -> None:
-        self._base = (base_url or settings.comfy_base_url).rstrip("/")
+        #: 不在构造时把地址定死：配置页改了 comfy_base_url 之后，这个进程内单例要跟着变。
+        self._explicit = (base_url or "").rstrip("/")
 
     @property
     def base_url(self) -> str:
-        return self._base
+        return self._explicit or settings.comfy_base_url.rstrip("/")
+
+    @property
+    def _base(self) -> str:
+        return self.base_url
 
     async def _get(self, path: str) -> Any:
         try:
@@ -86,6 +91,43 @@ class ComfyClient:
                 return str(resp.json().get("prompt_id", ""))
         except httpx.HTTPError as exc:
             raise _offline(exc) from exc
+
+    async def upload_image(self, filename: str, data: bytes, subfolder: str = "aivs") -> str:
+        """把首/末帧传进 ComfyUI 的 input 目录，返回图里该填的文件名。
+
+        R2V 的入口是图，而图在我们这边；ComfyUI 只认它自己 input 目录下的名字，
+        所以每次生成前先上传。同名会被 ComfyUI 自动改名，因此**必须用它回的名字**。
+        """
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=3.0)) as http:
+                resp = await http.post(
+                    f"{self._base}/upload/image",
+                    files={"image": (filename, data, "application/octet-stream")},
+                    data={"overwrite": "false", "subfolder": subfolder},
+                )
+                if resp.status_code >= 400:
+                    raise AppError(
+                        ErrorCode.COMFY_LOST,
+                        "参考图上传失败",
+                        f"HTTP {resp.status_code}: {resp.text[:500]}",
+                        [
+                            "确认 ComfyUI 版本支持 /upload/image",
+                            "确认 ComfyUI 侧 input 目录可写",
+                        ],
+                    )
+                body = resp.json()
+        except httpx.HTTPError as exc:
+            raise _offline(exc) from exc
+        except ValueError as exc:
+            raise AppError(
+                ErrorCode.COMFY_LOST,
+                "参考图上传的响应不认识",
+                f"{type(exc).__name__}: {exc}",
+                ["确认这个地址真的是 ComfyUI"],
+            ) from exc
+        name = str(body.get("name") or filename)
+        sub = str(body.get("subfolder") or "")
+        return f"{sub}/{name}" if sub else name
 
     async def history(self, prompt_id: str) -> dict[str, Any]:
         data = await self._get(f"/history/{prompt_id}")

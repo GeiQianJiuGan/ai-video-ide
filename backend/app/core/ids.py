@@ -35,6 +35,9 @@ PREFIX = {
     "asset_ref": "arf",
     "export_record": "exp",
     "request": "req",
+    # --- 幕流程图（场景之间的衔接 + AI 导演会话） ---
+    "scene_link": "lnk",
+    "director_turn": "dtn",
     # --- 应用级素材库（独立目录 + library.db，不属于任何工程） ---
     "library": "lib",
     "library_asset": "las",

@@ -8,10 +8,12 @@ AI Video Studio（`aivs`）：桌面端优先的 AI 原生长视频制作工作�
 
 ## 四条硬约束（改动前先确认没有违反）
 
-1. **业务层不绑定具体视频模型**——不允许出现 `if model == "wan"`；差异全部下沉到 Workflow
-   绑定表与 `apply_bindings`（`app/services/workflows.py`）。Shot 只写 capability
-   （`text2image` / `image2video` / `first_last_frame` / `upscale`）。整个后端只有
-   `GenerationService._execute` 与 `app/generation/comfy/client.py` 知道 ComfyUI 存在。
+1. **业务层不绑定具体视频模型**——不允许出现 `if model == "wan"` 或 `if provider == "comfy"`；
+   差异全部下沉到 `app/generation/providers/*`（provider 适配层）。Shot 只写 capability
+   （`text2image` / `image2video` / `first_last_frame` / `upscale`）与 provider 名。整个后端只有
+   `providers/comfy_preset.py` 与 `app/generation/comfy/client.py` 知道 ComfyUI 存在；
+   老的 Workflow 绑定表（`services/workflows.py::apply_bindings`）降级为兼容路径，
+   只在 `job.workflow_id` 非空时才走。
 2. **LLM 不是必选项**——默认 `llm_provider="none"`，AI 入口返回 `LLM_UNAVAILABLE`，且建议里
    必须写明手动路径。Manual 模式必须能走完全流程，Source of Truth 始终是 `project.db`。
 3. **生成版本永不覆盖**——`GenerationVersion` 只增不改，冻结当次 prompt / workflow /
@@ -27,18 +29,23 @@ AI Video Studio（`aivs`）：桌面端优先的 AI 原生长视频制作工作�
 
 ## 当前进度（先读这段，别假设前端已经接上后端）
 
-- **后端已全量落地**：docs/04 的 Step 1–9 都有实现——13 个 service（cast / world / assets /
-  workflows / story / context / generation / timeline / overview / projects / library / adopt /
-  fsbrowse）+ 15 个 router（含 `/ws`），152 个测试。
-- **前端接上后端的是应用级两页**：项目管理 `features/project/ProjectsView.vue` +
-  `stores/project.ts`、素材库 `features/library/LibraryView.vue` + `stores/library.ts`
-  （`app/features.ts` 里 `projects` / `library` 是 `ready: true`）。
-- **项目内 11 个功能页仍是外壳**：`/p/:pid` 下除概览外都渲染 `FeatureView`（按注册表画工作区
-  骨架与能力锁），`ready: false`。做功能页是「把 FeatureView 换成实页面」，不是从零搭。
+- **后端已全量落地**：docs/04 的 Step 1–9 都有实现，之后又落了「两级场景系统」这一轮
+  （应用级设置 → provider 适配层 → 衔接与编排 → 场景工作台 → 幕流程图 → AI 协作栏）——
+  17 个 service（cast / world / assets / workflows / story / context / generation / timeline /
+  overview / projects / library / adopt / fsbrowse / appsettings / frames / sequence / director）
+  + 18 个 router（含 `/ws`），203 个测试全绿。
+- **前端也全部接上了后端**：`app/features.ts` 里 15 个功能都是 `ready: true`，
+  `/p/:pid` 下不再有外壳页。`shared/ui/FeatureView.vue`（按注册表画工作区骨架与能力锁）
+  暂时没人用，留给下一个「登记了但还没接后端」的功能——那种情况先挂它，绝不给假界面。
+- 生成层的主路是 `flow`（幕）→ `scene`（场景工作台）；`workflows`（Workflow 管理）已经是
+  `advanced: true` 的兼容路径，不在导航里，只从命令面板或设置页进。
+- 单个能力仍会缺（ComfyUI 离线、没有 LLM）：这类按钮保持 `disabled` 并把原因写进 tooltip，
+  不画假界面、不造假数据。
 - 本机装了 `frontend/node_modules` 与 `backend/.venv`（后端命令用 `.venv/Scripts/python`），
-  没有 Rust 工具链，`cd tauri && cargo tauri dev` 从未编译过。
-- 本机装了 FFmpeg，所以 3 条断言「FFmpeg 缺失」的测试会失败，与改动无关：基线是
-  `3 failed / 152 passed`。
+  没有 Rust 工具链，`cd tauri && cargo tauri dev` 从未编译过；`tauri/src/backend.rs` 与
+  `tauri.conf.json` 的改动无法在本机验证。
+- **FFmpeg 随应用分发**，不再要求用户自己装（见下面的「内置 FFmpeg」段）。测试不依赖
+  「这台机器上恰好装了/没装」：缺失路径用 `conftest.py::no_ffmpeg` fixture 造。
 
 ## 常用命令
 
@@ -80,6 +87,18 @@ cd frontend && npm run dev
 cd frontend && npm run typecheck && npm run lint && npm run build
 ```
 
+内置 FFmpeg（首次克隆仓库后跑一次；二进制约 150 MB，不进 git，`.gitignore` 忽略 `bin/ffmpeg*`）：
+
+```bash
+python scripts/fetch_ffmpeg.py
+```
+
+打包前把它们摆成 Tauri externalBin 要的 `<tool>-<target-triple>` 命名：
+
+```bash
+python scripts/fetch_ffmpeg.py --for-tauri
+```
+
 桌面壳（需要 Rust + `cargo install tauri-cli --version "^2"`；本机从未编译过）：
 
 ```bash
@@ -99,6 +118,8 @@ cd backend && python -m alembic -x db=<工程目录>/project.db revision --autog
 配置全部走 `AIVS_` 前缀环境变量或 `backend/.env`（见 `backend/app/core/config.py`）：
 `AIVS_PORT` / `AIVS_COMFY_BASE_URL` / `AIVS_FFMPEG_PATH` / `AIVS_WORKER_LIMIT` /
 `AIVS_LLM_PROVIDER` / `AIVS_RUNTIME_DIR`。前端代理目标用 `AIVS_BACKEND` 覆盖。
+运行期还有一层**应用级设置**（配置页写的 `settings.json`）压在环境变量之上，
+顺序是 **settings.json → 环境变量 → 默认**（见下面的生成层那段）。
 
 ## 架构要点
 
@@ -144,6 +165,23 @@ token}` 写进 `.runtime/endpoint.json` → 壳校验后用 `window.__AIVS_ENDPO
 提供 `/fs/roots`、`/fs/dirs`、`/fs/mkdir`——浏览器拿不到绝对路径，所以目录树必须由后端给，
 `shared/ui/DirPicker.vue` 在浏览器与 Tauri 里走同一套；**只列目录，不返回任何文件内容**。
 
+**内置 FFmpeg**（`app/core/ffmpeg.py` 是唯一的查找入口，三个调用点
+`services/timeline.py::_ffmpeg`、`api/system.py::_probe_ffmpeg`、`services/overview.py::environment`
+都走它，**不要再写 `shutil.which("ffmpeg")`**）：抽帧 / 代理转码 / 导出都依赖它，它不该是一道
+「先去装个东西」的门槛，所以应用自带一份。查找顺序 **显式配置 → 内置副本 → PATH**：
+
+- 显式配置（`AIVS_FFMPEG_PATH` / `AIVS_FFPROBE_PATH` 写成含分隔符的路径）永远第一，指了却找不到时
+  **不静默回退**到内置——那是配置写错了，`require()` 抛 `FFMPEG_MISSING` 说出来；
+- 内置副本：`AIVS_BUNDLE_DIR`（Tauri 壳注入的主程序目录，externalBin 落点）→ 冻结后 sidecar 自身
+  目录 → `<repo>/bin`（开发期 `scripts/fetch_ffmpeg.py` 的下载目标）；
+- PATH 排最后：系统里那份版本未知，能用就用，但不该盖掉我们自带的。
+
+`locate()` 返回 `Located{path, source, searched, configured_missing}`，`source` 会一路传到 UI
+（概览页环境栏、状态栏、设置页）——「内置」和「你机器上那份」不是一回事，排查方向也不同。
+刻意不做缓存：用户可能在应用开着的时候才去下载。打包时 `tauri.conf.json` 的 `externalBin` 列了
+`bin/ffmpeg` / `bin/ffprobe`，构建前必须先 `python scripts/fetch_ffmpeg.py --for-tauri`，
+否则 bundle 会失败。
+
 **事件**：进程内 `EventBus`（`events/bus.py`）→ 单个 `/ws` 端点按 `project_id` + `channels`
 过滤（job / queue / shot / version / asset / system / error）。事件幂等、可丢失（队列满丢最旧），
 前端重连后必须调 REST 做全量对齐；不要给它加投递保证或持久化。
@@ -159,6 +197,51 @@ kind / priority / included / reason；人工覆写记在 `shot.context_overrides
 **时间线与导出**（`services/timeline.py`）：完全不依赖 AI。撤销栈是整轨快照（`UNDO_DEPTH=50`）；
 `GET /export/command` 只产出 ffmpeg 参数计划，`POST /export` 才真的起进程。
 
+**生成层 = 两级场景系统 + provider 适配层**（不再是「Workflow 为中心」）：
+
+- **第一级：幕流程图**（`services/sequence.py` + `api/sequence.py`，前端 `features/flow/FlowView.vue`）。
+  一个节点是一幕（`Scene`），节点之间那一条是**衔接**（新表 `SceneLink`，三种 mode）：
+  `cut` 不生成任何东西；`transition` 补一段 1~2s 转场视频，落成一个 `Shot.kind="transition"`
+  的镜头——**属于 from_scene 且排在它最后**，于是 `timeline.auto_assemble` 的「scene.index_no +
+  shot.index_no」排序天然把它放在两幕之间，导出逻辑一行不用改；`tail_frame` 只是把下游首镜头的
+  `prev_shot_id` 指到上游末镜头，复用已有的 `depends_on` / `wait_reason`。
+  编排两种模式（`parallel` / `sequential`）**一律先账单再动手**：`POST /sequence/plan` 只读地
+  列出「入队几个任务、补几段转场、哪一条缺什么」，`POST /sequence/run` 才真入队；被跳过的每条
+  都带四要素错误，跳过不是失败。
+- **第二级：场景工作台**（前端 `features/flow/SceneWorkbench.vue`）：单幕的首帧 / 末帧槽位 →
+  R2V 生成 → 版本轨。**本轮没有 T2V。**
+- **AI 协作栏**（`app/ai/director/` + `services/director.py` + `api/director.py`，前端
+  `features/flow/DirectorPanel.vue`）：`ai/director/tools.py` 里那条**读 / 写分界就是安全边界**——
+  读工具（`list_*` / `get_scene`）立刻执行，写工具（`add_scene` / `set_link` / …）**永不落库**，
+  只翻译成一条提案 `{op, target, temp_id, before, after, why, warnings}`。`chat` 一行库都不改，
+  只有 `POST /director/apply` 才落，且只落 `op != "reject"` 的条目（照
+  `story.propose_breakdown` / `apply_breakdown` 的老规矩），逐条转调已有的 `story` / `sequence`
+  写方法——绝不另写一份写库逻辑。工具循环上限 `agent.MAX_ROUNDS = 6`；转满轮数时**先把提案落成
+  `DirectorTurn` 记录再报错**，已产出的提案照旧可审阅。不支持 function calling 的端（Ollama）
+  退化成一次性 `complete_json()`，提案形状完全一样。会话与提案存 `DirectorTurn`（只增不改），
+  审阅到一半刷新页面不丢。
+- **provider 适配层**（`app/generation/providers/`）：`base.py` 定义与模型无关的 `VideoRequest`
+  （`mode` = `i2v` / `flf`、prompt、首尾帧、时长、seed、透传 `extra`）与 `VideoProvider`
+  协议（`probe` / `submit` / `poll` / `fetch`）；`comfy_preset.py` 是默认核心，`http_api.py` 是
+  通用 REST 合同，`registry.py::provider_for(name)` 按应用级设置选。
+  **本工具不维护模型端的图**：ComfyUI 适配器只按**节点 title 约定**注入入口参数——
+  `AIVS_FIRST_FRAME` / `AIVS_LAST_FRAME` / `AIVS_PROMPT` / `AIVS_NEGATIVE` / `AIVS_DURATION` /
+  `AIVS_SEED`——不解析、不校验、不改写图里的 lora 与加速节点。缺必需 title 时报
+  `INVALID_WORKFLOW`，建议里写「在 ComfyUI 里把该节点标题改成 X」。lora、加速节点、采样器
+  怎么摆是模型端自己的事，本工具跟着改迟早两边打架。
+- **真末帧抽取**（`services/frames.py`）：`tail_frame` 衔接靠它。FFmpeg `-sseof` 抽一张 PNG →
+  登记 `Asset(kind="frame")` → 同 (asset, at) 幂等复用；`services/context.py` 的 `prev_frame`
+  指的就是这张抽出来的帧，不是上游那整段视频。抽取失败报 `FFMPEG_ERROR`，建议里给出
+  「改用转场衔接」这条出路。
+- **应用级设置**（`services/appsettings.py` + `api/settings.py`）：落
+  `settings.runtime_dir / "settings.json"`（与 `library.json` / `recent.json` 同级），生效顺序
+  **settings.json → 环境变量 → 默认**，每个字段回一个 `source` 让 UI 标出「来自配置文件 /
+  环境变量」。`POST /settings/probe` 分别探 LLM 与视频服务。**API key 永不回明文**：只回
+  `masked` + `has_value`，前端只在用户真的输入了才提交那个字段。
+- **老的「Workflow 管理」是高级 / 兼容路径**：页面与代码原样保留（`features.ts` 里
+  `advanced: true`、不进 `PROJECT_NAV`），`GenerationService._execute` 默认走 provider，
+  只有 `job.workflow_id` 非空时才走 `apply_bindings` 那一支。
+
 ## 代码约定
 
 - **id**：`new_id("shot")` → `sht_<ULID>`。新实体必须先在 `app/core/ids.py` 的 `PREFIX` 里登记，
@@ -169,8 +252,8 @@ kind / priority / included / reason；人工覆写记在 `shot.context_overrides
 - **新增表**：工程表必须在 `persistence/all_models.py` 里 import，否则 `Base.metadata` 漏表；
   素材库表相反——挂 `LibraryBase`，**不要**进 `all_models.py`（理由见上面的素材库段）。
 - **新增迁移**：`alembic/versions/` 加脚本 → 在 `persistence/migrate.py::REVISION_SCHEMA` 登记
-  它对应的 schema 版本 → 同步 `settings.schema_version`（当前 3，最新一条是
-  `0003_library_origin`：给 Character / Location / Prop 加 `origin_library_id`）。漏登记会导致
+  它对应的 schema 版本 → 同步 `settings.schema_version`（当前 4，最新一条是
+  `0004_scene_flow`：`SceneLink` / `DirectorTurn` 两张表 + `Shot.kind`）。漏登记会导致
   打开旧工程时无法告诉用户「schema X → Y」。
 - **落盘**：资产 `path` 相对工程目录存（整个目录拷走仍然有效）；类型→子目录映射在
   `services/assets.py::KIND_DIR`，`generations/` 只放生成物，手动素材一律进 `assets/`。
@@ -187,7 +270,8 @@ kind / priority / included / reason；人工覆写记在 `shot.context_overrides
 ## 测试约定
 
 - 都是同步 `TestClient` 测试（`asyncio_mode=auto`）。autouse 的 `clean_runtime` 把
-  `settings.runtime_dir` 指向 `tmp_path` 并在收尾时停掉所有 pump——工程是应用级状态，
+  `settings.runtime_dir` 指向 `tmp_path`、重新 `app_settings.apply()` + `provider_registry.reset()`，
+  并在收尾时停掉所有 pump——工程、素材库、应用级设置、provider 实例都是应用级状态，
   绝不能泄漏到下一个测试。
 - 涉及入队的测试**先 `POST /queue/pause`**，pump 就不会真去连 ComfyUI；需要一个「已生成」的镜头时
   用 `POST /shots/{id}/versions` 手工造版本。
@@ -195,9 +279,16 @@ kind / priority / included / reason；人工覆写记在 `shot.context_overrides
   本地绑定校验不需要 ComfyUI）、`upload_png`、`GRAPH` / `BINDINGS`；素材库侧是 `library`
   （在 `tmp_path` 下 configure 一个库，`clean_runtime` 收尾时 `library_service.shutdown()`）
   与 `lib_png`。
+- **LLM 一律 monkeypatch 掉**（`tests/test_director_agent.py::use_fake_llm` 是范本：改
+  `settings.llm_provider` / `llm_model` / `llm_base_url` 再换掉 `llm.complete_tools`）——
+  测的是提案不落库、apply 只落未 reject 的这些边界，不是某个模型的脾气。
 - **路径越界要用 `%2e%2e` 测**：httpx 会在发请求前折叠掉字面的 `..`，守卫根本轮不到执行。
   越界与其它 `VALIDATION_ERROR` 的状态码是 **422**（映射表在 `app/core/errors.py::_STATUS`）。
-- 导出相关测试查 `GET /export/command` 的参数计划，不需要装 FFmpeg。
+- 导出相关测试查 `GET /export/command` 的参数计划（只有 `{path, command, clips}`，没有 `args`），
+  不真起进程。
+- **「缺 FFmpeg 时怎么报错」要用 `no_ffmpeg` fixture 造**，别靠「这台机器上恰好没装」——应用现在
+  自带一份，那样的断言在开发机与 CI 上结论相反。反过来，「用的是内置那份」的正向测试在没跑过
+  `fetch_ffmpeg.py` 的机器上 `pytest.skip`。
 
 ## 文档
 

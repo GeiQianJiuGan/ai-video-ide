@@ -24,8 +24,10 @@ import {
   LayoutGrid,
   ListVideo,
   MapPinned,
+  Network,
   ScrollText,
   Users,
+  Video,
   Workflow,
 } from '@lucide/vue'
 
@@ -45,7 +47,7 @@ export const GROUPS: FeatureGroup[] = [
   { id: 'app', title: '工作台', question: '做哪一部片子、从哪里取素材' },
   { id: 'asset', title: '素材层', question: '谁出场、在哪里、用什么道具' },
   { id: 'story', title: '叙事层', question: '讲什么故事、怎么切成镜头' },
-  { id: 'generate', title: '生成层', question: '用哪套 Workflow 把镜头做出来' },
+  { id: 'generate', title: '生成层', question: '怎么一幕一幕把片子做出来' },
   { id: 'assemble', title: '成片层', question: '怎么拼成一条完整的片子' },
 ]
 
@@ -74,6 +76,12 @@ export interface Feature {
   milestone: Milestone
   /** 是否已真正可用。false 时功能页显示能力锁，绝不给假界面。 */
   ready: boolean
+  /**
+   * 高级 / 兼容路径。默认主路走两级场景系统（flow → scene），
+   * 标了 advanced 的功能不进导航，只在设置页与命令面板里出现——
+   * 它们没有被删掉，只是不再是推荐做法。
+   */
+  advanced?: boolean
   requires: Requirement[]
   /** 工作区骨架：左栏 / 主区 / 右栏检查器 / 底部。 */
   panels: { left?: PanelSpec; main: PanelSpec; right?: PanelSpec; bottom?: PanelSpec }
@@ -233,7 +241,7 @@ const PROJECT_DEFS: FeatureDef[] = [
     group: 'story',
     icon: ScrollText,
     milestone: 'M3',
-    ready: false,
+    ready: true,
     requires: ['backend'],
     panels: {
       left: { title: '剧本', body: '分段文本编辑，段落与 Scene 双向对应' },
@@ -246,7 +254,7 @@ const PROJECT_DEFS: FeatureDef[] = [
     actions: [
       { label: 'AI 自动拆解', hint: '需要配置 LLM；产出结果仍需你审阅', primary: true },
       { label: '手动添加 Scene', hint: '不依赖 LLM，完整流程照样可用' },
-      { label: '连续性检查', hint: '找出角色状态、时间线、道具的前后矛盾' },
+      { label: '挂地点变体', hint: '把一场戏钉在「城南旧宅 · 雨夜」上，镜头顺着它取参考图' },
     ],
     outcome: ['一份结构化的 Scene / Shot 清单', '每个镜头都挂好了角色与地点'],
   },
@@ -258,7 +266,7 @@ const PROJECT_DEFS: FeatureDef[] = [
     group: 'story',
     icon: LayoutGrid,
     milestone: 'M3',
-    ready: false,
+    ready: true,
     requires: ['backend'],
     panels: {
       main: {
@@ -269,7 +277,7 @@ const PROJECT_DEFS: FeatureDef[] = [
     },
     actions: [
       { label: '生成整个 Scene', hint: '把这一场的所有镜头一次性入队', primary: true },
-      { label: '拖拽排序', hint: '支持跨 Scene 移动镜头，顺序即时间顺序' },
+      { label: '移动镜头', hint: '本场内换位或跨场搬，顺序即时间顺序' },
       { label: '按状态筛选', hint: '只看失败的、只看缺上下文的' },
     ],
     outcome: ['一眼看出整片进度与缺口', '批量推进而不用一个个点'],
@@ -282,7 +290,7 @@ const PROJECT_DEFS: FeatureDef[] = [
     group: 'generate',
     icon: Clapperboard,
     milestone: 'M4',
-    ready: false,
+    ready: true,
     requires: ['backend', 'comfyui'],
     panels: {
       left: {
@@ -311,14 +319,65 @@ const PROJECT_DEFS: FeatureDef[] = [
     outcome: ['一个可用的镜头视频版本', '完整可追溯：这条片段是怎么来的'],
   },
   {
+    id: 'flow',
+    route: 'flow',
+    title: '幕流程图',
+    purpose: '整片就这一张图：有哪几幕、每一幕做到哪了、两幕之间怎么接',
+    group: 'generate',
+    icon: Network,
+    milestone: 'M4',
+    ready: true,
+    requires: ['backend'],
+    panels: {
+      main: {
+        title: '幕与衔接',
+        body: '一个节点是一幕（缩略图、出场角色、进度徽标），节点之间那一条是衔接：硬切 / 转场 / 续接末帧',
+      },
+      right: {
+        title: '编排账单',
+        body: '这次会入队几个任务、要补几段转场、哪一条缺什么；执行完把「做了的」和「说好的」摆在一起',
+      },
+    },
+    actions: [
+      { label: '先看账单', hint: '只算不做：把要生成的、要补的、缺的全列出来', primary: true },
+      { label: '执行编排', hint: '各幕并发（补转场）或单线程续接（上一段末帧当下一段首帧）' },
+      { label: '加一幕', hint: '不依赖 LLM，手动编排能走完全程' },
+    ],
+    outcome: ['整片结构一眼看全', '两幕之间怎么接是显式选择，不是默认行为'],
+  },
+  {
+    id: 'scene',
+    route: 'scene',
+    title: '幕工作台',
+    purpose: '一幕的小工作坊：给镜头首帧（角色表 / 地点参考 / 上传 / 上游末帧），生成并留版本',
+    group: 'generate',
+    icon: Video,
+    milestone: 'M4',
+    ready: true,
+    requires: ['backend'],
+    panels: {
+      left: { title: '这一幕', body: '地点变体、时间、镜头清单与本镜头出场角色' },
+      main: { title: '首帧与上下文', body: '首帧的四条来路，以及真正喂给模型的那张账单' },
+      right: { title: '版本轨', body: '历次生成只增不改；也能手动导入一个成片' },
+      bottom: { title: 'Prompt 与参数', body: '正负向 Prompt、时长、种子；入队那一刻被冻结进版本' },
+    },
+    actions: [
+      { label: '生成本镜头', hint: '按当前首帧与上下文入队一个新版本', primary: true },
+      { label: '整幕入队', hint: '这一幕里可生成的一次入队，缺上下文的写明原因后跳过' },
+      { label: '接上游末帧', hint: '生成前抽上游的真末帧当首帧，等待可解释' },
+    ],
+    outcome: ['一幕的每个镜头都有可用的视频版本', '首帧是哪来的写在脸上'],
+  },
+  {
     id: 'workflows',
     route: 'workflows',
-    title: 'Workflow 管理',
-    purpose: '把 ComfyUI 的工作流登记成「能力」，业务层从此不关心用的是哪个模型',
+    title: 'Workflow 管理（高级）',
+    purpose: '高级 / 兼容路径：手工把 ComfyUI 工作流的节点字段绑成能力，只有主路满足不了时才用',
     group: 'generate',
     icon: Workflow,
     milestone: 'M2',
-    ready: false,
+    ready: true,
+    advanced: true,
     requires: ['backend', 'comfyui'],
     panels: {
       left: {
@@ -339,7 +398,10 @@ const PROJECT_DEFS: FeatureDef[] = [
       { label: '校验绑定', hint: '检查节点是否存在、自定义节点是否已安装' },
       { label: '设为默认', hint: '新镜头默认使用这套 Workflow' },
     ],
-    outcome: ['换模型只需换 Workflow，镜头数据完全不动', '提前发现缺失的自定义节点'],
+    outcome: [
+      '换模型只需换 Workflow，镜头数据完全不动',
+      '主路（幕流程图 → 幕工作台）不需要它：模型端的图由模型端维护',
+    ],
   },
   {
     id: 'queue',
@@ -349,7 +411,7 @@ const PROJECT_DEFS: FeatureDef[] = [
     group: 'generate',
     icon: ListVideo,
     milestone: 'M4',
-    ready: false,
+    ready: true,
     requires: ['backend', 'comfyui'],
     panels: {
       main: {
@@ -373,7 +435,7 @@ const PROJECT_DEFS: FeatureDef[] = [
     group: 'assemble',
     icon: Film,
     milestone: 'M5',
-    ready: false,
+    ready: true,
     requires: ['backend', 'ffmpeg'],
     panels: {
       main: {
@@ -402,7 +464,7 @@ const PROJECT_DEFS: FeatureDef[] = [
     group: 'assemble',
     icon: Images,
     milestone: 'M1',
-    ready: false,
+    ready: true,
     requires: ['backend'],
     panels: {
       left: { title: '按类型筛选', body: '角色表 / 场景参考 / 道具图 / 生成视频 / 抽帧 / 代理' },
@@ -433,10 +495,12 @@ export interface ChainNode {
 export const CHAIN: ChainNode[] = [
   { label: 'Character', route: 'characters', desc: '角色本体' },
   { label: 'Appearance', route: 'characters', desc: '同一角色的不同形象' },
-  { label: 'Scene', route: 'story', desc: '一场戏：地点 + 时间 + 出场角色' },
+  { label: 'Scene', route: 'flow', desc: '一场戏：地点 + 时间 + 出场角色' },
   { label: 'Shot', route: 'storyboard', desc: '一个镜头' },
-  { label: 'Context', route: 'shot', desc: '真正喂给模型的参考集合' },
-  { label: 'Generation', route: 'queue', desc: '一次生成请求' },
+  // Context / Generation 现在的主路是幕工作台，但它必须带着 sid 才有意义，
+  // 所以链路上指向流程图——从那儿点一个节点进去。
+  { label: 'Context', route: 'flow', desc: '真正喂给模型的参考集合' },
+  { label: 'Generation', route: 'flow', desc: '一次生成请求' },
   { label: 'Version', route: 'shot', desc: '生成结果，永不覆盖' },
   { label: 'Clip', route: 'timeline', desc: '被选中进入成片的片段' },
   { label: 'Timeline', route: 'timeline', desc: '确定性的编辑系统' },
@@ -462,7 +526,13 @@ export function featuresOf(group: GroupId): Feature[] {
 /** 应用级导航：没打开工程时左栏只有这些。 */
 export const APP_NAV = ['projects', 'library'] as const
 
-/** 项目内导航顺序：按创作流程走，而不是按字母。 */
+/**
+ * 项目内导航顺序：按创作流程走，而不是按字母。
+ *
+ * 生成层的入口是 `flow`（幕流程图）——从整片结构进到某一幕，再进那一幕的工作台。
+ * `scene` 不在这里：它只从流程图点节点进去（URL 必须带 sid）。
+ * `workflows` 也不在这里：它是 `advanced: true` 的兼容路径，从命令面板或设置页进。
+ */
 export const PROJECT_NAV = [
   'dashboard',
   'characters',
@@ -470,7 +540,7 @@ export const PROJECT_NAV = [
   'props',
   'story',
   'storyboard',
-  'workflows',
+  'flow',
   'queue',
   'timeline',
   'assets',
@@ -484,6 +554,13 @@ function pick(ids: readonly string[]): Feature[] {
 
 export const APP_NAV_FEATURES: Feature[] = pick(APP_NAV)
 export const PROJECT_NAV_FEATURES: Feature[] = pick(PROJECT_NAV)
+/**
+ * 高级 / 兼容路径的项目内功能：不进左栏导航，但命令面板里要能搜到。
+ * 「不推荐」不等于「藏起来找不到」——已经配好的东西必须还能进去。
+ */
+export const PROJECT_ADVANCED_FEATURES: Feature[] = FEATURES.filter(
+  (f) => f.scope === 'project' && f.advanced === true,
+)
 
 /** Activity Bar 只有 48px 宽，需要更短的标签；tooltip 里给全名与作用。 */
 export const NAV_LABEL: Record<string, string> = {
@@ -495,6 +572,8 @@ export const NAV_LABEL: Record<string, string> = {
   props: '道具',
   story: '剧本',
   storyboard: '分镜',
+  flow: '幕',
+  scene: '幕内',
   workflows: '流程',
   queue: '队列',
   timeline: '时间线',

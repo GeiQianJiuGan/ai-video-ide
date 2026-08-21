@@ -15,6 +15,12 @@ from app.persistence.models_edit import (
     Track,
     Transition,
 )
+from app.persistence.models_flow import (
+    LINK_MODES,
+    SHOT_KINDS,
+    DirectorTurn,
+    SceneLink,
+)
 from app.persistence.models_gen import (
     CAPABILITIES,
     JOB_STATUS,
@@ -45,12 +51,15 @@ __all__ = [
     "CAPABILITIES",
     "INHERITABLE",
     "JOB_STATUS",
+    "LINK_MODES",
     "REQUIRED_SLOTS",
+    "SHOT_KINDS",
     "SHOT_STATUS",
     "Appearance",
     "Asset",
     "AssetRef",
     "Character",
+    "DirectorTurn",
     "ExportRecord",
     "GenerationVersion",
     "Job",
@@ -61,6 +70,7 @@ __all__ = [
     "Prop",
     "PropReference",
     "Scene",
+    "SceneLink",
     "SheetVersion",
     "Shot",
     "ShotCast",

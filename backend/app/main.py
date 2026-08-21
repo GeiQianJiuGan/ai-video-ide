@@ -18,12 +18,15 @@ from fastapi.responses import JSONResponse
 from app.api import assets as assets_api
 from app.api import cast as cast_api
 from app.api import context as context_api
+from app.api import director as director_api
 from app.api import files as files_api
 from app.api import fs as fs_api
 from app.api import generation as generation_api
 from app.api import library as library_api
 from app.api import overview as overview_api
 from app.api import projects as projects_api
+from app.api import sequence as sequence_api
+from app.api import settings as settings_api
 from app.api import story as story_api
 from app.api import system, ws
 from app.api import timeline as timeline_api
@@ -38,6 +41,7 @@ from app.core.errors import (
     validation_error_handler,
 )
 from app.core.logging import get_logger, setup_logging
+from app.services.appsettings import app_settings
 from app.services.library import library
 from app.services.projects import projects
 
@@ -63,6 +67,8 @@ def _authorized(request: Request) -> bool:
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     setup_logging()
+    # 设置文件里的覆盖要在任何 service 读 settings 之前生效（顺序：文件 → 环境变量 → 默认）
+    app_settings.apply()
     log.info(
         "backend.starting",
         version=settings.version,
@@ -117,6 +123,7 @@ def create_app() -> FastAPI:
     app.add_exception_handler(Exception, unhandled_error_handler)
 
     app.include_router(system.router, prefix=API_PREFIX)
+    app.include_router(settings_api.router, prefix=API_PREFIX)
     app.include_router(fs_api.router, prefix=API_PREFIX)
     app.include_router(projects_api.router, prefix=API_PREFIX)
     app.include_router(cast_api.router, prefix=API_PREFIX)
@@ -128,6 +135,8 @@ def create_app() -> FastAPI:
     app.include_router(story_api.router, prefix=API_PREFIX)
     app.include_router(context_api.router, prefix=API_PREFIX)
     app.include_router(generation_api.router, prefix=API_PREFIX)
+    app.include_router(sequence_api.router, prefix=API_PREFIX)
+    app.include_router(director_api.router, prefix=API_PREFIX)
     app.include_router(timeline_api.router, prefix=API_PREFIX)
     app.include_router(overview_api.router, prefix=API_PREFIX)
     app.include_router(ws.router, prefix=API_PREFIX)
