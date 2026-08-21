@@ -11,15 +11,23 @@ import { createRouter, createWebHistory, type RouteRecordRaw } from 'vue-router'
 const FeatureView = () => import('@/shared/ui/FeatureView.vue')
 
 const projectRoutes: RouteRecordRaw[] = [
-  // 概览页多一条核心链路，其余部分仍走注册表骨架
+  // 概览与素材层三页已接后端；其余仍走注册表骨架（FeatureView）
   {
     path: '',
     name: 'dashboard',
     component: () => import('@/features/project/OverviewView.vue'),
   },
-  { path: 'characters', name: 'characters', component: FeatureView },
-  { path: 'locations', name: 'locations', component: FeatureView },
-  { path: 'props', name: 'props', component: FeatureView },
+  {
+    path: 'characters',
+    name: 'characters',
+    component: () => import('@/features/cast/CharactersView.vue'),
+  },
+  {
+    path: 'locations',
+    name: 'locations',
+    component: () => import('@/features/world/LocationsView.vue'),
+  },
+  { path: 'props', name: 'props', component: () => import('@/features/world/PropsView.vue') },
   { path: 'story', name: 'story', component: FeatureView },
   { path: 'storyboard', name: 'storyboard', component: FeatureView },
   { path: 'shot/:sid?', name: 'shot', component: FeatureView },

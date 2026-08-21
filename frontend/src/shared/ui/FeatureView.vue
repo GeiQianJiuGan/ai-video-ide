@@ -11,35 +11,18 @@ import { useRoute } from 'vue-router'
 import { Lock } from '@lucide/vue'
 import AppPanel from './AppPanel.vue'
 import AppButton from './AppButton.vue'
-import AppBadge from './AppBadge.vue'
 import EmptyState from './EmptyState.vue'
-import { REQUIREMENT_LABEL, featureByRoute, type Requirement } from '@/app/features'
-import { useSystemStore } from '@/stores/system'
+import FeatureHeader from './FeatureHeader.vue'
+import { featureByRoute } from '@/app/features'
 
 const route = useRoute()
-const sys = useSystemStore()
 
 const feature = computed(() => featureByRoute(route.name as string | undefined))
-
-function satisfied(req: Requirement): boolean {
-  if (req === 'backend') return sys.health !== null
-  return sys.deps.find((d) => d.name === req)?.ok ?? false
-}
 </script>
 
 <template>
   <div v-if="feature" class="flex min-h-0 flex-1 flex-col">
-    <header class="border-line-1 bg-base-1 shrink-0 border-b px-3 py-2">
-      <div class="flex items-center gap-2">
-        <component :is="feature.icon" :size="14" :stroke-width="1.6" class="text-accent" />
-        <h1 class="text-fg-1 text-sm font-medium">{{ feature.title }}</h1>
-        <AppBadge tone="accent">{{ feature.milestone }}</AppBadge>
-        <AppBadge v-for="r in feature.requires" :key="r" :tone="satisfied(r) ? 'ok' : 'warn'">
-          {{ REQUIREMENT_LABEL[r] }}
-        </AppBadge>
-      </div>
-      <p class="text-fg-3 mt-1 text-xs">{{ feature.purpose }}</p>
-    </header>
+    <FeatureHeader />
 
     <div class="border-line-1 bg-base-1 flex h-row shrink-0 items-center gap-1 border-b px-2">
       <AppButton

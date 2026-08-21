@@ -6,14 +6,20 @@
  *   1. 没配置不是错误——画引导让用户选目录（DirPicker，与新建工程共用一套）；
  *   2. 采用必须先出账单再动手（AdoptDialog 负责），这里只管选中哪一条；
  *   3. 「采用是单向复制」写在页面上，别让用户以为库和工程会互相同步。
+ *
+ * 版式：一次性动作（建预设 / 建标签 / 建变体 / 挂图）全部收进弹窗，页面只留
+ * 「库里有什么」。原来这些输入框和下拉常驻在每一行上，一个五个角色的库要显示
+ * 十几个空控件，真正要看的名字和缩略图反而被挤没了。
  */
 import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { FolderSearch, Plus, RefreshCw, Trash2, Upload } from '@lucide/vue'
+import { FolderSearch, ImagePlus, Plus, RefreshCw, Tag, Trash2, Upload } from '@lucide/vue'
 import AppPanel from '@/shared/ui/AppPanel.vue'
 import AppButton from '@/shared/ui/AppButton.vue'
 import AppBadge from '@/shared/ui/AppBadge.vue'
+import AppDialog from '@/shared/ui/AppDialog.vue'
 import EmptyState from '@/shared/ui/EmptyState.vue'
+import ErrorPanel from '@/shared/ui/ErrorPanel.vue'
 import DirPicker from '@/shared/ui/DirPicker.vue'
 import AdoptDialog from './AdoptDialog.vue'
 import { libraryFileUrl } from '@/shared/api/files'
@@ -32,6 +38,9 @@ const proj = useProjectStore()
 const router = useRouter()
 
 type Tab = 'assets' | 'characters' | 'locations' | 'props'
+type PresetKind = 'character' | 'location' | 'prop'
+type AttachTarget = 'appearance' | 'variant' | 'prop'
+
 const TABS: { key: Tab; label: string }[] = [
   { key: 'assets', label: '素材' },
   { key: 'characters', label: '角色' },
@@ -39,6 +48,22 @@ const TABS: { key: Tab; label: string }[] = [
   { key: 'props', label: '道具' },
 ]
 const KINDS = Object.keys(LIBRARY_KIND_LABEL) as LibraryKind[]
+const PRESET_LABEL: Record<PresetKind, string> = {
+  character: '角色',
+  location: '地点',
+  prop: '道具',
+}
+/** 挂图时该从库里的哪一类素材里挑。 */
+const ATTACH_KIND: Record<AttachTarget, LibraryKind> = {
+  appearance: 'character_sheet',
+  variant: 'location_reference',
+  prop: 'prop_reference',
+}
+const ATTACH_LABEL: Record<AttachTarget, string> = {
+  appearance: '定妆图',
+  variant: '参考图',
+  prop: '参考图',
+}
 
 const tab = ref<Tab>('assets')
 const picking = ref(false)
@@ -46,16 +71,30 @@ const kindFilter = ref<'' | LibraryKind>('')
 const tagFilter = ref('')
 const uploadKind = ref<LibraryKind>('upload')
 const fileInput = ref<HTMLInputElement | null>(null)
-const newName = ref('')
-const newTag = ref('')
-/** 每个「挂参考图」的位置各自记住选了哪张图。 */
-const pendingAsset = ref<Record<string, string>>({})
-/** 每个地点各自记住正在输入的变体名。 */
-const variantName = ref<Record<string, string>>({})
 const adopting = ref<{ kind: AdoptKind; id: string } | null>(null)
 const adopted = ref<AdoptResult | null>(null)
 /** 删素材被引用时后端会拒；记下这一条，错误面板才能给「仍然删除」。 */
 const deleting = ref('')
+
+/** 弹窗：新建预设 / 新建标签 / 新建变体 / 挂图。同时只会开一个。 */
+const presetKind = ref<'' | PresetKind>('')
+const presetName = ref('')
+const tagging = ref(false)
+const newTag = ref('')
+const variantFor = ref<{ id: string; name: string } | null>(null)
+const variantName = ref('')
+const attaching = ref<{ target: AttachTarget; id: string; title: string } | null>(null)
+const attachPick = ref('')
+
+const dialogOpen = computed(
+  () =>
+    presetKind.value !== '' ||
+    tagging.value ||
+    variantFor.value !== null ||
+    attaching.value !== null,
+)
+/** 弹窗开着时错误显示在弹窗里（就地重试），否则显示在页面上。同一条只画一次。 */
+const pageError = computed(() => (dialogOpen.value ? null : lib.lastError))
 
 const pid = computed(() => proj.current?.id ?? '')
 const assetById = computed(() => new Map(lib.assets.map((a) => [a.id, a])))
@@ -68,11 +107,22 @@ const visibleAssets = computed(() =>
   ),
 )
 
+/** 当前 tab 对应的预设类型；素材 tab 没有预设可建。 */
+const tabPreset = computed<PresetKind | ''>(() =>
+  tab.value === 'characters'
+    ? 'character'
+    : tab.value === 'locations'
+      ? 'location'
+      : tab.value === 'props'
+        ? 'prop'
+        : '',
+)
+
 function kindLabel(kind: string): string {
   return LIBRARY_KIND_LABEL[kind as LibraryKind] ?? kind
 }
 
-/** 挂参考图的候选：库里还在的图，本类型优先，「其它上传」也允许。 */
+/** 挂图的候选：库里还在的图，本类型优先，「其它上传」也允许。 */
 function pickable(kind: LibraryKind) {
   return lib.assets.filter((a) => !a.missing && (a.kind === kind || a.kind === 'upload'))
 }
@@ -91,6 +141,7 @@ function onAdopted(out: AdoptResult): void {
   adopted.value = out
   adopting.value = null
 }
+
 async function onFiles(ev: Event): Promise<void> {
   const input = ev.target as HTMLInputElement
   const files = Array.from(input.files ?? [])
@@ -104,23 +155,50 @@ async function onFiles(ev: Event): Promise<void> {
   }
 }
 
-async function addPreset(kind: 'character' | 'location' | 'prop'): Promise<void> {
-  const name = newName.value.trim()
-  if (!name) return
+/** 下面四个开窗函数都先清错：一进来就看到上一次的红字会让人以为这次就失败了。 */
+function startPreset(kind: PresetKind): void {
+  lib.clearError()
+  presetName.value = ''
+  presetKind.value = kind
+}
+
+function startTag(): void {
+  lib.clearError()
+  newTag.value = ''
+  tagging.value = true
+}
+
+function startVariant(id: string, name: string): void {
+  lib.clearError()
+  variantName.value = ''
+  variantFor.value = { id, name }
+}
+
+function startAttach(target: AttachTarget, id: string, title: string): void {
+  lib.clearError()
+  attachPick.value = ''
+  attaching.value = { target, id, title }
+}
+
+async function addPreset(): Promise<void> {
+  const kind = presetKind.value
+  const name = presetName.value.trim()
+  if (!kind || !name) return
   try {
     await lib.createPreset(kind, name)
-    newName.value = ''
+    presetKind.value = ''
   } catch {
-    /* 错误已由 store 记入 lastError，下方错误面板负责展示 */
+    /* 错误已由 store 记入 lastError，弹窗内的错误面板负责展示 */
   }
 }
 
-async function addVariant(lid: string): Promise<void> {
-  const name = (variantName.value[lid] ?? '').trim()
-  if (!name) return
+async function addVariant(): Promise<void> {
+  const target = variantFor.value
+  const name = variantName.value.trim()
+  if (!target || !name) return
   try {
-    await lib.createVariant(lid, name)
-    delete variantName.value[lid]
+    await lib.createVariant(target.id, name)
+    variantFor.value = null
   } catch {
     /* 同上 */
   }
@@ -133,9 +211,10 @@ async function addTag(): Promise<void> {
     await lib.createTag(name)
     newTag.value = ''
   } catch {
-    /* 同上 */
+    /* 同上；标签框不关，通常要连着建好几个 */
   }
 }
+
 async function tagAsset(aid: string, ev: Event): Promise<void> {
   const select = ev.target as HTMLSelectElement
   const tid = select.value
@@ -148,12 +227,12 @@ async function tagAsset(aid: string, ev: Event): Promise<void> {
   }
 }
 
-async function attach(kind: 'appearance' | 'variant' | 'prop', id: string): Promise<void> {
-  const assetId = pendingAsset.value[id]
-  if (!assetId) return
+async function attach(): Promise<void> {
+  const target = attaching.value
+  if (!target || !attachPick.value) return
   try {
-    await lib.attachReference({ kind, id }, assetId)
-    delete pendingAsset.value[id]
+    await lib.attachReference({ kind: target.target, id: target.id }, attachPick.value)
+    attaching.value = null
   } catch {
     /* 同上 */
   }
@@ -184,14 +263,38 @@ onMounted(() => void lib.refresh())
 <template>
   <div class="min-h-0 flex-1 overflow-auto p-2">
     <section class="border-line-1 bg-base-1 border p-4">
-      <h1 class="text-fg-1 text-base font-medium">素材库</h1>
-      <p class="text-fg-2 mt-1 text-xs">
-        库是应用级的一个目录，跨项目复用：素材文件 + 角色 / 地点 / 道具预设。
-      </p>
-      <p class="text-fg-4 mt-1 text-2xs">
-        采用是单向复制：文件会进工程目录，之后库里改了不回流工程，工程里改了也不影响库。
-      </p>
+      <div class="flex items-start gap-2">
+        <div class="min-w-0 flex-1">
+          <h1 class="text-fg-1 text-base font-medium">素材库</h1>
+          <p class="text-fg-2 mt-1 text-xs">
+            库是应用级的一个目录，跨项目复用：素材文件 + 角色 / 地点 / 道具预设。
+          </p>
+          <p class="text-fg-4 mt-1 text-2xs">
+            采用是单向复制：文件会进工程目录，之后库里改了不回流工程，工程里改了也不影响库。
+          </p>
+        </div>
+        <AppButton v-if="lib.configured" variant="ghost" @click="lib.refresh()">
+          <RefreshCw :size="12" />刷新
+        </AppButton>
+        <AppButton :variant="lib.configured ? 'default' : 'primary'" @click="picking = true">
+          <FolderSearch :size="12" />{{ lib.configured ? '换个目录' : '选择素材库目录' }}
+        </AppButton>
+      </div>
     </section>
+
+    <ErrorPanel v-if="pageError" class="mt-2" :error="pageError" @dismiss="lib.clearError()">
+      <!-- 被预设占用的素材：说清破坏什么之后，才给硬删这条路 -->
+      <template #actions>
+        <AppButton
+          v-if="pageError.code === 'CONFLICT' && deleting"
+          size="sm"
+          variant="danger"
+          @click="removeAsset(deleting, true)"
+        >
+          仍然删除，并解除这些引用
+        </AppButton>
+      </template>
+    </ErrorPanel>
 
     <!-- 没配置不是错误：画引导，别自动瞎建目录 -->
     <AppPanel v-if="!lib.configured" title="还没有素材库" class="mt-2">
@@ -211,12 +314,6 @@ onMounted(() => void lib.refresh())
     <template v-else>
       <AppPanel :title="lib.info?.name ?? '当前素材库'" class="mt-2">
         <template #actions>
-          <AppButton size="sm" variant="ghost" @click="lib.refresh()">
-            <RefreshCw :size="10" />刷新
-          </AppButton>
-          <AppButton size="sm" variant="ghost" @click="picking = true">
-            <FolderSearch :size="10" />换个目录
-          </AppButton>
           <AppButton
             size="sm"
             variant="ghost"
@@ -261,8 +358,16 @@ onMounted(() => void lib.refresh())
         >
           {{ t.label }}
         </button>
+        <AppButton
+          v-if="tabPreset"
+          size="sm"
+          variant="primary"
+          class="ml-1"
+          @click="startPreset(tabPreset)"
+        >
+          <Plus :size="10" />新建{{ PRESET_LABEL[tabPreset] }}
+        </AppButton>
       </div>
-
       <AppPanel v-if="tab === 'assets'" title="素材" class="mt-2">
         <template #actions>
           <select
@@ -279,6 +384,9 @@ onMounted(() => void lib.refresh())
             <option value="">全部标签</option>
             <option v-for="t in lib.tags" :key="t.id" :value="t.name">{{ t.name }}</option>
           </select>
+          <AppButton size="sm" variant="ghost" title="管理标签" @click="startTag()">
+            <Tag :size="10" />标签
+          </AppButton>
           <select
             v-model="uploadKind"
             title="上传为哪一类素材"
@@ -340,45 +448,16 @@ onMounted(() => void lib.refresh())
                   <option value="">＋标签</option>
                   <option v-for="t in lib.tags" :key="t.id" :value="t.id">{{ t.name }}</option>
                 </select>
-                <AppButton
-                  size="sm"
-                  variant="ghost"
-                  title="从库里删除"
-                  @click="removeAsset(a.id)"
-                >
+                <AppButton size="sm" variant="ghost" title="从库里删除" @click="removeAsset(a.id)">
                   <Trash2 :size="10" />
                 </AppButton>
               </div>
             </figcaption>
           </figure>
         </div>
-
-        <div class="border-line-1 flex items-center gap-1.5 border-t p-2">
-          <input
-            v-model="newTag"
-            placeholder="新建标签"
-            class="border-line-1 bg-base-2 text-fg-1 placeholder:text-fg-4 focus:border-accent/60 h-row w-40 rounded-sm border px-2 text-xs outline-none"
-            @keydown.enter.prevent="addTag()"
-          />
-          <AppButton size="sm" :disabled="newTag.trim() === ''" @click="addTag()">
-            <Plus :size="10" />标签
-          </AppButton>
-          <p class="text-fg-4 text-2xs">库会越攒越大，标签是之后找回素材的主要手段。</p>
-        </div>
       </AppPanel>
 
       <AppPanel v-else-if="tab === 'characters'" title="角色预设" class="mt-2">
-        <template #actions>
-          <input
-            v-model="newName"
-            placeholder="角色名"
-            class="border-line-1 bg-base-2 text-fg-1 placeholder:text-fg-4 h-5 w-32 rounded-sm border px-1.5 text-2xs outline-none"
-            @keydown.enter.prevent="addPreset('character')"
-          />
-          <AppButton size="sm" :disabled="newName.trim() === ''" @click="addPreset('character')">
-            <Plus :size="10" />新建
-          </AppButton>
-        </template>
         <EmptyState
           v-if="lib.characters.length === 0"
           title="库里还没有角色"
@@ -415,21 +494,11 @@ onMounted(() => void lib.refresh())
                   覆写 {{ a.overrides.join(' / ') }}
                 </AppBadge>
                 <span class="text-fg-4 text-2xs">定妆图 {{ a.sheet_count }}</span>
-                <select
-                  v-model="pendingAsset[a.id]"
-                  class="border-line-1 bg-base-1 text-fg-3 h-5 w-28 rounded-sm border px-1 text-2xs outline-none"
-                >
-                  <option value="">选一张图</option>
-                  <option v-for="o in pickable('character_sheet')" :key="o.id" :value="o.id">
-                    {{ o.title || o.path }}
-                  </option>
-                </select>
                 <AppButton
                   size="sm"
-                  :disabled="!pendingAsset[a.id]"
-                  @click="attach('appearance', a.id)"
+                  @click="startAttach('appearance', a.id, `${c.name} · ${a.name}`)"
                 >
-                  挂定妆图
+                  <ImagePlus :size="10" />挂定妆图
                 </AppButton>
               </li>
             </ul>
@@ -438,17 +507,6 @@ onMounted(() => void lib.refresh())
       </AppPanel>
 
       <AppPanel v-else-if="tab === 'locations'" title="地点预设" class="mt-2">
-        <template #actions>
-          <input
-            v-model="newName"
-            placeholder="地点名"
-            class="border-line-1 bg-base-2 text-fg-1 placeholder:text-fg-4 h-5 w-32 rounded-sm border px-1.5 text-2xs outline-none"
-            @keydown.enter.prevent="addPreset('location')"
-          />
-          <AppButton size="sm" :disabled="newName.trim() === ''" @click="addPreset('location')">
-            <Plus :size="10" />新建
-          </AppButton>
-        </template>
         <EmptyState
           v-if="lib.locations.length === 0"
           title="库里还没有地点"
@@ -460,6 +518,9 @@ onMounted(() => void lib.refresh())
               <span class="text-fg-1 min-w-0 flex-1 truncate">{{ l.name }}</span>
               <AppBadge v-for="t in l.tags" :key="t.id" tone="accent">{{ t.name }}</AppBadge>
               <AppBadge>{{ l.variants.length }} 个变体</AppBadge>
+              <AppButton size="sm" @click="startVariant(l.id, l.name)">
+                <Plus :size="10" />变体
+              </AppButton>
               <AppButton size="sm" :disabled="!pid" @click="askAdopt('location', l.id)">
                 采用
               </AppButton>
@@ -468,7 +529,10 @@ onMounted(() => void lib.refresh())
               </AppButton>
             </div>
             <p v-if="l.description" class="text-fg-4 mt-0.5 text-2xs">{{ l.description }}</p>
-            <ul class="mt-1.5 space-y-1">
+            <p v-if="l.variants.length === 0" class="text-fg-4 mt-1 text-2xs">
+              还没有变体。参考图挂在变体上，所以至少要有一个（雨夜 / 白天…）。
+            </p>
+            <ul v-else class="mt-1.5 space-y-1">
               <li
                 v-for="v in l.variants"
                 :key="v.id"
@@ -478,52 +542,16 @@ onMounted(() => void lib.refresh())
                 <AppBadge v-if="v.weather">{{ v.weather }}</AppBadge>
                 <AppBadge v-if="v.time_of_day">{{ v.time_of_day }}</AppBadge>
                 <span class="text-fg-4 text-2xs">参考图 {{ v.reference_count }}</span>
-                <select
-                  v-model="pendingAsset[v.id]"
-                  class="border-line-1 bg-base-1 text-fg-3 h-5 w-28 rounded-sm border px-1 text-2xs outline-none"
-                >
-                  <option value="">选一张图</option>
-                  <option v-for="o in pickable('location_reference')" :key="o.id" :value="o.id">
-                    {{ o.title || o.path }}
-                  </option>
-                </select>
-                <AppButton size="sm" :disabled="!pendingAsset[v.id]" @click="attach('variant', v.id)">
-                  挂参考图
+                <AppButton size="sm" @click="startAttach('variant', v.id, `${l.name} · ${v.name}`)">
+                  <ImagePlus :size="10" />挂参考图
                 </AppButton>
               </li>
             </ul>
-            <div class="mt-1 flex items-center gap-1.5">
-              <input
-                v-model="variantName[l.id]"
-                placeholder="新变体（雨夜 / 白天…）"
-                class="border-line-1 bg-base-2 text-fg-1 placeholder:text-fg-4 h-5 w-40 rounded-sm border px-1.5 text-2xs outline-none"
-                @keydown.enter.prevent="addVariant(l.id)"
-              />
-              <AppButton
-                size="sm"
-                variant="ghost"
-                :disabled="(variantName[l.id] ?? '').trim() === ''"
-                @click="addVariant(l.id)"
-              >
-                <Plus :size="10" />变体
-              </AppButton>
-            </div>
           </li>
         </ul>
       </AppPanel>
 
       <AppPanel v-else title="道具预设" class="mt-2">
-        <template #actions>
-          <input
-            v-model="newName"
-            placeholder="道具名"
-            class="border-line-1 bg-base-2 text-fg-1 placeholder:text-fg-4 h-5 w-32 rounded-sm border px-1.5 text-2xs outline-none"
-            @keydown.enter.prevent="addPreset('prop')"
-          />
-          <AppButton size="sm" :disabled="newName.trim() === ''" @click="addPreset('prop')">
-            <Plus :size="10" />新建
-          </AppButton>
-        </template>
         <EmptyState
           v-if="lib.props.length === 0"
           title="库里还没有道具"
@@ -540,17 +568,8 @@ onMounted(() => void lib.refresh())
             <span class="text-fg-1 min-w-0 flex-1 truncate">{{ p.name }}</span>
             <AppBadge v-for="t in p.tags" :key="t.id" tone="accent">{{ t.name }}</AppBadge>
             <span class="text-fg-4 text-2xs">参考图 {{ p.reference_count }}</span>
-            <select
-              v-model="pendingAsset[p.id]"
-              class="border-line-1 bg-base-1 text-fg-3 h-5 w-28 rounded-sm border px-1 text-2xs outline-none"
-            >
-              <option value="">选一张图</option>
-              <option v-for="o in pickable('prop_reference')" :key="o.id" :value="o.id">
-                {{ o.title || o.path }}
-              </option>
-            </select>
-            <AppButton size="sm" :disabled="!pendingAsset[p.id]" @click="attach('prop', p.id)">
-              挂参考图
+            <AppButton size="sm" @click="startAttach('prop', p.id, p.name)">
+              <ImagePlus :size="10" />挂参考图
             </AppButton>
             <AppButton size="sm" :disabled="!pid" @click="askAdopt('prop', p.id)">采用</AppButton>
             <AppButton size="sm" variant="ghost" @click="lib.deletePreset('prop', p.id)">
@@ -560,30 +579,6 @@ onMounted(() => void lib.refresh())
         </ul>
       </AppPanel>
     </template>
-
-    <AppPanel v-if="lib.lastError" title="上一步失败了" class="mt-2">
-      <template #actions>
-        <AppButton size="sm" variant="ghost" @click="lib.clearError()">关闭</AppButton>
-      </template>
-      <div class="p-3 text-xs">
-        <p class="text-st-failed">{{ lib.lastError.title }}</p>
-        <p class="text-fg-3 mt-0.5 text-2xs">{{ lib.lastError.detail }}</p>
-        <ul class="text-fg-4 mt-1 space-y-0.5 text-2xs">
-          <li v-for="s in lib.lastError.suggestions" :key="s">· {{ s }}</li>
-        </ul>
-        <p class="text-fg-4 mt-1 font-mono text-2xs">{{ lib.lastError.code }}</p>
-        <!-- 被预设占用的素材：说清破坏什么之后，才给硬删这条路 -->
-        <AppButton
-          v-if="lib.lastError.code === 'CONFLICT' && deleting"
-          size="sm"
-          variant="danger"
-          class="mt-1.5"
-          @click="removeAsset(deleting, true)"
-        >
-          仍然删除，并解除这些引用
-        </AppButton>
-      </div>
-    </AppPanel>
 
     <input ref="fileInput" type="file" multiple class="hidden" @change="onFiles" />
 
@@ -605,5 +600,196 @@ onMounted(() => void lib.refresh())
       @update:open="adopting = $event ? adopting : null"
       @adopted="onAdopted"
     />
+    <!-- 新建预设：只要一个名字，其余属性建完再改 -->
+    <AppDialog
+      :open="presetKind !== ''"
+      :title="presetKind ? `新建${PRESET_LABEL[presetKind]}预设` : ''"
+      subtitle="库里的预设是模板，采用进工程后是可再改的副本"
+      size="sm"
+      @update:open="presetKind = $event ? presetKind : ''"
+    >
+      <form id="new-preset" class="p-3" @submit.prevent="addPreset()">
+        <label class="block">
+          <span class="text-fg-3 text-2xs">名称</span>
+          <input
+            v-model="presetName"
+            type="text"
+            autofocus
+            :placeholder="
+              presetKind === 'character'
+                ? '林昭'
+                : presetKind === 'location'
+                  ? '城南旧宅'
+                  : '铜制怀表'
+            "
+            class="border-line-1 bg-base-2 text-fg-1 placeholder:text-fg-4 focus:border-accent/60 mt-0.5 h-row w-full rounded-sm border px-2 text-xs outline-none"
+          />
+        </label>
+        <p v-if="presetKind === 'character'" class="text-fg-4 mt-1.5 text-2xs">
+          建好后会带一个默认形象，定妆图挂在形象上。
+        </p>
+        <p v-else-if="presetKind === 'location'" class="text-fg-4 mt-1.5 text-2xs">
+          建好后再加变体（雨夜 / 白天…），参考图挂在变体上。
+        </p>
+      </form>
+
+      <ErrorPanel
+        v-if="lib.lastError"
+        class="mx-3 mb-3"
+        :error="lib.lastError"
+        @dismiss="lib.clearError()"
+      />
+
+      <template #footer>
+        <span class="flex-1" />
+        <AppButton variant="ghost" @click="presetKind = ''">取消</AppButton>
+        <AppButton
+          type="submit"
+          form="new-preset"
+          variant="primary"
+          :disabled="lib.busy || presetName.trim() === ''"
+        >
+          <Plus :size="11" />新建
+        </AppButton>
+      </template>
+    </AppDialog>
+
+    <!-- 标签：库会越攒越大，这是之后找回素材的主要手段 -->
+    <AppDialog
+      v-model:open="tagging"
+      title="标签"
+      subtitle="库会越攒越大，标签是之后找回素材的主要手段"
+      size="sm"
+    >
+      <form
+        id="new-tag"
+        class="border-line-1 flex items-center gap-1.5 border-b p-3"
+        @submit.prevent="addTag()"
+      >
+        <input
+          v-model="newTag"
+          placeholder="新标签名，例如 民国"
+          class="border-line-1 bg-base-2 text-fg-1 placeholder:text-fg-4 focus:border-accent/60 h-row min-w-0 flex-1 rounded-sm border px-2 text-xs outline-none"
+        />
+        <AppButton type="submit" :disabled="lib.busy || newTag.trim() === ''">
+          <Plus :size="11" />新建
+        </AppButton>
+      </form>
+      <p v-if="lib.tags.length === 0" class="text-fg-4 p-3 text-2xs">还没有标签。</p>
+      <div v-else class="flex flex-wrap gap-1 p-3">
+        <AppBadge v-for="t in lib.tags" :key="t.id" tone="accent">{{ t.name }}</AppBadge>
+      </div>
+
+      <ErrorPanel
+        v-if="lib.lastError"
+        class="mx-3 mb-3"
+        :error="lib.lastError"
+        @dismiss="lib.clearError()"
+      />
+
+      <template #footer>
+        <p class="text-fg-4 min-w-0 flex-1 text-2xs">标签建好后在素材卡片上的「＋标签」里挂。</p>
+        <AppButton variant="ghost" @click="tagging = false">关闭</AppButton>
+      </template>
+    </AppDialog>
+
+    <!-- 新建变体：参考图挂在变体上，所以地点必须先有变体 -->
+    <AppDialog
+      :open="variantFor !== null"
+      title="新建变体"
+      :subtitle="variantFor?.name ?? ''"
+      size="sm"
+      @update:open="variantFor = $event ? variantFor : null"
+    >
+      <form id="new-variant" class="p-3" @submit.prevent="addVariant()">
+        <label class="block">
+          <span class="text-fg-3 text-2xs">变体名</span>
+          <input
+            v-model="variantName"
+            type="text"
+            autofocus
+            placeholder="雨夜 / 白天 / 火灾后"
+            class="border-line-1 bg-base-2 text-fg-1 placeholder:text-fg-4 focus:border-accent/60 mt-0.5 h-row w-full rounded-sm border px-2 text-xs outline-none"
+          />
+        </label>
+        <p class="text-fg-4 mt-1.5 text-2xs">
+          同一处地点的不同时间 / 天气各是一个变体，各自挂一套参考图。
+        </p>
+      </form>
+
+      <ErrorPanel
+        v-if="lib.lastError"
+        class="mx-3 mb-3"
+        :error="lib.lastError"
+        @dismiss="lib.clearError()"
+      />
+
+      <template #footer>
+        <span class="flex-1" />
+        <AppButton variant="ghost" @click="variantFor = null">取消</AppButton>
+        <AppButton
+          type="submit"
+          form="new-variant"
+          variant="primary"
+          :disabled="lib.busy || variantName.trim() === ''"
+        >
+          <Plus :size="11" />新建
+        </AppButton>
+      </template>
+    </AppDialog>
+
+    <!-- 挂图：从库里已上传的图里挑一张，看图选比看文件名选靠得住 -->
+    <AppDialog
+      :open="attaching !== null"
+      :title="attaching ? `挂${ATTACH_LABEL[attaching.target]}` : ''"
+      :subtitle="attaching?.title ?? ''"
+      @update:open="attaching = $event ? attaching : null"
+    >
+      <template v-if="attaching">
+        <EmptyState
+          v-if="pickable(ATTACH_KIND[attaching.target]).length === 0"
+          title="库里还没有可挂的图"
+          body="先回素材 tab 上传一张（类型选对应的参考图，或用「其它上传」），再回来挂。"
+        />
+        <div
+          v-else
+          class="grid gap-2 p-3 [grid-template-columns:repeat(auto-fill,minmax(7rem,1fr))]"
+        >
+          <button
+            v-for="o in pickable(ATTACH_KIND[attaching.target])"
+            :key="o.id"
+            type="button"
+            class="bg-base-2 flex flex-col overflow-hidden border text-left"
+            :class="attachPick === o.id ? 'border-accent/60' : 'border-line-1'"
+            @click="attachPick = o.id"
+          >
+            <span class="bg-base-3 flex h-20 items-center justify-center overflow-hidden">
+              <img
+                :src="libraryFileUrl(o.path)"
+                alt=""
+                loading="lazy"
+                class="size-full object-cover"
+              />
+            </span>
+            <span class="text-fg-2 truncate px-1.5 py-1 text-2xs">{{ o.title || o.path }}</span>
+          </button>
+        </div>
+      </template>
+
+      <ErrorPanel
+        v-if="lib.lastError"
+        class="mx-3 mb-3"
+        :error="lib.lastError"
+        @dismiss="lib.clearError()"
+      />
+
+      <template #footer>
+        <p class="text-fg-4 min-w-0 flex-1 text-2xs">新挂的自动成为当前版本，旧的留在历史里。</p>
+        <AppButton variant="ghost" @click="attaching = null">取消</AppButton>
+        <AppButton variant="primary" :disabled="lib.busy || attachPick === ''" @click="attach()">
+          <ImagePlus :size="11" />挂上
+        </AppButton>
+      </template>
+    </AppDialog>
   </div>
 </template>

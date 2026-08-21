@@ -62,6 +62,18 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * 「项目未打开」判定。
+ *
+ * 每工程一个库、没有全局数据库：ProjectService 是进程内注册表，后端重启后进程里
+ * 没有任何已打开的工程，此时 /projects/{pid}/... 一律 404。这是设计而不是 bug，
+ * 所以 UI 要引导回起始页重开，而不是当成崩溃。
+ * 靠 related_ids.project_id 与普通的「找不到某条记录」区分开（见 services/projects.py::get）。
+ */
+export function isProjectNotOpen(err: unknown): boolean {
+  return err instanceof ApiError && err.code === 'NOT_FOUND' && 'project_id' in err.relatedIds
+}
+
 function networkError(cause: unknown): ApiError {
   return new ApiError(
     {
@@ -72,6 +84,31 @@ function networkError(cause: unknown): ApiError {
       related_ids: {},
     },
     0,
+  )
+}
+
+/**
+ * 应答不符合 `{error: {...}}` 契约时的兜底。
+ *
+ * 后端自己的三个 handler 会把连未捕获异常都归一成契约形状（`app/main.py`），所以
+ * **拿到非契约响应基本等于「答话的不是后端」**——开发期是 Vite 代理在后端没起时
+ * 回的 500、生产是 sidecar 挂了。此时照样要给出可执行的下一步，不能只丢一个
+ * 「HTTP 500」了事，否则等于静默失败。
+ */
+function offContractError(status: number, text: string): ApiError {
+  return new ApiError(
+    {
+      code: 'NETWORK_ERROR',
+      title: '后端服务没有按契约应答',
+      detail: `HTTP ${status}${text ? `：${text.slice(0, 300)}` : '（响应为空）'}`,
+      suggestions: [
+        '确认后端进程还活着（开发期：cd backend && AIVS_PORT=8765 python -m app.main）',
+        '若是桌面版，重启应用让 Tauri 重新拉起 sidecar',
+        '后端确实在跑却仍报这个，看后端日志里同一时刻的堆栈',
+      ],
+      related_ids: {},
+    },
+    status,
   )
 }
 
@@ -96,21 +133,21 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
   if (resp.status === 204) return undefined as T
 
   const text = await resp.text()
-  const parsed: unknown = text ? JSON.parse(text) : null
+  // 代理或反代可能回 HTML；JSON.parse 直接抛会变成没人认领的异常（= 静默失败）
+  let parsed: unknown = null
+  let jsonOk = true
+  try {
+    parsed = text ? JSON.parse(text) : null
+  } catch {
+    jsonOk = false
+  }
 
   if (!resp.ok) {
-    const wrapped = parsed as { error?: ErrorPayload } | null
-    throw new ApiError(
-      wrapped?.error ?? {
-        code: 'INTERNAL',
-        title: `请求失败（HTTP ${resp.status}）`,
-        detail: text.slice(0, 500),
-        suggestions: [],
-        related_ids: {},
-      },
-      resp.status,
-    )
+    const wrapped = jsonOk ? (parsed as { error?: ErrorPayload } | null) : null
+    if (!wrapped?.error) throw offContractError(resp.status, text)
+    throw new ApiError(wrapped.error, resp.status)
   }
+  if (!jsonOk) throw offContractError(resp.status, text)
   return parsed as T
 }
 
