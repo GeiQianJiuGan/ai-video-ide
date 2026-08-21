@@ -13,7 +13,7 @@
  * 这一页必须把它们逐条列出来——「排了 5 个、跳过 2 个」里那 2 个才是要处理的事。
  */
 import { computed, onMounted, ref, watch } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
+import { useRoute } from 'vue-router'
 import {
   ChevronDown,
   ChevronLeft,
@@ -39,12 +39,13 @@ import {
   type ShotStatus,
   type StoryboardCard,
 } from '@/shared/api/story'
+import { useConsoleStore } from '@/stores/console'
 import { useStoryStore } from '@/stores/story'
 import { generationApi, type EnqueueSceneResult } from '@/shared/api/generation'
 
 const route = useRoute()
-const router = useRouter()
 const story = useStoryStore()
+const consolePanel = useConsoleStore()
 
 const pid = computed(() => String(route.params.pid ?? ''))
 
@@ -236,10 +237,10 @@ async function generateScene(): Promise<void> {
       <AppButton
         size="sm"
         variant="ghost"
-        title="去队列页看任务跑到哪了"
-        @click="router.push({ name: 'queue', params: { pid } })"
+        title="在底部控制台的任务框里看任务跑到哪了（不用离开这一页）"
+        @click="consolePanel.openWith('jobs')"
       >
-        <ListVideo :size="10" />队列
+        <ListVideo :size="10" />任务
       </AppButton>
       <AppButton size="sm" variant="ghost" class="ml-auto" :disabled="story.busy" @click="reload()">
         <RefreshCw :size="10" />刷新

@@ -185,7 +185,13 @@ def test_ws_connect_and_receive_event(client: TestClient) -> None:
     with client.websocket_connect("/api/v1/ws?project_id=prj_1&channels=job") as socket:
         hello = socket.receive_json()
         assert hello["event"] == "system.connected"
+        # 握手帧也必须是完整信封：前端按契约读 ts / project_id，少一个就是它那边一处崩溃
+        assert set(hello) == {"channel", "event", "project_id", "ts", "payload"}
+        assert hello["channel"] == "system"
+        assert hello["project_id"] == "prj_1"
+        assert hello["ts"]
         bus.emit(Channel.JOB, "job.completed", {"job_id": "job_1"}, project_id="prj_1")
         msg = socket.receive_json()
         assert msg["channel"] == "job"
         assert msg["payload"]["job_id"] == "job_1"
+        assert set(msg) == set(hello)

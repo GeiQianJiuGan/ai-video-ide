@@ -406,12 +406,14 @@ const PROJECT_DEFS: FeatureDef[] = [
   {
     id: 'queue',
     route: 'queue',
-    title: '生成队列',
-    purpose: '所有生成任务的调度现场：谁在跑、谁在等、失败的为什么失败',
+    title: '生成队列（细看）',
+    purpose:
+      '队列的常驻界面是底部控制台的任务框；这一页是点开细看的那层：失败现场、入队时冻结的参数、优先级',
     group: 'generate',
     icon: ListVideo,
     milestone: 'M4',
     ready: true,
+    advanced: true,
     requires: ['backend', 'comfyui'],
     panels: {
       main: {
@@ -425,7 +427,11 @@ const PROJECT_DEFS: FeatureDef[] = [
       { label: '重试失败任务', hint: '沿用原参数重跑，仍然不覆盖任何旧版本' },
       { label: '调整优先级', hint: '把某个镜头提到队首' },
     ],
-    outcome: ['长时间批量生成可以放手不看', '失败有明确的下一步动作，绝不静默失败'],
+    outcome: [
+      '长时间批量生成可以放手不看',
+      '失败有明确的下一步动作，绝不静默失败',
+      '日常盯任务不用离开当前页面：状态条上点一下就升起控制台',
+    ],
   },
   {
     id: 'timeline',
@@ -532,6 +538,9 @@ export const APP_NAV = ['projects', 'library'] as const
  * 生成层的入口是 `flow`（幕流程图）——从整片结构进到某一幕，再进那一幕的工作台。
  * `scene` 不在这里：它只从流程图点节点进去（URL 必须带 sid）。
  * `workflows` 也不在这里：它是 `advanced: true` 的兼容路径，从命令面板或设置页进。
+ * `queue` 同样不在这里：队列是**一直在跑的东西**而不是一个要走过去看的页面，
+ * 它的常驻界面是底部控制台的任务框（状态条上那个任务标识点一下就升起来）；
+ * 队列页只留给「点开细看」——失败现场、冻结参数、优先级细调。
  */
 export const PROJECT_NAV = [
   'dashboard',
@@ -541,7 +550,6 @@ export const PROJECT_NAV = [
   'story',
   'storyboard',
   'flow',
-  'queue',
   'timeline',
   'assets',
 ] as const
@@ -575,7 +583,7 @@ export const NAV_LABEL: Record<string, string> = {
   flow: '幕',
   scene: '幕内',
   workflows: '流程',
-  queue: '队列',
+  queue: '队列细看',
   timeline: '时间线',
   assets: '资产',
 }

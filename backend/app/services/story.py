@@ -10,19 +10,45 @@ Shot 的 index_no 就是时间顺序，跨 Scene 移动后统一重排，避免�
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from app.ai.llm import client as llm
+from app.core.config import settings
 from app.core.errors import AppError, ErrorCode
 from app.core.ids import new_id
 from app.persistence.models import utc_now
-from app.persistence.models_cast import Appearance, Character
+from app.persistence.models_cast import Appearance, Character, SheetVersion
 from app.persistence.models_gen import GenerationVersion
-from app.persistence.models_story import SHOT_STATUS, Scene, Shot, ShotCast, ShotProp, Story
-from app.persistence.models_world import Location, LocationVariant, Prop
+from app.persistence.models_story import (
+    SHOT_STATUS,
+    Scene,
+    SceneCast,
+    SceneLocation,
+    Shot,
+    ShotCast,
+    ShotProp,
+    Story,
+)
+from app.persistence.models_world import (
+    Asset,
+    Location,
+    LocationReference,
+    LocationVariant,
+    Prop,
+)
+from app.services.assets import kind_of_suffix
 from app.services.base import as_dict, db_of, fetch, fetch_all, load_json
 
-SCENE_FIELDS = ("title", "summary", "source_text", "location_variant_id", "time_of_day", "notes")
+SCENE_FIELDS = (
+    "title",
+    "summary",
+    "source_text",
+    "prompt",
+    "location_variant_id",
+    "time_of_day",
+    "notes",
+)
 SHOT_FIELDS = (
     "title",
     "description",
@@ -48,6 +74,133 @@ BREAKDOWN_SYSTEM = (
 
 def _renumber(rows: list[Shot]) -> list[tuple[str, int]]:
     return [(row.id, i + 1) for i, row in enumerate(rows)]
+
+
+#: 上限的改法只写一遍，错误建议里直接引它——用户看到的和设置页里的是同一个键。
+LIMIT_HINT = "上限可改：设置页「幕（流程图节点）」→「一幕里人物 / 地点的上限」（scene.node_limit）"
+
+
+def node_limit() -> int:
+    """一幕里人物 / 地点各自的上限。可配置：settings.json → 环境变量 → 默认 9。"""
+    return max(1, int(settings.scene_node_limit))
+
+
+def _unique(ids: list[str]) -> list[str]:
+    """去重但保留顺序——第一条是主地点，顺序有意义，不能用 set。"""
+    seen: set[str] = set()
+    return [i for i in ids if not (i in seen or seen.add(i))]
+
+
+def _guard_node_limit(what: str, ids: list[str]) -> None:
+    limit = node_limit()
+    if len(ids) > limit:
+        raise AppError(
+            ErrorCode.VALIDATION_ERROR,
+            f"这一幕的{what}超过上限",
+            f"选了 {len(ids)} 个，当前上限是 {limit} 个。",
+            [f"最多留 {limit} 个，先去掉多出来的 {len(ids) - limit} 个", LIMIT_HINT],
+            {"limit": limit, "count": len(ids)},
+        )
+
+
+def _image_path(asset_id: str | None, assets: dict[str, Asset]) -> str | None:
+    """asset id → 相对路径，**只认图片**。
+
+    小节点上那张缩略图是给人挑东西用的，所以按后缀过一遍：把 `.mp4` 喂给 `<img>`
+    就是之前那个坏图的来源（同 `sequence._video_of` 的教训）。文件登记丢了就当没有图——
+    缺图不是错误，界面显示「无图」照样能挂这个人物 / 地点。
+    """
+    asset = assets.get(asset_id or "")
+    if asset is None or kind_of_suffix(Path(asset.path).suffix) != "image":
+        return None
+    return asset.path
+
+
+def _sheet_thumbs(sheets: list[SheetVersion], assets: dict[str, Asset]) -> dict[str, str]:
+    """appearance_id → 角色表缩略图。
+
+    当前版本优先，当前那版没有图（占位版本）时退到最新一个有图的版本：
+    挑人的时候看见一张旧图，比看见「无图」有用得多。
+    """
+    out: dict[str, str] = {}
+    for row in sorted(sheets, key=lambda s: (s.is_current, s.version_no)):
+        path = _image_path(row.asset_id, assets)
+        if path:
+            out[row.appearance_id] = path
+    return out
+
+
+def _variant_thumbs(refs: list[LocationReference], assets: dict[str, Asset]) -> dict[str, str]:
+    """location_variant_id → 参考图缩略图。当前那张优先，其次最后登记的一张。"""
+    out: dict[str, str] = {}
+    for row in sorted(refs, key=lambda r: (r.is_current, r.created_at)):
+        path = _image_path(row.asset_id, assets)
+        if path:
+            out[row.variant_id] = path
+    return out
+
+
+def _scene_nodes(
+    scene: Scene,
+    cast_rows: list[SceneCast],
+    loc_rows: list[SceneLocation],
+    apps: dict[str, Appearance],
+    chars: dict[str, Character],
+    variants: dict[str, LocationVariant],
+    locations: dict[str, Location],
+    cast_thumbs: dict[str, str],
+    loc_thumbs: dict[str, str],
+) -> dict[str, Any]:
+    """一幕的小节点投影：名字与缩略图在后端拼好，前端不再自己查三张表。"""
+    cast: list[dict[str, Any]] = []
+    for row in cast_rows:
+        appearance = apps.get(row.appearance_id)
+        character = chars.get(appearance.character_id) if appearance else None
+        cast.append(
+            {
+                "id": row.id,
+                "appearance_id": row.appearance_id,
+                "index_no": row.index_no,
+                "appearance_name": appearance.name if appearance else None,
+                "character_id": appearance.character_id if appearance else None,
+                "character_name": character.name if character else None,
+                "label": (
+                    f"{character.name} · {appearance.name}"
+                    if appearance and character
+                    else (appearance.name if appearance else row.appearance_id)
+                ),
+                # 角色表的当前版本；只会是图片，节点上直接当 <img src> 用
+                "thumbnail_path": cast_thumbs.get(row.appearance_id),
+            }
+        )
+    locs: list[dict[str, Any]] = []
+    for row in loc_rows:
+        variant = variants.get(row.location_variant_id)
+        location = locations.get(variant.location_id) if variant else None
+        locs.append(
+            {
+                "id": row.id,
+                "location_variant_id": row.location_variant_id,
+                "index_no": row.index_no,
+                "variant_name": variant.name if variant else None,
+                "label": (
+                    f"{location.name} · {variant.name}"
+                    if variant and location
+                    else (variant.name if variant else row.location_variant_id)
+                ),
+                # 主地点 = 同步回 scene.location_variant_id 的那一条（列表里的第一条）
+                "is_primary": row.location_variant_id == scene.location_variant_id,
+                "thumbnail_path": loc_thumbs.get(row.location_variant_id),
+            }
+        )
+    return {
+        "cast": cast,
+        "cast_names": _unique([str(c["character_name"] or c["label"]) for c in cast]),
+        "locations": locs,
+        #: prompt 是唯一必填的小节点，缺它前端就该把节点标黄。
+        "prompt_ok": bool((scene.prompt or "").strip()),
+        "node_limit": node_limit(),
+    }
 
 
 class StoryService:
@@ -84,6 +237,14 @@ class StoryService:
         shots = await fetch_all(db, Shot, order_by=Shot.index_no)
         variants = {v.id: v for v in await fetch_all(db, LocationVariant)}
         locations = {loc.id: loc for loc in await fetch_all(db, Location)}
+        cast_rows = await fetch_all(db, SceneCast, order_by=SceneCast.index_no)
+        loc_rows = await fetch_all(db, SceneLocation, order_by=SceneLocation.index_no)
+        apps = {a.id: a for a in await fetch_all(db, Appearance)}
+        chars = {c.id: c for c in await fetch_all(db, Character)}
+        # 缩略图：一次拉全，别在循环里按 id 查——一幕最多 node_limit 个小节点，但幕可以很多
+        assets = {a.id: a for a in await fetch_all(db, Asset)}
+        cast_thumbs = _sheet_thumbs(await fetch_all(db, SheetVersion), assets)
+        loc_thumbs = _variant_thumbs(await fetch_all(db, LocationReference), assets)
         out = []
         for scene in scenes:
             variant = variants.get(scene.location_variant_id or "")
@@ -96,9 +257,90 @@ class StoryService:
                     "location_variant_name": (
                         f"{location.name} · {variant.name}" if variant and location else None
                     ),
+                    **_scene_nodes(
+                        scene,
+                        [c for c in cast_rows if c.scene_id == scene.id],
+                        [r for r in loc_rows if r.scene_id == scene.id],
+                        apps,
+                        chars,
+                        variants,
+                        locations,
+                        cast_thumbs,
+                        loc_thumbs,
+                    ),
                 }
             )
         return out
+
+    async def node_options(self, pid: str) -> dict[str, Any]:
+        """挑小节点时的两张清单：可挑的形象、可挑的地点变体，各自带缩略图。
+
+        为什么是一个接口而不是让前端拼：前端原来按角色一个个拉 `appearances`（N+1），
+        要图还得再按变体拉一次 `references`（又一轮 N+1）。名字怎么拼
+        （`角色 · 形象` / `地点 · 变体`）本来就只该有一处口径，图也一样。
+
+        `thumbnail_path` 是**相对工程目录**的路径，前端过 `fileUrl(pid, path)`；
+        没有图的条目给 `null` 并保留在清单里——没有角色表的形象照样能挂，
+        只是生成时喂不出参考图，界面上标一下就行。
+        """
+        db = db_of(pid)
+        chars = {c.id: c for c in await fetch_all(db, Character, order_by=Character.created_at)}
+        apps = await fetch_all(db, Appearance, order_by=Appearance.created_at)
+        locations = {loc.id: loc for loc in await fetch_all(db, Location)}
+        variants = await fetch_all(db, LocationVariant, order_by=LocationVariant.created_at)
+        assets = {a.id: a for a in await fetch_all(db, Asset)}
+        sheets = await fetch_all(db, SheetVersion)
+        cast_thumbs = _sheet_thumbs(sheets, assets)
+        loc_thumbs = _variant_thumbs(await fetch_all(db, LocationReference), assets)
+        sheet_count: dict[str, int] = {}
+        for sheet in sheets:
+            sheet_count[sheet.appearance_id] = sheet_count.get(sheet.appearance_id, 0) + 1
+        return {
+            "cast": [
+                {
+                    "appearance_id": row.id,
+                    "character_id": row.character_id,
+                    "character_name": chars[row.character_id].name
+                    if row.character_id in chars
+                    else None,
+                    "appearance_name": row.name,
+                    "label": (
+                        f"{chars[row.character_id].name} · {row.name}"
+                        if row.character_id in chars
+                        else row.name
+                    ),
+                    "is_default": bool(row.is_default),
+                    "has_sheet": sheet_count.get(row.id, 0) > 0,
+                    "thumbnail_path": cast_thumbs.get(row.id),
+                }
+                for row in apps
+            ],
+            "locations": [
+                {
+                    "id": row.id,
+                    "location_id": row.location_id,
+                    "variant_name": row.name,
+                    "label": (
+                        f"{locations[row.location_id].name} · {row.name}"
+                        if row.location_id in locations
+                        else row.name
+                    ),
+                    "thumbnail_path": loc_thumbs.get(row.id),
+                }
+                for row in variants
+            ],
+            "node_limit": node_limit(),
+            "limit_hint": LIMIT_HINT,
+        }
+
+    async def get_scene(self, pid: str, sid: str) -> dict[str, Any]:
+        """单幕。小节点（prompt / 人物 / 地点）都在里面，前端不用再拼三张表。"""
+        rows = await self.list_scenes(pid)
+        row = next((r for r in rows if r["id"] == sid), None)
+        if row is None:
+            await fetch(db_of(pid), Scene, sid, "场景")  # 统一的 NOT_FOUND 四要素
+            raise AssertionError("unreachable")
+        return row
 
     async def create_scene(self, pid: str, patch: dict[str, Any]) -> dict[str, Any]:
         db = db_of(pid)
@@ -117,13 +359,20 @@ class StoryService:
         )
         async with db.write() as session:
             session.add(row)
-        return as_dict(row)
+        if patch.get("location_variant_id"):
+            await self._write_scene_locations(pid, row.id, [patch["location_variant_id"]])
+        return await self.get_scene(pid, row.id)
 
     async def update_scene(self, pid: str, sid: str, patch: dict[str, Any]) -> dict[str, Any]:
         db = db_of(pid)
         await fetch(db, Scene, sid, "场景")
         if patch.get("location_variant_id"):
             await fetch(db, LocationVariant, patch["location_variant_id"], "地点变体")
+        # 主地点要和 scene_location 列表对齐，先把目标算出来并过上限——
+        # 否则列写进去了、列表没写，两边说法不一致。
+        locations: list[str] | None = None
+        if "location_variant_id" in patch:
+            locations = await self._plan_primary_location(pid, sid, patch["location_variant_id"])
         async with db.write() as session:
             row = await session.get(Scene, sid)
             assert row is not None
@@ -131,7 +380,9 @@ class StoryService:
                 if key in patch:
                     setattr(row, key, patch[key])
             row.updated_at = utc_now()
-            return as_dict(row)
+        if locations is not None:
+            await self._write_scene_locations(pid, sid, locations)
+        return await self.get_scene(pid, sid)
 
     async def delete_scene(self, pid: str, sid: str) -> None:
         db = db_of(pid)
@@ -368,6 +619,88 @@ class StoryService:
                 if row is not None:
                     row.index_no = num
 
+    # --- 幕的小节点（prompt / 人物 / 地点） ---
+
+    async def set_scene_cast(self, pid: str, sid: str, appearance_ids: list[str]) -> dict[str, Any]:
+        """这一幕有哪些人物。可以一个都不选；上限见 `node_limit()`。
+
+        镜头没挂自己的出场表时，Context Resolver 会用这一份——小节点必须真的影响生成，
+        否则只是装饰（见 `services/context.py` 里 `resolve()` 的 `inherited` 分支）。
+        """
+        db = db_of(pid)
+        await fetch(db, Scene, sid, "场景")
+        ids = _unique([str(i) for i in appearance_ids])
+        _guard_node_limit("人物", ids)
+        for aid in ids:
+            await fetch(db, Appearance, aid, "形象")
+        existing = await fetch_all(db, SceneCast, where=SceneCast.scene_id == sid)
+        async with db.write() as session:
+            for row in existing:
+                fresh = await session.get(SceneCast, row.id)
+                if fresh is not None:
+                    await session.delete(fresh)
+            for i, aid in enumerate(ids):
+                session.add(
+                    SceneCast(id=new_id("scene_cast"), scene_id=sid, appearance_id=aid, index_no=i)
+                )
+        return await self.get_scene(pid, sid)
+
+    async def set_scene_locations(
+        self, pid: str, sid: str, variant_ids: list[str]
+    ) -> dict[str, Any]:
+        """这一幕可以用哪几个地点变体。第一条是主地点，会同步进 `Scene.location_variant_id`。"""
+        db = db_of(pid)
+        await fetch(db, Scene, sid, "场景")
+        ids = _unique([str(i) for i in variant_ids])
+        _guard_node_limit("地点", ids)
+        for vid in ids:
+            await fetch(db, LocationVariant, vid, "地点变体")
+        await self._write_scene_locations(pid, sid, ids)
+        return await self.get_scene(pid, sid)
+
+    async def _plan_primary_location(self, pid: str, sid: str, variant_id: str | None) -> list[str]:
+        """算出「把主地点换成 variant_id」之后地点列表该是什么样，顺手过一遍上限。
+
+        传 None 表示这一幕不选地点了——整张列表一起清空：留着一串备选却没有主地点，
+        在 Context Resolver 那边解释不通。
+        """
+        db = db_of(pid)
+        rows = await fetch_all(
+            db,
+            SceneLocation,
+            where=SceneLocation.scene_id == sid,
+            order_by=SceneLocation.index_no,
+        )
+        current = [r.location_variant_id for r in rows]
+        if not variant_id:
+            return []
+        target = [variant_id, *[v for v in current if v != variant_id]]
+        _guard_node_limit("地点", target)
+        return target
+
+    async def _write_scene_locations(self, pid: str, sid: str, ids: list[str]) -> None:
+        """整表重写 + 把第一条同步成主地点（与 `set_shot_cast` 同一套做法）。"""
+        db = db_of(pid)
+        existing = await fetch_all(db, SceneLocation, where=SceneLocation.scene_id == sid)
+        async with db.write() as session:
+            for row in existing:
+                fresh = await session.get(SceneLocation, row.id)
+                if fresh is not None:
+                    await session.delete(fresh)
+            for i, vid in enumerate(ids):
+                session.add(
+                    SceneLocation(
+                        id=new_id("scene_location"),
+                        scene_id=sid,
+                        location_variant_id=vid,
+                        index_no=i,
+                    )
+                )
+            scene = await session.get(Scene, sid)
+            if scene is not None:
+                scene.location_variant_id = ids[0] if ids else None
+                scene.updated_at = utc_now()
+
     # --- 出场表 ---
 
     async def set_shot_cast(
@@ -419,6 +752,7 @@ class StoryService:
         scenes = await fetch_all(db, Scene, order_by=Scene.index_no)
         shots = await fetch_all(db, Shot, order_by=Shot.index_no)
         cast_rows = await fetch_all(db, ShotCast)
+        scene_cast_rows = await fetch_all(db, SceneCast, order_by=SceneCast.index_no)
         versions = {v.id: v for v in await fetch_all(db, GenerationVersion)}
         variants = {v.id: v for v in await fetch_all(db, LocationVariant)}
         apps = {a.id: a for a in await fetch_all(db, Appearance)}
@@ -427,14 +761,26 @@ class StoryService:
         lanes = []
         for scene in scenes:
             cards = []
+            # 幕级人物是镜头没挂出场表时的兜底，和生成时的取值口径保持一致
+            # （见 services/context.py::_cast_appearances）。
+            scene_names = _unique(
+                [
+                    chars[apps[c.appearance_id].character_id].name
+                    for c in scene_cast_rows
+                    if c.scene_id == scene.id
+                    and c.appearance_id in apps
+                    and apps[c.appearance_id].character_id in chars
+                ]
+            )
             for shot in [s for s in shots if s.scene_id == scene.id]:
-                names = [
+                own = [
                     chars[apps[c.appearance_id].character_id].name
                     for c in cast_rows
                     if c.shot_id == shot.id
                     and c.appearance_id in apps
                     and apps[c.appearance_id].character_id in chars
                 ]
+                names = own or scene_names
                 issues = []
                 # 转场镜头不过上下文门槛（它没有出场角色也不需要地点变体），
                 # 所以那几条对它不算问题——列出来只会变成永远消不掉的黄色感叹号。
@@ -443,7 +789,7 @@ class StoryService:
                         issues.append("缺少地点变体，Context 不完整")
                     if not names:
                         issues.append("没有出场角色")
-                    if not (shot.prompt or shot.description):
+                    if not (shot.prompt or shot.description or scene.prompt):
                         issues.append("没有 prompt 也没有画面描述")
                 current = versions.get(shot.current_version_id or "")
                 cards.append(

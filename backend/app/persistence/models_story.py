@@ -32,6 +32,14 @@ class Story(Base):
 
 
 class Scene(Base):
+    """一幕。流程图上的一个节点，也是「小节点」（prompt / 人物 / 地点）的挂载点。
+
+    `prompt` 是这一幕的必填件——镜头没写自己的 prompt 时由它兜底（见
+    `services/context.py` 与 `services/generation.py::enqueue_shot`）。
+    `location_variant_id` 保留为「主地点」：多选地点存在 `scene_location` 里，
+    第一条会同步回这一列，于是 Context Resolver 与分镜板一行都不用改。
+    """
+
     __tablename__ = "scene"
 
     id: Mapped[str] = mapped_column(String(40), primary_key=True)
@@ -40,11 +48,17 @@ class Scene(Base):
     summary: Mapped[str | None] = mapped_column(Text)
     #: 剧本原文里对应的段落，用于双向定位
     source_text: Mapped[str | None] = mapped_column(Text)
+    #: 这一幕的 prompt（小节点里唯一必填的那个）。镜头级 prompt 优先，空着才用它。
+    prompt: Mapped[str | None] = mapped_column(Text)
+    #: 主地点变体。多选地点在 scene_location 表里，这一列始终等于其中第一条。
     location_variant_id: Mapped[str | None] = mapped_column(
         String(40), ForeignKey("location_variant.id", ondelete="SET NULL")
     )
     time_of_day: Mapped[str | None] = mapped_column(String(50))
     notes: Mapped[str | None] = mapped_column(Text)
+    #: 采用为这一幕主视频的那个生成版本。刻意不加外键（与 Shot.current_version_id 同理：
+    #: 版本表反过来引用镜头，加外键会绕成一圈），取不到时按「还没有主视频」处理。
+    main_version_id: Mapped[str | None] = mapped_column(String(40))
     created_at: Mapped[str] = mapped_column(String(40), nullable=False, default=utc_now)
     updated_at: Mapped[str] = mapped_column(String(40), nullable=False, default=utc_now)
 
@@ -115,3 +129,43 @@ class ShotProp(Base):
     )
     #: present（出现）/ discarded（被丢弃）——用于前后矛盾检查
     state: Mapped[str] = mapped_column(String(20), nullable=False, default="present")
+
+
+class SceneCast(Base):
+    """幕出场表：这一幕里有哪些形象（流程图上的「人物」小节点）。
+
+    镜头没挂自己的 `ShotCast` 时由它兜底——小节点必须真的影响生成，否则只是装饰。
+    `index_no` 是显示与优先级顺序，替换时整表重写（与 `set_shot_cast` 同一套做法）。
+    """
+
+    __tablename__ = "scene_cast"
+
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    scene_id: Mapped[str] = mapped_column(
+        String(40), ForeignKey("scene.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    appearance_id: Mapped[str] = mapped_column(
+        String(40), ForeignKey("appearance.id", ondelete="CASCADE"), nullable=False
+    )
+    index_no: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    note: Mapped[str | None] = mapped_column(Text)
+
+
+class SceneLocation(Base):
+    """幕地点表：这一幕可以用哪几个地点变体（流程图上的「场景」小节点）。
+
+    `index_no == 0` 的那条是主地点，会同步进 `Scene.location_variant_id`；
+    其余几条在 Context Resolver 里也算「可用」，只是优先级低一档。
+    """
+
+    __tablename__ = "scene_location"
+
+    id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    scene_id: Mapped[str] = mapped_column(
+        String(40), ForeignKey("scene.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    location_variant_id: Mapped[str] = mapped_column(
+        String(40), ForeignKey("location_variant.id", ondelete="CASCADE"), nullable=False
+    )
+    index_no: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    note: Mapped[str | None] = mapped_column(Text)

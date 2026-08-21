@@ -62,6 +62,11 @@ class GenerationService:
     ) -> dict[str, Any]:
         db = db_of(pid)
         shot = await fetch(db, Shot, shot_id, "镜头")
+        # 幕级 prompt 是镜头没写 prompt 时的兜底（流程图上那个必填的小节点），
+        # 取值口径与 context.resolve 的 problems 一致，否则会出现「账单说齐了，冻结进
+        # 版本里的 prompt 却是空的」。
+        scene_of_shot = await fetch(db, Scene, shot.scene_id, "场景")
+        prompt = shot.prompt or shot.description or scene_of_shot.prompt or ""
         capability = kind or ("first_last_frame" if shot.prev_shot_id else "image2video")
         # 走适配层时不需要工作流：模型端那份图由模型端维护（预设 / 通用 REST 合同）。
         # 只有旧的 comfy_workflow 兼容路径才必须先解析出一份已校验的工作流。
@@ -90,7 +95,7 @@ class GenerationService:
             workflow_id=workflow.id if workflow else None,
             params_json=dump_json(
                 {
-                    "prompt": shot.prompt or shot.description or "",
+                    "prompt": prompt,
                     "negative_prompt": shot.negative_prompt,
                     "seed": shot.seed,
                     "steps": shot.steps,

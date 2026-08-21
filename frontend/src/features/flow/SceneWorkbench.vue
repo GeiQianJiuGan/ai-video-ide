@@ -34,6 +34,7 @@ import {
 import AppBadge from '@/shared/ui/AppBadge.vue'
 import AppButton from '@/shared/ui/AppButton.vue'
 import AppPanel from '@/shared/ui/AppPanel.vue'
+import AppThumb from '@/shared/ui/AppThumb.vue'
 import EmptyState from '@/shared/ui/EmptyState.vue'
 import ErrorPanel from '@/shared/ui/ErrorPanel.vue'
 import FeatureHeader from '@/shared/ui/FeatureHeader.vue'
@@ -42,11 +43,13 @@ import { fileUrl } from '@/shared/api/files'
 import { assetsApi, type Asset } from '@/shared/api/assets'
 import { CONTEXT_KIND_LABEL } from '@/shared/api/generation'
 import { SHOT_STATUS, SHOT_STATUS_LABEL, type ShotStatus } from '@/shared/api/story'
+import { useConsoleStore } from '@/stores/console'
 import { useSceneStore } from '@/stores/scene'
 
 const route = useRoute()
 const router = useRouter()
 const workbench = useSceneStore()
+const consolePanel = useConsoleStore()
 
 const pid = computed(() => String(route.params.pid ?? ''))
 const sid = computed(() => String(route.params.sid ?? ''))
@@ -74,6 +77,10 @@ const prevShot = computed(
   () => workbench.shots.find((s) => s.id === shot.value?.prev_shot_id) ?? null,
 )
 const prevReady = computed(() => Boolean(prevShot.value?.current_version_id))
+/** 这一幕选的地点变体那张参考图——`<select>` 里塞不进图，所以在它下面单独给一眼。 */
+const sceneVariant = computed(
+  () => workbench.variants.find((v) => v.id === scene.value?.location_variant_id) ?? null,
+)
 
 function thumb(assetId: string | null): string {
   if (!assetId) return ''
@@ -248,10 +255,10 @@ async function generateScene(): Promise<void> {
       <AppButton
         size="sm"
         variant="ghost"
-        title="去队列页看它跑到哪了"
-        @click="router.push({ name: 'queue', params: { pid } })"
+        title="在底部控制台的任务框里看它跑到哪了（不用离开这一页）"
+        @click="consolePanel.openWith('jobs')"
       >
-        <ListVideo :size="10" />队列
+        <ListVideo :size="10" />任务
       </AppButton>
       <span v-if="workbench.lastJob" class="text-fg-4 text-2xs">
         最近入队 · {{ workbench.lastJob.status }}
@@ -331,6 +338,21 @@ async function generateScene(): Promise<void> {
                 <p v-if="!scene.location_variant_id" class="text-st-review text-2xs">
                   没选地点变体，这一幕的每个镜头上下文都不完整，入队会被拒。
                 </p>
+                <div v-else class="mt-px flex items-center gap-1.5">
+                  <AppThumb
+                    :pid="pid"
+                    :path="sceneVariant?.thumbnail_path ?? null"
+                    :label="sceneVariant?.label ?? ''"
+                    size="md"
+                  />
+                  <p class="text-fg-4 min-w-0 flex-1 text-2xs">
+                    {{
+                      sceneVariant?.thumbnail_path
+                        ? '这张参考图会进这一幕每个镜头的上下文账单。'
+                        : '这个变体还没有参考图，去地点页给它挂一张，否则账单里少这一条。'
+                    }}
+                  </p>
+                </div>
                 <label class="block">
                   <span class="text-fg-4 text-2xs">时间</span>
                   <input
@@ -428,6 +450,7 @@ async function generateScene(): Promise<void> {
                       class="accent-accent"
                       @change="toggleCast(c.appearance_id)"
                     />
+                    <AppThumb :pid="pid" :path="c.thumbnail_path" :label="c.label" />
                     <span class="text-fg-2 min-w-0 flex-1 truncate text-2xs">{{ c.label }}</span>
                     <AppBadge
                       v-if="!c.has_sheet"

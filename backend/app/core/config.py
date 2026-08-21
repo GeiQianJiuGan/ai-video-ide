@@ -15,7 +15,7 @@ class Settings(BaseSettings):
 
     app_name: str = "AI Video Studio"
     version: str = "0.1.0"
-    schema_version: int = 4
+    schema_version: int = 5
 
     # --- 网络：只监听回环，绝不对外暴露工程数据 ---
     host: str = "127.0.0.1"
@@ -41,6 +41,11 @@ class Settings(BaseSettings):
     # --- 调度器 ---
     worker_limit: int = 1
     job_max_attempt: int = 1
+
+    # --- 幕（流程图上的一个节点）---
+    # 一幕里人物 / 地点这类小节点各自的上限。9 是「一眼能数清」的默认值，
+    # 上下文参考图上限（context 的 ref_limit）是另一件事，别混为一谈。
+    scene_node_limit: int = 9
 
     # --- 视频生成：本工具不维护模型端的图，只按约定调它 ---
     # comfy_preset  模型端保存好工作流，我们按节点 title 约定注入入口参数（默认，核心路径）

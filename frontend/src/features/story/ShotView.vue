@@ -30,6 +30,7 @@ import { worldApi, type Prop } from '@/shared/api/world'
 import { CONTEXT_KIND_LABEL } from '@/shared/api/generation'
 import { SHOT_STATUS, SHOT_STATUS_LABEL } from '@/shared/api/story'
 import { CAPABILITY_LABEL, type Capability } from '@/shared/api/workflows'
+import { useConsoleStore } from '@/stores/console'
 import { useShotStore } from '@/stores/shot'
 import { useStoryStore } from '@/stores/story'
 import { useWorkflowStore } from '@/stores/workflows'
@@ -39,6 +40,7 @@ const router = useRouter()
 const editor = useShotStore()
 const story = useStoryStore()
 const wf = useWorkflowStore()
+const consolePanel = useConsoleStore()
 
 const pid = computed(() => String(route.params.pid ?? ''))
 const sid = computed(() => String(route.params.sid ?? ''))
@@ -243,10 +245,10 @@ async function generate(skipContext: boolean): Promise<void> {
       <AppButton
         size="sm"
         variant="ghost"
-        title="去队列页看它跑到哪了"
-        @click="router.push({ name: 'queue', params: { pid } })"
+        title="在底部控制台的任务框里看它跑到哪了（不用离开这一页）"
+        @click="consolePanel.openWith('jobs')"
       >
-        <ListVideo :size="10" />队列
+        <ListVideo :size="10" />任务
       </AppButton>
       <span v-if="editor.lastJob" class="text-fg-4 text-2xs">
         最近入队 {{ editor.lastJob.kind }} · {{ editor.lastJob.status }}

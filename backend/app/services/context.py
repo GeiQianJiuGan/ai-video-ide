@@ -14,7 +14,7 @@ from app.core.errors import AppError, ErrorCode
 from app.persistence.models import utc_now
 from app.persistence.models_cast import Appearance, Character, SheetVersion
 from app.persistence.models_gen import GenerationVersion
-from app.persistence.models_story import Scene, Shot, ShotCast, ShotProp
+from app.persistence.models_story import Scene, SceneCast, SceneLocation, Shot, ShotCast, ShotProp
 from app.persistence.models_world import (
     Asset,
     Location,
@@ -66,14 +66,24 @@ class ContextService:
         assets = {a.id: a for a in await fetch_all(db, Asset)}
         items: list[dict[str, Any]] = []
 
-        # 1. 出场形象的角色表：同一角色保留优先级最高的一个形象
+        # 1. 出场形象的角色表：同一角色保留优先级最高的一个形象。
+        #    镜头没单独挂出场表时**继承这一幕的人物**——流程图上那些「人物」小节点
+        #    必须真的影响生成，否则只是装饰（幕级清单见 services/story.py::set_scene_cast）。
         cast_rows = await fetch_all(db, ShotCast, where=ShotCast.shot_id == shot_id)
+        picks = [r.appearance_id for r in sorted(cast_rows, key=lambda r: r.id)]
+        inherited = False
+        if not picks:
+            scene_cast = await fetch_all(
+                db, SceneCast, where=SceneCast.scene_id == scene.id, order_by=SceneCast.index_no
+            )
+            picks = [r.appearance_id for r in scene_cast]
+            inherited = bool(picks)
         apps = {a.id: a for a in await fetch_all(db, Appearance)}
         chars = {c.id: c for c in await fetch_all(db, Character)}
         sheets = await fetch_all(db, SheetVersion, order_by=SheetVersion.version_no)
         seen_char: set[str] = set()
-        for row in sorted(cast_rows, key=lambda r: r.id):
-            app = apps.get(row.appearance_id)
+        for appearance_id in picks:
+            app = apps.get(appearance_id)
             if app is None:
                 continue
             char = chars.get(app.character_id)
@@ -91,7 +101,7 @@ class ContextService:
                 {
                     "key": f"character_sheet:{app.id}",
                     "kind": "character_sheet",
-                    "label": label,
+                    "label": label + ("（本幕人物）" if inherited else ""),
                     "priority": PRIORITY["character_sheet"] if not duplicate else 30,
                     "asset_id": current.asset_id if current else None,
                     "source_id": app.id,
@@ -100,7 +110,11 @@ class ContextService:
                         "同一角色已有更高优先级形象"
                         if duplicate
                         else (
-                            "该角色在本镜头出场"
+                            (
+                                "该角色在本幕出场（镜头没单独挂人物）"
+                                if inherited
+                                else "该角色在本镜头出场"
+                            )
                             if current and current.asset_id
                             else "该形象还没有角色表图"
                         )
@@ -108,23 +122,33 @@ class ContextService:
                 }
             )
 
-        # 2. 地点参考：本 Scene 选定的变体优先；同地点其他变体列出但省略，理由写清
+        # 2. 地点参考：本 Scene 的主地点优先；幕里另外选的地点也能用，只是低一档；
+        #    同地点的其他变体列出但省略，理由写清。
         variants = {v.id: v for v in await fetch_all(db, LocationVariant)}
         locations = {loc.id: loc for loc in await fetch_all(db, Location)}
         loc_refs = await fetch_all(db, LocationReference, order_by=LocationReference.created_at)
         chosen = variants.get(scene.location_variant_id or "")
+        picked_rows = await fetch_all(
+            db,
+            SceneLocation,
+            where=SceneLocation.scene_id == scene.id,
+            order_by=SceneLocation.index_no,
+        )
+        picked = {r.location_variant_id for r in picked_rows}
         for ref in loc_refs:
             variant = variants.get(ref.variant_id)
             if variant is None:
                 continue
             location = locations.get(variant.location_id)
             same = chosen is not None and variant.id == chosen.id
+            extra = not same and variant.id in picked
             sibling = (
-                chosen is not None
-                and variant.id != chosen.id
+                not same
+                and not extra
+                and chosen is not None
                 and variant.location_id == chosen.location_id
             )
-            if not same and not sibling:
+            if not same and not extra and not sibling:
                 continue
             items.append(
                 {
@@ -132,11 +156,19 @@ class ContextService:
                     "kind": "location_reference",
                     "label": f"{location.name if location else '未知地点'} · {variant.name}"
                     + (f" · 机位 {ref.camera}" if ref.camera else ""),
-                    "priority": PRIORITY["location_reference"] if same else 20,
+                    "priority": (
+                        PRIORITY["location_reference"]
+                        if same
+                        else (PRIORITY["location_reference"] - 5 if extra else 20)
+                    ),
                     "asset_id": ref.asset_id,
                     "source_id": ref.id,
-                    "eligible": same,
-                    "reason": "本 Scene 选定的地点变体" if same else "与本 Scene 的时间设定冲突",
+                    "eligible": same or extra,
+                    "reason": (
+                        "本 Scene 选定的地点变体"
+                        if same
+                        else ("本幕另外选中的地点变体" if extra else "与本 Scene 的时间设定冲突")
+                    ),
                 }
             )
 
@@ -250,9 +282,10 @@ class ContextService:
         problems = []
         if not scene.location_variant_id:
             problems.append("本 Scene 还没有选定地点变体")
-        if not cast_rows:
+        if not picks:
             problems.append("本镜头没有出场角色")
-        if not (shot.prompt or shot.description):
+        # 幕级 prompt 是镜头没写 prompt 时的兜底，取值口径与 generation.enqueue_shot 一致
+        if not (shot.prompt or shot.description or scene.prompt):
             problems.append("既没有 prompt 也没有画面描述")
         if shot.prev_shot_id and not any(
             i["kind"] == "prev_frame" and i["included"] for i in items

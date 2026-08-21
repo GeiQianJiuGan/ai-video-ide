@@ -32,6 +32,8 @@ from app.persistence.models_gen import (
 from app.persistence.models_story import (
     SHOT_STATUS,
     Scene,
+    SceneCast,
+    SceneLocation,
     Shot,
     ShotCast,
     ShotProp,
@@ -70,7 +72,9 @@ __all__ = [
     "Prop",
     "PropReference",
     "Scene",
+    "SceneCast",
     "SceneLink",
+    "SceneLocation",
     "SheetVersion",
     "Shot",
     "ShotCast",

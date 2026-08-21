@@ -320,6 +320,13 @@ async function acceptAll(): Promise<void> {
               size="sm"
               variant="primary"
               :disabled="director.busy || !draft.trim()"
+              :title="
+                director.busy
+                  ? '它还在想上一句'
+                  : draft.trim()
+                    ? '发出去；它只会提提案，按下采用之前库里什么都不会变'
+                    : '先在上面写一句话，比如「把第 2 幕拆成两幕」'
+              "
               @click="send()"
             >
               <Send :size="10" />{{ director.busy ? '想…' : '发送' }}

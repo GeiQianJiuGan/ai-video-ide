@@ -26,6 +26,9 @@ class SceneBody(BaseModel):
     title: str | None = None
     summary: str | None = None
     source_text: str | None = None
+    prompt: str | None = Field(
+        default=None, description="这一幕的提示词——小节点里唯一必填的那个；镜头级 prompt 优先"
+    )
     location_variant_id: str | None = None
     time_of_day: str | None = None
     notes: str | None = None
@@ -57,6 +60,12 @@ class MoveBody(BaseModel):
 
 class CastBody(BaseModel):
     appearance_ids: list[str]
+
+
+class LocationsBody(BaseModel):
+    location_variant_ids: list[str] = Field(
+        description="这一幕出现的地点变体；第一条同时是主地点（Scene.location_variant_id）"
+    )
 
 
 class PropsBody(BaseModel):
@@ -93,9 +102,33 @@ async def create_scene(pid: str, body: SceneBody) -> dict[str, Any]:
     return await story.create_scene(pid, body.model_dump(exclude_none=True))
 
 
+@router.get("/projects/{pid}/scene-node-options")
+async def scene_node_options(pid: str) -> dict[str, Any]:
+    """挑小节点用的两张清单（形象 / 地点变体），各带缩略图与当前上限。"""
+    return await story.node_options(pid)
+
+
+@router.get("/projects/{pid}/scenes/{sid}")
+async def get_scene(pid: str, sid: str) -> dict[str, Any]:
+    """一幕的全部小节点（prompt / 人物 / 地点）与当前上限。"""
+    return await story.get_scene(pid, sid)
+
+
 @router.patch("/projects/{pid}/scenes/{sid}")
 async def update_scene(pid: str, sid: str, body: SceneBody) -> dict[str, Any]:
     return await story.update_scene(pid, sid, body.model_dump(exclude_none=True))
+
+
+@router.put("/projects/{pid}/scenes/{sid}/cast")
+async def set_scene_cast(pid: str, sid: str, body: CastBody) -> dict[str, Any]:
+    """这一幕的人物小节点。可以是空的，但不能超过 scene.node_limit。"""
+    return await story.set_scene_cast(pid, sid, body.appearance_ids)
+
+
+@router.put("/projects/{pid}/scenes/{sid}/locations")
+async def set_scene_locations(pid: str, sid: str, body: LocationsBody) -> dict[str, Any]:
+    """这一幕的地点小节点。第一条会同步成主地点变体，同样受 scene.node_limit 限制。"""
+    return await story.set_scene_locations(pid, sid, body.location_variant_ids)
 
 
 @router.delete("/projects/{pid}/scenes/{sid}", status_code=204)

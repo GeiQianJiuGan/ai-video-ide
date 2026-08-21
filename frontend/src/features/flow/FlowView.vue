@@ -5,28 +5,20 @@
  * 整片就这一张图：一个节点是一幕，节点之间那一条是**衔接**。这一页要回答两个问题——
  * 「这片子由哪几幕组成、每一幕做到哪一步了」和「两幕之间怎么接上」。
  *
- * 四个刻意的设计：
+ * 五个刻意的设计：
  *   1. **衔接是可点的一等公民**，不是节点上的一个字段。硬切 / 转场 / 续接末帧三种，
  *      每种的一句话解释由后端给（`link.hint`），前端不复制一份文案。
  *   2. **先账单再动手**。「编排生成」是两步：`plan` 只读地把「要生成几条、要补几段转场、
  *      缺什么」列出来，看完了才 `run`。改了衔接账单立刻作废，逼你重新看一眼。
  *   3. **跳过不是失败**。`run` 回来的 `skipped` 每条都带四要素错误，照常显示，不弹红叉。
- *   4. 节点用 HTML 卡片而不是 SVG 图元——里面要放缩略图、下拉、徽标，
+ *   4. 节点用 HTML 卡片而不是 SVG 图元——里面要放视频、下拉、徽标，
  *      这些在 `foreignObject` 里的行为在各平台上不一致，连线用一根 1px 的横线就够了。
+ *   5. **单击选中、双击进第二级**：节点上只看（成片能直接播、小节点一眼扫完），
+ *      改动全在右边的检查器里做。这一层不做镜头级的事。
  */
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import {
-  ArrowRight,
-  Bot,
-  ClipboardList,
-  ListVideo,
-  Play,
-  Plus,
-  RefreshCw,
-  Trash2,
-  X,
-} from '@lucide/vue'
+import { ArrowRight, Bot, ClipboardList, ListVideo, Play, Plus, RefreshCw, X } from '@lucide/vue'
 import AppBadge from '@/shared/ui/AppBadge.vue'
 import AppButton from '@/shared/ui/AppButton.vue'
 import AppPanel from '@/shared/ui/AppPanel.vue'
@@ -34,7 +26,8 @@ import EmptyState from '@/shared/ui/EmptyState.vue'
 import ErrorPanel from '@/shared/ui/ErrorPanel.vue'
 import FeatureHeader from '@/shared/ui/FeatureHeader.vue'
 import DirectorPanel from './DirectorPanel.vue'
-import { fileUrl } from '@/shared/api/files'
+import SceneNodeCard from './SceneNodeCard.vue'
+import SceneNodeInspector from './SceneNodeInspector.vue'
 import {
   LINK_MODES,
   LINK_MODE_LABEL,
@@ -43,11 +36,13 @@ import {
   type LinkMode,
   type SequenceMode,
 } from '@/shared/api/sequence'
+import { useConsoleStore } from '@/stores/console'
 import { useFlowStore } from '@/stores/flow'
 
 const route = useRoute()
 const router = useRouter()
 const flow = useFlowStore()
+const consolePanel = useConsoleStore()
 
 const pid = computed(() => String(route.params.pid ?? ''))
 const newSceneTitle = ref('')
@@ -71,10 +66,6 @@ const segments = computed(() =>
     }
   }),
 )
-
-function thumb(path: string | null): string {
-  return path ? fileUrl(pid.value, path) : ''
-}
 
 function fmt(n: number): string {
   return `${Math.round(n * 10) / 10}s`
@@ -153,10 +144,10 @@ function switchMode(value: string): void {
       <AppButton
         size="sm"
         variant="ghost"
-        title="去队列页看它们跑到哪了"
-        @click="router.push({ name: 'queue', params: { pid } })"
+        title="在底部控制台的任务框里看它们跑到哪了（不用离开这一页）"
+        @click="consolePanel.openWith('jobs')"
       >
-        <ListVideo :size="10" />队列
+        <ListVideo :size="10" />任务
       </AppButton>
       <span class="text-fg-4 tnum text-2xs">
         {{ flow.nodes.length }} 幕 · {{ flow.generatedTotal }}/{{ flow.shotTotal }} 镜头已出片
@@ -201,57 +192,15 @@ function switchMode(value: string): void {
           />
           <div v-else class="flex items-stretch gap-0">
             <template v-for="(node, i) in flow.nodes" :key="node.id">
-              <!-- 节点：一幕 -->
-              <div
-                class="w-44 shrink-0 border p-1.5"
-                :class="
-                  node.id === flow.selectedSceneId
-                    ? 'border-accent/60 bg-accent-dim/30'
-                    : 'border-line-1 bg-base-2'
-                "
-                @click="flow.selectedSceneId = node.id"
-              >
-                <div class="flex items-center gap-1">
-                  <span class="text-fg-4 tnum text-2xs">{{ node.index_no }}</span>
-                  <span class="text-fg-1 min-w-0 flex-1 truncate text-2xs" :title="node.title">
-                    {{ node.title }}
-                  </span>
-                  <button
-                    class="text-fg-4 hover:text-st-failed"
-                    title="删掉这一幕（它的镜头与版本会一起没）"
-                    @click.stop="flow.removeScene(pid, node.id).catch(() => {})"
-                  >
-                    <Trash2 :size="10" />
-                  </button>
-                </div>
-                <div class="bg-base-3 mt-1 flex h-20 items-center justify-center overflow-hidden">
-                  <img
-                    v-if="thumb(node.thumbnail_path)"
-                    :src="thumb(node.thumbnail_path)"
-                    class="max-h-full max-w-full object-contain"
-                    :alt="node.title"
-                  />
-                  <span v-else class="text-fg-4 text-2xs">还没有成片</span>
-                </div>
-                <div class="mt-1 flex flex-wrap items-center gap-1">
-                  <AppBadge tone="neutral"
-                    >{{ node.generated_count }}/{{ node.shot_count }} 镜头</AppBadge
-                  >
-                  <AppBadge v-if="node.transition_count" tone="accent">
-                    转场 {{ node.transition_count }}
-                  </AppBadge>
-                  <AppBadge v-if="node.issues.length" tone="warn" :title="node.issues.join('；')">
-                    {{ node.issues.length }} 个问题
-                  </AppBadge>
-                </div>
-                <p class="text-fg-4 mt-0.5 truncate text-2xs" :title="node.cast_names.join('、')">
-                  {{ node.cast_names.length ? node.cast_names.join('、') : '没有出场角色' }}
-                </p>
-                <p class="text-fg-4 tnum text-2xs">{{ fmt(node.duration_total) }}</p>
-                <AppButton size="sm" variant="ghost" class="mt-1" @click.stop="openScene(node.id)">
-                  进这一幕的工作台
-                </AppButton>
-              </div>
+              <!-- 节点：一幕。单击选中、双击进第二级 -->
+              <SceneNodeCard
+                :pid="pid"
+                :node="node"
+                :selected="node.id === flow.selectedSceneId"
+                @select="flow.select(pid, node.id)"
+                @open="openScene(node.id)"
+                @remove="flow.removeScene(pid, node.id).catch(() => {})"
+              />
               <!-- 连线：这两幕之间的衔接 -->
               <div
                 v-if="segments[i]"
@@ -285,124 +234,135 @@ function switchMode(value: string): void {
             </template>
           </div>
           <p v-if="flow.nodes.length" class="text-fg-4 mt-3 text-2xs">
-            连线上那个下拉就是衔接：改了它，账单会立刻作废——两幕之间怎么接会改变要做多少事。
+            节点上是这一幕的成片与小节点：单击选中（右边可以改 prompt、挂人物 / 地点、挑主视频），
+            双击进这一幕的工作台。连线上那个下拉是衔接：改了它，账单会立刻作废——两幕之间怎么接
+            会改变要做多少事。
           </p>
         </div>
       </AppPanel>
-      <!-- 右：账单与执行结果。「说好的」与「做了的」要能对上 -->
-      <AppPanel title="编排账单" class="w-72 shrink-0">
-        <template #actions>
-          <AppButton
-            v-if="flow.plan"
-            size="sm"
-            variant="ghost"
-            title="丢掉这份账单"
-            @click="flow.discardPlan()"
-          >
-            <X :size="10" />
-          </AppButton>
-        </template>
-        <div class="min-h-0 flex-1 overflow-auto p-2">
-          <EmptyState
-            v-if="!flow.plan"
-            title="还没有账单"
-            body="按「先看账单」算一份：这次会入队几个任务、要补几段转场、哪一条缺什么。只算不做。"
-          />
-          <template v-else>
-            <p class="text-fg-1 text-2xs">
-              {{ SEQUENCE_MODE_LABEL[flow.plan.mode as SequenceMode] ?? flow.plan.mode }} · 入队
-              {{ flow.plan.total_jobs }} 个任务
-            </p>
-            <p class="text-fg-4 text-2xs">
-              要补 {{ flow.plan.transitions_to_create }} 段转场{{
-                flow.plan.ignored_transitions
-                  ? `，忽略 ${flow.plan.ignored_transitions} 条配好的转场`
-                  : ''
-              }}
-            </p>
-            <ul v-if="flow.plan.notes.length" class="text-fg-4 mt-1 space-y-px text-2xs">
-              <li v-for="n in flow.plan.notes" :key="n">· {{ n }}</li>
-            </ul>
-
-            <p class="text-fg-3 mt-2 text-2xs tracking-wide uppercase">按幕</p>
-            <ul class="mt-1 space-y-px">
-              <li
-                v-for="s in flow.plan.scenes"
-                :key="s.scene_id"
-                class="border-line-1 bg-base-2 border px-1 py-0.5"
-              >
-                <div class="flex items-center gap-1">
-                  <span class="text-fg-2 min-w-0 flex-1 truncate text-2xs">
-                    {{ s.index_no }}. {{ s.title }}
-                  </span>
-                  <span class="text-fg-4 tnum text-2xs">
-                    {{ s.ready_count }}/{{ s.shot_count }}
-                  </span>
-                </div>
-                <p v-if="s.already_generated" class="text-fg-4 text-2xs">
-                  已出片 {{ s.already_generated }} 条，这次照旧只追加新版本。
-                </p>
-                <ul v-if="s.missing.length" class="text-st-review space-y-px text-2xs">
-                  <li v-for="m in s.missing" :key="m">· {{ m }}</li>
-                </ul>
-              </li>
-            </ul>
-
-            <template v-if="flow.plan.blockers.length">
-              <p class="text-fg-3 mt-2 text-2xs tracking-wide uppercase">
-                会被跳过（{{ flow.plan.blockers.length }}）
+      <!-- 右：选中那一幕的检查器 + 编排账单。「说好的」与「做了的」要能对上 -->
+      <div class="flex w-80 shrink-0 flex-col gap-2">
+        <SceneNodeInspector
+          v-if="flow.selectedScene"
+          :pid="pid"
+          :node="flow.selectedScene"
+          @open="openScene(flow.selectedScene.id)"
+        />
+        <AppPanel title="编排账单" class="min-h-0 flex-1">
+          <template #actions>
+            <AppButton
+              v-if="flow.plan"
+              size="sm"
+              variant="ghost"
+              title="丢掉这份账单"
+              @click="flow.discardPlan()"
+            >
+              <X :size="10" />
+            </AppButton>
+          </template>
+          <div class="min-h-0 flex-1 overflow-auto p-2">
+            <EmptyState
+              v-if="!flow.plan"
+              title="还没有账单"
+              body="按「先看账单」算一份：这次会入队几个任务、要补几段转场、哪一条缺什么。只算不做。"
+            />
+            <template v-else>
+              <p class="text-fg-1 text-2xs">
+                {{ SEQUENCE_MODE_LABEL[flow.plan.mode as SequenceMode] ?? flow.plan.mode }} · 入队
+                {{ flow.plan.total_jobs }} 个任务
               </p>
+              <p class="text-fg-4 text-2xs">
+                要补 {{ flow.plan.transitions_to_create }} 段转场{{
+                  flow.plan.ignored_transitions
+                    ? `，忽略 ${flow.plan.ignored_transitions} 条配好的转场`
+                    : ''
+                }}
+              </p>
+              <ul v-if="flow.plan.notes.length" class="text-fg-4 mt-1 space-y-px text-2xs">
+                <li v-for="n in flow.plan.notes" :key="n">· {{ n }}</li>
+              </ul>
+
+              <p class="text-fg-3 mt-2 text-2xs tracking-wide uppercase">按幕</p>
               <ul class="mt-1 space-y-px">
                 <li
-                  v-for="(b, i) in flow.plan.blockers"
-                  :key="`${b.scene_id}-${b.shot_id ?? i}`"
-                  class="border-st-failed/40 bg-base-2 border px-1 py-0.5"
-                >
-                  <p class="text-fg-2 text-2xs">{{ b.why }}</p>
-                  <p class="text-fg-4 text-2xs">怎么办：{{ b.how }}</p>
-                </li>
-              </ul>
-            </template>
-            <template v-if="flow.lastRun">
-              <p class="text-fg-3 mt-3 text-2xs tracking-wide uppercase">这次做了什么</p>
-              <p class="text-fg-2 mt-1 text-2xs">
-                入队 {{ flow.lastRun.queued.length }} 条 · 补转场
-                {{ flow.lastRun.transitions.length }} 段 · 跳过 {{ flow.lastRun.skipped.length }} 条
-              </p>
-              <ul v-if="flow.lastRun.transitions.length" class="mt-1 space-y-px">
-                <li
-                  v-for="t in flow.lastRun.transitions"
-                  :key="t.shot_id"
+                  v-for="s in flow.plan.scenes"
+                  :key="s.scene_id"
                   class="border-line-1 bg-base-2 border px-1 py-0.5"
                 >
-                  <p class="text-fg-2 text-2xs">
-                    第 {{ t.link.from_index_no }} 幕 → 第 {{ t.link.to_index_no }} 幕
-                    {{ t.reused ? '（已有成片，这次没重做）' : `· ${fmt(t.link.duration ?? 0)}` }}
+                  <div class="flex items-center gap-1">
+                    <span class="text-fg-2 min-w-0 flex-1 truncate text-2xs">
+                      {{ s.index_no }}. {{ s.title }}
+                    </span>
+                    <span class="text-fg-4 tnum text-2xs">
+                      {{ s.ready_count }}/{{ s.shot_count }}
+                    </span>
+                  </div>
+                  <p v-if="s.already_generated" class="text-fg-4 text-2xs">
+                    已出片 {{ s.already_generated }} 条，这次照旧只追加新版本。
                   </p>
-                  <p v-if="t.note" class="text-fg-4 text-2xs">{{ t.note }}</p>
-                </li>
-              </ul>
-              <ul v-if="flow.lastRun.skipped.length" class="mt-1 space-y-px">
-                <li
-                  v-for="(s, i) in flow.lastRun.skipped"
-                  :key="`${s.shot_id ?? 'link'}-${i}`"
-                  class="border-st-failed/40 bg-base-2 border px-1 py-0.5"
-                >
-                  <p class="text-fg-1 text-2xs">{{ s.error.title }}</p>
-                  <p class="text-fg-2 text-2xs">{{ s.error.detail }}</p>
-                  <ul class="text-fg-4 space-y-px text-2xs">
-                    <li v-for="sg in s.error.suggestions" :key="sg">· {{ sg }}</li>
+                  <ul v-if="s.missing.length" class="text-st-review space-y-px text-2xs">
+                    <li v-for="m in s.missing" :key="m">· {{ m }}</li>
                   </ul>
                 </li>
               </ul>
-              <p v-if="flow.lastRun.chain?.length" class="text-fg-4 mt-1 text-2xs">
-                串成了一条 {{ flow.lastRun.chain.length }} 段的链：每段拿上一段的真末帧当首帧，
-                队列里那些等待都写着在等谁。
-              </p>
+
+              <template v-if="flow.plan.blockers.length">
+                <p class="text-fg-3 mt-2 text-2xs tracking-wide uppercase">
+                  会被跳过（{{ flow.plan.blockers.length }}）
+                </p>
+                <ul class="mt-1 space-y-px">
+                  <li
+                    v-for="(b, i) in flow.plan.blockers"
+                    :key="`${b.scene_id}-${b.shot_id ?? i}`"
+                    class="border-st-failed/40 bg-base-2 border px-1 py-0.5"
+                  >
+                    <p class="text-fg-2 text-2xs">{{ b.why }}</p>
+                    <p class="text-fg-4 text-2xs">怎么办：{{ b.how }}</p>
+                  </li>
+                </ul>
+              </template>
+              <template v-if="flow.lastRun">
+                <p class="text-fg-3 mt-3 text-2xs tracking-wide uppercase">这次做了什么</p>
+                <p class="text-fg-2 mt-1 text-2xs">
+                  入队 {{ flow.lastRun.queued.length }} 条 · 补转场
+                  {{ flow.lastRun.transitions.length }} 段 · 跳过
+                  {{ flow.lastRun.skipped.length }} 条
+                </p>
+                <ul v-if="flow.lastRun.transitions.length" class="mt-1 space-y-px">
+                  <li
+                    v-for="t in flow.lastRun.transitions"
+                    :key="t.shot_id"
+                    class="border-line-1 bg-base-2 border px-1 py-0.5"
+                  >
+                    <p class="text-fg-2 text-2xs">
+                      第 {{ t.link.from_index_no }} 幕 → 第 {{ t.link.to_index_no }} 幕
+                      {{ t.reused ? '（已有成片，这次没重做）' : `· ${fmt(t.link.duration ?? 0)}` }}
+                    </p>
+                    <p v-if="t.note" class="text-fg-4 text-2xs">{{ t.note }}</p>
+                  </li>
+                </ul>
+                <ul v-if="flow.lastRun.skipped.length" class="mt-1 space-y-px">
+                  <li
+                    v-for="(s, i) in flow.lastRun.skipped"
+                    :key="`${s.shot_id ?? 'link'}-${i}`"
+                    class="border-st-failed/40 bg-base-2 border px-1 py-0.5"
+                  >
+                    <p class="text-fg-1 text-2xs">{{ s.error.title }}</p>
+                    <p class="text-fg-2 text-2xs">{{ s.error.detail }}</p>
+                    <ul class="text-fg-4 space-y-px text-2xs">
+                      <li v-for="sg in s.error.suggestions" :key="sg">· {{ sg }}</li>
+                    </ul>
+                  </li>
+                </ul>
+                <p v-if="flow.lastRun.chain?.length" class="text-fg-4 mt-1 text-2xs">
+                  串成了一条 {{ flow.lastRun.chain.length }} 段的链：每段拿上一段的真末帧当首帧，
+                  队列里那些等待都写着在等谁。
+                </p>
+              </template>
             </template>
-          </template>
-        </div>
-      </AppPanel>
+          </div>
+        </AppPanel>
+      </div>
       <!-- 最右：AI 协作栏。提案落库后重拉整张图（幕数、镜头数、衔接都可能变了） -->
       <DirectorPanel v-if="showDirector" :pid="pid" @applied="reload()" />
     </div>

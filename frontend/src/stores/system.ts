@@ -58,5 +58,10 @@ export const useSystemStore = defineStore('system', () => {
     connState.value = 'closed'
   }
 
-  return { health, deps, connState, lastError, events, refresh, connect, disconnect }
+  /** 清空日志框。只丢前端这份环形缓冲，后端什么都不会被删。 */
+  function clearEvents(): void {
+    events.value = []
+  }
+
+  return { health, deps, connState, lastError, events, refresh, connect, disconnect, clearEvents }
 })

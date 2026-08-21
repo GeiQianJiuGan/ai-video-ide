@@ -2,16 +2,22 @@
 /**
  * 生成队列（Step 7 的前端）。
  *
+ * 队列的**常驻界面是底部控制台**（`app/layout/ConsolePanel.vue` 的任务框）：那里能看
+ * 谁在跑、按暂停、重试失败。这一页是「点开细看」的那一层——失败现场、入队时冻结的
+ * 参数、优先级细调，屏幕够大才摆得下，所以它不进左栏导航。
+ *
  * 队列页要回答的只有三个问题：谁在跑、谁在等（等谁）、失败的为什么失败。
  *
- * 三个刻意的设计：
- *   1. **等待要能解释**。`waiting` 的任务把 `wait_reason` 写在行里——
+ * 四个刻意的设计：
+ *   1. **WS 订阅不归它**。订阅挂在常驻的控制台上，这一页只 `load()` 做一次对齐——
+ *      以前是这里 `onUnmounted` 时 disconnect，于是一离开页面实时通道就断了。
+ *   2. **等待要能解释**。`waiting` 的任务把 `wait_reason` 写在行里——
  *      「等上游 Shot 14 出当前版本」和「卡住了」在界面上必须长得不一样。
- *   2. **失败现场是一整块，不是一行红字**。右栏放选中任务的结构化错误四要素，
+ *   3. **失败现场是一整块，不是一行红字**。右栏放选中任务的结构化错误四要素，
  *      建议一条条列出来，旁边就是「重试」——看见原因的地方就能动手。
- *   3. **暂停不等于取消**。工具栏那句提示写明：已经在跑的照常跑完。
+ *   4. **暂停不等于取消**。工具栏那句提示写明：已经在跑的照常跑完。
  */
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ArrowUp, Ban, Pause, Play, RefreshCw, RotateCcw } from '@lucide/vue'
 import AppPanel from '@/shared/ui/AppPanel.vue'
@@ -49,14 +55,13 @@ const TONE: Record<string, 'neutral' | 'accent' | 'ok' | 'warn' | 'fail'> = {
   paused: 'warn',
 }
 
+/** 只做一次全量对齐；实时订阅由底部控制台常驻持有，离开这一页不该把它带走。 */
 function start(): void {
   if (!pid.value) return
   void queue.load(pid.value).catch(() => {})
-  queue.connect(pid.value)
 }
 
 onMounted(start)
-onUnmounted(() => queue.disconnect())
 watch(pid, start)
 
 /** 选中的任务被清掉后不要留一块空的失败现场。 */

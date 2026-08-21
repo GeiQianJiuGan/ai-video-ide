@@ -33,12 +33,13 @@ AI Video Studio（`aivs`）：桌面端优先的 AI 原生长视频制作工作�
   （应用级设置 → provider 适配层 → 衔接与编排 → 场景工作台 → 幕流程图 → AI 协作栏）——
   17 个 service（cast / world / assets / workflows / story / context / generation / timeline /
   overview / projects / library / adopt / fsbrowse / appsettings / frames / sequence / director）
-  + 18 个 router（含 `/ws`），203 个测试全绿。
+  + 18 个 router（含 `/ws`），214 passed / 1 skipped。
 - **前端也全部接上了后端**：`app/features.ts` 里 15 个功能都是 `ready: true`，
   `/p/:pid` 下不再有外壳页。`shared/ui/FeatureView.vue`（按注册表画工作区骨架与能力锁）
   暂时没人用，留给下一个「登记了但还没接后端」的功能——那种情况先挂它，绝不给假界面。
-- 生成层的主路是 `flow`（幕）→ `scene`（场景工作台）；`workflows`（Workflow 管理）已经是
-  `advanced: true` 的兼容路径，不在导航里，只从命令面板或设置页进。
+- 生成层的主路是 `flow`（幕）→ `scene`（场景工作台）；`workflows`（Workflow 管理）与
+  `queue`（生成队列细看）都是 `advanced: true` 的兼容 / 细看路径，不在导航里，只从命令面板、
+  设置页或底部控制台进——队列日常看的是控制台的任务框（见下面的「队列」段）。
 - 单个能力仍会缺（ComfyUI 离线、没有 LLM）：这类按钮保持 `disabled` 并把原因写进 tooltip，
   不画假界面、不造假数据。
 - 本机装了 `frontend/node_modules` 与 `backend/.venv`（后端命令用 `.venv/Scripts/python`），
@@ -48,6 +49,17 @@ AI Video Studio（`aivs`）：桌面端优先的 AI 原生长视频制作工作�
   「这台机器上恰好装了/没装」：缺失路径用 `conftest.py::no_ffmpeg` fixture 造。
 
 ## 常用命令
+
+一键起开发环境（`scripts/dev.py`：后端固定端口 + 前端 dev server + 依赖体检，起好自动开浏览器，
+Ctrl+C 一起停；任一个子进程退出就把另一半也停掉，不留半死的环境）：
+
+```bash
+python scripts/dev.py
+```
+
+Windows 也可以直接双击仓库根的 `start.cmd`（macOS / Linux 是 `./start.sh`），它们只是找一个
+Python 再转调上面那个脚本。常用参数：`--backend-only` / `--frontend-only` / `--port 8899` /
+`--no-open`。下面两段是它内部实际跑的东西，需要单独调时照旧可用。
 
 后端（Python 3.11+）：
 
@@ -184,10 +196,18 @@ token}` 写进 `.runtime/endpoint.json` → 壳校验后用 `window.__AIVS_ENDPO
 
 **事件**：进程内 `EventBus`（`events/bus.py`）→ 单个 `/ws` 端点按 `project_id` + `channels`
 过滤（job / queue / shot / version / asset / system / error）。事件幂等、可丢失（队列满丢最旧），
-前端重连后必须调 REST 做全量对齐；不要给它加投递保证或持久化。
+前端重连后必须调 REST 做全量对齐；不要给它加投递保证或持久化。连线上**只有一种信封**
+（`{channel, event, project_id, ts, payload}`）：握手 `system.connected` 与心跳 `system.ping`
+也必须过 `Event(...).to_dict()`，不许在 `api/ws.py` 里手写字面量——少一个 `ts`，前端按契约
+读它的那一处就白屏（`tests/test_m0_foundation.py::test_ws_connect_and_receive_event` 盯着）。
 
 **队列**：进程内调度，每个工程一个 pump task，`worker_limit` 控并发。`waiting` + `depends_on`
-+ `wait_reason` 让「等上游镜头末帧」变成可解释的等待而不是卡住。
++ `wait_reason` 让「等上游镜头末帧」变成可解释的等待而不是卡住。前端侧它**不是一个页面而是
+底部控制台**（`app/layout/ConsolePanel.vue`：任务框 + 日志框，入口是状态条上那个任务标识，
+Ctrl + \` 开合，高度记在 localStorage）。控制台常驻，所以 **WS 订阅归它**
+（`queue.connect` / `disconnect` / 切工程时 `reset()`），队列页只 `load()`——以前订阅挂在队列页上，
+一离开页面实时通道就断了。`features/generation/QueueView.vue` 还在，但是 `advanced: true`、
+不进 `PROJECT_NAV`，只从命令面板或控制台的「队列页」按钮进，看失败现场与冻结参数。
 
 **Context Resolver**（`services/context.py`）：把「到底喂了什么给模型」变成一张账单——每条带
 kind / priority / included / reason；人工覆写记在 `shot.context_overrides_json`（可 reset 回
@@ -208,8 +228,27 @@ kind / priority / included / reason；人工覆写记在 `shot.context_overrides
   编排两种模式（`parallel` / `sequential`）**一律先账单再动手**：`POST /sequence/plan` 只读地
   列出「入队几个任务、补几段转场、哪一条缺什么」，`POST /sequence/run` 才真入队；被跳过的每条
   都带四要素错误，跳过不是失败。
+- **节点里的小节点**（`services/story.py` + `persistence` 里 `SceneCast` / `SceneLocation`，前端
+  `features/flow/SceneNodeCard.vue` + `SceneNodeInspector.vue`）：一幕是一张小图表，挂着三种小
+  节点——**prompt 必填**（`Scene.prompt`，缺了 `graph()` 会把它写进 `issues`），**人物 / 地点可以
+  一个都不选**但各自不超过 `story.node_limit()`（应用级设置 `scene.node_limit`，默认 9，运行期
+  可配，所以前端只显示 `N/上限` 并提前禁用，真正的守卫在后端）。地点表的**第一条同时是主地点**，
+  同步 `scene.location_variant_id`——「设为主地点」= 挪到第一位，不是另一个字段。超上限的四要素
+  错误里那句「上限可改：设置页…」只有一处口径：`story.py::LIMIT_HINT`。小节点必须真的影响生成，
+  不是装饰：镜头没挂自己的出场表时 `context.resolve()` 就继承这一份。
+  **挑的时候看图不看 id**：`GET /projects/{pid}/scene-node-options` 一次给两张清单
+  （`cast[]` / `locations[]`，各带 `label` 与相对工程目录的 `thumbnail_path`，没图给 `null` 但
+  仍留在清单里）+ `node_limit` / `limit_hint`；`GET /scenes/{sid}` 回的 `cast[]` / `locations[]`
+  也带同一个 `thumbnail_path`。前端一律走 `shared/ui/AppThumb.vue`（缺图退化成占位块，
+  绝不显示碎图标），**不要**再按角色 / 变体一个个拉 `appearances` / `references` 拼 N+1。
+- **节点上播的那一段**：`graph()` 的节点带 `video_path`（能播的 `<video>`）与 `thumbnail_path`
+  （只会是图片），**两个字段绝不混用**。挑用哪一段的顺序是「采用的主视频 → 首镜头的当前版本 →
+  最靠前的一段」；`GET /scenes/{sid}/videos` 列出候选（不能当候选的进 `omitted` 并附原因），
+  `POST /scenes/{sid}/main-video` 采用一段（`version_id: null` 取消）——它只改「用哪一段」，
+  顺手把它设成所属镜头的当前版本，一条版本都不会被删（硬约束 3）。采用过的那段后来不在候选里了
+  就进 `issues`，不静默换成别的。
 - **第二级：场景工作台**（前端 `features/flow/SceneWorkbench.vue`）：单幕的首帧 / 末帧槽位 →
-  R2V 生成 → 版本轨。**本轮没有 T2V。**
+  R2V 生成 → 版本轨。**本轮没有 T2V。** 从第一级过去的手势是**双击节点**（单击只选中）。
 - **AI 协作栏**（`app/ai/director/` + `services/director.py` + `api/director.py`，前端
   `features/flow/DirectorPanel.vue`）：`ai/director/tools.py` 里那条**读 / 写分界就是安全边界**——
   读工具（`list_*` / `get_scene`）立刻执行，写工具（`add_scene` / `set_link` / …）**永不落库**，
@@ -252,8 +291,9 @@ kind / priority / included / reason；人工覆写记在 `shot.context_overrides
 - **新增表**：工程表必须在 `persistence/all_models.py` 里 import，否则 `Base.metadata` 漏表；
   素材库表相反——挂 `LibraryBase`，**不要**进 `all_models.py`（理由见上面的素材库段）。
 - **新增迁移**：`alembic/versions/` 加脚本 → 在 `persistence/migrate.py::REVISION_SCHEMA` 登记
-  它对应的 schema 版本 → 同步 `settings.schema_version`（当前 4，最新一条是
-  `0004_scene_flow`：`SceneLink` / `DirectorTurn` 两张表 + `Shot.kind`）。漏登记会导致
+  它对应的 schema 版本 → 同步 `settings.schema_version`（当前 5，最新一条是
+  `0005_scene_nodes`：`SceneCast` / `SceneLocation` 两张表 + `Scene.prompt` /
+  `Scene.main_version_id`）。漏登记会导致
   打开旧工程时无法告诉用户「schema X → Y」。
 - **落盘**：资产 `path` 相对工程目录存（整个目录拷走仍然有效）；类型→子目录映射在
   `services/assets.py::KIND_DIR`，`generations/` 只放生成物，手动素材一律进 `assets/`。

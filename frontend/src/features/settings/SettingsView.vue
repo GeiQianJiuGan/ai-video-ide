@@ -235,6 +235,13 @@ async function pastePreset(): Promise<void> {
         <AppButton
           size="sm"
           :disabled="!presetName.trim() || !presetText.trim() || cfg.busy"
+          :title="
+            !presetName.trim()
+              ? '先给这份图起个名字——之后在 provider 设置里按名字选它'
+              : !presetText.trim()
+                ? '把 ComfyUI 导出的 API 格式 json 粘进下面那个框'
+                : '把这份图存进应用级预设目录'
+          "
           @click="pastePreset()"
         >
           保存这份图

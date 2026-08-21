@@ -54,6 +54,7 @@ GROUPS: tuple[tuple[str, str], ...] = (
     ("llm", "LLM（AI 协作）"),
     ("video", "视频生成 API"),
     ("comfy", "ComfyUI"),
+    ("scene", "幕（流程图节点）"),
     ("runtime", "运行"),
 )
 
@@ -96,6 +97,14 @@ FIELDS: tuple[FieldSpec, ...] = (
     ),
     FieldSpec("video.timeout", "video_timeout", "video", "单次超时（秒）", "int"),
     FieldSpec("comfy.base_url", "comfy_base_url", "comfy", "地址"),
+    FieldSpec(
+        "scene.node_limit",
+        "scene_node_limit",
+        "scene",
+        "一幕里人物 / 地点的上限",
+        "int",
+        impact="人物与地点各自不能超过它（prompt 不受限，它是必填的那一个）。",
+    ),
     FieldSpec(
         "runtime.worker_limit",
         "worker_limit",

@@ -29,10 +29,28 @@ class RunBody(BaseModel):
     priority: int = 100
 
 
+class MainVideoBody(BaseModel):
+    version_id: str | None = Field(
+        default=None, description="要采用为主视频的生成版本；null 表示取消采用"
+    )
+
+
 @router.get("/projects/{pid}/flow")
 async def flow_graph(pid: str) -> dict[str, Any]:
     """流程图：场景节点 + 衔接边。第一级页面的唯一数据源。"""
     return await sequence.graph(pid)
+
+
+@router.get("/projects/{pid}/scenes/{sid}/videos")
+async def scene_videos(pid: str, sid: str) -> dict[str, Any]:
+    """这一幕生成过的视频（候选主视频）。不能当候选的那些在 omitted 里带原因。"""
+    return await sequence.scene_videos(pid, sid)
+
+
+@router.post("/projects/{pid}/scenes/{sid}/main-video")
+async def adopt_main_video(pid: str, sid: str, body: MainVideoBody) -> dict[str, Any]:
+    """采用某一段为这一幕的主视频（同时设成所属镜头的当前版本）；null 是取消采用。"""
+    return await sequence.adopt_main_video(pid, sid, body.version_id)
 
 
 @router.get("/projects/{pid}/links")

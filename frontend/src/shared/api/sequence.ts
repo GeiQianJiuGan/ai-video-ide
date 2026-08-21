@@ -13,6 +13,7 @@
  */
 
 import { api } from './client'
+import type { SceneCastRow, SceneLocationRow } from './story'
 
 export const LINK_MODES = ['cut', 'transition', 'tail_frame'] as const
 export type LinkMode = (typeof LINK_MODES)[number]
@@ -50,7 +51,14 @@ export interface SceneLink {
   updated_at: string
 }
 
-/** 流程图上的一个节点 = 一幕。缩略图取这一幕第一个有成片的镜头。 */
+/**
+ * 流程图上的一个节点 = 一幕，本身就是一张小图表：
+ * 中间是这一幕的成片（没出片时 `has_video === false`，显示「暂无已生成视频」），
+ * 周围挂着小节点——prompt（必填的那个）、人物、地点。
+ *
+ * 两个字段千万不要混用：`video_path` 是**能播的那一段**（`<video>`），
+ * `thumbnail_path` 只会是图片（`<img>`）。把 `.mp4` 喂给 `<img>` 就是之前那个坏图。
+ */
 export interface FlowNode {
   id: string
   index_no: number
@@ -58,12 +66,31 @@ export interface FlowNode {
   summary: string | null
   time_of_day: string | null
   location_variant_id: string | null
+  location_variant_name: string | null
   shot_count: number
   transition_count: number
   generated_count: number
   duration_total: number
   cast_names: string[]
   cast_count: number
+  /** 这一幕的提示词。小节点里唯一必填的那个。 */
+  prompt: string | null
+  prompt_ok: boolean
+  cast: SceneCastRow[]
+  locations: SceneLocationRow[]
+  /** 人物 / 地点各自的上限，运行期可配（设置页 `scene.node_limit`）。 */
+  node_limit: number
+  /** 用户采用为主视频的那一版；null = 没人采用过，节点播的是自动挑的那一段。 */
+  main_version_id: string | null
+  video_version_id: string | null
+  video_asset_id: string | null
+  video_path: string | null
+  video_duration: number | null
+  /** 正在播的这一段就是用户采用的那一段。 */
+  video_adopted: boolean
+  /** 这一幕一共有几段可播的视频，就是「选一段采用」列表的长度。 */
+  video_count: number
+  has_video: boolean
   thumbnail_asset_id: string | null
   thumbnail_path: string | null
   /** 这一幕的上下文问题去重后的清单，就是节点上黄色感叹号的文案。 */
@@ -161,12 +188,68 @@ export interface LinkBody {
   prompt?: string | null
 }
 
+/**
+ * 这一幕生成过的一段视频（「选一段采用为主视频」列表里的一行）。
+ *
+ * `omitted` 里的行形状一样，只是多一条 `reason`——不能当候选也要说清为什么，
+ * 列表空着不给理由，用户只会以为功能坏了。
+ */
+export interface SceneVideoCard {
+  id: string
+  shot_id: string
+  shot_index_no: number
+  shot_title: string
+  /** shot（导演排的戏）/ transition（衔接补出来的那段）。 */
+  shot_kind: string
+  version_no: number
+  status: string
+  /** generated / manual —— 手工挂进来的版本也要能看出来。 */
+  source: string
+  duration: number | null
+  asset_id: string | null
+  asset_path: string | null
+  /** 它是所属镜头的当前版本——时间线导出的就是当前版本。 */
+  is_shot_current: boolean
+  /** 它是这一幕采用的主视频。 */
+  is_main: boolean
+  created_at: string
+  reason?: string
+}
+
+export interface SceneVideos {
+  scene_id: string
+  title: string
+  main_version_id: string | null
+  items: SceneVideoCard[]
+  omitted: SceneVideoCard[]
+  note: string
+}
+
+/** 采用结果。`node` 是重算过的那一个节点，页面可以直接换掉本地那一份。 */
+export interface AdoptResult {
+  scene_id: string
+  title: string
+  main_version_id: string | null
+  node: FlowNode
+  note: string
+}
+
 export const sequenceApi = {
   graph: (pid: string) => api.get<FlowGraph>(`/projects/${pid}/flow`),
   links: (pid: string) => api.get<SceneLink[]>(`/projects/${pid}/links`),
   /** 同一对场景之间只有一条衔接，所以这是 upsert。 */
   setLink: (pid: string, body: LinkBody) => api.put<SceneLink>(`/projects/${pid}/links`, body),
   deleteLink: (pid: string, linkId: string) => api.del<void>(`/projects/${pid}/links/${linkId}`),
+
+  /** 这一幕生成过的视频（候选主视频）；不能当候选的在 `omitted` 里带原因。 */
+  sceneVideos: (pid: string, sid: string) =>
+    api.get<SceneVideos>(`/projects/${pid}/scenes/${sid}/videos`),
+  /**
+   * 采用某一段为这一幕的主视频；`versionId = null` 是取消采用。
+   * 采用会同时把它设成所属镜头的当前版本——流程图播一段、时间线导出另一段是不能接受的。
+   */
+  adoptMainVideo: (pid: string, sid: string, versionId: string | null) =>
+    api.post<AdoptResult>(`/projects/${pid}/scenes/${sid}/main-video`, { version_id: versionId }),
 
   /** 只出账单，不入队任何任务。 */
   plan: (pid: string, mode: SequenceMode) =>

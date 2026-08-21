@@ -18,7 +18,7 @@ import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import { ApiError } from '@/shared/api/client'
 import { assetsApi } from '@/shared/api/assets'
-import { castApi, type AppearanceRow, type Character } from '@/shared/api/cast'
+import { loadNodeOptions, type CastOption, type VariantOption } from '@/shared/api/pickers'
 import {
   contextApi,
   generationApi,
@@ -33,20 +33,8 @@ import {
   type Shot,
   type ShotPatch,
 } from '@/shared/api/story'
-import { worldApi } from '@/shared/api/world'
 
-/** 左栏可挑的形象：角色名 + 形象名拼好，页面不再自己查两张表。 */
-export interface CastOption {
-  appearance_id: string
-  label: string
-  has_sheet: boolean
-}
-
-/** 可挑的地点变体：「城南旧宅 · 雨夜」，同样在 store 里拼好。 */
-export interface VariantOption {
-  id: string
-  label: string
-}
+export type { CastOption, VariantOption }
 
 export const useSceneStore = defineStore('scene', () => {
   const scene = ref<Scene | null>(null)
@@ -123,26 +111,11 @@ export const useSceneStore = defineStore('scene', () => {
     }
   }
 
-  /** 挑首帧要用的两张清单：有角色表的形象、有参考图的地点变体。 */
+  /** 挑首帧要用的两张清单：形象、地点变体（各自带缩略图，一个接口给全）。 */
   async function loadPickers(pid: string): Promise<void> {
-    const [chars, locs] = await Promise.all([
-      castApi.characters(pid).catch((): Character[] => []),
-      worldApi.locations(pid).catch(() => []),
-    ])
-    variants.value = locs.flatMap((l) =>
-      l.variants.map((v) => ({ id: v.id, label: `${l.name} · ${v.name}` })),
-    )
-    const nested = await Promise.all(
-      chars.map(async (c) => {
-        const apps = await castApi.appearances(pid, c.id).catch((): AppearanceRow[] => [])
-        return apps.map((a) => ({
-          appearance_id: a.id,
-          label: `${c.name} · ${a.name}`,
-          has_sheet: a.sheet_count > 0,
-        }))
-      }),
-    )
-    castOptions.value = nested.flat()
+    const options = await loadNodeOptions(pid)
+    castOptions.value = options.cast
+    variants.value = options.locations
   }
 
   async function load(pid: string, sid: string): Promise<void> {

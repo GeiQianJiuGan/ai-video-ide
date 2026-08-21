@@ -1,7 +1,9 @@
 /**
  * 队列 store（Step 7 的前端）。
  *
- * 队列是唯一「会自己变」的页面，所以这里比别的 store 多一件事：**WS 订阅**。
+ * 队列是唯一「会自己变」的东西，所以这里比别的 store 多一件事：**WS 订阅**。
+ * 订阅的归属在**底部控制台**（`app/layout/ConsolePanel.vue`）——它常驻，所以
+ * 离开队列页不会把实时通道一起带走；队列页只 `load()`，不 connect / disconnect。
  * 三个刻意的取舍：
  *   1. **WS 只当「该刷新了」的信号**。事件幂等且可丢失（docs/03 §5），
  *      所以收到任何 job/queue 事件都去重拉一次 REST，而不是把 payload 往列表里拼——
@@ -98,6 +100,16 @@ export const useQueueStore = defineStore('queue', () => {
     }
   }
 
+  /**
+   * 断开并清空。底部控制台是常驻的，切工程 / 关工程后如果不清掉上一份列表，
+   * 用户会在新工程里看到别的工程的任务——那比空列表糟得多。
+   */
+  function reset(): void {
+    disconnect()
+    state.value = null
+    lastError.value = null
+  }
+
   const pause = (pid: string) => guarded(pid, () => generationApi.pause(pid))
   const resume = (pid: string) => guarded(pid, () => generationApi.resume(pid))
   const retryFailed = (pid: string) => guarded(pid, () => generationApi.retryFailed(pid))
@@ -121,6 +133,7 @@ export const useQueueStore = defineStore('queue', () => {
     load,
     connect,
     disconnect,
+    reset,
     pause,
     resume,
     retryFailed,

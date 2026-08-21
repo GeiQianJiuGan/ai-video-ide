@@ -100,17 +100,21 @@ async function saveText(): Promise<void> {
   syncDraft()
 }
 
+/**
+ * 新建一场。**名字空着不是「按了没反应」**——补一个「第 N 场」的默认名照常建，
+ * 和幕流程图的「加一幕」同一个口径。按钮按下去什么都不发生，最像功能坏了。
+ */
 async function createScene(): Promise<void> {
-  const title = newSceneTitle.value.trim()
-  if (!title) return
+  const title = newSceneTitle.value.trim() || `第 ${story.scenes.length + 1} 场`
   newSceneTitle.value = ''
   await story.createScene(pid.value, { title }).catch(() => {})
 }
 
+/** 同上；镜头必须挂在某一场下，所以没选中场景时按钮是禁用的（tooltip 里写了原因）。 */
 async function createShot(): Promise<void> {
-  const title = newShotTitle.value.trim()
   const sid = story.selectedSceneId
-  if (!title || !sid) return
+  if (!sid) return
+  const title = newShotTitle.value.trim() || `镜头 ${sceneShots.value.length + 1}`
   newShotTitle.value = ''
   await story.createShot(pid.value, sid, { title }).catch(() => {})
   // createShot 只回一条镜头，泳道要重新拉才能看到它
@@ -263,7 +267,13 @@ function fmtDuration(n: number): string {
               class="border-line-1 bg-base-2 text-fg-1 placeholder:text-fg-4 focus:border-accent/60 h-5 w-52 border px-1.5 text-2xs outline-none"
               @keyup.enter="createScene()"
             />
-            <AppButton size="sm" variant="primary" :disabled="story.busy" @click="createScene()">
+            <AppButton
+              size="sm"
+              variant="primary"
+              :disabled="story.busy"
+              title="建一场；名字空着就叫「第 N 场」"
+              @click="createScene()"
+            >
               <Plus :size="10" />新建场景
             </AppButton>
           </template>
@@ -378,7 +388,16 @@ function fmtDuration(n: number): string {
                   class="border-line-1 bg-base-1 text-fg-1 placeholder:text-fg-4 focus:border-accent/60 h-5 min-w-0 flex-1 border px-1.5 text-2xs outline-none"
                   @keyup.enter="createShot()"
                 />
-                <AppButton size="sm" :disabled="story.busy" @click="createShot()">
+                <AppButton
+                  size="sm"
+                  :disabled="story.busy || !story.selectedSceneId"
+                  :title="
+                    story.selectedSceneId
+                      ? '在这一场末尾加一个镜头；名字空着就叫「镜头 N」'
+                      : '先在左边选一场——镜头必须挂在某一场下面'
+                  "
+                  @click="createShot()"
+                >
                   <Plus :size="10" />加镜头
                 </AppButton>
               </li>

@@ -9,7 +9,7 @@ from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 
 from app.core.config import settings
 from app.core.logging import get_logger
-from app.events.bus import Channel, bus
+from app.events.bus import Channel, Event, bus
 
 router = APIRouter()
 log = get_logger("api.ws")
@@ -45,16 +45,20 @@ async def ws_endpoint(
 
     await websocket.accept()
     selected = _parse_channels(channels)
+    # 握手与心跳也走 Event.to_dict()：连线上只有**一种**事件信封（channel / event /
+    # project_id / ts / payload）。以前这两条是手写字面量、少了 ts，前端日志面板照
+    # 契约读 `ts` 就会炸——契约只该有一处口径。
     await websocket.send_json(
-        {
-            "channel": "system",
-            "event": "system.connected",
-            "payload": {
+        Event(
+            channel=Channel.SYSTEM,
+            event="system.connected",
+            project_id=project_id,
+            payload={
                 "version": settings.version,
                 "project_id": project_id,
                 "channels": sorted(c.value for c in selected) if selected else "all",
             },
-        }
+        ).to_dict()
     )
 
     async def pump() -> None:
@@ -64,7 +68,14 @@ async def ws_endpoint(
     async def heartbeat() -> None:
         while True:
             await asyncio.sleep(HEARTBEAT_SECONDS)
-            await websocket.send_json({"channel": "system", "event": "system.ping", "payload": {}})
+            await websocket.send_json(
+                Event(
+                    channel=Channel.SYSTEM,
+                    event="system.ping",
+                    project_id=project_id,
+                    payload={},
+                ).to_dict()
+            )
 
     async def drain() -> None:
         # 客户端消息目前只用于保持连接活跃；订阅变更请重新建立连接。

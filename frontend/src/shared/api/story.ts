@@ -34,12 +34,44 @@ export interface Story {
   updated_at: string
 }
 
+/**
+ * 一幕里的人物小节点。名字由后端拼好（`label` = 角色 · 形象），前端不再查两张表。
+ */
+export interface SceneCastRow {
+  id: string
+  appearance_id: string
+  index_no: number
+  appearance_name: string | null
+  character_id: string | null
+  character_name: string | null
+  label: string
+  /**
+   * 当前角色表那张图，**相对工程目录**的路径（过 `fileUrl(pid, path)` 才是 URL）。
+   * 只会是图片；没有角色表、或那一版挂的不是图时是 null，界面显示「无图」。
+   */
+  thumbnail_path: string | null
+}
+
+/** 一幕里的地点小节点。`is_primary` 那条同步着 `scene.location_variant_id`。 */
+export interface SceneLocationRow {
+  id: string
+  location_variant_id: string
+  index_no: number
+  variant_name: string | null
+  label: string
+  is_primary: boolean
+  /** 变体的参考图，同 `SceneCastRow.thumbnail_path` 的口径。 */
+  thumbnail_path: string | null
+}
+
 export interface Scene {
   id: string
   index_no: number
   title: string
   summary: string | null
   source_text: string | null
+  /** 这一幕的提示词。小节点里**唯一必填**的那个；镜头自己写了 prompt 时以镜头为准。 */
+  prompt: string | null
   location_variant_id: string | null
   time_of_day: string | null
   notes: string | null
@@ -47,6 +79,14 @@ export interface Scene {
   duration_total: number
   /** 「城南旧宅 · 雨夜」，后端拼好的，前端不再自己查地点名。 */
   location_variant_name: string | null
+  /** 小节点：人物与地点都可以是空的，但各自不能超过 `node_limit`。 */
+  cast: SceneCastRow[]
+  locations: SceneLocationRow[]
+  cast_names: string[]
+  /** prompt 填了没有。false 就是节点上那个黄标。 */
+  prompt_ok: boolean
+  /** 人物 / 地点各自的上限，运行期可配（设置页 `scene.node_limit`）。 */
+  node_limit: number
   created_at: string
   updated_at: string
 }
@@ -199,7 +239,10 @@ export interface BreakdownProposal {
 
 export type StoryPatch = Partial<Pick<Story, 'title' | 'raw_text' | 'mode'>>
 export type ScenePatch = Partial<
-  Pick<Scene, 'title' | 'summary' | 'source_text' | 'location_variant_id' | 'time_of_day' | 'notes'>
+  Pick<
+    Scene,
+    'title' | 'summary' | 'source_text' | 'prompt' | 'location_variant_id' | 'time_of_day' | 'notes'
+  >
 >
 export type ShotPatch = Partial<
   Pick<
@@ -224,13 +267,24 @@ export const storyApi = {
   saveStory: (pid: string, patch: StoryPatch) => api.patch<Story>(`/projects/${pid}/story`, patch),
 
   scenes: (pid: string) => api.get<Scene[]>(`/projects/${pid}/scenes`),
+  /** 单幕（含小节点）。流程图节点里已经带了同样的字段，这条是详情页用的。 */
+  scene: (pid: string, sid: string) => api.get<Scene>(`/projects/${pid}/scenes/${sid}`),
   createScene: (pid: string, patch: ScenePatch) =>
     api.post<Scene>(`/projects/${pid}/scenes`, patch),
+  /** 后端按 `exclude_none` 收 patch：要**清空**某个字段得传 `''`，传 `null` 等于没改。 */
   updateScene: (pid: string, sid: string, patch: ScenePatch) =>
     api.patch<Scene>(`/projects/${pid}/scenes/${sid}`, patch),
   deleteScene: (pid: string, sid: string) => api.del<void>(`/projects/${pid}/scenes/${sid}`),
   reorderScenes: (pid: string, order: string[]) =>
     api.put<Scene[]>(`/projects/${pid}/scenes/order`, { order }),
+  /** 这一幕的人物小节点。可以是空数组；超过 `node_limit` 由后端拒绝并说明改哪里。 */
+  setSceneCast: (pid: string, sid: string, appearanceIds: string[]) =>
+    api.put<Scene>(`/projects/${pid}/scenes/${sid}/cast`, { appearance_ids: appearanceIds }),
+  /** 这一幕的地点小节点。**第一条同时是主地点**，所以顺序有意义。 */
+  setSceneLocations: (pid: string, sid: string, variantIds: string[]) =>
+    api.put<Scene>(`/projects/${pid}/scenes/${sid}/locations`, {
+      location_variant_ids: variantIds,
+    }),
 
   createShot: (pid: string, sid: string, patch: ShotPatch) =>
     api.post<Shot>(`/projects/${pid}/scenes/${sid}/shots`, patch),

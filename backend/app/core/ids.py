@@ -32,6 +32,8 @@ PREFIX = {
     "import_session": "imp",
     "shot_cast": "scs",
     "shot_prop": "spp",
+    "scene_cast": "scc",
+    "scene_location": "scl",
     "asset_ref": "arf",
     "export_record": "exp",
     "request": "req",

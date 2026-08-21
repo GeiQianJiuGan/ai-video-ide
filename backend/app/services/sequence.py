@@ -1,9 +1,11 @@
 """场景衔接与编排（两级场景系统的第一级）。
 
-这一层回答两个问题，其它都不管：
+这一层回答三个问题，其它都不管：
 
   1. **两幕之间怎么接**——`SceneLink` 的增删改查（硬切 / 转场 / 续接末帧）；
-  2. **一整部片子怎么排着生成**——`plan()` 先出账单，`run()` 才动手。
+  2. **一整部片子怎么排着生成**——`plan()` 先出账单，`run()` 才动手；
+  3. **一幕的成片是哪一段**——`scene_videos()` 列出这一幕生成过的视频，
+     `adopt_main_video()` 把其中一段采用为这一幕的主视频（流程图节点上能直接播的那一段）。
 
 先出账单是有意的，和 `adopt/plan` 一个道理：编排一次可能起十几个任务、造出几段转场镜头，
 用户得先看见「要生成几条、缺什么、哪几幕会被跳过」，再决定要不要按下去。
@@ -25,6 +27,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from app.core.errors import AppError, ErrorCode
@@ -34,10 +37,11 @@ from app.persistence.models_flow import LINK_MODES, SceneLink
 from app.persistence.models_gen import GenerationVersion
 from app.persistence.models_story import Scene, Shot, ShotCast
 from app.persistence.models_world import Asset
+from app.services.assets import kind_of_suffix
 from app.services.base import as_dict, db_of, fetch, fetch_all
 from app.services.context import context
 from app.services.generation import generation
-from app.services.story import story
+from app.services.story import node_limit, story
 
 MODES = ("parallel", "sequential")
 
@@ -160,7 +164,15 @@ class SequenceService:
     # --- 流程图数据（第一级页面的唯一数据源） ---
 
     async def graph(self, pid: str) -> dict[str, Any]:
-        """场景节点 + 衔接边。节点自带缩略图、出场角色与「能不能生成」。"""
+        """场景节点 + 衔接边。
+
+        节点自带三样东西，前端不用再拼第二遍：
+
+          - **主视频**——这一幕出过片就给出能直接播的那一段（`video_path`），
+            没出片时 `has_video=False`，界面显示「暂无已生成视频」而不是一个坏掉的图；
+          - **小节点**——prompt（必填的那个）、人物、地点，以及当前上限 `node_limit`；
+          - **能不能生成**——`issues` 来自 `story.storyboard` 的上下文检查。
+        """
         db = db_of(pid)
         scenes = await fetch_all(db, Scene, order_by=Scene.index_no)
         shots = await fetch_all(db, Shot, order_by=Shot.index_no)
@@ -168,21 +180,17 @@ class SequenceService:
         assets = {a.id: a for a in await fetch_all(db, Asset)}
         cast_rows = await fetch_all(db, ShotCast)
         board = {lane["id"]: lane for lane in await story.storyboard(pid)}
+        # 小节点（prompt / 人物 / 地点）只有 story 一处口径，这里取它的结果而不是重算一遍。
+        rows = {row["id"]: row for row in await story.list_scenes(pid)}
 
         nodes = []
         for scene in scenes:
             mine = [s for s in shots if s.scene_id == scene.id]
             real = [s for s in mine if s.kind != "transition"]
             done = [s for s in real if s.current_version_id]
-            thumb = next(
-                (
-                    versions[s.current_version_id].asset_id
-                    for s in real
-                    if s.current_version_id and s.current_version_id in versions
-                ),
-                None,
-            )
+            video = self._video_of(scene, mine, versions, assets)
             lane = board.get(scene.id, {})
+            row = rows.get(scene.id, {})
             real_ids = {s.id for s in real}
             names = sorted(
                 {
@@ -192,6 +200,9 @@ class SequenceService:
                     if name
                 }
             )
+            issues = {i for card in lane.get("shots", []) for i in card.get("context_issues", [])}
+            if video.pop("stale_main"):
+                issues.add("采用为主视频的那个版本已经不在这一幕里，节点上播的是自动挑的那一段")
             nodes.append(
                 {
                     "id": scene.id,
@@ -200,6 +211,7 @@ class SequenceService:
                     "summary": scene.summary,
                     "time_of_day": scene.time_of_day,
                     "location_variant_id": scene.location_variant_id,
+                    "location_variant_name": row.get("location_variant_name"),
                     "shot_count": len(real),
                     "transition_count": len(mine) - len(real),
                     "generated_count": len(done),
@@ -208,15 +220,14 @@ class SequenceService:
                     "cast_count": len(
                         {c.appearance_id for c in cast_rows if c.shot_id in real_ids}
                     ),
-                    "thumbnail_asset_id": thumb,
-                    "thumbnail_path": assets[thumb].path if thumb in assets else None,
-                    "issues": sorted(
-                        {
-                            i
-                            for card in lane.get("shots", [])
-                            for i in card.get("context_issues", [])
-                        }
-                    ),
+                    # 小节点：prompt 必填，人物 / 地点可以是空的，但各自不能超过 node_limit
+                    "prompt": scene.prompt,
+                    "prompt_ok": bool(row.get("prompt_ok")),
+                    "cast": row.get("cast", []),
+                    "locations": row.get("locations", []),
+                    "node_limit": row.get("node_limit", node_limit()),
+                    **video,
+                    "issues": sorted(issues),
                 }
             )
         return {
@@ -224,6 +235,186 @@ class SequenceService:
             "links": await self.list_links(pid),
             "modes": [{"name": m, "hint": LINK_HINT[m]} for m in LINK_MODES],
             "note": "节点是一幕，点进去是这一幕的工作台；线是衔接，决定两幕之间怎么接。",
+        }
+
+    def _video_of(
+        self,
+        scene: Scene,
+        mine: list[Shot],
+        versions: dict[str, GenerationVersion],
+        assets: dict[str, Asset],
+    ) -> dict[str, Any]:
+        """这一幕在节点上播哪一段，以及一共有几段可选。
+
+        挑选顺序 **采用的主视频 → 首镜头的当前版本 → 最靠前的一段**：
+        用户明确采用过就一定是那一段；没采用过时也不该在节点上显示「暂无」——
+        已经出片了却看不见，比挑错一段更糟。缩略图只认图片资产，
+        视频永远走 `video_path`（把 `.mp4` 喂给 `<img>` 是之前那个坏图的来源）。
+        """
+        order = {s.id: i for i, s in enumerate(mine)}
+        current = {s.current_version_id for s in mine if s.current_version_id}
+        videos: list[GenerationVersion] = []
+        images: list[GenerationVersion] = []
+        for version in versions.values():
+            if version.shot_id not in order or version.status != "done" or not version.asset_id:
+                continue
+            asset = assets.get(version.asset_id)
+            if asset is None:  # 文件登记丢了：不拿它当可播的那一段
+                continue
+            bucket = kind_of_suffix(Path(asset.path).suffix)
+            if bucket == "video":
+                videos.append(version)
+            elif bucket == "image":
+                images.append(version)
+        videos.sort(key=lambda v: (order[v.shot_id], v.version_no))
+        images.sort(key=lambda v: (order[v.shot_id], v.version_no))
+
+        adopted = next((v for v in videos if v.id == scene.main_version_id), None)
+        picked = adopted or next((v for v in videos if v.id in current), None)
+        picked = picked or (videos[0] if videos else None)
+        poster = images[0] if images else None
+        poster_asset = assets.get(poster.asset_id or "") if poster else None
+        return {
+            "main_version_id": scene.main_version_id,
+            "video_version_id": picked.id if picked else None,
+            "video_asset_id": picked.asset_id if picked else None,
+            "video_path": assets[picked.asset_id].path
+            if picked and picked.asset_id in assets
+            else None,
+            "video_duration": picked.duration if picked else None,
+            "video_adopted": adopted is not None and picked is adopted,
+            "video_count": len(videos),
+            "has_video": picked is not None,
+            "thumbnail_asset_id": poster.asset_id if poster else None,
+            "thumbnail_path": poster_asset.path if poster_asset else None,
+            "stale_main": bool(scene.main_version_id) and adopted is None,
+        }
+
+    # --- 一幕的主视频 ---
+
+    async def scene_videos(self, pid: str, sid: str) -> dict[str, Any]:
+        """这一幕生成过的视频，用来在节点上列出「采用哪一段当主视频」。
+
+        非视频的版本（T2I 出的图）不进候选，但要在 `omitted` 里说清为什么——
+        列表空着而不给理由，用户只会以为功能坏了。
+
+        顺序：镜头按 `index_no` 升序，同一镜头内**新版本在前**——沿用
+        `GET /shots/{id}/versions`（`generation.list_versions`）的口径，
+        不在这里造第二种顺序，否则同一批版本在两个界面里排法不一样。
+        """
+        db = db_of(pid)
+        scene = await fetch(db, Scene, sid, "场景")
+        shots = [s for s in await fetch_all(db, Shot, order_by=Shot.index_no) if s.scene_id == sid]
+        assets = {a.id: a for a in await fetch_all(db, Asset)}
+        items: list[dict[str, Any]] = []
+        omitted: list[dict[str, Any]] = []
+        for shot in shots:
+            for version in await generation.list_versions(pid, shot.id):
+                asset = assets.get(str(version.get("asset_id") or ""))
+                card = {
+                    "id": version["id"],
+                    "shot_id": shot.id,
+                    "shot_index_no": shot.index_no,
+                    "shot_title": shot.title,
+                    "shot_kind": shot.kind,
+                    "version_no": version["version_no"],
+                    "status": version["status"],
+                    "source": version["source"],
+                    "duration": version["duration"],
+                    "asset_id": version.get("asset_id"),
+                    "asset_path": asset.path if asset else None,
+                    "is_shot_current": bool(version.get("is_current")),
+                    "is_main": version["id"] == scene.main_version_id,
+                    "created_at": version["created_at"],
+                }
+                why = self._not_a_candidate(version, asset)
+                if why:
+                    omitted.append({**card, "reason": why})
+                else:
+                    items.append(card)
+        return {
+            "scene_id": sid,
+            "title": scene.title,
+            "main_version_id": scene.main_version_id,
+            "items": items,
+            "omitted": omitted,
+            "note": "采用为主视频会同时把它设成所属镜头的当前版本——时间线只认当前版本，"
+            "两边不能各说一套。旧版本一条都不会删。",
+        }
+
+    def _not_a_candidate(self, version: dict[str, Any], asset: Asset | None) -> str:
+        if version["status"] != "done":
+            return f"这一版还没出片（{version['status']}）"
+        if not version.get("asset_id"):
+            return "这一版没有产出文件"
+        if asset is None:
+            return "产出文件的登记已经不在了"
+        if kind_of_suffix(Path(asset.path).suffix) != "video":
+            return "这一版是图片，不是可播放的视频"
+        return ""
+
+    async def adopt_main_video(self, pid: str, sid: str, version_id: str | None) -> dict[str, Any]:
+        """把某一段采用为这一幕的主视频；`version_id=None` 是取消采用。
+
+        采用**不改任何版本**（版本只增不改），只做两件事：写 `Scene.main_version_id`，
+        并把它设成所属镜头的当前版本——不然流程图上播的是这一段、时间线导出的是另一段。
+        """
+        db = db_of(pid)
+        scene = await fetch(db, Scene, sid, "场景")
+        if version_id:
+            version = await fetch(db, GenerationVersion, version_id, "生成版本")
+            shot = await fetch(db, Shot, version.shot_id, "镜头")
+            if shot.scene_id != sid:
+                raise AppError(
+                    ErrorCode.VALIDATION_ERROR,
+                    "这一版不属于这一幕",
+                    f"版本 {version_id} 的镜头属于另一幕（{shot.scene_id}）。",
+                    ["从这一幕自己的视频列表里选一段", "或者去那一幕采用它"],
+                    {"scene_id": sid, "shot_id": shot.id},
+                )
+            asset = None
+            if version.asset_id:
+                asset = next(
+                    iter(await fetch_all(db, Asset, where=Asset.id == version.asset_id)), None
+                )
+            why = self._not_a_candidate(
+                {
+                    "status": version.status,
+                    "asset_id": version.asset_id,
+                    "version_no": version.version_no,
+                },
+                asset,
+            )
+            if why:
+                raise AppError(
+                    ErrorCode.MISSING_ASSET if version.asset_id else ErrorCode.MISSING_INPUT,
+                    "这一版不能当主视频",
+                    why,
+                    [
+                        "选一段已经出片的视频版本",
+                        "图片版本请在场景工作台里当首帧用，而不是当主视频",
+                        "这一幕还没有任何视频时，先在工作台里生成一段",
+                    ],
+                    {"version_id": version_id},
+                )
+            await generation.set_current_version(pid, version_id)
+
+        async with db.write() as session:
+            row = await session.get(Scene, sid)
+            assert row is not None
+            row.main_version_id = version_id or None
+            row.updated_at = utc_now()
+
+        graph = await self.graph(pid)
+        node = next((n for n in graph["nodes"] if n["id"] == sid), None)
+        return {
+            "scene_id": sid,
+            "title": scene.title,
+            "main_version_id": version_id or None,
+            "node": node,
+            "note": "已采用为这一幕的主视频，并同步成了所属镜头的当前版本。"
+            if version_id
+            else "已取消采用，节点会回到自动挑选的那一段。",
         }
 
     # --- 编排 ---

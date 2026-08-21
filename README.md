@@ -4,6 +4,19 @@
 
 > **AI = 素材生产器 · System = 视频工程与编排器 · Human = 导演**
 
+## 快速开始（开发期）
+
+```bash
+python scripts/dev.py
+```
+
+一条命令起后端（`127.0.0.1:8765`）+ 前端（<http://localhost:5173>），起好自动开浏览器，
+Ctrl+C 一起停。Windows 上也可以直接双击 `start.cmd`，macOS / Linux 用 `./start.sh`。
+
+首次克隆后先装依赖：`cd backend && python -m pip install -e ".[dev]"`、
+`cd frontend && npm install`；抽帧 / 导出还需要内置 FFmpeg：`python scripts/fetch_ffmpeg.py`。
+少了哪一步，启动脚本会直接告诉你该敲什么。
+
 ## 文档
 
 | 文档 | 内容 |

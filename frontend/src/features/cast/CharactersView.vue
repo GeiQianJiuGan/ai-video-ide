@@ -190,7 +190,13 @@ async function saveCharacterField(key: string, value: string): Promise<void> {
         class="border-line-1 bg-base-2 text-fg-1 placeholder:text-fg-4 h-5 w-44 border px-1.5 text-2xs outline-none focus:border-accent/60"
         @keyup.enter="createCharacter()"
       />
-      <AppButton size="sm" variant="primary" :disabled="cast.busy" @click="createCharacter()">
+      <AppButton
+        size="sm"
+        variant="primary"
+        :disabled="cast.busy || !newName.trim()"
+        :title="newName.trim() ? `建一个叫「${newName.trim()}」的角色` : '先在左边填一个角色名字'"
+        @click="createCharacter()"
+      >
         <Plus :size="10" />新建角色
       </AppButton>
       <AppButton size="sm" @click="picking = true"> <Library :size="10" />从素材库采用 </AppButton>
