@@ -75,6 +75,12 @@ export const useConsoleStore = defineStore('console', () => {
     open.value = true
   }
 
+  /** 确保控制台打开并落到指定页签，不执行“同页签再次点击则收起”的切换语义。 */
+  function show(next: ConsoleTab): void {
+    tab.value = next
+    open.value = true
+  }
+
   function toggle(): void {
     open.value = !open.value
   }
@@ -87,5 +93,5 @@ export const useConsoleStore = defineStore('console', () => {
     height.value = clampHeight(px)
   }
 
-  return { open, tab, height, openWith, toggle, close, setHeight, MIN_H, MAX_H }
+  return { open, tab, height, openWith, show, toggle, close, setHeight, MIN_H, MAX_H }
 })

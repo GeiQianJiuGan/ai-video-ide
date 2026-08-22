@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -135,6 +136,15 @@ class TimelineService:
             shot = shots.get(clip.shot_id or "")
             version = versions.get(clip.version_id or "")
             asset = assets_by_id.get(clip.asset_id or "")
+            source_duration = (
+                float(asset.duration)
+                if asset is not None and asset.duration is not None
+                else float(version.duration)
+                if version is not None and version.duration is not None
+                else float(clip.out_point)
+                if clip.out_point is not None
+                else float(clip.in_point + clip.duration)
+            )
             by_track[clip.track_id].append(
                 {
                     **as_dict(clip),
@@ -142,6 +152,7 @@ class TimelineService:
                     "shot_index_no": shot.index_no if shot else None,
                     "version_no": version.version_no if version else None,
                     "asset_path": asset.path if asset else None,
+                    "source_duration": source_duration,
                     "missing_file": bool(clip.asset_id) and asset is None,
                     #: 这段画面的声音被拆到了哪个片段上（没拆过是 None）。
                     "detached_audio_clip_id": detached.get(clip.id),
@@ -427,6 +438,26 @@ class TimelineService:
         new_in = clip.in_point if in_point is None else max(0.0, float(in_point))
         source_end = clip.out_point if clip.out_point is not None else clip.in_point + clip.duration
         new_out = source_end if out_point is None else float(out_point)
+        async with db.read() as session:
+            asset = await session.get(Asset, clip.asset_id) if clip.asset_id else None
+            version = (
+                await session.get(GenerationVersion, clip.version_id) if clip.version_id else None
+            )
+        source_duration = (
+            float(asset.duration)
+            if asset is not None and asset.duration is not None
+            else float(version.duration)
+            if version is not None and version.duration is not None
+            else source_end
+        )
+        if new_in < 0 or new_out > source_duration + 0.001:
+            raise AppError(
+                ErrorCode.VALIDATION_ERROR,
+                "裁切范围超出原视频",
+                f"原视频长度 {source_duration:.3f} 秒，收到的裁切范围是 {new_in:.3f}~{new_out:.3f} 秒。",
+                ["把前后边界线移回原视频范围内", "需要更长内容时换用更长的素材版本"],
+                {"clip_id": clip_id, "source_duration": source_duration},
+            )
         if new_out - new_in <= 0:
             raise AppError(
                 ErrorCode.VALIDATION_ERROR,
@@ -1046,7 +1077,16 @@ class TimelineService:
         }
 
     async def export(self, pid: str, out_path: str | None = None) -> dict[str, Any]:
-        plan = await self.build_command(pid, out_path)
+        try:
+            plan = await self.build_command(pid, out_path)
+        except AppError as err:
+            bus.emit(
+                Channel.ERROR,
+                "export.preflight_failed",
+                err.to_dict(),
+                project_id=pid,
+            )
+            raise
         timeline = await self.get(pid)
         db = db_of(pid)
         record = ExportRecord(
@@ -1111,6 +1151,39 @@ class TimelineService:
             "version_ids": plan["version_ids"],
             "duration": timeline["duration_total"],
         }
+
+    async def open_export_folder(self, pid: str) -> dict[str, str]:
+        """在系统文件管理器中打开工程的默认成片目录。"""
+        target = project_of(pid).dir / "generations" / "exports"
+        target.mkdir(parents=True, exist_ok=True)
+        if sys.platform == "win32":
+            command = ["explorer.exe", str(target)]
+        elif sys.platform == "darwin":
+            command = ["open", str(target)]
+        else:
+            command = ["xdg-open", str(target)]
+        try:
+            await asyncio.create_subprocess_exec(
+                *command,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+        except OSError as exc:
+            raise AppError(
+                ErrorCode.MISSING_CAPABILITY,
+                "无法打开成片文件夹",
+                f"{type(exc).__name__}: {exc}",
+                [f"手动打开 {target}", "确认系统文件管理器可以正常启动"],
+                {"path": str(target)},
+            ) from exc
+        bus.emit(
+            Channel.SYSTEM,
+            "export.folder_opened",
+            {"path": str(target)},
+            project_id=pid,
+        )
+        return {"path": str(target)}
 
     async def list_exports(self, pid: str) -> list[dict[str, Any]]:
         rows = await fetch_all(db_of(pid), ExportRecord, order_by=ExportRecord.created_at.desc())

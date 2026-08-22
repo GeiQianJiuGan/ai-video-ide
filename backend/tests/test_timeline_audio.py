@@ -362,6 +362,27 @@ def test_trim_start_snaps_to_the_neighbour_edge(client: TestClient, pid: str) ->
     )
 
 
+def test_trim_cannot_extend_past_the_original_video(client: TestClient, pid: str) -> None:
+    clip = make_clips(client, pid, 4.0)[0]
+    assert clip["source_duration"] == 4.0
+
+    resp = client.post(
+        f"/api/v1/projects/{pid}/clips/{clip['id']}/trim",
+        json={"in_point": 0.0, "out_point": 5.0},
+    )
+    assert resp.status_code == 422
+    err = error_of(resp)
+    assert "超出原视频" in err["title"]
+    assert err["related_ids"]["source_duration"] == 4.0
+
+    unchanged = clip_in(client.get(f"/api/v1/projects/{pid}/timeline").json(), clip["id"])
+    assert (unchanged["in_point"], unchanged["out_point"], unchanged["duration"]) == (
+        0.0,
+        4.0,
+        4.0,
+    )
+
+
 def test_tracks_are_auto_numbered_and_the_last_video_track_is_protected(
     client: TestClient, pid: str
 ) -> None:
@@ -615,3 +636,21 @@ def test_export_still_refuses_a_missing_audio_file(
     err = error_of(plan)
     assert err["code"] == "MISSING_ASSET"
     assert err["related_ids"]["clip_ids"] == [placed.json()["clip_id"]]
+
+
+def test_open_export_folder_uses_the_platform_file_manager(
+    client: TestClient, pid: str, monkeypatch: pytest.MonkeyPatch, project_dir: Path
+) -> None:
+    calls: list[tuple[tuple[str, ...], dict[str, Any]]] = []
+
+    async def spawn(*args: str, **kwargs: Any) -> object:
+        calls.append((args, kwargs))
+        return object()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    resp = client.post(f"/api/v1/projects/{pid}/exports/open-folder")
+    assert resp.status_code == 200, resp.text
+    target = project_dir / "generations" / "exports"
+    assert Path(resp.json()["path"]) == target
+    assert target.is_dir()
+    assert calls and str(target) in calls[0][0]

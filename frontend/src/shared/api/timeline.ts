@@ -53,6 +53,8 @@ export interface Clip {
   shot_index_no: number | null
   version_no: number | null
   asset_path: string | null
+  /** 原素材总时长。裁切边界绝不能越过它。 */
+  source_duration: number
   /** 所属轨道的类型，省得每次回头去 tracks 里找。 */
   track_kind: string | null
   /** 这段画面的声音被拆到了哪个片段上（没拆过是 null）。 */
@@ -221,6 +223,8 @@ export const timelineApi = {
     api.del<void>(`/projects/${pid}/transitions/${tid}`),
 
   exports: (pid: string) => api.get<ExportRecord[]>(`/projects/${pid}/exports`),
+  openExportFolder: (pid: string) =>
+    api.post<{ path: string }>(`/projects/${pid}/exports/open-folder`),
   exportCommand: (pid: string) => api.get<ExportPlan>(`/projects/${pid}/export/command`),
   /** `path` 留空则写进工程 `generations/exports/`。 */
   export: (pid: string, path?: string | null) =>

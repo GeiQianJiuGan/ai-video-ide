@@ -248,6 +248,14 @@ export const useTimelineStore = defineStore('timeline', () => {
     return record
   }
 
+  async function openExportFolder(pid: string): Promise<string | null> {
+    try {
+      return (await guarded(() => timelineApi.openExportFolder(pid))).path
+    } catch {
+      return null
+    }
+  }
+
   return {
     timeline,
     transitions,
@@ -283,6 +291,7 @@ export const useTimelineStore = defineStore('timeline', () => {
     removeTransition,
     loadPlan,
     runExport,
+    openExportFolder,
     clearError,
     clearAssembleNote,
   }

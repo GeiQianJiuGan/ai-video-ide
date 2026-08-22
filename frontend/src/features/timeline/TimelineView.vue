@@ -10,8 +10,8 @@
  *      不在本地算 ripple 之后的位置——两套算法必然对不上。
  *   2. **撤销按钮只信后端的 can_undo / can_redo**。撤销栈在进程里，重启应用就空了；
  *      前端自己记一份会在重启后骗人。
- *   3. **导出先看命令**。「预检」把将要执行的 FFmpeg 参数原样摆出来，确认后才真的起进程。
- *      看不见命令的导出出问题时无从下手。
+ *   3. **导出状态集中到控制台**。预览区只保留导出成片与打开成片文件夹，
+ *      运行状态、失败详情和后端日志统一落到任务 / 日志框。
  *   4. **缺文件的片段自己举手**。`missing_file` 的片段画成红框并在工具栏计数——
  *      导出会在半路失败，不如提前说。
  *   5. **播放头是唯一的时间真相**。标尺上那根竖条、预览器播到哪、「在播放头处切分」用的
@@ -21,16 +21,18 @@
  *      （从画面「拆出声音」或导入配乐）。音频轨之间可以随意重叠——叠加是它存在的意义，
  *      不是错误；后端导出时用 `amix` 把它们混在一起。
  *
- * 拖拽只做三件事：拖块身 = 移动、拖左右边缘 = 裁切、拖标尺 = 移播放头。**提交仍然全在
- * 后端**：拖动期间只画一个位移预览，松手才发请求，返回的整条时间线整体覆盖。波形没有。
+ * 拖拽只做三件事：拖块身 = 移动、拖左右边界线 = 生成裁切草稿、拖标尺 = 移播放头。
+ * 裁切草稿只在片段内预览，右键确认后才发请求，返回的整条时间线整体覆盖。
  */
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   AudioLines,
+  Check,
   Clapperboard,
+  Crop,
   Download,
-  FileSearch,
+  FolderOpen,
   Lock,
   LockOpen,
   Music,
@@ -47,9 +49,11 @@ import {
 import AppPanel from '@/shared/ui/AppPanel.vue'
 import AppButton from '@/shared/ui/AppButton.vue'
 import AppBadge from '@/shared/ui/AppBadge.vue'
+import AppDialog from '@/shared/ui/AppDialog.vue'
 import EmptyState from '@/shared/ui/EmptyState.vue'
 import ErrorPanel from '@/shared/ui/ErrorPanel.vue'
 import FeatureHeader from '@/shared/ui/FeatureHeader.vue'
+import SplitPane from '@/shared/ui/SplitPane.vue'
 import PreviewPlayer from './PreviewPlayer.vue'
 import {
   TRACK_KIND_LABEL,
@@ -61,18 +65,19 @@ import {
 import { generationApi, type GenerationVersion } from '@/shared/api/generation'
 import { assetsApi } from '@/shared/api/assets'
 import { ApiError, confirmFlagOf } from '@/shared/api/client'
+import { useConsoleStore } from '@/stores/console'
 import { useTimelineStore } from '@/stores/timeline'
 
 const route = useRoute()
 const router = useRouter()
 const tl = useTimelineStore()
+const consolePanel = useConsoleStore()
 
 const pid = computed(() => String(route.params.pid ?? ''))
 
 /** 轨道区的比例尺：每秒多少像素。 */
 const zoom = ref(24)
 const selectedId = ref('')
-const exportPath = ref('')
 /** 选中片段所属镜头的版本列表——「换成另一个版本」的下拉数据。 */
 const versions = ref<GenerationVersion[]>([])
 /** 播放头（秒）。预览器与标尺上那根竖条共用它，见文件开头第 5 条。 */
@@ -84,6 +89,22 @@ const importing = ref(false)
 const note = ref('')
 /** 等确认的删轨：后端回 CONFLICT + `confirm: "force"` 时记下来，确认后带 force 重放。 */
 const forceTrackId = ref('')
+const trimDialogOpen = ref(false)
+
+interface TrimDraft {
+  inOffset: number
+  outOffset: number
+}
+
+interface ClipMenu {
+  clipId: string
+  x: number
+  y: number
+}
+
+/** 边界线只是裁切草稿；用户确认前不写后端。偏移量相对当前片段。 */
+const trimDrafts = ref<Record<string, TrimDraft>>({})
+const clipMenu = ref<ClipMenu | null>(null)
 
 const total = computed(() => tl.timeline?.duration_total ?? 0)
 /** 轨道区的宽度：末尾多留 40px，方便把片段拖到最后一段之后。 */
@@ -105,6 +126,10 @@ function clampTime(value: number): number {
 const selected = computed<Clip | null>(
   () => tl.clips.find((c) => c.id === selectedId.value) ?? null,
 )
+const menuClip = computed<Clip | null>(
+  () => tl.clips.find((c) => c.id === clipMenu.value?.clipId) ?? null,
+)
+const latestExport = computed(() => tl.exports[0] ?? null)
 /** 挂在选中片段上的转场（进或出）。 */
 const clipTransitions = computed(() =>
   tl.transitions.filter(
@@ -142,6 +167,8 @@ async function reload(): Promise<void> {
 
 onMounted(reload)
 watch(pid, reload)
+onMounted(() => window.addEventListener('click', closeClipMenu))
+onUnmounted(() => window.removeEventListener('click', closeClipMenu))
 
 /** 选中的片段被删掉后不要留一块空的检查器。 */
 watch(
@@ -171,15 +198,77 @@ async function saveStart(value: string): Promise<void> {
   await tl.move(pid.value, clip.id, start).catch(() => {})
 }
 
-async function saveTrim(key: 'in_point' | 'out_point', value: string): Promise<void> {
-  const clip = selected.value
-  if (!clip) return
-  const num = value.trim() === '' ? null : Number(value)
-  if (num !== null && !Number.isFinite(num)) return
-  await tl.trim(pid.value, clip.id, { [key]: num, ripple: rippleTrim.value }).catch(() => {})
+function draftOf(clip: Clip): TrimDraft {
+  return (
+    trimDrafts.value[clip.id] ?? {
+      inOffset: Math.max(0, clip.in_point),
+      outOffset: clip.out_point ?? clip.in_point + clip.duration,
+    }
+  )
 }
 
-const rippleTrim = ref(true)
+function trimBounds(clip: Clip): { inOffset: number; outOffset: number } {
+  const draft = draftOf(clip)
+  const sourceEnd = Math.max(MIN_LEN, clip.source_duration)
+  const out = Math.max(MIN_LEN, Math.min(draft.outOffset, sourceEnd))
+  const inOffset = Math.max(0, Math.min(draft.inOffset, out - MIN_LEN))
+  return {
+    inOffset,
+    outOffset: Math.max(inOffset + MIN_LEN, out),
+  }
+}
+
+function hasTrimDraft(clip: Clip): boolean {
+  const draft = trimBounds(clip)
+  const currentEnd = clip.out_point ?? clip.in_point + clip.duration
+  return (
+    Math.abs(draft.inOffset - clip.in_point) > 0.001 ||
+    Math.abs(draft.outOffset - currentEnd) > 0.001
+  )
+}
+
+function closeClipMenu(): void {
+  clipMenu.value = null
+}
+
+function openClipMenu(event: MouseEvent, clip: Clip): void {
+  event.preventDefault()
+  event.stopPropagation()
+  selectedId.value = clip.id
+  clipMenu.value = {
+    clipId: clip.id,
+    x: Math.min(event.clientX, window.innerWidth - 190),
+    y: Math.min(event.clientY, window.innerHeight - 150),
+  }
+}
+
+function requestTrim(): void {
+  if (!menuClip.value) return
+  trimDialogOpen.value = true
+  closeClipMenu()
+}
+
+async function confirmTrim(): Promise<void> {
+  const clip = selected.value
+  if (!clip) return
+  const draft = trimBounds(clip)
+  if (!hasTrimDraft(clip) || draft.outOffset - draft.inOffset < MIN_LEN) return
+  trimDialogOpen.value = false
+  try {
+    await tl.trim(pid.value, clip.id, {
+      in_point: draft.inOffset,
+      out_point: draft.outOffset,
+      start: clip.start + (draft.inOffset - clip.in_point),
+      ripple: false,
+    })
+  } catch {
+    return
+  }
+  const next = { ...trimDrafts.value }
+  delete next[clip.id]
+  trimDrafts.value = next
+}
+
 const splitAt = ref('')
 
 async function doSplit(): Promise<void> {
@@ -273,6 +362,8 @@ interface Drag {
   mode: DragMode
   originX: number
   dx: number
+  originIn: number
+  originOut: number
 }
 
 const drag = ref<Drag | null>(null)
@@ -282,26 +373,65 @@ const DRAG_SLOP = 3
 const MIN_LEN = 0.05
 
 function beginDrag(event: PointerEvent, clip: Clip, mode: DragMode, track: Track): void {
+  if (event.button !== 0) return
   selectedId.value = clip.id
   playhead.value = clampTime(clip.start)
   if (track.locked) return // 锁了的轨道只能看
   capture(event)
-  drag.value = { id: clip.id, mode, originX: event.clientX, dx: 0 }
+  const draft = trimBounds(clip)
+  drag.value = {
+    id: clip.id,
+    mode,
+    originX: event.clientX,
+    dx: 0,
+    originIn: draft.inOffset,
+    originOut: draft.outOffset,
+  }
 }
 
 function onDragMove(event: PointerEvent): void {
-  if (drag.value) drag.value.dx = event.clientX - drag.value.originX
+  if (!drag.value) return
+  drag.value.dx = event.clientX - drag.value.originX
+  const clip = tl.clips.find((c) => c.id === drag.value?.id)
+  if (!clip || drag.value.mode === 'move') return
+  const delta = drag.value.dx / zoom.value
+  const next =
+    drag.value.mode === 'left'
+      ? {
+          inOffset: Math.min(
+            drag.value.originOut - MIN_LEN,
+            Math.max(0, drag.value.originIn + delta),
+          ),
+          outOffset: drag.value.originOut,
+        }
+      : {
+          inOffset: drag.value.originIn,
+          outOffset: Math.max(
+            drag.value.originIn + MIN_LEN,
+            Math.min(
+              clip.source_duration,
+              drag.value.originOut + delta,
+            ),
+          ),
+        }
+  trimDrafts.value = { ...trimDrafts.value, [clip.id]: next }
 }
 
 /** 拖动中的位移预览：只是画一下，位置的真相仍然是后端返回的那一条时间线。 */
 function clipStyle(clip: Clip): Record<string, string> {
   const d = drag.value?.id === clip.id ? drag.value : null
   const shift = d ? d.dx : 0
-  const left = clip.start * zoom.value + (d && d.mode !== 'right' ? shift : 0)
-  const grow = d ? (d.mode === 'right' ? shift : d.mode === 'left' ? -shift : 0) : 0
+  if (hasTrimDraft(clip)) {
+    const bounds = trimBounds(clip)
+    return {
+      left: `${Math.max(0, (clip.start + bounds.inOffset - clip.in_point) * zoom.value + (d?.mode === 'move' ? shift : 0))}px`,
+      width: `${Math.max(8, (bounds.outOffset - bounds.inOffset) * zoom.value)}px`,
+    }
+  }
+  const left = clip.start * zoom.value + (d?.mode === 'move' ? shift : 0)
   return {
     left: `${Math.max(0, left)}px`,
-    width: `${Math.max(8, clip.duration * zoom.value + grow)}px`,
+    width: `${Math.max(8, clip.duration * zoom.value)}px`,
   }
 }
 
@@ -312,30 +442,11 @@ async function endDrag(event: PointerEvent): Promise<void> {
   const clip = d ? tl.clips.find((c) => c.id === d.id) : null
   if (!d || !clip || Math.abs(d.dx) < DRAG_SLOP) return
   const delta = d.dx / zoom.value
-  const outPoint = clip.out_point ?? clip.in_point + clip.duration
   if (d.mode === 'move') {
     await tl.move(pid.value, clip.id, Math.max(0, clip.start + delta)).catch(() => {})
     return
   }
-  if (d.mode === 'left') {
-    // 左边缘要同时改「从素材哪里开始」与「在时间线哪里开始」：一次请求、一格撤销。
-    // ripple 关掉——用户刚刚亲手把这一边拖到了这个位置，紧接着又被贴走就是在跟人抢方向盘。
-    const inPoint = Math.min(Math.max(0, clip.in_point + delta), outPoint - MIN_LEN)
-    await tl
-      .trim(pid.value, clip.id, {
-        in_point: inPoint,
-        start: Math.max(0, clip.start + (inPoint - clip.in_point)),
-        ripple: false,
-      })
-      .catch(() => {})
-    return
-  }
-  await tl
-    .trim(pid.value, clip.id, {
-      out_point: Math.max(clip.in_point + MIN_LEN, outPoint + delta),
-      ripple: rippleTrim.value,
-    })
-    .catch(() => {})
+  // 裁切边界只保存草稿；右键选择“裁切”并在确认框中确认后才提交。
 }
 
 async function doRemove(clipId: string, ripple: boolean): Promise<void> {
@@ -451,18 +562,14 @@ async function addTransition(): Promise<void> {
     .catch(() => {})
 }
 
-/** 导出：预检与执行分成两个动作，不合并。 */
-const exportedNote = ref('')
-
 async function runExport(): Promise<void> {
-  exportedNote.value = ''
-  const rec = await tl.runExport(pid.value, exportPath.value.trim() || null)
-  if (rec) {
-    exportedNote.value =
-      rec.status === 'done'
-        ? `导出完成：${rec.path}`
-        : `导出结束但状态是 ${rec.status}，下面的历史里有详情`
-  }
+  consolePanel.show('logs')
+  await tl.runExport(pid.value, null)
+}
+
+async function openExportFolder(): Promise<void> {
+  consolePanel.show('logs')
+  await tl.openExportFolder(pid.value)
 }
 
 function goShot(shotId: string | null): void {
@@ -623,21 +730,40 @@ function goShot(shotId: string | null): void {
       </button>
     </div>
 
-    <div class="flex min-h-0 flex-1 gap-2 p-2">
-      <div class="flex min-h-0 min-w-0 flex-1 flex-col gap-2">
-        <!-- 预览器：轨道区正上方，逐段实时播放整体成片（不预渲染，见组件开头） -->
-        <PreviewPlayer
-          v-model:playhead="playhead"
-          :pid="pid"
-          :timeline="tl.timeline"
-          class="h-64 shrink-0"
-        />
-
+    <div class="min-h-0 flex-1 p-2">
+      <SplitPane id="timeline-main" direction="horizontal" :sizes="[78, 22]" :min-sizes="[55, 18]">
+        <template #pane-0>
+          <div class="flex min-h-0 min-w-0 flex-1 flex-col gap-1.5 pr-1.5">
+            <div class="border-line-1 bg-base-1 flex h-row shrink-0 items-center gap-1 border px-1.5">
+              <span class="text-fg-3 text-2xs">成片预览</span>
+              <span class="text-fg-4 text-2xs">{{ clock(playhead) }} / {{ clock(total) }}</span>
+              <span v-if="latestExport" class="text-fg-4 max-w-[28rem] truncate text-2xs" :title="latestExport.path">
+                · 最近 {{ latestExport.status === 'done' ? '导出完成' : latestExport.status }}：{{ latestExport.path }}
+              </span>
+              <div class="ml-auto flex items-center gap-1">
+                <AppButton size="sm" :disabled="tl.busy || tl.clips.length === 0" @click="runExport()">
+                  <Download :size="10" />导出成片
+                </AppButton>
+                <AppButton size="sm" variant="ghost" :disabled="tl.busy" @click="openExportFolder()">
+                  <FolderOpen :size="10" />打开成片文件夹
+                </AppButton>
+              </div>
+            </div>
+            <SplitPane id="timeline-preview" direction="vertical" :sizes="[42, 58]" :min-sizes="[24, 28]">
+              <template #pane-0>
+                <PreviewPlayer
+                  v-model:playhead="playhead"
+                  :pid="pid"
+                  :timeline="tl.timeline"
+                  class="min-h-0 flex-1"
+                />
+              </template>
+              <template #pane-1>
         <!-- 轨道区：按秒数比例画块 + 一根贯穿所有轨道的播放头竖条 -->
         <AppPanel title="轨道区" class="min-h-0 flex-1">
           <template #actions>
             <span class="text-fg-4 text-2xs">
-              拖标尺移播放头 · 拖块身移动 · 拖左右边缘裁切 · 松手才提交，位置由后端重排
+              拖标尺移播放头 · 拖块身移动 · 拖左右边界线生成裁切草稿 · 右键确认后提交
             </span>
           </template>
           <EmptyState
@@ -730,18 +856,24 @@ function goShot(shotId: string | null): void {
                           : 'border-line-1',
                     ]"
                     :style="clipStyle(clip)"
-                    :title="`${clip.label ?? clip.id} · 起点 ${fmt(clip.start)} · 时长 ${fmt(clip.duration)}${clip.muted ? ' · 已静音' : ''}${clip.missing_file ? ' · 文件已丢失' : ''}${track.locked ? ' · 轨道已锁，拖不动' : ' · 拖块身移动，拖左右边缘裁切'}`"
+                    :title="`${clip.label ?? clip.id} · 起点 ${fmt(clip.start)} · 时长 ${fmt(clip.duration)}${clip.muted ? ' · 已静音' : ''}${clip.missing_file ? ' · 文件已丢失' : ''}${track.locked ? ' · 轨道已锁，拖不动' : ' · 拖块身移动；拖边界线生成裁切草稿'}`"
                     @click="selectedId = clip.id"
+                    @contextmenu="openClipMenu($event, clip)"
                     @pointerdown="beginDrag($event, clip, 'move', track)"
                     @pointermove="onDragMove($event)"
                     @pointerup="endDrag($event)"
                     @pointercancel="endDrag($event)"
                   >
+                    <span
+                      v-if="hasTrimDraft(clip)"
+                      class="bg-accent/10 pointer-events-none absolute inset-0 z-[1]"
+                    />
                     <!-- 裁切把手。左边缘同时改入点与起点（一次请求、一格撤销） -->
                     <span
                       v-if="!track.locked"
-                      class="hover:bg-accent/70 absolute top-0 bottom-0 left-0 z-10 w-1.5 cursor-ew-resize bg-white/10"
-                      title="拖它改入点（在时间线上的起点跟着走）"
+                      class="hover:bg-accent/70 absolute top-0 bottom-0 z-10 w-1 cursor-ew-resize bg-white/70"
+                      :style="{ left: '0px' }"
+                      title="拖动前边界线，松手后右键选择裁切"
                       @pointerdown.stop="beginDrag($event, clip, 'left', track)"
                       @pointermove.stop="onDragMove($event)"
                       @pointerup.stop="endDrag($event)"
@@ -749,8 +881,9 @@ function goShot(shotId: string | null): void {
                     />
                     <span
                       v-if="!track.locked"
-                      class="hover:bg-accent/70 absolute top-0 right-0 bottom-0 z-10 w-1.5 cursor-ew-resize bg-white/10"
-                      title="拖它改出点"
+                      class="hover:bg-accent/70 absolute top-0 bottom-0 z-10 w-1 cursor-ew-resize bg-white/70"
+                      :style="{ right: '0px' }"
+                      title="拖动后边界线，松手后右键选择裁切"
                       @pointerdown.stop="beginDrag($event, clip, 'right', track)"
                       @pointermove.stop="onDragMove($event)"
                       @pointerup.stop="endDrag($event)"
@@ -790,96 +923,44 @@ function goShot(shotId: string | null): void {
                 <span class="bg-accent absolute top-0 -left-[3px] h-1.5 w-[7px]" />
               </div>
             </div>
+            <div
+              v-if="clipMenu && menuClip"
+              class="border-line-2 bg-base-1 fixed z-50 w-44 border p-1 shadow-xl"
+              :style="{ left: `${clipMenu.x}px`, top: `${clipMenu.y}px` }"
+              @click.stop
+            >
+              <button
+                class="text-fg-1 hover:bg-base-2 flex w-full items-center gap-1.5 px-2 py-1 text-left text-2xs disabled:cursor-not-allowed disabled:opacity-40"
+                :disabled="!hasTrimDraft(menuClip) || tl.busy"
+                @click="requestTrim()"
+              >
+                <Crop :size="11" />确认裁切边界
+              </button>
+              <button
+                v-if="menuClip.track_kind === 'video'"
+                class="text-fg-1 hover:bg-base-2 flex w-full items-center gap-1.5 px-2 py-1 text-left text-2xs"
+                :disabled="tl.busy || !menuClip.asset_path || menuClip.missing_file"
+                @click="detachAudio(); closeClipMenu()"
+              >
+                <AudioLines :size="11" />分割音频到独立轨
+              </button>
+            </div>
             <p v-if="tl.missing.length" class="text-st-review mt-2 text-2xs">
               有 {{ tl.missing.length }} 个片段的文件已经不在磁盘上：导出会在半路失败。
               先把它们换成别的版本或删掉。
             </p>
           </div>
         </AppPanel>
-
-        <!-- 导出：先预检命令，再执行 -->
-        <AppPanel title="导出" class="h-56 shrink-0">
-          <template #actions>
-            <input
-              v-model="exportPath"
-              placeholder="留空则写进工程 generations/exports/"
-              class="border-line-1 bg-base-2 text-fg-1 placeholder:text-fg-4 focus:border-accent/60 h-5 w-60 border px-1.5 text-2xs outline-none"
-            />
-            <AppButton
-              size="sm"
-              :disabled="tl.busy || tl.clips.length === 0"
-              title="只算命令不起进程：把将要执行的 FFmpeg 参数原样摆出来"
-              @click="tl.loadPlan(pid).catch(() => {})"
-            >
-              <FileSearch :size="10" />预检命令
-            </AppButton>
-            <AppButton
-              size="sm"
-              variant="primary"
-              :disabled="tl.busy || tl.clips.length === 0"
-              title="真的起 FFmpeg 进程，用原始素材而不是代理"
-              @click="runExport()"
-            >
-              <Download :size="10" />导出成片
-            </AppButton>
-          </template>
-          <div class="space-y-2 p-2">
-            <p v-if="exportedNote" class="text-fg-2 text-2xs">{{ exportedNote }}</p>
-            <div v-if="tl.plan">
-              <p class="text-fg-3 text-2xs">
-                将写入 <span class="text-fg-1">{{ tl.plan.path }}</span> ·
-                {{ tl.plan.clips }} 个画面片段 · {{ tl.plan.audio_clips }} 段独立音频参与混音
-              </p>
-              <!--
-                预检的警告不是「可能有问题」而是「已经确定会被丢掉 / 说不准」：静音的轨、
-                比画面长的声音、会被 concat 合掉的空档。它必须显示在命令旁边——
-                导出完了才发现少了一条音轨，就得从头再来一遍。
-              -->
-              <ul v-if="tl.plan.warnings.length" class="mt-1 space-y-px">
-                <li v-for="w in tl.plan.warnings" :key="w" class="text-st-review text-2xs">
-                  · {{ w }}
-                </li>
-              </ul>
-              <pre
-                class="text-fg-3 bg-base-2 border-line-1 mt-1 max-h-24 overflow-auto border p-1 text-2xs"
-                >{{ tl.plan.command }}</pre>
-            </div>
-            <p v-else class="text-fg-4 text-2xs">
-              还没预检。导出走 FFmpeg，不碰 ComfyUI 也不碰 LLM——这条路在 AI 全部离线时照样能走完。
-            </p>
-
-            <div class="border-line-1 border-t pt-1.5">
-              <p class="text-fg-3 text-2xs tracking-wide uppercase">导出历史</p>
-              <p v-if="tl.exports.length === 0" class="text-fg-4 mt-1 text-2xs">还没有导出记录。</p>
-              <ul v-else class="mt-1 space-y-1">
-                <li v-for="e in tl.exports" :key="e.id" class="text-2xs">
-                  <span :class="e.status === 'done' ? 'text-st-done' : 'text-st-review'">
-                    {{ e.status }}
-                  </span>
-                  <span class="text-fg-2"> {{ e.path }}</span>
-                  <span class="text-fg-4">
-                    · {{ e.version_ids.length }} 个版本 · {{ e.created_at.slice(0, 16) }}
-                  </span>
-                  <div v-if="e.error" class="border-st-failed/40 bg-base-2 mt-0.5 border p-1">
-                    <p class="text-st-review">{{ e.error.title }}</p>
-                    <p class="text-fg-2">{{ e.error.detail }}</p>
-                    <ul v-if="e.error.suggestions.length" class="text-fg-2 mt-0.5 space-y-px">
-                      <li v-for="s in e.error.suggestions" :key="s">· {{ s }}</li>
-                    </ul>
-                    <p class="text-fg-4 mt-0.5">{{ e.error.code }}</p>
-                  </div>
-                </li>
-              </ul>
-            </div>
+              </template>
+            </SplitPane>
           </div>
-        </AppPanel>
-      </div>
-
-      <AppPanel title="片段属性" class="w-72 shrink-0">
+        </template>
+        <template #pane-1>
+      <AppPanel title="片段属性" class="min-h-0 flex-1">
         <EmptyState
           v-if="!selected"
           title="尚无选中片段"
-          body="点轨道上的一块，这里可以改起点与入出点、切分、换成同一镜头的另一个版本，或者加一个转场。"
+          body="点轨道上的一块，这里可以改起点、切分、拆出声音、换版本或添加转场。"
         />
         <div v-else class="space-y-3 p-2">
           <section>
@@ -920,33 +1001,20 @@ function goShot(shotId: string | null): void {
                   @change="saveStart(($event.target as HTMLInputElement).value)"
                 />
               </label>
-              <label class="block">
-                <span class="text-fg-4 text-2xs">入点（秒）</span>
-                <input
-                  :value="selected.in_point"
-                  type="number"
-                  min="0"
-                  step="0.1"
-                  class="border-line-1 bg-base-2 text-fg-1 focus:border-accent/60 tnum mt-px h-5 w-full border px-1.5 text-2xs outline-none"
-                  @change="saveTrim('in_point', ($event.target as HTMLInputElement).value)"
-                />
-              </label>
-              <label class="block">
-                <span class="text-fg-4 text-2xs">出点（秒，留空=到底）</span>
-                <input
-                  :value="selected.out_point ?? ''"
-                  type="number"
-                  min="0"
-                  step="0.1"
-                  class="border-line-1 bg-base-2 text-fg-1 focus:border-accent/60 tnum mt-px h-5 w-full border px-1.5 text-2xs outline-none"
-                  @change="saveTrim('out_point', ($event.target as HTMLInputElement).value)"
-                />
-              </label>
-              <label class="text-fg-4 flex items-end gap-1 pb-0.5 text-2xs">
-                <input v-model="rippleTrim" type="checkbox" class="accent-accent" />
-                裁切后贴紧后续
-              </label>
+              <div class="text-fg-4 text-2xs">
+                <span class="block">当前保留区间</span>
+                <span class="text-fg-1 tnum mt-px block">
+                  {{ fmt(selected.in_point) }} → {{ fmt(selected.out_point ?? selected.in_point + selected.duration) }}
+                </span>
+              </div>
+              <div class="text-fg-4 text-2xs">
+                <span class="block">原素材长度</span>
+                <span class="text-fg-1 tnum mt-px block">{{ fmt(selected.source_duration) }}</span>
+              </div>
             </div>
+            <p v-if="hasTrimDraft(selected)" class="text-st-review mt-1 text-2xs">
+              待确认保留 {{ fmt(trimBounds(selected).inOffset) }} → {{ fmt(trimBounds(selected).outOffset) }}；右键片段选择“确认裁切”。
+            </p>
             <div class="mt-1 flex items-end gap-1">
               <label class="block min-w-0 flex-1">
                 <span class="text-fg-4 text-2xs">在第几秒切开（时间线绝对秒数）</span>
@@ -1130,6 +1198,43 @@ function goShot(shotId: string | null): void {
           </section>
         </div>
       </AppPanel>
+        </template>
+      </SplitPane>
     </div>
+    <AppDialog
+      v-model:open="trimDialogOpen"
+      title="确认裁切"
+      subtitle="确认后才会写入时间线，原视频文件不会被修改"
+      size="sm"
+    >
+      <div v-if="selected" class="space-y-2 p-3 text-2xs">
+        <p class="text-fg-2">{{ selected.label ?? '未命名片段' }}</p>
+        <div class="bg-base-2 border-line-1 grid grid-cols-2 gap-2 border p-2">
+          <div>
+            <p class="text-fg-4">保留原视频区间</p>
+            <p class="text-fg-1 tnum mt-0.5">
+              {{ fmt(trimBounds(selected).inOffset) }} → {{ fmt(trimBounds(selected).outOffset) }}
+            </p>
+          </div>
+          <div>
+            <p class="text-fg-4">保留时长</p>
+            <p class="text-fg-1 tnum mt-0.5">
+              {{ fmt(trimBounds(selected).outOffset - trimBounds(selected).inOffset) }}
+            </p>
+          </div>
+        </div>
+        <p class="text-fg-4">原素材长度 {{ fmt(selected.source_duration) }}。只保留两条边界线之间的内容。</p>
+      </div>
+      <template #footer>
+        <AppButton variant="ghost" @click="trimDialogOpen = false">取消</AppButton>
+        <AppButton
+          variant="primary"
+          :disabled="!selected || !hasTrimDraft(selected) || tl.busy"
+          @click="confirmTrim()"
+        >
+          <Check :size="10" />确认裁切
+        </AppButton>
+      </template>
+    </AppDialog>
   </div>
 </template>

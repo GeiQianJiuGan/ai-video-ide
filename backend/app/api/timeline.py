@@ -197,6 +197,11 @@ async def list_exports(pid: str) -> list[dict[str, Any]]:
     return await timeline.list_exports(pid)
 
 
+@router.post("/projects/{pid}/exports/open-folder")
+async def open_export_folder(pid: str) -> dict[str, str]:
+    return await timeline.open_export_folder(pid)
+
+
 @router.get("/projects/{pid}/export/command")
 async def export_command(pid: str) -> dict[str, Any]:
     """导出前的预检：把将要执行的 FFmpeg 命令原样给人看。
