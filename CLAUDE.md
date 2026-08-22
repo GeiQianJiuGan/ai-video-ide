@@ -33,7 +33,7 @@ AI Video Studio（`aivs`）：桌面端优先的 AI 原生长视频制作工作�
   （应用级设置 → provider 适配层 → 衔接与编排 → 场景工作台 → 幕流程图 → AI 协作栏）——
   17 个 service（cast / world / assets / workflows / story / context / generation / timeline /
   overview / projects / library / adopt / fsbrowse / appsettings / frames / sequence / director）
-  + 18 个 router（含 `/ws`），238 passed / 1 skipped。
+  + 18 个 router（含 `/ws`），263 passed / 1 skipped。
 - **前端也全部接上了后端**：`app/features.ts` 里 15 个功能都是 `ready: true`，
   `/p/:pid` 下不再有外壳页。`shared/ui/FeatureView.vue`（按注册表画工作区骨架与能力锁）
   暂时没人用，留给下一个「登记了但还没接后端」的功能——那种情况先挂它，绝不给假界面。
@@ -212,7 +212,10 @@ Ctrl + \` 开合，高度记在 localStorage）。控制台常驻，所以 **WS 
 **Context Resolver**（`services/context.py`）：把「到底喂了什么给模型」变成一张账单——每条带
 kind / priority / included / reason；人工覆写记在 `shot.context_overrides_json`（可 reset 回
 自动），`snapshot()` 的结果冻结进 `GenerationVersion.context_json`。入队前
-`require_complete()` 是硬门槛，`check_context=false` 才能显式跳过。
+`require_complete()` 是硬门槛，`check_context=false` 才能显式跳过。采用的条目还带一个
+`role`（`first_frame` / `reference`）——**「哪一张当首帧」这条规则只在 `_assign_roles` 这一处**，
+`services/generation.py::_images_of` 照账单读它，绝不在生成层再挑一遍（两边各挑一次的话，
+检查器上标的和真正喂进去的会分叉）。上限是应用级设置 `video.ref_limit`（默认 8，`ref_limit()`）。
 
 **时间线与导出**（`services/timeline.py`）：完全不依赖 AI。撤销栈是整轨快照（`UNDO_DEPTH=50`）；
 `GET /export/command` 只产出 ffmpeg 参数计划，`POST /export` 才真的起进程。
@@ -241,12 +244,28 @@ kind / priority / included / reason；人工覆写记在 `shot.context_overrides
   仍留在清单里）+ `node_limit` / `limit_hint`；`GET /scenes/{sid}` 回的 `cast[]` / `locations[]`
   也带同一个 `thumbnail_path`。前端一律走 `shared/ui/AppThumb.vue`（缺图退化成占位块，
   绝不显示碎图标），**不要**再按角色 / 变体一个个拉 `appearances` / `references` 拼 N+1。
+- **「用哪一段」只挂在镜头上，幕上没有第二个指针**：一幕下面很多镜头，每个镜头各自独立生成
+  很多段，所以这件事只能一个镜头一个镜头地定——就是 `Shot.current_version_id`，
+  `timeline.auto_assemble` 装配的、下游镜头抽末帧认的都是它，采用只走全工程唯一那个入口
+  `POST /projects/{pid}/versions/{version_id}/current`（硬约束 3；新版本入库时自动成为当前版本，
+  所以刚生成完就是「已采用」，换一段就是再采用一次，旧版本一条都不删）。
+  `GET /scenes/{sid}/videos` **按镜头分组**列候选（`shots[]`，每组带 `adopted_version_id` 与
+  `items` / `omitted`，不能当候选的进 `omitted` 并附原因），前端照组渲染，不再有幕级别的
+  「主视频」。历史上幕上另存过一个 `Scene.main_version_id`：镜头一搬到别的幕那个指针就发霉，
+  只能靠 `issues` 报「已失效」——`0006_shot_adopted_video` 把它回填进
+  `shot.current_version_id` 后删掉了这一列。
 - **节点上播的那一段**：`graph()` 的节点带 `video_path`（能播的 `<video>`）与 `thumbnail_path`
-  （只会是图片），**两个字段绝不混用**。挑用哪一段的顺序是「采用的主视频 → 首镜头的当前版本 →
-  最靠前的一段」；`GET /scenes/{sid}/videos` 列出候选（不能当候选的进 `omitted` 并附原因），
-  `POST /scenes/{sid}/main-video` 采用一段（`version_id: null` 取消）——它只改「用哪一段」，
-  顺手把它设成所属镜头的当前版本，一条版本都不会被删（硬约束 3）。采用过的那段后来不在候选里了
-  就进 `issues`，不静默换成别的。
+  （只会是图片），**两个字段绝不混用**。挑用哪一段的顺序是「按镜头顺序 → 同一镜头内采用的
+  那一版优先 → 否则最新的那一版」，并带上 `video_shot_id`（播的这段属于哪个镜头）与
+  `video_adopted`；整幕都没采用过视频时也不显示「暂无」——已经出片了却看不见比挑错一段更糟，
+  此时 `video_adopted=false`，界面上标出「播的只是自动挑的一段」，不假装是。
+  **这条「视频 / 缩略图分开给」的规矩三处共用**：幕节点（`sequence.graph()`）、分镜板卡片
+  （`story._shot_media`）、版本轨（`generation._version_media`）。缩略图只有两个来源——那一版本身
+  就是图片，或这段视频**已经抽过首帧**（`frames.start_frame_index`，`Asset(kind="frame")` 的
+  `meta_json.at == "start"`，解读只放在这一个函数里）；一张都没有时只回 `video_path`，
+  `<video preload="metadata">` 自己会画第一帧，**读路径绝不顺手起 FFmpeg**（补抽走分镜板的
+  `POST /storyboard/posters` 这个显式入口）。把 `.mp4` 塞进 `<img>` 只会得到一个坏图标——
+  「分镜里截取的首帧加载失败」与版本轨上那一排坏图都是这么来的。
 - **第二级：场景工作台**（前端 `features/flow/SceneWorkbench.vue`）：单幕的首帧 / 末帧槽位 →
   R2V 生成 → 版本轨。**本轮没有 T2V。** 从第一级过去的手势是**双击节点**（单击只选中）。
 - **AI 协作栏**（`app/ai/director/` + `services/director.py` + `api/director.py`，前端
@@ -260,18 +279,34 @@ kind / priority / included / reason；人工覆写记在 `shot.context_overrides
   退化成一次性 `complete_json()`，提案形状完全一样。会话与提案存 `DirectorTurn`（只增不改），
   审阅到一半刷新页面不丢。
 - **provider 适配层**（`app/generation/providers/`）：`base.py` 定义与模型无关的 `VideoRequest`
-  （`mode` = `i2v` / `flf`、prompt、首尾帧、时长、seed、透传 `extra`）与 `VideoProvider`
-  协议（`probe` / `submit` / `poll` / `fetch`）；`comfy_preset.py` 是默认核心，`http_api.py` 是
-  通用 REST 合同，`registry.py::provider_for(name)` 按应用级设置选。
+  （`mode` = `i2v` / `flf`、prompt、首尾帧、**参考图 `refs`**、时长、seed、透传 `extra`、
+  降级说明 `notes`）与 `VideoProvider` 协议（`probe` / `submit` / `poll` / `fetch`）；
+  `comfy_preset.py` 是默认核心，`http_api.py` 是通用 REST 合同，`registry.py::provider()`
+  按应用级设置选。
   **本工具不维护模型端的图**：ComfyUI 适配器只按**节点 title 约定**注入入口参数——
   `AIVS_FIRST_FRAME` / `AIVS_LAST_FRAME` / `AIVS_PROMPT` / `AIVS_NEGATIVE` / `AIVS_DURATION` /
-  `AIVS_SEED`——不解析、不校验、不改写图里的 lora 与加速节点。缺必需 title 时报
-  `INVALID_WORKFLOW`，建议里写「在 ComfyUI 里把该节点标题改成 X」。lora、加速节点、采样器
-  怎么摆是模型端自己的事，本工具跟着改迟早两边打架。
+  `AIVS_SEED` / `AIVS_REF_1`…`AIVS_REF_9`——不解析、不校验、不改写图里的 lora 与加速节点。
+  缺必需 title 时报 `INVALID_WORKFLOW`，建议里写「在 ComfyUI 里把该节点标题改成 X」。
+  lora、加速节点、采样器怎么摆是模型端自己的事，本工具跟着改迟早两边打架。
+- **首尾帧 ≠ 参考图**（`AIVS_REF_*` 那一组就是为这件事加的）：首尾帧决定「画面从哪一格开始 /
+  结束」，参考图决定「谁出场、在哪儿」。只喂一张首帧最容易丢的就是人物形象，所以账单里采用的
+  条目**除首帧那一张之外全部当参考图送到模型端**（`generation._images_of`）。
+  **槽位不够只降级、不失败**：图里标了 3 个而账单给了 5 张就填前 3 张，把少喂了哪几张写进
+  `req.notes` → 冻结成版本参数 `ref_notes`（`refs` 记实际喂了哪几张），界面上看得见。
+  一个 `AIVS_REF_*` 都没有的预设照样 `ready`，只是设置页的预设列表会把「参考图 0 槽」
+  标成警告。默认会在 prompt 末尾附一句 `参考图说明：参考图1=…`（`base.ref_hint`，
+  ComfyUI 那类图收不到标签，只能靠这句对号），设置里 `video.ref_labels` 可关。
 - **真末帧抽取**（`services/frames.py`）：`tail_frame` 衔接靠它。FFmpeg `-sseof` 抽一张 PNG →
   登记 `Asset(kind="frame")` → 同 (asset, at) 幂等复用；`services/context.py` 的 `prev_frame`
   指的就是这张抽出来的帧，不是上游那整段视频。抽取失败报 `FFMPEG_ERROR`，建议里给出
   「改用转场衔接」这条出路。
+  **抽出来的首尾帧是临时资源，不是工程资产**：它落 `cache/frames/`（`KIND_DIR["frame"]`）而不是
+  `assets/`，在 `assets.TRANSIENT_KINDS` 里，所以**不进资产总账、不算孤儿**（要看它们得显式
+  `?kind=frame`）——它没有任何 `AssetRef`，算进孤儿列表只会把「可以回收的文件」这份清单刷满。
+  它仍然是一行 `Asset`：上下文账单与 `_images_of` 都是靠 `asset_id → path` 取文件的，从登记里
+  拿掉就得另造一套解析。**源成片一删，从它抽的帧跟着删**（`assets.delete` 走
+  `frames.derived_frames` 认 `meta_json.from_asset_id`），删了哪几张回在 `derived_removed` 里，
+  界面必须说出来——连带删除绝不静默。反过来不成立：单独删一张帧不动成片，需要时重抽一次就有。
 - **应用级设置**（`services/appsettings.py` + `api/settings.py`）：落
   `settings.runtime_dir / "settings.json"`（与 `library.json` / `recent.json` 同级），生效顺序
   **settings.json → 环境变量 → 默认**，每个字段回一个 `source` 让 UI 标出「来自配置文件 /
@@ -306,12 +341,13 @@ kind / priority / included / reason；人工覆写记在 `shot.context_overrides
 - **新增表**：工程表必须在 `persistence/all_models.py` 里 import，否则 `Base.metadata` 漏表；
   素材库表相反——挂 `LibraryBase`，**不要**进 `all_models.py`（理由见上面的素材库段）。
 - **新增迁移**：`alembic/versions/` 加脚本 → 在 `persistence/migrate.py::REVISION_SCHEMA` 登记
-  它对应的 schema 版本 → 同步 `settings.schema_version`（当前 5，最新一条是
-  `0005_scene_nodes`：`SceneCast` / `SceneLocation` 两张表 + `Scene.prompt` /
-  `Scene.main_version_id`）。漏登记会导致
+  它对应的 schema 版本 → 同步 `settings.schema_version`（当前 6，最新一条是
+  `0006_shot_adopted_video`：把 `Scene.main_version_id` 回填进 `shot.current_version_id`
+  后删掉那一列，「用哪一段」从此只有镜头级一个指针）。漏登记会导致
   打开旧工程时无法告诉用户「schema X → Y」。
 - **落盘**：资产 `path` 相对工程目录存（整个目录拷走仍然有效）；类型→子目录映射在
-  `services/assets.py::KIND_DIR`，`generations/` 只放生成物，手动素材一律进 `assets/`。
+  `services/assets.py::KIND_DIR`，`generations/` 只放生成物，手动素材一律进 `assets/`，
+  可再生的临时文件（抽出来的首尾帧）进 `cache/`。
   所有落盘文件都要登记 `Asset` + `AssetRef`，删除前先说清会破坏什么。
 - **外部依赖离线不是崩溃**：ComfyUI / FFmpeg / LLM 不可用时给带建议的结构化错误
   （`COMFY_OFFLINE` / `FFMPEG_MISSING` / `LLM_UNAVAILABLE`），并指出哪些路径不受影响。

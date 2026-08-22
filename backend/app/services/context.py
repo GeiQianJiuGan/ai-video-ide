@@ -4,12 +4,16 @@
 每一条都必须回答三个问题——哪来的、优先级多少、为什么被包含或被省略。
 人可以手动移除 / 添加 / 替换，覆写记录写在 shot.context_overrides_json，
 随时可以「恢复自动」。
+
+被采用的条目还带一个 `role`：**哪一张当首帧、剩下的当参考图**。这条规则只写在这里，
+`services/generation.py` 照账单读它，不再自己挑一遍——否则界面上标的和真正喂进去的会分叉。
 """
 
 from __future__ import annotations
 
 from typing import Any
 
+from app.core.config import settings
 from app.core.errors import AppError, ErrorCode
 from app.persistence.models import utc_now
 from app.persistence.models_cast import Appearance, Character, SheetVersion
@@ -33,8 +37,34 @@ PRIORITY = {
     "prop_reference": 60,
     "manual": 110,
 }
-#: 单次生成能喂进去的参考图上限。真实上限应由 Workflow 声明，这里给一个保守默认。
-DEFAULT_REF_LIMIT = 4
+
+
+def ref_limit() -> int:
+    """一次生成最多算到第几张参考图（含当首帧那一张）。
+
+    运行期可配（设置页 `video.ref_limit`）：真实上限取决于模型端那份图有几个参考图槽位，
+    我们这边只负责别把账单算得比它还满。
+    """
+    return max(1, int(settings.video_ref_limit))
+
+
+def _assign_roles(items: list[dict[str, Any]], has_prev: bool) -> None:
+    """给采用的条目标上 `role`：一张 `first_frame`，其余 `reference`。
+
+    规则只有这一份，`services/generation.py` 照它读——以前那边自己又挑了一遍首帧，
+    于是检查器上标的和真正喂进去的可能不是同一张。
+
+    挑首帧的顺序：**有上游就用上游末帧**（连续性优先，这是 tail_frame 衔接的全部意义），
+    否则用优先级最高的那张（通常是角色表）。没有采用任何条目时谁都不标，
+    生成层会去 `params.first_frame_asset_id` 里找显式指定的那张。
+    """
+    used = [i for i in items if i.get("included")]
+    for item in items:
+        item["role"] = "reference" if item.get("included") else ""
+    if not used:
+        return
+    first = next((i for i in used if i["kind"] == "prev_frame"), None) if has_prev else None
+    (first or used[0])["role"] = "first_frame"
 
 
 def _extracted_frame(assets: Any, from_asset_id: str | None) -> str | None:
@@ -256,7 +286,7 @@ class ContextService:
 
         # 排序 → 应用覆写 → 卡上限
         items.sort(key=lambda i: (-int(i["priority"]), str(i["key"])))
-        limit = DEFAULT_REF_LIMIT
+        limit = ref_limit()
         included = 0
         for item in items:
             item["manual"] = item["kind"] == "manual" or item["key"] in removed
@@ -270,7 +300,7 @@ class ContextService:
                 item["reason"] = "没有可用的图片资产"
             elif included >= limit:
                 item["included"] = False
-                item["reason"] = f"参考图总数已达 Workflow 上限 {limit}"
+                item["reason"] = f"已达参考图上限 {limit} 张（可在设置页的「视频生成 API」里调整）"
             else:
                 item["included"] = True
                 included += 1
@@ -278,6 +308,7 @@ class ContextService:
             item["asset_path"] = asset.path if asset else None
             item["missing_file"] = bool(item["asset_id"]) and asset is None
             item.pop("eligible", None)
+        _assign_roles(items, bool(shot.prev_shot_id))
 
         problems = []
         if not scene.location_variant_id:
@@ -408,6 +439,8 @@ class ContextService:
                     "label": i["label"],
                     "asset_id": i["asset_id"],
                     "priority": i["priority"],
+                    #: 这一张是当首帧还是当参考图。冻结它，事后才说得清「喂了什么」。
+                    "role": i.get("role") or "reference",
                 }
                 for i in ctx["items"]
                 if i["included"]

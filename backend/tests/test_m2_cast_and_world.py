@@ -388,7 +388,14 @@ def test_orphans_then_referenced_asset_refuses_deletion(
 
     forced = client.delete(f"/api/v1/projects/{pid}/assets/{asset['id']}?force=true")
     assert forced.status_code == 200, forced.text
-    assert forced.json() == {"id": asset["id"], "file_removed": True, "broken_refs": 1}
+    assert forced.json() == {
+        "id": asset["id"],
+        "file_removed": True,
+        "broken_refs": 1,
+        # 这张图没派生过临时帧（它不是视频），所以连带删除是空的——空列表也要给，
+        # 前端照这个字段渲染「连带删掉了几张帧」，缺字段就得写一堆兜底判断。
+        "derived_removed": [],
+    }
     assert not (project_dir / asset["path"]).exists()
 
 

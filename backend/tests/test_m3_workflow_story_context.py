@@ -425,7 +425,7 @@ def test_context_lists_every_problem_when_empty(client: TestClient, pid: str) ->
     ]
     assert ctx["items"] == []
     assert ctx["included_count"] == 0
-    assert ctx["limit"] == 4
+    assert ctx["limit"] == 8  # 应用级设置 video.ref_limit 的默认值
     assert ctx["at_limit"] is False
 
 
@@ -436,6 +436,8 @@ def test_context_bill_explains_priority_and_source(client: TestClient, pid: str)
     assert ctx["problems"] == []
     kinds = [(i["kind"], i["included"], i["priority"]) for i in ctx["items"]]
     assert kinds == [("character_sheet", True, 100), ("location_reference", True, 90)]
+    # 没有上游镜头时优先级最高的那张当首帧，其余当参考图——这条规则只在 context 里
+    assert [i["role"] for i in ctx["items"]] == ["first_frame", "reference"]
     sheet = ctx["items"][0]
     assert sheet["reason"] == "该角色在本镜头出场"
     assert sheet["asset_path"].startswith("assets/character_sheets/")
@@ -537,8 +539,10 @@ def test_context_snapshot_records_included_and_omitted(client: TestClient, pid: 
     )
     snap = client.get(f"/api/v1/projects/{pid}/shots/{shot_id}/context/snapshot").json()
     assert [i["kind"] for i in snap["included"]] == ["location_reference"]
+    # 首帧那一张也冻结进账单：地点参考是唯一剩下的采用条目，所以它就是首帧
+    assert [i["role"] for i in snap["included"]] == ["first_frame"]
     assert [(i["key"], i["reason"]) for i in snap["omitted"]] == [(sheet_key, "手动移除")]
-    assert snap["limit"] == 4
+    assert snap["limit"] == 8
     assert snap["resolved_at"]
 
 

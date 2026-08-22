@@ -8,6 +8,7 @@
       assets/             角色表、场景参考、道具图
       generations/        每次生成的输出与参数快照
       proxies/            720p 代理流，仅用于预览
+      cache/              派生的临时文件（抽出来的首尾帧），删了能重新生成
 
 两条硬规矩：
   1. 绝不覆盖用户的文件。目录里已有无法识别的 project.db 时直接报错，
@@ -39,7 +40,7 @@ log = get_logger("projects")
 
 MANIFEST_NAME = "project.aivs.json"
 DB_NAME = "project.db"
-SUBDIRS = ("assets", "generations", "proxies")
+SUBDIRS = ("assets", "generations", "proxies", "cache")
 MANIFEST_KIND = "aivs-project"
 RECENT_LIMIT = 20
 

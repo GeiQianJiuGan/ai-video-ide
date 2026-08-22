@@ -88,7 +88,8 @@ MANIFEST_KIND = "aivs-library"
 LIBRARY_SCHEMA = 1
 SUBDIRS = ("assets",)
 
-#: 库里允许的素材类型 → 子目录。生成物与代理流是工程的东西，库里没有它们。
+#: 库里允许的素材类型 → 子目录。只收 `assets/` 下的那些：生成物与代理流是工程的东西，
+#: 抽出来的首尾帧是临时资源（落 `cache/frames/`），两类都不该进库。
 LIB_KIND_DIR = {kind: rel for kind, rel in KIND_DIR.items() if rel.startswith("assets/")}
 TAG_OWNERS = ("asset", "character", "location", "prop")
 

@@ -13,6 +13,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from app.ai import prompts
 from app.ai.llm import client as llm
 from app.core.config import settings
 from app.core.errors import AppError, ErrorCode
@@ -39,6 +40,7 @@ from app.persistence.models_world import (
 )
 from app.services.assets import kind_of_suffix
 from app.services.base import as_dict, db_of, fetch, fetch_all, load_json
+from app.services.frames import frames, start_frame_index
 
 SCENE_FIELDS = (
     "title",
@@ -62,13 +64,6 @@ SHOT_FIELDS = (
     "steps",
     "workflow_id",
     "prev_shot_id",
-)
-
-BREAKDOWN_SYSTEM = (
-    "你是分镜师。把中文剧本拆成 Scene 与 Shot，只返回 JSON 对象，"
-    '形如 {"scenes":[{"title":"","summary":"","time_of_day":"",'
-    '"shots":[{"title":"","description":"","duration":4,"camera":"","movement":"",'
-    '"characters":["角色名"]}]}]}。duration 单位为秒，取 2~8。不要输出解释文字。'
 )
 
 
@@ -114,6 +109,60 @@ def _image_path(asset_id: str | None, assets: dict[str, Asset]) -> str | None:
     if asset is None or kind_of_suffix(Path(asset.path).suffix) != "image":
         return None
     return asset.path
+
+
+def _shot_media(
+    shot: Shot,
+    versions: dict[str, GenerationVersion],
+    assets: dict[str, Asset],
+    posters: dict[str, Asset],
+) -> dict[str, Any]:
+    """一张卡片上「能播的那一段」与「能当图显示的那一张」。
+
+    以前这里只回一个 `thumbnail_asset_id = 当前版本的资产`——而当前版本几乎总是
+    一段 `.mp4`，前端把它塞进 `<img>` 就是「分镜里截取的首帧加载失败」的真正原因。
+    现在两件事分开：视频永远走 `video_path`，缩略图**只认图片**。
+
+    缩略图的挑选顺序 **抽出来的真首帧 → 该镜头生成出的图片版本**；两样都没有而
+    确实有视频时回 `poster_pending=true`，前端据它去调
+    `POST /storyboard/posters` 补抽——读路径自己绝不起 FFmpeg。
+    """
+    mine = [
+        v
+        for v in versions.values()
+        if v.shot_id == shot.id and v.status == "done" and v.asset_id and v.asset_id in assets
+    ]
+    mine.sort(key=lambda v: v.version_no)
+
+    def bucket(version: GenerationVersion) -> str:
+        return kind_of_suffix(Path(assets[version.asset_id or ""].path).suffix)
+
+    videos = [v for v in mine if bucket(v) == "video"]
+    images = [v for v in mine if bucket(v) == "image"]
+
+    current = versions.get(shot.current_version_id or "")
+    picked = next((v for v in videos if current and v.id == current.id), None) or (
+        videos[-1] if videos else None
+    )
+    video_asset = assets.get(picked.asset_id or "") if picked else None
+
+    poster = posters.get(video_asset.id) if video_asset else None
+    poster_path = poster.path if poster else None
+    if poster_path is None:
+        chosen = next((v for v in images if current and v.id == current.id), None) or (
+            images[-1] if images else None
+        )
+        poster = assets.get(chosen.asset_id or "") if chosen else None
+        poster_path = poster.path if poster else None
+    return {
+        "thumbnail_asset_id": poster.id if poster else None,
+        "thumbnail_path": poster_path,
+        "video_version_id": picked.id if picked else None,
+        "video_asset_id": video_asset.id if video_asset else None,
+        "video_path": video_asset.path if video_asset else None,
+        # 有片子但还没有能当图显示的那一张：可以补抽，不是错误
+        "poster_pending": bool(video_asset) and poster_path is None,
+    }
 
 
 def _sheet_thumbs(sheets: list[SheetVersion], assets: dict[str, Asset]) -> dict[str, str]:
@@ -757,6 +806,8 @@ class StoryService:
         variants = {v.id: v for v in await fetch_all(db, LocationVariant)}
         apps = {a.id: a for a in await fetch_all(db, Appearance)}
         chars = {c.id: c for c in await fetch_all(db, Character)}
+        assets = {a.id: a for a in await fetch_all(db, Asset)}
+        posters = start_frame_index(list(assets.values()))
 
         lanes = []
         for scene in scenes:
@@ -791,7 +842,7 @@ class StoryService:
                         issues.append("没有出场角色")
                     if not (shot.prompt or shot.description or scene.prompt):
                         issues.append("没有 prompt 也没有画面描述")
-                current = versions.get(shot.current_version_id or "")
+                media = _shot_media(shot, versions, assets, posters)
                 cards.append(
                     {
                         "id": shot.id,
@@ -803,7 +854,7 @@ class StoryService:
                         "status": shot.status,
                         "camera": shot.camera,
                         "cast_names": names,
-                        "thumbnail_asset_id": current.asset_id if current else None,
+                        **media,
                         "version_count": len(
                             [v for v in versions.values() if v.shot_id == shot.id]
                         ),
@@ -822,6 +873,47 @@ class StoryService:
             )
         return lanes
 
+    async def extract_posters(self, pid: str, shot_ids: list[str] | None = None) -> dict[str, Any]:
+        """给分镜板上「有片子但还没有图」的卡片补抽一张首帧。
+
+        它是**写操作**，所以独立成一个端点：`GET /storyboard` 只读，绝不在读路径上
+        起 FFmpeg 进程（同 `context.py` 那条规矩）。抽出来的是一张真 PNG，登记成
+        `Asset(kind="frame")`，同一段视频再抽是幂等复用（`frames.extract`）。
+
+        单条失败不打断其余——某一段视频损坏是它自己的事。每条失败都带完整四要素，
+        界面照原样显示。只有 FFmpeg 本身缺失是**全局**问题，那种情况立刻抛出去，
+        不给用户看 20 条一模一样的错。
+        """
+        lanes = await self.storyboard(pid)
+        wanted = set(shot_ids or [])
+        pending = [
+            card
+            for lane in lanes
+            for card in lane["shots"]
+            if card["poster_pending"] and (not wanted or card["id"] in wanted)
+        ]
+        extracted: list[dict[str, Any]] = []
+        failed: list[dict[str, Any]] = []
+        for card in pending:
+            try:
+                asset = await frames.extract(pid, card["video_asset_id"], "start")
+            except AppError as err:
+                if err.code == ErrorCode.FFMPEG_MISSING:
+                    raise
+                failed.append(
+                    {"shot_id": card["id"], "title": card["title"], "error": err.to_dict()}
+                )
+                continue
+            extracted.append(
+                {
+                    "shot_id": card["id"],
+                    "asset_id": asset["id"],
+                    "path": asset["path"],
+                    "reused": bool(asset.get("reused")),
+                }
+            )
+        return {"requested": len(pending), "extracted": extracted, "failed": failed}
+
     # --- AI 拆解（可选） ---
 
     async def propose_breakdown(self, pid: str, text: str | None = None) -> dict[str, Any]:
@@ -835,7 +927,9 @@ class StoryService:
                 "没有可拆解的文本。",
                 ["先把剧本粘贴进左栏", "或直接用「手动添加 Scene」"],
             )
-        data = await llm.complete_json(BREAKDOWN_SYSTEM, raw)
+        # 系统提示词是可配的（设置页「AI 提示词」→「剧本拆解」），内置默认与
+        # 「形状永远由代码追加」这条规矩都在 app/ai/prompts.py。
+        data = await llm.complete_json(prompts.breakdown(), raw)
         scenes_raw = data.get("scenes")
         if not isinstance(scenes_raw, list) or not scenes_raw:
             raise AppError(

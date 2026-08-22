@@ -35,8 +35,11 @@ KIND_DIR = {
     "character_sheet": "assets/character_sheets",
     "location_reference": "assets/locations",
     "prop_reference": "assets/props",
-    #: 从视频里抽出来的单帧（真末帧续接靠它），见 services/frames.py
-    "frame": "assets/frames",
+    #: 从视频里抽出来的单帧（真末帧续接靠它）——**临时资源，不算资产**。
+    #: 落在 cache/ 而不是 assets/：它们是派生的、可重新生成的，删掉成片时应该连带删掉。
+    #: 老工程里已经在 assets/frames/ 的那些帧路径记在库里，照旧能读（cache/ 优先），
+    #: 只是新抽的帧不再进 assets/。见 services/frames.py 与下面的 delete() 级联清理。
+    "frame": "cache/frames",
     "audio": "assets/audio",
     "upload": "assets/uploads",
     "generated_image": "generations/images",
@@ -46,6 +49,11 @@ KIND_DIR = {
 }
 IMAGE_SUFFIX = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
 VIDEO_SUFFIX = {".mp4", ".mov", ".mkv", ".webm", ".avi"}
+
+#: **临时资源**：登记在 asset 表里（生成层要靠 asset_id → path 把它喂给模型），
+#: 但不算「工程资产」——资产页与孤儿扫描一律不列它们，它们的生命周期挂在源文件上
+#: （源成片一删，派生的帧跟着删，见 `AssetService.delete`）。
+TRANSIENT_KINDS = frozenset({"frame"})
 
 
 def sniff_size(path: Path) -> tuple[int | None, int | None]:
@@ -280,6 +288,12 @@ class AssetService:
     # --- 列表与孤儿 ---
 
     async def list_assets(self, pid: str, kind: str | None = None) -> list[dict[str, Any]]:
+        """工程资产总账。
+
+        **临时资源不在这张账上**（`TRANSIENT_KINDS`，目前只有抽出来的首尾帧）：
+        它们是从成片派生的、可以重抽的，生命周期跟着源文件走，列进资产页只会让人
+        以为「这里多了一堆我没导入过的图，是不是能删」。要看它们得显式传 `kind="frame"`。
+        """
         db = db_of(pid)
         proj = project_of(pid)
         rows = await fetch_all(db, Asset, order_by=Asset.created_at.desc())
@@ -291,6 +305,8 @@ class AssetService:
         for row in rows:
             if kind and row.kind != kind:
                 continue
+            if not kind and row.kind in TRANSIENT_KINDS:
+                continue
             out.append(
                 {
                     **as_dict(row),
@@ -301,11 +317,20 @@ class AssetService:
         return out
 
     async def orphans(self, pid: str) -> list[dict[str, Any]]:
-        """没有任何引用的资产。列出大小，让人在删之前知道能省多少空间。"""
+        """没有任何引用的资产。列出大小，让人在删之前知道能省多少空间。
+
+        抽出来的帧从来没有 `AssetRef`，会把这张表刷满，所以它们不算孤儿——
+        `list_assets` 已经把临时资源排除掉了（要清理它们请删掉对应的成片）。
+        """
         return [a for a in await self.list_assets(pid) if a["ref_count"] == 0]
 
     async def delete(self, pid: str, asset_id: str, force: bool = False) -> dict[str, Any]:
-        """删除资产。仍被引用时默认拒绝，并告诉用户是谁在用。"""
+        """删除资产。仍被引用时默认拒绝，并告诉用户是谁在用。
+
+        删成功时会**连带删掉从它派生的临时帧**（首帧 / 末帧）：那些帧只有配合这段视频
+        才有意义，源片没了还留着一堆孤零零的 PNG 是垃圾。连带删除的每一条都写进返回值的
+        `derived_removed`——「绝不静默连带删除」说的是不静默，不是不删。
+        """
         db = db_of(pid)
         proj = project_of(pid)
         row = await fetch(db, Asset, asset_id, "资产")
@@ -323,25 +348,52 @@ class AssetService:
                 ],
                 {"asset_id": asset_id},
             )
+        derived = [] if row.kind in TRANSIENT_KINDS else await self._derived_frames(pid, asset_id)
         file_path = proj.dir / row.path
         async with db.write() as session:
+            for extra in derived:  # 派生的帧没有引用，直接跟着走
+                stale = await session.get(Asset, extra.id)
+                if stale is not None:
+                    await session.delete(stale)
             fresh = await session.get(Asset, asset_id)
             if fresh is not None:
                 await session.delete(fresh)
-        removed = False
-        if file_path.is_file():
-            try:
-                file_path.unlink()
-                removed = True
-            except OSError as exc:  # 登记已删，文件删不掉要说出来而不是假装成功
-                bus.emit(
-                    Channel.ERROR,
-                    "asset.file_kept",
-                    {"asset_id": asset_id, "error": str(exc)},
-                    project_id=pid,
-                )
+        removed = self._unlink(pid, asset_id, file_path)
+        derived_removed = []
+        for extra in derived:
+            self._unlink(pid, extra.id, proj.dir / extra.path)
+            derived_removed.append({"id": extra.id, "path": extra.path})
         bus.emit(Channel.ASSET, "asset.deleted", {"id": asset_id}, project_id=pid)
-        return {"id": asset_id, "file_removed": removed, "broken_refs": len(refs) if force else 0}
+        for extra_out in derived_removed:
+            bus.emit(Channel.ASSET, "asset.deleted", extra_out, project_id=pid)
+        return {
+            "id": asset_id,
+            "file_removed": removed,
+            "broken_refs": len(refs) if force else 0,
+            #: 跟着一起删掉的临时帧。空列表是常态（大多数资产没派生过帧）。
+            "derived_removed": derived_removed,
+        }
+
+    async def _derived_frames(self, pid: str, asset_id: str) -> list[Asset]:
+        """从这个资产抽出来的临时帧。出处的解读只在 services/frames.py 一处。"""
+        from app.services.frames import derived_frames  # 延迟导入：frames 依赖本模块
+
+        return derived_frames(await fetch_all(db_of(pid), Asset), asset_id)
+
+    def _unlink(self, pid: str, asset_id: str, file_path: Path) -> bool:
+        if not file_path.is_file():
+            return False
+        try:
+            file_path.unlink()
+            return True
+        except OSError as exc:  # 登记已删，文件删不掉要说出来而不是假装成功
+            bus.emit(
+                Channel.ERROR,
+                "asset.file_kept",
+                {"asset_id": asset_id, "error": str(exc)},
+                project_id=pid,
+            )
+            return False
 
 
 assets = AssetService()

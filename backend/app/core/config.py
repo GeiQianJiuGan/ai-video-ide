@@ -15,7 +15,7 @@ class Settings(BaseSettings):
 
     app_name: str = "AI Video Studio"
     version: str = "0.1.0"
-    schema_version: int = 5
+    schema_version: int = 6
 
     # --- 网络：只监听回环，绝不对外暴露工程数据 ---
     host: str = "127.0.0.1"
@@ -56,12 +56,25 @@ class Settings(BaseSettings):
     video_api_key: str = ""
     video_preset: str = ""  # comfy_preset 用哪一份图（presets 目录里的文件名）
     video_timeout: int = 900  # 单次生成的等待上限（秒）
+    # 一次生成最多喂几张参考图（含被当成首帧的那一张）。只喂首帧最容易丢人物形象，
+    # 所以默认放宽到 8：角色表 + 地点参考 + 道具通常就是这个量级。真正能收几张由模型端
+    # 那份图决定（comfy_preset 数 AIVS_REF_* 槽位），这里只管账单算到第几张。
+    video_ref_limit: int = 8
+    # 把「参考图1=林小雨（常服）」这句对应关系拼到 prompt 末尾。ComfyUI 那类图收不到
+    # 标签，只能靠这句话让模型知道哪张是主角；不想让它动 prompt 就关掉。
+    video_ref_labels: bool = True
 
     # --- LLM：默认关闭，Manual 模式必须全流程可用 ---
     llm_provider: str = "none"  # none|openai_compatible|anthropic|ollama
     llm_base_url: str = ""
     llm_model: str = ""
     llm_api_key: str = ""
+
+    # --- 系统提示词：空字符串表示「用内置默认」（内置文本在 app/ai/prompts.py）---
+    # 「AI 拆出来的场景不够好」多半是这段话不够好，所以它必须可改。
+    # 但 JSON 输出形状由代码始终追加，不受这两个字段影响。
+    prompt_breakdown: str = ""
+    prompt_director: str = ""
 
     log_level: str = "INFO"
     dev_cors: bool = True  # 开发期允许 Vite dev server 跨源

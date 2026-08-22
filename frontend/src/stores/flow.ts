@@ -18,6 +18,7 @@
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import { ApiError } from '@/shared/api/client'
+import { generationApi } from '@/shared/api/generation'
 import { loadNodeOptions, type CastOption, type VariantOption } from '@/shared/api/pickers'
 import {
   sequenceApi,
@@ -41,7 +42,7 @@ export const useFlowStore = defineStore('flow', () => {
   const plan = ref<SequencePlan | null>(null)
   /** 最近一次执行的结果，含被跳过的每一条与原因。 */
   const lastRun = ref<SequenceRun | null>(null)
-  /** 选中那一幕生成过的视频。切幕时先清空，绝不把上一幕的列表留在屏幕上。 */
+  /** 选中那一幕每个镜头的视频候选。切幕时先清空，绝不把上一幕的列表留在屏幕上。 */
   const videos = ref<SceneVideos | null>(null)
   /** 小节点要挑的两张清单：形象、地点变体。 */
   const castOptions = ref<CastOption[]>([])
@@ -90,7 +91,7 @@ export const useFlowStore = defineStore('flow', () => {
     await loadVideos(pid, selectedSceneId.value)
   }
 
-  /** 选中一幕：顺手把它生成过的视频拉出来（就是「选一段采用」那个列表）。 */
+  /** 选中一幕：顺手把它**按镜头分组**的视频候选拉出来（每个镜头各自采用一段）。 */
   async function select(pid: string, sid: string): Promise<void> {
     selectedSceneId.value = sid
     await loadVideos(pid, sid)
@@ -105,12 +106,16 @@ export const useFlowStore = defineStore('flow', () => {
   }
 
   /**
-   * 采用某一段为这一幕的主视频（`versionId = null` 取消采用）。
-   * 后端顺手把它设成所属镜头的当前版本，所以整张图要重拉——别的幕的计数也可能跟着变。
+   * 把某一段采用为**它所属镜头**的成片（= `Shot.current_version_id`）。
+   *
+   * 走的是全工程唯一那个入口 `POST /versions/{id}/current`，不是幕级别的什么「主视频」：
+   * 一幕下面有很多镜头，用哪一段只能一个镜头一个镜头地定，时间线装配认的也正是这个指针。
+   * 采用之后整张图要重拉——节点上播的那一段会跟着换。
+   * 没有「取消采用」：每个镜头永远有一段当前版本，换一段就是再采用一次（旧版本一条不删）。
    */
-  async function adoptMainVideo(pid: string, sid: string, versionId: string | null): Promise<void> {
+  async function adoptShotVideo(pid: string, sid: string, versionId: string): Promise<void> {
     await guarded(async () => {
-      await sequenceApi.adoptMainVideo(pid, sid, versionId)
+      await generationApi.setCurrent(pid, versionId)
       graph.value = await sequenceApi.graph(pid)
       await loadVideos(pid, sid)
     })
@@ -230,7 +235,7 @@ export const useFlowStore = defineStore('flow', () => {
     load,
     select,
     loadVideos,
-    adoptMainVideo,
+    adoptShotVideo,
     linkBetween,
     addScene,
     saveScene,

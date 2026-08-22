@@ -22,14 +22,15 @@ from app.core.logging import get_logger
 from app.events.bus import Channel, bus
 from app.generation.comfy.client import comfy, outputs_of
 from app.generation.providers import registry
-from app.generation.providers.base import TaskState, VideoRequest
+from app.generation.providers.base import RefImage, TaskState, VideoRequest
 from app.persistence.models import utc_now
 from app.persistence.models_gen import GenerationVersion, Job, Workflow
 from app.persistence.models_story import Scene, Shot
 from app.persistence.models_world import Asset
-from app.services.assets import assets
+from app.services.assets import assets, kind_of_suffix
 from app.services.base import as_dict, db_of, dump_json, fetch, fetch_all, load_json, project_of
 from app.services.context import context
+from app.services.frames import start_frame_index
 from app.services.workflows import apply_bindings, parse_graph, workflows
 
 log = get_logger("queue")
@@ -37,6 +38,10 @@ log = get_logger("queue")
 ACTIVE = ("queued", "waiting", "running")
 POLL_INTERVAL = 1.0
 POLL_LIMIT = 1800  # 30 分钟上限，超时也要给出结构化错误而不是永远转圈
+
+#: 版本没有资产（失败现场、占位版本）时的媒体字段。**两个键永远都在**——
+#: 前端按「哪个非空」决定画 `<video>` 还是 `<img>`，键时有时无就得到处写可选判断。
+_NO_MEDIA: dict[str, Any] = {"video_path": None, "thumbnail_path": None}
 
 
 class GenerationService:
@@ -398,7 +403,7 @@ class GenerationService:
     ) -> tuple[str, bytes, str | None]:
         """默认路径：把请求交给适配器，轮询到出片。service 层不认识任何具体模型。"""
         provider = registry.provider()
-        first, last = await self._frames_of(pid, job, params)
+        first, last, refs = await self._images_of(pid, job, params)
         mode = "flf" if last is not None else "i2v"
         if mode == "i2v" and first is None:
             raise AppError(
@@ -417,11 +422,18 @@ class GenerationService:
             negative=str(params.get("negative_prompt") or ""),
             first_frame=first,
             last_frame=last,
+            refs=refs,
             duration=float(params.get("duration") or 4.0),
             seed=params.get("seed"),
             extra=params.get("extra") or {},
         )
         task_id = await provider.submit(req, client_id=f"aivs-{pid}")
+        # 冻结「实际喂了哪几张参考图」与适配器的降级说明。`_execute` 在这之后才收集
+        # params，所以这里改它就会跟着版本一起存下来——账单说要喂 5 张、图只收了 3 张，
+        # 事后必须在版本里看得见这件事（绝不静默失败）。
+        params["refs"] = [{"label": r.label, "kind": r.kind, "file": r.path.name} for r in refs]
+        if req.notes:
+            params["ref_notes"] = list(req.notes)
         state = TaskState("queued")
         for tick in range(POLL_LIMIT):
             self._require_not_cancelled(job.id)
@@ -463,12 +475,18 @@ class GenerationService:
         filename, data = await provider.fetch(task_id)
         return filename, data, None
 
-    async def _frames_of(
+    async def _images_of(
         self, pid: str, job: Job, params: dict[str, Any]
-    ) -> tuple[Path | None, Path | None]:
-        """定首帧与末帧：显式指定优先，其次用上下文账单里那张图。
+    ) -> tuple[Path | None, Path | None, list[RefImage]]:
+        """定首帧、末帧，以及**首尾帧之外的那些参考图**。
 
-        这里只挑「哪张图」，不管模型怎么用它——差异在适配器里。
+        这里只挑「哪几张图、谁是谁」，不管模型怎么用它们——差异在适配器里。
+        「哪一张当首帧」这条规则不在这里，在 `services/context.py::_assign_roles`
+        （账单上标的 `role`）：两边各挑一次的话，检查器里标的和真正喂进去的会分叉。
+
+        剩下的采用条目全部当参考图带走，**这就是「角色/场景真正被引入」的那一步**——
+        以前它们算进了账单却在这里被丢掉，于是只剩一张首帧，人物形象自然跑偏。
+        显式指定的首/末帧如果本身就在账单里，不会再重复当一次参考图。
 
         有一处不能用入队时冻结的那份账单：**要接上游末帧的镜头**。那张图在入队的时刻
         还不存在（上游还没出片），所以对这种镜头在真正要跑的时候重新结一次账并按需抽帧
@@ -479,17 +497,19 @@ class GenerationService:
         explicit_first = params.get("first_frame_asset_id")
         explicit_last = params.get("last_frame_asset_id")
         included = [i for i in (params.get("context") or {}).get("included") or []]
+        shot = await fetch(db, Shot, job.shot_id, "镜头")
+        if shot.prev_shot_id and not explicit_first:
+            fresh = await context.ensure_frames(pid, job.shot_id)
+            included = [i for i in fresh["items"] if i.get("included")]
+        usable = [i for i in included if i.get("asset_id")]
         if not explicit_first:
-            shot = await fetch(db, Shot, job.shot_id, "镜头")
-            if shot.prev_shot_id:
-                fresh = await context.ensure_frames(pid, job.shot_id)
-                included = [i for i in fresh["items"] if i.get("included")]
-            prev = next(
-                (i for i in included if i.get("kind") == "prev_frame" and i.get("asset_id")),
-                None,
-            )
-            fallback = next((i for i in included if i.get("asset_id")), None)
-            explicit_first = (prev or fallback or {}).get("asset_id")
+            chosen = next((i for i in usable if i.get("role") == "first_frame"), None)
+            if chosen is None:  # 旧版本冻结的账单里没有 role，退回原来的挑法
+                chosen = next((i for i in usable if i.get("kind") == "prev_frame"), None) or next(
+                    iter(usable), None
+                )
+            explicit_first = (chosen or {}).get("asset_id")
+        spent = {explicit_first, explicit_last} - {None, ""}
 
         async def resolve(asset_id: str | None) -> Path | None:
             if not asset_id:
@@ -497,7 +517,19 @@ class GenerationService:
             asset = await fetch(db, Asset, asset_id, "资产")
             return proj.dir / asset.path
 
-        return await resolve(explicit_first), await resolve(explicit_last)
+        refs: list[RefImage] = []
+        for item in usable:
+            asset_id = str(item["asset_id"])
+            if asset_id in spent:
+                continue
+            spent.add(asset_id)  # 同一张图在账单里出现两次时只喂一次
+            path = await resolve(asset_id)
+            if path is None:
+                continue
+            refs.append(
+                RefImage(path=path, label=str(item.get("label") or ""), kind=str(item["kind"]))
+            )
+        return await resolve(explicit_first), await resolve(explicit_last), refs
 
     def _require_not_cancelled(self, job_id: str) -> None:
         if job_id in self._cancelled:
@@ -618,6 +650,7 @@ class GenerationService:
             where=GenerationVersion.shot_id == shot_id,
             order_by=GenerationVersion.version_no.desc(),
         )
+        media = await self._version_media(pid, rows)
         return [
             {
                 **as_dict(r),
@@ -625,9 +658,45 @@ class GenerationService:
                 "params": load_json(r.params_json, {}),
                 "context": load_json(r.context_json, None),
                 "error": load_json(r.error_json, None),
+                **media.get(r.id, _NO_MEDIA),
             }
             for r in rows
         ]
+
+    async def _version_media(
+        self, pid: str, rows: list[GenerationVersion]
+    ) -> dict[str, dict[str, Any]]:
+        """每个版本「能播的那一段」与「能当图显示的那一张」。
+
+        和分镜板卡片（`story._shot_media`）同一条规矩，理由也同一个：版本的资产
+        绝大多数是 `.mp4`，只回一个 `asset_id` 的话前端只能把它塞进 `<img>`，
+        得到的就是一个坏图标。所以这里分成两个字段——**`video_path` 才是视频，
+        `thumbnail_path` 只会是图片**，前端按哪个非空决定画 `<video>` 还是 `<img>`。
+
+        缩略图的来源只有两种：版本本身就是图片，或者这段视频**已经抽过首帧**
+        （`frames.start_frame_index`）。一张都没有时只有 `video_path`——播放器自己
+        会画第一帧，**读版本轨绝不顺手起 FFmpeg**（要补抽走分镜板那个显式入口）。
+        """
+        wanted = {r.asset_id for r in rows if r.asset_id}
+        if not wanted:
+            return {}
+        db = db_of(pid)
+        all_assets = await fetch_all(db, Asset)
+        by_id = {a.id: a for a in all_assets}
+        posters = start_frame_index(all_assets)
+        out: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            asset = by_id.get(row.asset_id or "")
+            if asset is None:
+                out[row.id] = dict(_NO_MEDIA)
+                continue
+            is_video = kind_of_suffix(Path(asset.path).suffix) == "video"
+            poster = posters.get(asset.id) if is_video else asset
+            out[row.id] = {
+                "video_path": asset.path if is_video else None,
+                "thumbnail_path": poster.path if poster is not None else None,
+            }
+        return out
 
     async def set_current_version(self, pid: str, version_id: str) -> dict[str, Any]:
         db = db_of(pid)

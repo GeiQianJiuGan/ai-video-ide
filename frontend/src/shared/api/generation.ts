@@ -23,6 +23,15 @@ export const CONTEXT_KIND_LABEL: Record<string, string> = {
   manual: '手动添加',
 }
 
+/**
+ * 采用的条目在生成时**充当什么**。规则只在后端（`services/context.py::_assign_roles`），
+ * 前端只负责把它标出来——没被采用的是空串。
+ */
+export const CONTEXT_ROLE_LABEL: Record<string, string> = {
+  first_frame: '首帧',
+  reference: '参考图',
+}
+
 /** 账单里的一条。`included` 为 false 时 `reason` 就是「为什么没用它」。 */
 export interface ContextItem {
   key: string
@@ -33,6 +42,8 @@ export interface ContextItem {
   source_id: string | null
   reason: string
   included: boolean
+  /** `first_frame` / `reference`，没被采用时是空串。旧版本冻结的账单里可能没有这个字段。 */
+  role?: string
   /** 手动添加的，或被手动移除的——两种都算人工干预过。 */
   manual: boolean
   asset_path: string | null
@@ -70,6 +81,13 @@ export interface GenerationVersion {
   context: unknown
   error: unknown
   created_at: string
+  /**
+   * 能播的那一段（后端保证是视频）。**和 `thumbnail_path` 绝不混用**：
+   * 把 `.mp4` 塞进 `<img>` 只会得到一个坏图标——版本轨上那个坏图就是这么来的。
+   */
+  video_path?: string | null
+  /** 能当图显示的那一张（版本本身是图片，或这段视频抽出来的首帧）。 */
+  thumbnail_path?: string | null
 }
 
 export const JOB_STATUS = [

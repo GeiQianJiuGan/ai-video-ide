@@ -56,9 +56,6 @@ class Scene(Base):
     )
     time_of_day: Mapped[str | None] = mapped_column(String(50))
     notes: Mapped[str | None] = mapped_column(Text)
-    #: 采用为这一幕主视频的那个生成版本。刻意不加外键（与 Shot.current_version_id 同理：
-    #: 版本表反过来引用镜头，加外键会绕成一圈），取不到时按「还没有主视频」处理。
-    main_version_id: Mapped[str | None] = mapped_column(String(40))
     created_at: Mapped[str] = mapped_column(String(40), nullable=False, default=utc_now)
     updated_at: Mapped[str] = mapped_column(String(40), nullable=False, default=utc_now)
 
@@ -92,6 +89,10 @@ class Shot(Base):
 
     #: 上游镜头：需要它的末帧做首帧时填。空表示不依赖任何镜头。
     prev_shot_id: Mapped[str | None] = mapped_column(String(40))
+    #: **这个镜头采用了哪一段成片**。全工程只有这一个「用哪一段」的指针：时间线装配
+    #: （`services/timeline.py::auto_assemble`）、下游镜头抽末帧、流程图节点上播的那一段
+    #: 都读它。刻意不加外键（版本表反过来引用镜头，加外键会绕成一圈），
+    #: 取不到时按「这个镜头还没出片」处理。
     current_version_id: Mapped[str | None] = mapped_column(String(40))
     #: Context Inspector 里的人工干预记录（移除/添加/替换），JSON 列表
     context_overrides_json: Mapped[str | None] = mapped_column(Text)

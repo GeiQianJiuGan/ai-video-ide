@@ -21,7 +21,7 @@ import pytest
 from app.core.config import settings
 from app.core.errors import AppError
 from app.generation.providers import presets, registry
-from app.generation.providers.base import VideoRequest
+from app.generation.providers.base import RefImage, VideoRequest
 from app.generation.providers.comfy_preset import ComfyPresetProvider
 from app.generation.providers.http_api import HttpApiProvider
 
@@ -90,6 +90,27 @@ def write_preset(name: str, graph: dict[str, Any]) -> None:
     )
 
 
+def with_ref_slots(count: int) -> dict[str, Any]:
+    """在 GRAPH 上加 count 个参考图槽位（AIVS_REF_1…）。"""
+    graph = {k: dict(v) for k, v in GRAPH.items()}
+    for i in range(1, count + 1):
+        graph[f"1{i}"] = {
+            "class_type": "LoadImage",
+            "inputs": {"image": f"占位{i}.png"},
+            "_meta": {"title": f"AIVS_REF_{i}"},
+        }
+    return graph
+
+
+def make_refs(tmp_path: Path, *labels: str) -> list[RefImage]:
+    out: list[RefImage] = []
+    for i, label in enumerate(labels, 1):
+        path = tmp_path / f"ref{i}.png"
+        path.write_bytes(b"R")
+        out.append(RefImage(path=path, label=label, kind="character_sheet"))
+    return out
+
+
 async def test_preset_injection_hits_titles_and_leaves_the_rest_alone(tmp_path: Path) -> None:
     write_preset("wan-flf", GRAPH)
     first = tmp_path / "first.png"
@@ -149,6 +170,111 @@ async def test_preset_without_the_last_frame_title_says_how_to_fix_it(tmp_path: 
     assert any("Title" in s for s in err.suggestions), "必须告诉用户去 ComfyUI 里改标题"
 
 
+async def test_preset_feeds_reference_images_into_the_ref_slots(tmp_path: Path) -> None:
+    """账单里的角色表 / 地点参考图必须真的进到图里——「人物形象丢失」就是这一步漏了。"""
+    write_preset("多参考图", with_ref_slots(2))
+    first = tmp_path / "first.png"
+    first.write_bytes(b"A")
+    fake = FakeComfy()
+    provider = ComfyPresetProvider(client=fake)  # type: ignore[arg-type]
+    req = VideoRequest(
+        mode="i2v",
+        prompt="雨夜推门",
+        first_frame=first,
+        refs=make_refs(tmp_path, "林小雨（常服）", "雨夜巷口"),
+        extra={"preset": "多参考图"},
+    )
+
+    await provider.submit(req, client_id="aivs-test")
+    graph = fake.submitted or {}
+    assert graph["11"]["inputs"]["image"] == "aivs/ref1.png"
+    assert graph["12"]["inputs"]["image"] == "aivs/ref2.png"
+    assert fake.uploaded == ["first.png", "ref1.png", "ref2.png"]
+    # 顺序即语义：ComfyUI 那类图收不到标签，只能把对应关系写进 prompt
+    assert graph["3"]["inputs"]["text"].startswith("雨夜推门")
+    assert "参考图1=林小雨（常服）" in graph["3"]["inputs"]["text"]
+    assert "参考图2=雨夜巷口" in graph["3"]["inputs"]["text"]
+    assert any("参考图对应关系" in n for n in req.notes)
+
+
+async def test_ref_labels_can_be_turned_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(settings, "video_ref_labels", False)
+    write_preset("多参考图", with_ref_slots(1))
+    first = tmp_path / "first.png"
+    first.write_bytes(b"A")
+    fake = FakeComfy()
+    provider = ComfyPresetProvider(client=fake)  # type: ignore[arg-type]
+    req = VideoRequest(
+        mode="i2v",
+        prompt="雨夜推门",
+        first_frame=first,
+        refs=make_refs(tmp_path, "林小雨（常服）"),
+        extra={"preset": "多参考图"},
+    )
+
+    await provider.submit(req, client_id="aivs-test")
+    graph = fake.submitted or {}
+    assert graph["11"]["inputs"]["image"] == "aivs/ref1.png", "关掉标签不影响图照样喂进去"
+    assert graph["3"]["inputs"]["text"] == "雨夜推门", "关掉了就绝不动 prompt"
+
+
+async def test_preset_with_too_few_ref_slots_degrades_and_says_which_were_dropped(
+    tmp_path: Path,
+) -> None:
+    """槽位不够只降级不失败——图是模型端维护的，但少喂了哪几张必须说出来。"""
+    write_preset("只有一个槽位", with_ref_slots(1))
+    first = tmp_path / "first.png"
+    first.write_bytes(b"A")
+    fake = FakeComfy()
+    provider = ComfyPresetProvider(client=fake)  # type: ignore[arg-type]
+    req = VideoRequest(
+        mode="i2v",
+        prompt="雨夜推门",
+        first_frame=first,
+        refs=make_refs(tmp_path, "林小雨（常服）", "雨夜巷口", "旧怀表"),
+        extra={"preset": "只有一个槽位"},
+    )
+
+    await provider.submit(req, client_id="aivs-test")
+    assert fake.uploaded == ["first.png", "ref1.png"]
+    dropped = next(n for n in req.notes if "没喂进去" in n)
+    assert "雨夜巷口" in dropped and "旧怀表" in dropped
+    assert "只有 1 个参考图槽位" in dropped
+
+
+async def test_preset_without_ref_slots_still_runs_but_explains_the_risk(tmp_path: Path) -> None:
+    write_preset("没有槽位", GRAPH)
+    first = tmp_path / "first.png"
+    first.write_bytes(b"A")
+    fake = FakeComfy()
+    provider = ComfyPresetProvider(client=fake)  # type: ignore[arg-type]
+    req = VideoRequest(
+        mode="i2v",
+        prompt="雨夜推门",
+        first_frame=first,
+        refs=make_refs(tmp_path, "林小雨（常服）"),
+        extra={"preset": "没有槽位"},
+    )
+
+    task_id = await provider.submit(req, client_id="aivs-test")
+    assert task_id == "pid-1", "没有参考图槽位不该让整个任务跑不了"
+    assert fake.uploaded == ["first.png"]
+    assert any("AIVS_REF_" in n and "只能靠首帧带" in n for n in req.notes)
+
+
+def test_preset_inspection_reports_how_many_reference_images_it_takes() -> None:
+    write_preset("三个槽位", with_ref_slots(3))
+    write_preset("没有槽位", GRAPH)
+    rows = {r["name"]: r for r in presets.listing()}
+    assert rows["三个槽位"]["ref_slots"] == 3
+    assert "3 张参考图" in rows["三个槽位"]["ref_hint"]
+    assert rows["没有槽位"]["ref_slots"] == 0
+    assert rows["没有槽位"]["ready"] is True, "没有参考图槽位不算体检不过"
+    assert "AIVS_REF_1" in rows["没有槽位"]["ref_hint"], "要告诉用户怎么支持参考图"
+
+
 def test_preset_missing_required_titles_is_rejected_on_save() -> None:
     with pytest.raises(AppError) as caught:
         presets.save("缺入口", json.dumps({"1": {"class_type": "KSampler", "inputs": {"seed": 0}}}))
@@ -156,6 +282,26 @@ def test_preset_missing_required_titles_is_rejected_on_save() -> None:
     assert err.code == "INVALID_WORKFLOW"
     assert "AIVS_FIRST_FRAME" in err.detail
     assert presets.listing() == [], "体检不过的图绝不留在预设目录里"
+
+
+def test_preset_rejects_the_ui_workflow_with_the_real_reason() -> None:
+    """界面工作流是最常见的上传错误，报错必须说「格式选错了」而不是列一串顶层键。"""
+    ui_format = {
+        "id": "3f1c",
+        "revision": 0,
+        "last_node_id": 5549,
+        "last_link_id": 9001,
+        "nodes": [{"id": 1, "type": "LoadImage", "title": "AIVS_FIRST_FRAME"}],
+        "links": [],
+    }
+    with pytest.raises(AppError) as caught:
+        presets.save("界面格式", json.dumps(ui_format))
+    err = caught.value
+    assert err.code == "INVALID_WORKFLOW"
+    assert "界面工作流" in err.title
+    assert any("导出 (API)" in s for s in err.suggestions), "必须指出去哪儿换导出格式"
+    assert any("AIVS_" in s for s in err.suggestions), "标题没白改，要写明不用重设"
+    assert presets.listing() == [], "格式不对的图绝不落盘"
 
 
 def test_preset_listing_shows_broken_files_instead_of_hiding_them() -> None:

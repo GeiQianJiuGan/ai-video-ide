@@ -2,7 +2,13 @@
 
 单线程续接的整个前提是「上一段的**真末帧**当下一段的首帧」。以前 context 里的
 `prev_frame` 指的是上游那**整段视频**的资产——模型端拿到一段视频是没法当首帧用的，
-所以这里补上真正缺的那一步：用 FFmpeg 抽一张 PNG，登记成 `Asset(kind="frame")`。
+所以这里补上真正缺的那一步：用 FFmpeg 抽一张 PNG。
+
+抽出来的帧是**临时资源，不是工程资产**：它登记成 `Asset(kind="frame")`（生成层要靠
+`asset_id → path` 才能把它喂给模型），但落在 `cache/frames/` 而不是 `assets/`，
+资产页与孤儿扫描都不列它（`assets.TRANSIENT_KINDS`），而且**源成片一删它就跟着删**
+（`assets.delete` 调下面的 `derived_frames`）。理由很简单：它是派生的、随时能重抽的，
+没有源片就没有意义——留在资产里只会让人以为自己多了一堆不知从哪来的图。
 
 三条约定：
 
@@ -26,7 +32,7 @@ from app.core.logging import get_logger
 from app.persistence.models_world import Asset
 from app.services import assets as asset_module
 from app.services.assets import assets as asset_service
-from app.services.base import db_of, fetch, project_of
+from app.services.base import db_of, fetch, load_json, project_of
 
 log = get_logger("frames")
 
@@ -44,9 +50,47 @@ def _label(at: str | float) -> str:
     return f"t{float(at):.3f}".replace(".", "_")
 
 
+def start_frame_index(rows: list[Asset]) -> dict[str, Asset]:
+    """源视频 asset id → 已经从它抽出来的**首帧**图。
+
+    `extract(pid, asset_id, "start")` 把出处写进 `Asset.meta_json`
+    （`{from_asset_id, at}`），所以读路径不用再问 FFmpeg，只按这条线索认出
+    「这段视频的首帧抽过了」。**抽帧是写操作，读路径绝不顺手起 FFmpeg**——
+    要补抽走各自的显式入口（分镜板的 `POST /storyboard/posters`）。
+
+    这条线索的解读只放在这一处：分镜板卡片（`story._shot_media`）与版本轨
+    （`generation.list_versions`）都从这里拿，两边各写一遍迟早对不上。
+    """
+    out: dict[str, Asset] = {}
+    for asset in rows:
+        if asset.kind != "frame":
+            continue
+        meta = load_json(asset.meta_json, {})
+        src = meta.get("from_asset_id")
+        if meta.get("at") == "start" and isinstance(src, str):
+            out[src] = asset
+    return out
+
+
+def derived_frames(rows: list[Asset], source_asset_id: str) -> list[Asset]:
+    """从某个资产抽出来的所有临时帧（首帧 / 末帧 / 任意时间点）。
+
+    `services/assets.py::delete` 靠它做级联清理：**成片删了，从它抽的帧也得删**。
+    和 `start_frame_index` 一样，`meta_json.from_asset_id` 的解读只放在这个模块里。
+    """
+    out: list[Asset] = []
+    for asset in rows:
+        if asset.kind != "frame":
+            continue
+        meta = load_json(asset.meta_json, {})
+        if meta.get("from_asset_id") == source_asset_id:
+            out.append(asset)
+    return out
+
+
 class FrameService:
     async def extract(self, pid: str, asset_id: str, at: str | float = "end") -> dict[str, Any]:
-        """抽一帧并登记。`at` 是 "end" / "start" / 秒数。返回资产字典 + `reused`。"""
+        """抽一帧并登记成临时资源。`at` 是 "end" / "start" / 秒数。返回资产字典 + `reused`。"""
         db = db_of(pid)
         proj = project_of(pid)
         asset = await fetch(db, Asset, asset_id, "资产")
@@ -83,8 +127,12 @@ class FrameService:
         registered = await asset_service.register_path(
             pid, "frame", str(target), source="extract", copy=False
         )
+        # sha1 去重命中了别的位置（老工程里的帧还在 assets/frames/ 下）：刚抽的这一份是
+        # 多余副本，删掉它——不然升级后磁盘上会静静躺着两份一样的 PNG。
+        if registered["path"] != target.relative_to(proj.dir).as_posix():
+            target.unlink(missing_ok=True)  # noqa: ASYNC240 - 本地文件操作，开销可忽略
         # 出处（从哪段视频、抽的哪个位置）必须留在资产上：context 就是靠它认出
-        # 「这张图是上游那段的末帧」，而不是又去抽一次。
+        # 「这张图是上游那段的末帧」，而不是又去抽一次；`assets.delete` 也靠它做级联清理。
         merged = await asset_service.merge_meta(
             pid,
             registered["id"],

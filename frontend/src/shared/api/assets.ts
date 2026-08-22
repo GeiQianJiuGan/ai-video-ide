@@ -51,11 +51,17 @@ export interface AssetRef {
   created_at: string
 }
 
-/** 删除结果：文件到底删掉没有、强删破了几处引用，都要说出来。 */
+/** 删除结果：文件到底删掉没有、强删破了几处引用、连带删了哪些临时帧，都要说出来。 */
 export interface DeleteResult {
   id: string
   file_removed: boolean
   broken_refs: number
+  /**
+   * 跟着一起删掉的**临时帧**（从这段成片抽出来的首 / 末帧）。
+   * 它们不算工程资产（不在列表里），生命周期挂在源文件上——源片没了就留不住。
+   * 空数组是常态：大多数资产没派生过帧。
+   */
+  derived_removed: { id: string; path: string }[]
 }
 
 export const assetsApi = {

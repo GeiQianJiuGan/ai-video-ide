@@ -27,7 +27,11 @@ import { ApiError } from '@/shared/api/client'
 import { assetsApi, type Asset } from '@/shared/api/assets'
 import { castApi, type AppearanceRow, type Character } from '@/shared/api/cast'
 import { worldApi, type Prop } from '@/shared/api/world'
-import { CONTEXT_KIND_LABEL } from '@/shared/api/generation'
+import {
+  CONTEXT_KIND_LABEL,
+  CONTEXT_ROLE_LABEL,
+  type GenerationVersion,
+} from '@/shared/api/generation'
 import { SHOT_STATUS, SHOT_STATUS_LABEL } from '@/shared/api/story'
 import { CAPABILITY_LABEL, type Capability } from '@/shared/api/workflows'
 import { useConsoleStore } from '@/stores/console'
@@ -80,6 +84,19 @@ function thumb(assetId: string | null): string {
   const asset = assetById.value.get(assetId)
   if (!asset || asset.missing) return ''
   return fileUrl(pid.value, asset.path)
+}
+
+/**
+ * 版本轨上那一格：**视频走 `<video>`、图片走 `<img>`**。两个字段由后端分开给
+ * （`generation._version_media`），因为版本的资产几乎总是一段 `.mp4`——
+ * 把它塞进 `<img>` 只会得到一个坏图标。
+ */
+function versionVideo(v: GenerationVersion): string {
+  return v.video_path ? fileUrl(pid.value, v.video_path) : ''
+}
+
+function versionPoster(v: GenerationVersion): string {
+  return v.thumbnail_path ? fileUrl(pid.value, v.thumbnail_path) : ''
 }
 
 async function loadSide(): Promise<void> {
@@ -492,7 +509,11 @@ async function generate(skipContext: boolean): Promise<void> {
                 </div>
                 <div class="p-1">
                   <div class="flex items-center gap-1">
-                    <AppBadge tone="accent">
+                    <!-- 当首帧还是当参考图：规则只在后端（context.py::_assign_roles），这里只标 -->
+                    <AppBadge :tone="item.role === 'first_frame' ? 'ok' : 'accent'">
+                      {{ CONTEXT_ROLE_LABEL[item.role ?? ''] ?? '参考图' }}
+                    </AppBadge>
+                    <AppBadge tone="neutral">
                       {{ CONTEXT_KIND_LABEL[item.kind] ?? item.kind }}
                     </AppBadge>
                     <AppBadge v-if="item.manual" tone="warn">人工</AppBadge>
@@ -595,12 +616,22 @@ async function generate(skipContext: boolean): Promise<void> {
                   </button>
                   <Star v-else :size="10" class="text-accent ml-auto" />
                 </div>
+                <!-- 视频给播放器，图片才走 <img>：两个字段绝不混用 -->
                 <div
-                  v-if="thumb(v.asset_id)"
+                  v-if="versionVideo(v) || versionPoster(v)"
                   class="bg-base-3 mt-1 flex h-16 items-center justify-center overflow-hidden"
                 >
+                  <video
+                    v-if="versionVideo(v)"
+                    :src="versionVideo(v)"
+                    :poster="versionPoster(v) || undefined"
+                    controls
+                    preload="metadata"
+                    class="max-h-full max-w-full"
+                  />
                   <img
-                    :src="thumb(v.asset_id)"
+                    v-else
+                    :src="versionPoster(v)"
                     class="max-h-full max-w-full object-contain"
                     :alt="`v${v.version_no}`"
                   />

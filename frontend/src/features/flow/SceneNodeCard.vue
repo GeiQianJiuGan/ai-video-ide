@@ -94,11 +94,11 @@ const promptText = computed(() => (props.node.prompt ?? '').trim())
         :tone="node.video_adopted ? 'ok' : 'accent'"
         :title="
           node.video_adopted
-            ? '这一段是你采用的主视频'
-            : '这一幕有可播的视频，但还没采用哪一段当主视频——节点上播的是自动挑的那一段'
+            ? '播的这一段就是它所属镜头采用了的那一版（时间线导出的也是它）'
+            : '这一幕有可播的视频，但播的这一段还不是所属镜头采用的那一版——节点上播的是自动挑的一段'
         "
       >
-        {{ node.video_adopted ? '已采用主视频' : `${node.video_count} 段可选` }}
+        {{ node.video_adopted ? '播的是已采用' : `${node.video_count} 段可选` }}
       </AppBadge>
       <AppBadge v-if="node.transition_count" tone="accent">
         转场 {{ node.transition_count }}

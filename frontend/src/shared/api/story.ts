@@ -186,7 +186,20 @@ export interface StoryboardCard {
   status: string
   camera: string | null
   cast_names: string[]
+  /**
+   * 卡片上那张图，**相对工程目录**的路径（过 `fileUrl(pid, path)` 才是 URL）。
+   * 后端保证它**只会是图片**：优先是从成片里抽出来的真首帧，其次是该镜头生成的图片版本。
+   * 以前这里给的是当前版本的资产 id，而当前版本几乎总是 `.mp4`——那就是「分镜里
+   * 截取的首帧加载失败」的来源。
+   */
+  thumbnail_path: string | null
   thumbnail_asset_id: string | null
+  /** 能播的那一段（`<video>` 才用它，绝不喂给 `<img>`）。 */
+  video_path: string | null
+  video_asset_id: string | null
+  video_version_id: string | null
+  /** 有片子但还没有能当图显示的那一张：调 `extractPosters` 补抽，不是错误。 */
+  poster_pending: boolean
   version_count: number
   context_ok: boolean
   context_issues: string[]
@@ -235,6 +248,22 @@ export interface BreakdownProposal {
   shot_count: number
   character_mapping: CharacterMapping[]
   note: string
+}
+
+/**
+ * 补首帧的结果。
+ *
+ * 抽帧是写操作，所以它不在 `GET /storyboard` 里顺手做——读一次分镜板绝不会
+ * 起 FFmpeg 进程。单条失败不打断其余，每条都带完整四要素。
+ */
+export interface PosterResult {
+  requested: number
+  extracted: { shot_id: string; asset_id: string; path: string; reused: boolean }[]
+  failed: {
+    shot_id: string
+    title: string
+    error: { code: string; title: string; detail: string; suggestions: string[] }
+  }[]
 }
 
 export type StoryPatch = Partial<Pick<Story, 'title' | 'raw_text' | 'mode'>>
@@ -306,6 +335,11 @@ export const storyApi = {
     api.put<Shot>(`/projects/${pid}/shots/${shotId}/props`, { items }),
 
   storyboard: (pid: string) => api.get<StoryboardLane[]>(`/projects/${pid}/storyboard`),
+  /** 给 `poster_pending` 的卡片补抽首帧。不传 shotIds 就是「全部补上」。 */
+  extractPosters: (pid: string, shotIds?: string[]) =>
+    api.post<PosterResult>(`/projects/${pid}/storyboard/posters`, {
+      shot_ids: shotIds ?? null,
+    }),
 
   /** 只出提案，不写库。LLM 未配置时抛 `LLM_UNAVAILABLE`，建议里带手动路径。 */
   propose: (pid: string, text?: string) =>

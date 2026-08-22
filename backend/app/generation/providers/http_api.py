@@ -4,8 +4,11 @@
 只要满足下面三个端点就能当视频生成后端，本工具不需要认识它内部长什么样。
 
     POST {base}/submit
-      body {mode, prompt, negative, duration, seed, extra, first_frame, last_frame}
+      body {mode, prompt, negative, duration, seed, extra, first_frame, last_frame, refs}
       —— 两个 frame 是 base64（图在我们这边，不能指望对方能读我们的磁盘）
+      —— refs 是**首尾帧之外的参考图**，按优先级排好的数组，每项
+         {data: base64, name, label, kind}：label 是「它是谁」（角色表 / 地点参考），
+         模型端用不上可以忽略，但顺序必须当成语义——第 1 张最重要
       resp {task_id}
 
     GET {base}/tasks/{task_id}
@@ -133,6 +136,17 @@ class HttpApiProvider:
                 continue
             body[key] = _encode(path)
             body[f"{key}_name"] = path.name
+        # 参考图整组带过去：这条合同由我们定，所以它天生支持多张，不存在槽位不够的问题。
+        if req.refs:
+            body["refs"] = [
+                {
+                    "data": _encode(ref.path),
+                    "name": ref.path.name,
+                    "label": ref.label,
+                    "kind": ref.kind,
+                }
+                for ref in req.refs
+            ]
         try:
             async with httpx.AsyncClient(timeout=self._timeout()) as http:
                 resp = await http.post(f"{base}/submit", json=body, headers=self._headers())
@@ -147,7 +161,13 @@ class HttpApiProvider:
                 f"POST {base}/submit 的响应里没有 task_id：{str(data)[:400]}",
                 [f"服务端需要按合同返回：{CONTRACT[0]}"],
             )
-        log.info("provider.submitted", provider=self.name, task_id=task_id, mode=req.mode)
+        log.info(
+            "provider.submitted",
+            provider=self.name,
+            task_id=task_id,
+            mode=req.mode,
+            refs=len(req.refs),
+        )
         return task_id
 
     async def poll(self, task_id: str) -> TaskState:

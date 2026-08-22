@@ -1,10 +1,11 @@
 """Step 1 验收：应用级设置与配置页契约。
 
-四件事必须成立：
+五件事必须成立：
   1. settings.json 的覆盖压过环境变量，且每个字段说清值是哪来的（file / env / default）；
   2. API Key 永不回明文——只回 masked 与 has_value；
   3. 取值不合法当场报四要素错误，绝不悄悄存一个坏值；
-  4. 探测失败也是四要素错误，而不是一个红叉。
+  4. 探测失败也是四要素错误，而不是一个红叉；
+  5. 系统提示词可改，但 JSON 输出形状那一段**永远由代码追加**——用户改不坏落库那条路。
 """
 
 from __future__ import annotations
@@ -109,7 +110,69 @@ def test_probe_failures_name_the_target_and_the_way_out(client: TestClient) -> N
     assert error_of(resp)["title"]
 
 
+def test_reference_image_limit_and_labels_are_configurable(client: TestClient) -> None:
+    """「只喂一张首帧就丢人物形象」的两个旋钮都得能在设置页调。"""
+    fields = fields_of(client)
+    assert fields["video.ref_limit"]["value"] == 8
+    assert fields["video.ref_labels"]["kind"] == "bool"
+    assert fields["video.ref_labels"]["value"] is True
+
+    resp = client.patch("/api/v1/settings", json={"video.ref_limit": 3, "video.ref_labels": False})
+    assert resp.status_code == 200, resp.text
+    assert settings.video_ref_limit == 3
+    assert settings.video_ref_labels is False
+
+    from app.services.context import ref_limit
+
+    assert ref_limit() == 3, "账单的参考图上限就读这一项"
+
+    resp = client.patch("/api/v1/settings", json={"video.ref_limit": 0})
+    assert resp.status_code == 422
+    assert error_of(resp)["related_ids"]["key"] == "video.ref_limit"
+
+
 def test_legacy_provider_is_offered_but_marked(client: TestClient) -> None:
     rows = {p["name"]: p for p in client.get("/api/v1/settings").json()["providers"]}
     assert rows["comfy_preset"]["legacy"] is False
     assert rows["comfy_workflow"]["legacy"] is True, "旧绑定路径要标成兼容选项"
+
+
+def test_system_prompt_is_configurable_but_the_shape_is_not(client: TestClient) -> None:
+    """「AI 拆出来的场景不够好」得能自己改那段话——但改不到 JSON 形状那一段。"""
+    from app.ai import prompts
+
+    field = fields_of(client)["prompt.breakdown"]
+    assert field["kind"] == "text"
+    assert field["source"] == "default"
+    assert field["builtin"] == prompts.BREAKDOWN_TASK, "内置文案只有后端一份，设置页照它画占位"
+    assert field["impact"], "配错了会怎样得由后端给文案，前端不重写一遍"
+
+    resp = client.patch("/api/v1/settings", json={"prompt.breakdown": "只拆成两幕，每幕一个镜头。"})
+    assert resp.status_code == 200, resp.text
+    assert fields_of(client)["prompt.breakdown"]["source"] == "file"
+
+    text = prompts.breakdown()
+    assert text.startswith("只拆成两幕"), "填了就是替换那一段"
+    assert prompts.BREAKDOWN_TASK not in text, "不是拼在内置文案后面，是换掉它"
+    assert prompts.BREAKDOWN_SHAPE in text, "JSON 形状契约永远由代码追加，用户改不掉"
+
+    # 清空（哪怕只敲了空格）= 恢复内置默认，而不是存一段空提示词
+    resp = client.patch("/api/v1/settings", json={"prompt.breakdown": "   "})
+    assert resp.status_code == 200, resp.text
+    assert fields_of(client)["prompt.breakdown"]["source"] == "default"
+    assert prompts.BREAKDOWN_TASK in prompts.breakdown()
+
+
+def test_director_prompt_reaches_both_paths(client: TestClient) -> None:
+    """支持工具的端与退化路径读的是同一段可配文案；工具清单与形状仍由代码生成。"""
+    from app.ai import prompts
+    from app.ai.director import agent
+
+    resp = client.patch("/api/v1/settings", json={"prompt.director": "你是一位克制的导演。"})
+    assert resp.status_code == 200, resp.text
+    assert prompts.director() == "你是一位克制的导演。"
+
+    fallback = agent._fallback_system()  # noqa: SLF001 —— 就是要盯这条退化路径的拼法
+    assert fallback.startswith("你是一位克制的导演。")
+    assert "add_scene" in fallback, "工具清单由代码生成，不靠提示词里手抄一份"
+    assert "只输出 JSON" in fallback, "形状那一段永远拼在最后"

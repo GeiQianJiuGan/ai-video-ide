@@ -1,4 +1,4 @@
-"""幕的小节点（prompt / 人物 / 地点）与节点上的主视频。
+"""幕的小节点（prompt / 人物 / 地点）与节点上播的那一段。
 
 这个文件盯的是「流程图上那个节点到底说了什么」，四件事：
 
@@ -7,8 +7,10 @@
   2. **人物 / 地点可以多选也可以不选**，但各自不能超过上限，超了要报四要素错误，
      并且**说清上限在哪儿改**；
   3. **上限真的可配置**——改 `scene.node_limit` 立刻生效，不用重启；
-  4. **没出片时是「暂无已生成视频」，出片后节点给出能播的那一段**；采用某一段为主视频
-     会同步成所属镜头的当前版本（时间线只认当前版本，两边不能各说一套）。
+  4. **「用哪一段」是镜头级的，幕上没有第二个指针**：一幕下面很多镜头，每个镜头各自
+     生成很多段，采用走全工程唯一那个入口 `POST /versions/{id}/current`
+     （= `Shot.current_version_id`），时间线装配认的就是它。节点上播哪一段只是「挑一段
+     来看」，挑到的不是采用的那一版时要标出来（`video_adopted=false`），不假装是。
 
 入队的用例先 `POST /queue/pause`，pump 就不会真去连 ComfyUI。
 """
@@ -225,21 +227,25 @@ def test_scene_cast_is_inherited_by_shots_without_their_own(client: TestClient, 
     assert ctx["complete"] is True
 
 
-# --- 4. 节点上的主视频 ---
+# --- 4. 每个镜头采用了哪一段（幕上没有「主视频」这种东西） ---
 
 
 def test_node_says_no_video_before_any_generation(client: TestClient, pid: str) -> None:
     sid = make_scene(client, pid, "雨夜追车", prompt="雨夜追车")
-    make_shot(client, pid, sid, "车灯划过水面")
+    shot = make_shot(client, pid, sid, "车灯划过水面")
     node = node_of(client, pid, sid)
     assert node["has_video"] is False
     assert node["video_path"] is None and node["video_count"] == 0
-    assert node["main_version_id"] is None
+    assert node["video_shot_id"] is None and node["video_adopted"] is False
 
     listed = client.get(f"{API}/projects/{pid}/scenes/{sid}/videos")
     assert listed.status_code == 200, listed.text
-    assert listed.json()["items"] == []
-    assert listed.json()["note"], "空列表也要给一句解释"
+    body = listed.json()
+    # 镜头照旧列出来（空的那一组也要有），否则界面上看不出「这个镜头还没出片」
+    assert [g["shot_id"] for g in body["shots"]] == [shot]
+    assert body["shots"][0]["items"] == [] and body["shots"][0]["adopted_version_id"] is None
+    assert (body["total"], body["adopted_count"]) == (0, 0)
+    assert body["note"], "空列表也要给一句解释"
 
 
 def test_node_plays_video_and_never_feeds_mp4_to_an_img(client: TestClient, pid: str) -> None:
@@ -255,7 +261,8 @@ def test_node_plays_video_and_never_feeds_mp4_to_an_img(client: TestClient, pid:
     assert node["has_video"] is True and node["video_count"] == 1
     assert str(node["video_path"]).endswith(".mp4")
     assert node["video_version_id"] == made.json()["id"]
-    assert node["video_adopted"] is False, "没人采用过，节点播的是自动挑的那一段"
+    assert node["video_shot_id"] == shot, "采用是镜头级的，所以要知道播的这段属于哪个镜头"
+    assert node["video_adopted"] is True, "新版本自动成为当前版本，所以播的就是采用的那一段"
     assert node["thumbnail_path"] is None, "缩略图只认图片，绝不能把 mp4 塞给 <img>"
 
     # 同一幕里再来一张图片版本：它可以当封面，但不能变成「能播的那一段」
@@ -270,7 +277,43 @@ def test_node_plays_video_and_never_feeds_mp4_to_an_img(client: TestClient, pid:
     assert str(node["video_path"]).endswith(".mp4")
 
 
-def test_adopt_main_video_switches_shot_current_version(client: TestClient, pid: str) -> None:
+def test_node_marks_the_played_clip_as_not_adopted(client: TestClient, pid: str) -> None:
+    """播的那一段不是所属镜头采用的那一版时，必须标出来而不是假装是。
+
+    这种情形是真会发生的：这个镜头最后采用的是一张图（T2I 的分镜草图），
+    但它先前生成过视频。节点上仍然播那段视频（已经出片了却看不见更糟），
+    只是 `video_adopted=false`，界面上说清「播的只是自动挑的一段」。
+    """
+    sid = make_scene(client, pid, "雨夜追车", prompt="雨夜追车")
+    shot = make_shot(client, pid, sid, "车灯划过水面")
+    clip = client.post(
+        f"{API}/projects/{pid}/shots/{shot}/versions",
+        json={"asset_id": upload_mp4(client, pid, "v1.mp4"), "duration": 4.0},
+    ).json()
+    picture = client.post(
+        f"{API}/projects/{pid}/shots/{shot}/versions",
+        json={"asset_id": upload_png(client, pid, "generated_image", "draft.png"), "kind": "image"},
+    ).json()
+
+    node = node_of(client, pid, sid)
+    assert node["video_version_id"] == clip["id"], "图片当不了「能播的那一段」"
+    assert node["video_adopted"] is False
+
+    listed = client.get(f"{API}/projects/{pid}/scenes/{sid}/videos").json()
+    group = listed["shots"][0]
+    assert group["adopted_version_id"] == picture["id"]
+    assert [row["id"] for row in group["items"]] == [clip["id"]]
+    assert [row["reason"] for row in group["omitted"]], "不能当候选的要说清为什么"
+
+
+def test_adopting_a_shot_video_switches_that_shots_current_version(
+    client: TestClient, pid: str
+) -> None:
+    """采用走的是全工程唯一那个入口：`POST /versions/{id}/current`。
+
+    幕上刻意没有第二个「主视频」指针——一幕下面有很多镜头，每个镜头各自生成很多段，
+    「用哪一段」只能一个镜头一个镜头地定，而时间线装配认的就是 `Shot.current_version_id`。
+    """
     sid = make_scene(client, pid, "雨夜追车", prompt="雨夜追车")
     shot = make_shot(client, pid, sid, "车灯划过水面")
     first = client.post(
@@ -283,88 +326,90 @@ def test_adopt_main_video_switches_shot_current_version(client: TestClient, pid:
     ).json()
 
     listed = client.get(f"{API}/projects/{pid}/scenes/{sid}/videos").json()
+    group = listed["shots"][0]
+    assert (group["shot_id"], group["index_no"], group["kind"]) == (shot, 1, "shot")
     # 同一镜头内新版本在前，和 `GET /shots/{id}/versions` 同一个口径
-    assert [row["id"] for row in listed["items"]] == [second["id"], first["id"]]
-    assert [row["version_no"] for row in listed["items"]] == [2, 1]
+    assert [row["id"] for row in group["items"]] == [second["id"], first["id"]]
+    assert [row["version_no"] for row in group["items"]] == [2, 1]
+    assert group["adopted_version_id"] == second["id"], "新版本自动成为当前版本"
+    assert [row["is_adopted"] for row in group["items"]] == [True, False]
+    assert (listed["total"], listed["adopted_count"]) == (2, 1)
 
-    adopted = client.post(
-        f"{API}/projects/{pid}/scenes/{sid}/main-video", json={"version_id": first["id"]}
-    )
+    adopted = client.post(f"{API}/projects/{pid}/versions/{first['id']}/current")
     assert adopted.status_code == 200, adopted.text
-    node = adopted.json()["node"]
-    assert node["main_version_id"] == first["id"]
-    assert node["video_adopted"] is True
-    assert node["video_version_id"] == first["id"]
-    # 采用即换当前版本：流程图播这一段、时间线导出另一段是不能接受的
+
+    again = client.get(f"{API}/projects/{pid}/scenes/{sid}/videos").json()["shots"][0]
+    assert again["adopted_version_id"] == first["id"]
+    assert [row["is_adopted"] for row in again["items"]] == [False, True]
     versions = client.get(f"{API}/projects/{pid}/shots/{shot}/versions").json()
     assert {v["id"]: v["is_current"] for v in versions}[first["id"]] is True
     assert len(versions) == 2, "版本只增不改，采用不会删掉任何一条"
-
-    cleared = client.post(
-        f"{API}/projects/{pid}/scenes/{sid}/main-video", json={"version_id": None}
-    )
-    assert cleared.status_code == 200, cleared.text
-    assert cleared.json()["main_version_id"] is None
-    assert cleared.json()["node"]["video_adopted"] is False
+    # 节点上播的也要跟着换：流程图播这一段、时间线导出另一段是不能接受的
+    node = node_of(client, pid, sid)
+    assert node["video_version_id"] == first["id"] and node["video_adopted"] is True
 
 
-def test_adopt_rejects_images_and_other_scenes(client: TestClient, pid: str) -> None:
-    a = make_scene(client, pid, "雨夜追车", prompt="雨夜追车")
-    b = make_scene(client, pid, "天台对峙", prompt="天台对峙")
-    shot_a = make_shot(client, pid, a, "车灯划过水面")
-    shot_b = make_shot(client, pid, b, "推门上天台")
-    mine = client.post(
-        f"{API}/projects/{pid}/shots/{shot_a}/versions",
-        json={"asset_id": upload_mp4(client, pid, "v1.mp4")},
+def test_timeline_assembles_the_adopted_video_of_each_shot(client: TestClient, pid: str) -> None:
+    """采用哪一段，时间线就装配哪一段——这才是「采用」的意义所在。"""
+    sid = make_scene(client, pid, "雨夜追车", prompt="雨夜追车")
+    shot = make_shot(client, pid, sid, "车灯划过水面")
+    first = client.post(
+        f"{API}/projects/{pid}/shots/{shot}/versions",
+        json={"asset_id": upload_mp4(client, pid, "v1.mp4"), "duration": 3.0},
     ).json()
-    picture = client.post(
-        f"{API}/projects/{pid}/shots/{shot_b}/versions",
-        json={"asset_id": upload_png(client, pid, "generated_image", "draft.png"), "kind": "image"},
-    ).json()
-
-    foreign = client.post(
-        f"{API}/projects/{pid}/scenes/{b}/main-video", json={"version_id": mine["id"]}
+    client.post(
+        f"{API}/projects/{pid}/shots/{shot}/versions",
+        json={"asset_id": upload_mp4(client, pid, "v2.mp4"), "duration": 5.0},
     )
-    assert foreign.status_code == 422
-    assert any("这一幕" in s for s in error_of(foreign)["suggestions"])
 
-    as_image = client.post(
-        f"{API}/projects/{pid}/scenes/{b}/main-video", json={"version_id": picture["id"]}
-    )
-    # MISSING_ASSET 在 core/errors.py::_STATUS 里是 400：版本确实存在，只是它不是能播的那种
-    assert as_image.status_code == 400, as_image.text
-    err = error_of(as_image)
-    assert err["code"] == "MISSING_ASSET"
-    assert "图片" in err["detail"] or "图片" in "".join(err["suggestions"])
+    def assemble() -> dict[str, Any]:
+        resp = client.post(f"{API}/projects/{pid}/timeline/assemble", json={"replace": True})
+        assert resp.status_code == 200, resp.text
+        track = next(t for t in resp.json()["timeline"]["tracks"] if t["kind"] == "video")
+        assert len(track["clips"]) == 1
+        return dict(track["clips"][0])
 
-    listed = client.get(f"{API}/projects/{pid}/scenes/{b}/videos").json()
-    assert listed["items"] == []
-    assert [row["reason"] for row in listed["omitted"]], "不能当候选的要说清为什么"
+    assert assemble()["version_no"] == 2, "默认用的就是这个镜头当前采用的那一版"
 
-    missing = client.post(
-        f"{API}/projects/{pid}/scenes/{a}/main-video", json={"version_id": "ver_不存在"}
-    )
+    client.post(f"{API}/projects/{pid}/versions/{first['id']}/current")
+    clip = assemble()
+    assert (clip["version_no"], clip["duration"]) == (1, 3.0), "换了采用，装配出来的就得换"
+
+
+def test_adopting_a_version_that_does_not_exist_is_a_four_element_error(
+    client: TestClient, pid: str
+) -> None:
+    missing = client.post(f"{API}/projects/{pid}/versions/ver_不存在/current")
     assert missing.status_code == 404
     error_of(missing)
 
 
-def test_stale_main_video_is_reported_not_swallowed(client: TestClient, pid: str) -> None:
-    """采用过的那一段被搬走 / 删掉之后，节点要说出来，而不是悄悄换一段。"""
+def test_the_adopted_clip_follows_the_shot_when_it_moves(client: TestClient, pid: str) -> None:
+    """镜头搬去别的幕，「用哪一段」跟着它走——这正是这个指针挂在镜头上而不是幕上的原因。
+
+    以前幕上另存一个「主视频」，镜头一搬那个指针就发霉，只能靠 issues 报「已失效」。
+    现在两边不可能各说一套：从来只有一个指针。
+    """
     a = make_scene(client, pid, "雨夜追车", prompt="雨夜追车")
     b = make_scene(client, pid, "天台对峙", prompt="天台对峙")
     shot = make_shot(client, pid, a, "车灯划过水面")
     version = client.post(
         f"{API}/projects/{pid}/shots/{shot}/versions",
-        json={"asset_id": upload_mp4(client, pid, "v1.mp4")},
+        json={"asset_id": upload_mp4(client, pid, "v1.mp4"), "duration": 4.0},
     ).json()
-    client.post(f"{API}/projects/{pid}/scenes/{a}/main-video", json={"version_id": version["id"]})
 
     moved = client.post(f"{API}/projects/{pid}/shots/{shot}/move", json={"scene_id": b})
     assert moved.status_code == 200, moved.text
 
-    node = node_of(client, pid, a)
-    assert node["has_video"] is False
-    assert any("主视频" in i for i in node["issues"]), "主视频失效必须写进 issues"
+    left = node_of(client, pid, a)
+    assert left["has_video"] is False and left["video_count"] == 0
+    assert not any("视频" in i for i in left["issues"]), "没有会发霉的指针，就没有「已失效」可报"
+
+    arrived = node_of(client, pid, b)
+    assert arrived["video_version_id"] == version["id"]
+    assert arrived["video_shot_id"] == shot and arrived["video_adopted"] is True
+    group = client.get(f"{API}/projects/{pid}/scenes/{b}/videos").json()["shots"][0]
+    assert group["adopted_version_id"] == version["id"]
 
 
 # --- 5. 挑人物 / 地点时看得到图 ---

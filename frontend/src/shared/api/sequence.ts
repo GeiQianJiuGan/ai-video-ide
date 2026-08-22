@@ -53,11 +53,14 @@ export interface SceneLink {
 
 /**
  * 流程图上的一个节点 = 一幕，本身就是一张小图表：
- * 中间是这一幕的成片（没出片时 `has_video === false`，显示「暂无已生成视频」），
+ * 中间是这一幕能播的那一段（没出片时 `has_video === false`，显示「暂无已生成视频」），
  * 周围挂着小节点——prompt（必填的那个）、人物、地点。
  *
  * 两个字段千万不要混用：`video_path` 是**能播的那一段**（`<video>`），
  * `thumbnail_path` 只会是图片（`<img>`）。把 `.mp4` 喂给 `<img>` 就是之前那个坏图。
+ *
+ * 幕上**没有**「主视频」这种东西：采用哪一段是每个镜头自己的事
+ * （`ShotVideoGroup.adopted_version_id`），节点上播的只是按镜头顺序挑出来的一段。
  */
 export interface FlowNode {
   id: string
@@ -80,15 +83,15 @@ export interface FlowNode {
   locations: SceneLocationRow[]
   /** 人物 / 地点各自的上限，运行期可配（设置页 `scene.node_limit`）。 */
   node_limit: number
-  /** 用户采用为主视频的那一版；null = 没人采用过，节点播的是自动挑的那一段。 */
-  main_version_id: string | null
   video_version_id: string | null
   video_asset_id: string | null
+  /** 播的这一段属于哪个镜头。采用是镜头级的，所以要知道去哪个镜头改。 */
+  video_shot_id: string | null
   video_path: string | null
   video_duration: number | null
-  /** 正在播的这一段就是用户采用的那一段。 */
+  /** 播的这一段就是所属镜头采用了的那一版（否则只是自动挑的一段）。 */
   video_adopted: boolean
-  /** 这一幕一共有几段可播的视频，就是「选一段采用」列表的长度。 */
+  /** 这一幕一共有几段可播的视频，就是「按镜头选一段采用」列表的总长度。 */
   video_count: number
   has_video: boolean
   thumbnail_asset_id: string | null
@@ -189,18 +192,14 @@ export interface LinkBody {
 }
 
 /**
- * 这一幕生成过的一段视频（「选一段采用为主视频」列表里的一行）。
+ * 某个镜头生成过的一段视频（「按镜头选一段采用」列表里的一行）。
  *
  * `omitted` 里的行形状一样，只是多一条 `reason`——不能当候选也要说清为什么，
  * 列表空着不给理由，用户只会以为功能坏了。
  */
-export interface SceneVideoCard {
+export interface ShotVideoCard {
   id: string
   shot_id: string
-  shot_index_no: number
-  shot_title: string
-  /** shot（导演排的戏）/ transition（衔接补出来的那段）。 */
-  shot_kind: string
   version_no: number
   status: string
   /** generated / manual —— 手工挂进来的版本也要能看出来。 */
@@ -208,29 +207,38 @@ export interface SceneVideoCard {
   duration: number | null
   asset_id: string | null
   asset_path: string | null
-  /** 它是所属镜头的当前版本——时间线导出的就是当前版本。 */
-  is_shot_current: boolean
-  /** 它是这一幕采用的主视频。 */
-  is_main: boolean
+  /** 这一版就是该镜头采用了的那一段（= `Shot.current_version_id`）。 */
+  is_adopted: boolean
   created_at: string
   reason?: string
+}
+
+/**
+ * 一幕里的一个镜头，以及它自己的那一批候选。
+ *
+ * **采用是镜头级的**：一幕下面有很多镜头，每个镜头各自独立生成很多段视频，
+ * 「用哪一段」只能一个镜头一个镜头地定。它就是 `adopted_version_id`
+ * （后端的 `Shot.current_version_id`），时间线装配认的也是它。
+ */
+export interface ShotVideoGroup {
+  shot_id: string
+  index_no: number
+  title: string
+  /** shot（导演排的戏）/ transition（衔接补出来的那段）。 */
+  kind: string
+  adopted_version_id: string | null
+  items: ShotVideoCard[]
+  omitted: ShotVideoCard[]
 }
 
 export interface SceneVideos {
   scene_id: string
   title: string
-  main_version_id: string | null
-  items: SceneVideoCard[]
-  omitted: SceneVideoCard[]
-  note: string
-}
-
-/** 采用结果。`node` 是重算过的那一个节点，页面可以直接换掉本地那一份。 */
-export interface AdoptResult {
-  scene_id: string
-  title: string
-  main_version_id: string | null
-  node: FlowNode
+  shots: ShotVideoGroup[]
+  /** 这一幕所有镜头的候选总数。 */
+  total: number
+  /** 已经采用了成片的镜头数。 */
+  adopted_count: number
   note: string
 }
 
@@ -241,15 +249,14 @@ export const sequenceApi = {
   setLink: (pid: string, body: LinkBody) => api.put<SceneLink>(`/projects/${pid}/links`, body),
   deleteLink: (pid: string, linkId: string) => api.del<void>(`/projects/${pid}/links/${linkId}`),
 
-  /** 这一幕生成过的视频（候选主视频）；不能当候选的在 `omitted` 里带原因。 */
+  /**
+   * 这一幕**按镜头分组**的视频候选；不能当候选的在 `omitted` 里带原因。
+   *
+   * 这里只列候选。采用走 `versionsApi.setCurrent`（`POST /versions/{id}/current`）——
+   * 全工程只有那一个「用哪一段」的入口，刻意不在这一层再开第二个。
+   */
   sceneVideos: (pid: string, sid: string) =>
     api.get<SceneVideos>(`/projects/${pid}/scenes/${sid}/videos`),
-  /**
-   * 采用某一段为这一幕的主视频；`versionId = null` 是取消采用。
-   * 采用会同时把它设成所属镜头的当前版本——流程图播一段、时间线导出另一段是不能接受的。
-   */
-  adoptMainVideo: (pid: string, sid: string, versionId: string | null) =>
-    api.post<AdoptResult>(`/projects/${pid}/scenes/${sid}/main-video`, { version_id: versionId }),
 
   /** 只出账单，不入队任何任务。 */
   plan: (pid: string, mode: SequenceMode) =>

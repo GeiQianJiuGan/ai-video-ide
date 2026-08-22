@@ -14,7 +14,7 @@
 import { api } from './client'
 
 export type SettingSource = 'file' | 'env' | 'default'
-export type SettingKind = 'str' | 'int' | 'float' | 'bool' | 'secret' | 'enum'
+export type SettingKind = 'str' | 'int' | 'float' | 'bool' | 'secret' | 'enum' | 'text'
 
 export const SOURCE_LABEL: Record<SettingSource, string> = {
   file: '来自配置文件',
@@ -37,6 +37,12 @@ export interface SettingField {
   fetch: string
   /** 这项配错了会导致什么做不出来。后端给的文案，前端不重写一遍。 */
   impact: string
+  /**
+   * `kind === 'text'` 用：留空时实际生效的那段内置文本（系统提示词的内置默认）。
+   * 「恢复内置默认」= 把输入框填回这一段并提交空串——内置文案只有后端一份，
+   * 前端绝不抄第二份。
+   */
+  builtin: string
   source: SettingSource
   /** secret 字段恒为 null。 */
   value: string | number | boolean | null
@@ -125,6 +131,13 @@ export interface PresetRow {
   found?: string[]
   missing_required?: string[]
   node_count?: number
+  /**
+   * 这份图能收几张参考图（`AIVS_REF_1…` 标了几个）。
+   * **0 不影响 `ready`**——只是角色表 / 地点参考图喂不进去，人物形象只能靠首帧带，
+   * 所以页面要把 `ref_hint` 那句话显示出来，而不是只画一个绿点。
+   */
+  ref_slots: number
+  ref_hint: string
 }
 
 export interface PresetListing {

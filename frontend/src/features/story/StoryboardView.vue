@@ -11,6 +11,12 @@
  *
  * 生成按钮直接入队（队列页负责跑）。整场生成会返回被跳过的镜头与结构化理由，
  * 这一页必须把它们逐条列出来——「排了 5 个、跳过 2 个」里那 2 个才是要处理的事。
+ *
+ * 卡片上那张图只认后端给的 `thumbnail_path`（后端保证它是图片）。以前这里拿的是
+ * 「当前版本的资产 id」，而当前版本几乎总是一段 `.mp4`，塞进 `<img>` 就是那个
+ * 「分镜里截取的首帧加载失败」。抽帧是写操作，读分镜板绝不起 FFmpeg，所以
+ * `poster_pending` 的卡片要人点一下「补首帧」（`POST /storyboard/posters`），
+ * 抽不出来的逐条列理由。
  */
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
@@ -19,6 +25,7 @@ import {
   ChevronLeft,
   ChevronRight,
   ChevronUp,
+  Image,
   ListVideo,
   RefreshCw,
   Sparkles,
@@ -31,11 +38,12 @@ import EmptyState from '@/shared/ui/EmptyState.vue'
 import ErrorPanel from '@/shared/ui/ErrorPanel.vue'
 import FeatureHeader from '@/shared/ui/FeatureHeader.vue'
 import { fileUrl } from '@/shared/api/files'
-import { assetsApi, type Asset } from '@/shared/api/assets'
 import { ApiError } from '@/shared/api/client'
 import {
   SHOT_STATUS,
   SHOT_STATUS_LABEL,
+  storyApi,
+  type PosterResult,
   type ShotStatus,
   type StoryboardCard,
 } from '@/shared/api/story'
@@ -51,13 +59,6 @@ const pid = computed(() => String(route.params.pid ?? ''))
 
 /** 'all' / 某个状态 / 'issues'（只看上下文不完整的）。 */
 const filter = ref<'all' | 'issues' | ShotStatus>('all')
-const assets = ref<Asset[]>([])
-const assetError = ref<ApiError | null>(null)
-
-const assetById = computed(() => new Map(assets.value.map((a) => [a.id, a])))
-const showAssetError = computed(
-  () => assetError.value !== null && assetError.value.code !== story.lastError?.code,
-)
 
 const total = computed(() => {
   const shots = story.lanes.flatMap((l) => l.shots)
@@ -68,17 +69,21 @@ const total = computed(() => {
   }
 })
 
+/** 有片子但还没有能当图显示的那一张——「补首帧」那个按钮的数据来源。 */
+const pendingPosters = computed(() =>
+  story.lanes.flatMap((l) => l.shots).filter((s) => s.poster_pending),
+)
+
+function thumb(card: StoryboardCard): string {
+  // 后端已经保证 thumbnail_path 只会是图片：这里不再按资产 id 去查一遍，
+  // 也就不会再把一段 .mp4 塞进 <img>。
+  return card.thumbnail_path ? fileUrl(pid.value, card.thumbnail_path) : ''
+}
+
 function visible(shots: StoryboardCard[]): StoryboardCard[] {
   if (filter.value === 'all') return shots
   if (filter.value === 'issues') return shots.filter((s) => !s.context_ok)
   return shots.filter((s) => s.status === filter.value)
-}
-
-function thumb(assetId: string | null): string {
-  if (!assetId) return ''
-  const asset = assetById.value.get(assetId)
-  if (!asset || asset.missing) return ''
-  return fileUrl(pid.value, asset.path)
 }
 
 function statusTone(status: string): 'neutral' | 'accent' | 'ok' | 'warn' {
@@ -88,24 +93,33 @@ function statusTone(status: string): 'neutral' | 'accent' | 'ok' | 'warn' {
   return 'neutral'
 }
 
-async function loadAssets(): Promise<void> {
-  if (!pid.value) return
-  try {
-    assets.value = await assetsApi.list(pid.value)
-    assetError.value = null
-  } catch (err) {
-    assets.value = []
-    assetError.value = err instanceof ApiError ? err : null
-  }
-}
-
 async function reload(): Promise<void> {
   if (!pid.value) return
-  await Promise.all([story.loadBoard(pid.value).catch(() => {}), loadAssets()])
+  await story.loadBoard(pid.value).catch(() => {})
 }
 
 onMounted(reload)
 watch(pid, reload)
+
+/** 补首帧：把「已经出片但卡片上还是空的」那些镜头抽一张真首帧出来。 */
+const posterBusy = ref(false)
+const posterError = ref<ApiError | null>(null)
+const posterResult = ref<PosterResult | null>(null)
+
+async function extractPosters(): Promise<void> {
+  if (!pid.value || posterBusy.value) return
+  posterBusy.value = true
+  posterError.value = null
+  posterResult.value = null
+  try {
+    posterResult.value = await storyApi.extractPosters(pid.value)
+    await reload()
+  } catch (err) {
+    posterError.value = err instanceof ApiError ? err : null
+  } finally {
+    posterBusy.value = false
+  }
+}
 
 function fmtDuration(n: number): string {
   return `${Math.round(n * 10) / 10}s`
@@ -235,6 +249,16 @@ async function generateScene(): Promise<void> {
         <Sparkles :size="10" />生成整场
       </AppButton>
       <AppButton
+        v-if="pendingPosters.length"
+        size="sm"
+        variant="ghost"
+        :disabled="posterBusy"
+        :title="`有 ${pendingPosters.length} 个镜头已经出片但卡片上还没有图：从成片里抽一张真首帧出来（读分镜板不会自己起 FFmpeg，所以要点这一下）`"
+        @click="extractPosters()"
+      >
+        <Image :size="10" />补首帧 {{ pendingPosters.length }}
+      </AppButton>
+      <AppButton
         size="sm"
         variant="ghost"
         title="在底部控制台的任务框里看任务跑到哪了（不用离开这一页）"
@@ -254,10 +278,10 @@ async function generateScene(): Promise<void> {
       @dismiss="story.clearError()"
     />
     <ErrorPanel
-      v-if="showAssetError"
+      v-if="posterError"
       class="mx-2 mt-2"
-      :error="assetError"
-      @dismiss="assetError = null"
+      :error="posterError"
+      @dismiss="posterError = null"
     />
     <ErrorPanel
       v-if="enqueueError"
@@ -265,6 +289,29 @@ async function generateScene(): Promise<void> {
       :error="enqueueError"
       @dismiss="enqueueError = null"
     />
+    <div
+      v-if="posterResult"
+      class="border-line-1 bg-base-2 mx-2 mt-2 flex items-start gap-2 border p-1.5"
+    >
+      <div class="min-w-0 flex-1">
+        <p class="text-fg-2 text-2xs">
+          补首帧：{{ posterResult.extracted.length }} / {{ posterResult.requested }} 个镜头抽到了图
+          <span v-if="posterResult.failed.length" class="text-st-review">
+            · {{ posterResult.failed.length }} 个没抽出来
+          </span>
+        </p>
+        <ul v-if="posterResult.failed.length" class="mt-1 space-y-0.5">
+          <li v-for="f in posterResult.failed" :key="f.shot_id" class="text-2xs">
+            <span class="text-st-review">{{ f.title }}：{{ f.error.title }}</span>
+            <span class="text-fg-4"> — {{ f.error.detail }}</span>
+            <span v-if="f.error.suggestions?.length" class="text-fg-4">
+              （{{ f.error.suggestions.join('；') }}）
+            </span>
+          </li>
+        </ul>
+      </div>
+      <button class="text-fg-4 hover:text-fg-1 text-2xs" @click="posterResult = null">关闭</button>
+    </div>
     <div
       v-if="enqueueNote"
       class="border-line-1 bg-base-2 mx-2 mt-2 flex items-start gap-2 border p-1.5"
@@ -322,11 +369,14 @@ async function generateScene(): Promise<void> {
                 <button class="block w-full text-left" @click="story.selectShot(pid, card.id)">
                   <span class="bg-base-3 flex h-24 items-center justify-center overflow-hidden">
                     <img
-                      v-if="thumb(card.thumbnail_asset_id)"
-                      :src="thumb(card.thumbnail_asset_id)"
+                      v-if="thumb(card)"
+                      :src="thumb(card)"
                       alt=""
                       class="h-full w-full object-cover"
                     />
+                    <span v-else-if="card.poster_pending" class="text-fg-4 px-1 text-center text-2xs">
+                      已出片，还没抽首帧
+                    </span>
                     <span v-else class="text-fg-4 text-2xs">还没有画面</span>
                   </span>
                   <span class="flex items-center gap-1 px-1.5 pt-1">

@@ -44,3 +44,4 @@ backend/dist/
 !.vscode/settings.json
 .DS_Store
 Thumbs.db
+backend/.pytest_tmp

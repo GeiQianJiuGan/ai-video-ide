@@ -60,6 +60,23 @@ def parse_graph(raw: str) -> dict[str, Any]:
             "顶层应是「节点 id → 节点」的对象，实际拿到的是空对象或数组。",
             ["在 ComfyUI 里用「Save (API Format)」重新导出", "确认没有把界面工作流当成 API 格式"],
         )
+    # 界面工作流的顶层是 {id, revision, last_node_id, last_link_id, nodes: [...], links: [...]}。
+    # 它和 API 格式差得远，但下面那条「缺少 class_type」的报错会把这几个顶层键当成节点名列出来
+    # ——用户看到的是一串不认识的字段，而真正的原因是导出格式选错了。所以先认出这一种。
+    if isinstance(data.get("nodes"), list):
+        raise AppError(
+            ErrorCode.INVALID_WORKFLOW,
+            "这是界面工作流，不是 API 格式",
+            f"顶层键是 {'、'.join(list(data)[:6])}，{len(data['nodes'])} 个节点在 nodes 数组里。"
+            "API 格式的顶层直接是「节点 id → {class_type, inputs}」，没有 nodes / links。",
+            [
+                "在 ComfyUI 里打开这份工作流 → 菜单「工作流 / Workflow」→「导出 (API)」",
+                "旧版前端：设置里打开「Enable Dev mode Options」后会出现「Save (API Format)」按钮",
+                "user/default/workflows/ 里存的都是界面格式，不能直接上传",
+                "节点标题（AIVS_*）不用重设，导出格式换对就行",
+            ],
+            {"node_count": len(data["nodes"])},
+        )
     bad = [k for k, v in data.items() if not isinstance(v, dict) or "class_type" not in v]
     if bad:
         raise AppError(

@@ -29,12 +29,6 @@ class RunBody(BaseModel):
     priority: int = 100
 
 
-class MainVideoBody(BaseModel):
-    version_id: str | None = Field(
-        default=None, description="要采用为主视频的生成版本；null 表示取消采用"
-    )
-
-
 @router.get("/projects/{pid}/flow")
 async def flow_graph(pid: str) -> dict[str, Any]:
     """流程图：场景节点 + 衔接边。第一级页面的唯一数据源。"""
@@ -43,14 +37,14 @@ async def flow_graph(pid: str) -> dict[str, Any]:
 
 @router.get("/projects/{pid}/scenes/{sid}/videos")
 async def scene_videos(pid: str, sid: str) -> dict[str, Any]:
-    """这一幕生成过的视频（候选主视频）。不能当候选的那些在 omitted 里带原因。"""
+    """这一幕**按镜头分组**的视频候选。不能当候选的那些在 omitted 里带原因。
+
+    这里只列候选。**采用是镜头级的**，走已有的那唯一一个入口
+    `POST /projects/{pid}/versions/{version_id}/current`——它改的就是
+    `Shot.current_version_id`，时间线装配认的也是它。刻意不在这一层再开一个
+    「采用」端点：同一件事两个入口，迟早两边行为分叉。
+    """
     return await sequence.scene_videos(pid, sid)
-
-
-@router.post("/projects/{pid}/scenes/{sid}/main-video")
-async def adopt_main_video(pid: str, sid: str, body: MainVideoBody) -> dict[str, Any]:
-    """采用某一段为这一幕的主视频（同时设成所属镜头的当前版本）；null 是取消采用。"""
-    return await sequence.adopt_main_video(pid, sid, body.version_id)
 
 
 @router.get("/projects/{pid}/links")

@@ -1,11 +1,13 @@
 """Step 2 验收：真末帧抽取。
 
 单线程续接的全部前提就是这一步——上一段的**真末帧**当下一段的首帧。
-所以这里测三件事：
+所以这里测五件事：
 
   1. 抽出来的是一张真 PNG，并且登记成 `Asset(kind="frame")`（有登记才能进 context 账单）；
   2. 同一个 (asset, at) 再问一次直接复用，不重复起 FFmpeg 进程；
-  3. 没有 FFmpeg 时报 `FFMPEG_MISSING`，并且建议里要给出**另一条路**——改成转场衔接。
+  3. 没有 FFmpeg 时报 `FFMPEG_MISSING`，并且建议里要给出**另一条路**——改成转场衔接；
+  4. 帧是**临时资源不是工程资产**：落 `cache/frames/`，不进资产总账、不算孤儿；
+  5. **源成片一删，从它抽的帧跟着删**（登记与磁盘文件都要没），并且删了哪些要说出来。
 
 这个文件不走 TestClient：抽帧是 service 层的异步调用，工程也在同一个事件循环里建，
 免得 aiosqlite 的连接跨循环。
@@ -68,7 +70,9 @@ async def test_extract_tail_frame_registers_a_frame_asset(tmp_path: Path) -> Non
     frame = await frames.extract(pid, source["id"], "end")
     assert frame["kind"] == "frame"
     assert frame["reused"] is False
-    assert frame["path"].startswith("assets/frames/"), "帧要落在 KIND_DIR['frame'] 下"
+    assert frame["path"].startswith("cache/frames/"), (
+        "帧是临时资源，落 cache/ 而不是 assets/（见 KIND_DIR['frame']）"
+    )
     on_disk = projects.get(pid).dir / frame["path"]
     assert on_disk.is_file() and on_disk.stat().st_size > 0
     assert on_disk.read_bytes()[:8] == bytes.fromhex("89504e470d0a1a0a"), "抽出来的必须是 PNG"
@@ -78,6 +82,62 @@ async def test_extract_tail_frame_registers_a_frame_asset(tmp_path: Path) -> Non
 
     listed = await asset_service.list_assets(pid, kind="frame")
     assert [a["id"] for a in listed] == [frame["id"]], "抽出来的帧必须能被列出来"
+
+
+async def test_frames_are_temporary_and_stay_off_the_asset_ledger(tmp_path: Path) -> None:
+    """帧不算工程资产：资产总账与孤儿扫描都不该出现它。
+
+    它没有任何 `AssetRef`，如果算进去，孤儿列表会被一堆「我没导入过的图」刷满，
+    而用户其实无从判断哪一张能删。要看它们得显式传 kind="frame"。
+    """
+    binary = ffmpeg_or_skip()
+    pid = await make_project(tmp_path)
+    clip = await make_clip(binary, tmp_path / "raw" / "上一幕.mp4")
+    source = await asset_service.register_path(pid, "generated_video", str(clip))
+    frame = await frames.extract(pid, source["id"], "end")
+
+    ledger = {a["id"] for a in await asset_service.list_assets(pid)}
+    assert source["id"] in ledger, "成片本身当然还在总账上"
+    assert frame["id"] not in ledger, "临时帧不进资产总账"
+    assert frame["id"] not in {a["id"] for a in await asset_service.orphans(pid)}, (
+        "临时帧没有引用，但它不是孤儿——它跟着源片走"
+    )
+
+
+async def test_deleting_the_clip_takes_its_frames_with_it(tmp_path: Path) -> None:
+    """成片删了，从它抽的首尾帧也得删——登记、磁盘文件都要没，并且要说出来。"""
+    binary = ffmpeg_or_skip()
+    pid = await make_project(tmp_path)
+    clip = await make_clip(binary, tmp_path / "raw" / "上一幕.mp4")
+    source = await asset_service.register_path(pid, "generated_video", str(clip))
+    tail = await frames.extract(pid, source["id"], "end")
+    head = await frames.extract(pid, source["id"], "start")
+    root = projects.get(pid).dir
+    assert (root / tail["path"]).is_file() and (root / head["path"]).is_file()
+
+    out = await asset_service.delete(pid, source["id"])
+    assert out["file_removed"] is True
+    assert {r["id"] for r in out["derived_removed"]} == {tail["id"], head["id"]}, (
+        "连带删除绝不静默：删了哪几张要出现在返回值里"
+    )
+    assert not (root / tail["path"]).exists() and not (root / head["path"]).exists()
+    left = await asset_service.list_assets(pid, kind="frame")
+    assert left == [], "登记也要跟着走，不然界面上会指着一个不存在的文件"
+
+
+async def test_deleting_a_frame_alone_does_not_touch_the_clip(tmp_path: Path) -> None:
+    """反过来不成立：单独删掉一张帧，源成片必须原样留着（需要时能重抽）。"""
+    binary = ffmpeg_or_skip()
+    pid = await make_project(tmp_path)
+    clip = await make_clip(binary, tmp_path / "raw" / "上一幕.mp4")
+    source = await asset_service.register_path(pid, "generated_video", str(clip))
+    tail = await frames.extract(pid, source["id"], "end")
+
+    out = await asset_service.delete(pid, tail["id"])
+    assert out["derived_removed"] == [], "帧本身没有派生物"
+    assert (projects.get(pid).dir / source["path"]).is_file(), "删一张帧不该动到成片"
+    again = await frames.extract(pid, source["id"], "end")
+    assert again["reused"] is False, "删掉之后能重新抽出来——它本来就是可再生的"
 
 
 async def test_extracting_the_same_frame_twice_reuses_it(tmp_path: Path) -> None:

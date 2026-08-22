@@ -10,9 +10,11 @@
  *      直接禁用，tooltip 里写「上限可改：设置页…」——和后端拒绝时给的建议是同一句话。
  *   3. **地点的第一条就是主地点**（同步 `scene.location_variant_id`），所以能改顺序：
  *      「设为主地点」= 把它挪到第一位，不是另一个字段。
- *   4. **采用主视频是一次选择，不是一次生成**：列表里都是已经存在的版本，
- *      采用只会改「用哪一段」，一条版本都不会被删（硬约束 3）。不能当候选的那些
- *      连原因一起列出来。
+ *   4. **采用是镜头级的**，所以视频列表按镜头分组：一幕下面有很多镜头，每个镜头各自
+ *      独立生成很多段，「用哪一段」只能一个镜头一个镜头地定，时间线装配认的也正是它
+ *      （`Shot.current_version_id`）。采用只改「用哪一段」，一条版本都不会被删（硬约束 3）；
+ *      幕上刻意**没有**「主视频」这种东西——那种指针和导出用的那一段迟早会各说一套。
+ *      不能当候选的那些连原因一起列出来。
  *   5. **挑人物 / 地点要看得见图**：两张清单每行左边是缩略图（`thumbnail_path`，
  *      后端给的相对路径），只给名字的话用户得先去角色页 / 地点页翻一遍才知道哪个是哪个。
  *      没有图的照旧列出来并给占位——没有角色表的形象能挂，只是喂不出参考图。
@@ -103,8 +105,9 @@ async function makePrimary(variantId: string): Promise<void> {
   await flow.setSceneLocations(props.pid, props.node.id, next).catch(() => {})
 }
 
-async function adopt(versionId: string | null): Promise<void> {
-  await flow.adoptMainVideo(props.pid, props.node.id, versionId).catch(() => {})
+/** 采用为**这一段所属镜头**的成片。没有取消——换一段就是再采用一次。 */
+async function adopt(versionId: string): Promise<void> {
+  await flow.adoptShotVideo(props.pid, props.node.id, versionId).catch(() => {})
 }
 </script>
 
@@ -239,86 +242,95 @@ async function adopt(versionId: string | null): Promise<void> {
           </li>
         </ul>
       </section>
-      <!-- 已生成的视频：挑一段采用为这一幕的主视频 -->
+      <!-- 已生成的视频：**按镜头分组**，每个镜头各自采用一段（= 它的当前版本） -->
       <section class="border-line-1 mt-2 border-t pt-2">
         <p class="text-fg-3 text-2xs tracking-wide uppercase">
-          已生成的视频（{{ flow.videos?.items.length ?? 0 }}）
+          每个镜头采用哪一段（{{ flow.videos?.adopted_count ?? 0 }}/{{
+            flow.videos?.shots.length ?? 0
+          }}
+          已采用）
         </p>
         <EmptyState
-          v-if="!flow.videos || flow.videos.items.length === 0"
+          v-if="!flow.videos || flow.videos.total === 0"
           title="暂无已生成视频"
           body="这一幕还没有可播的成片。去工作台生成，或在上面按「先看账单 → 执行编排」。"
         />
-        <ul v-else class="mt-1 space-y-1">
-          <li
-            v-for="v in flow.videos.items"
-            :key="v.id"
-            class="border bg-base-2 px-1 py-0.5"
-            :class="v.is_main ? 'border-accent/60' : 'border-line-1'"
-          >
-            <div class="flex items-center gap-1">
-              <span class="text-fg-2 min-w-0 flex-1 truncate text-2xs" :title="v.shot_title">
-                {{ v.shot_index_no }}. {{ v.shot_title }} · v{{ v.version_no }}
+        <div v-else class="mt-1 space-y-2">
+          <div v-for="g in flow.videos.shots" :key="g.shot_id">
+            <p class="flex items-center gap-1">
+              <span class="text-fg-2 min-w-0 flex-1 truncate text-2xs" :title="g.title">
+                {{ g.index_no }}. {{ g.title }}
               </span>
-              <span class="text-fg-4 tnum text-2xs">{{ fmt(v.duration) }}</span>
-            </div>
-            <div class="mt-0.5 flex flex-wrap items-center gap-1">
-              <AppBadge v-if="v.is_main" tone="ok">主视频</AppBadge>
-              <AppBadge v-if="v.is_shot_current" tone="accent" title="时间线导出的就是当前版本">
-                镜头当前版本
-              </AppBadge>
-              <AppBadge v-if="v.shot_kind === 'transition'" tone="neutral">转场</AppBadge>
-              <AppBadge v-if="v.source === 'manual'" tone="neutral" title="手工挂进来的版本">
-                手工
-              </AppBadge>
-              <AppButton
-                size="sm"
-                variant="ghost"
-                :title="previewId === v.id ? '收起预览' : '在这里播一下'"
-                @click="previewId = previewId === v.id ? '' : v.id"
-              >
-                {{ previewId === v.id ? '收起' : '预览' }}
-              </AppButton>
-              <AppButton
-                size="sm"
-                :variant="v.is_main ? 'ghost' : 'primary'"
-                :disabled="flow.busy"
+              <AppBadge v-if="g.kind === 'transition'" tone="neutral">转场</AppBadge>
+              <AppBadge
+                :tone="g.adopted_version_id ? 'ok' : 'warn'"
                 :title="
-                  v.is_main
-                    ? '取消采用：节点上会回到自动挑的那一段'
-                    : '采用为这一幕的主视频，同时把它设成所属镜头的当前版本'
+                  g.adopted_version_id
+                    ? '这个镜头已经定了用哪一段：时间线装配、下游抽末帧都认它'
+                    : '这个镜头还没定用哪一段，时间线装配时会缺这一格'
                 "
-                @click="adopt(v.is_main ? null : v.id)"
               >
-                {{ v.is_main ? '取消采用' : '采用为主视频' }}
-              </AppButton>
-            </div>
-            <video
-              v-if="previewId === v.id && clipUrl(v.asset_path)"
-              :src="clipUrl(v.asset_path)"
-              controls
-              preload="metadata"
-              class="bg-base-3 mt-1 max-h-40 w-full"
-            />
-          </li>
-        </ul>
-        <template v-if="flow.videos?.omitted.length">
-          <p class="text-fg-3 mt-2 text-2xs tracking-wide uppercase">
-            不能当候选（{{ flow.videos.omitted.length }}）
-          </p>
-          <ul class="mt-1 space-y-px">
-            <li
-              v-for="v in flow.videos.omitted"
-              :key="v.id"
-              class="border-line-1 bg-base-2 border px-1 py-0.5"
-            >
-              <p class="text-fg-2 truncate text-2xs">
-                {{ v.shot_index_no }}. {{ v.shot_title }} · v{{ v.version_no }}
-              </p>
-              <p class="text-fg-4 text-2xs">{{ v.reason }}</p>
-            </li>
-          </ul>
-        </template>
+                {{ g.adopted_version_id ? '已采用' : '未采用' }}
+              </AppBadge>
+            </p>
+            <ul class="mt-0.5 space-y-1">
+              <li
+                v-for="v in g.items"
+                :key="v.id"
+                class="bg-base-2 border px-1 py-0.5"
+                :class="v.is_adopted ? 'border-accent/60' : 'border-line-1'"
+              >
+                <div class="flex items-center gap-1">
+                  <span class="text-fg-2 min-w-0 flex-1 truncate text-2xs">v{{ v.version_no }}</span>
+                  <span class="text-fg-4 tnum text-2xs">{{ fmt(v.duration) }}</span>
+                </div>
+                <div class="mt-0.5 flex flex-wrap items-center gap-1">
+                  <AppBadge v-if="v.is_adopted" tone="ok" title="时间线导出的就是这一段">
+                    已采用
+                  </AppBadge>
+                  <AppBadge v-if="v.source === 'manual'" tone="neutral" title="手工挂进来的版本">
+                    手工
+                  </AppBadge>
+                  <AppButton
+                    size="sm"
+                    variant="ghost"
+                    :title="previewId === v.id ? '收起预览' : '在这里播一下'"
+                    @click="previewId = previewId === v.id ? '' : v.id"
+                  >
+                    {{ previewId === v.id ? '收起' : '预览' }}
+                  </AppButton>
+                  <AppButton
+                    v-if="!v.is_adopted"
+                    size="sm"
+                    variant="primary"
+                    :disabled="flow.busy"
+                    title="采用这一段：把它设成这个镜头的当前版本，旧版本一条都不会删"
+                    @click="adopt(v.id)"
+                  >
+                    采用
+                  </AppButton>
+                </div>
+                <video
+                  v-if="previewId === v.id && clipUrl(v.asset_path)"
+                  :src="clipUrl(v.asset_path)"
+                  controls
+                  preload="metadata"
+                  class="bg-base-3 mt-1 max-h-40 w-full"
+                />
+              </li>
+            </ul>
+            <ul v-if="g.omitted.length" class="mt-0.5 space-y-px">
+              <li
+                v-for="v in g.omitted"
+                :key="v.id"
+                class="border-line-1 bg-base-2 border border-dashed px-1 py-0.5"
+              >
+                <p class="text-fg-2 truncate text-2xs">v{{ v.version_no }} · 不能当候选</p>
+                <p class="text-fg-4 text-2xs">{{ v.reason }}</p>
+              </li>
+            </ul>
+          </div>
+        </div>
         <p v-if="flow.videos" class="text-fg-4 mt-1 text-2xs">{{ flow.videos.note }}</p>
       </section>
     </div>

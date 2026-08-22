@@ -68,6 +68,12 @@ class LocationsBody(BaseModel):
     )
 
 
+class PostersBody(BaseModel):
+    shot_ids: list[str] | None = Field(
+        default=None, description="只补这几个镜头；留空表示补全部「有片子但没有图」的卡片"
+    )
+
+
 class PropsBody(BaseModel):
     items: list[dict[str, Any]] = Field(
         description='[{"prop_id": "prp_…", "state": "present|discarded"}]'
@@ -185,6 +191,12 @@ async def set_shot_props(pid: str, shot_id: str, body: PropsBody) -> dict[str, A
 @router.get("/projects/{pid}/storyboard")
 async def storyboard(pid: str) -> list[dict[str, Any]]:
     return await story.storyboard(pid)
+
+
+@router.post("/projects/{pid}/storyboard/posters")
+async def extract_posters(pid: str, body: PostersBody | None = None) -> dict[str, Any]:
+    """给「有片子但没有图」的卡片补抽首帧。读分镜板不起 FFmpeg，补图是这一条显式动作。"""
+    return await story.extract_posters(pid, body.shot_ids if body else None)
 
 
 @router.post("/projects/{pid}/breakdown/propose")

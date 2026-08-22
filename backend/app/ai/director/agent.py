@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from app.ai import prompts
 from app.ai.director.tools import TOOLS, WRITE_TOOLS, run_read, to_op, tool_specs
 from app.ai.llm import client as llm
 from app.core.logging import get_logger
@@ -28,20 +29,10 @@ log = get_logger("director")
 #: 转多少轮就停手。六轮够它「看一眼现状 → 提三五条改动 → 说句话」，再多就是在绕圈。
 MAX_ROUNDS = 6
 
-SYSTEM = """你是一部 AI 生成短片的助理导演。你面对的是「幕流程图」：整部片子由若干幕组成，
-每一幕挂着地点变体、出场角色、道具与镜头，幕与幕之间有明确的衔接方式
-（cut 硬切 / transition 生成 1~2 秒转场 / tail_frame 上一幕真末帧当下一幕首帧）。
-
-规则：
-1. 动手之前先用读工具看清现状（list_scenes / list_characters / list_locations / list_props），
-   不要凭空猜 id。所有 id 必须来自读工具的返回。
-2. 你的写工具**不会改数据库**，只是提案，用户会逐条审阅。所以每条都要给 why：
-   一句话说清为什么要这么改。
-3. 宁少勿多：一次只提真正需要的几条。不要为了凑数改标题。
-4. 用中文。最后用一两句话总结你提了什么，不要罗列 id。"""
-
-FALLBACK_SYSTEM = """你是一部 AI 生成短片的助理导演。根据用户的要求与下面给出的工程现状，
-输出一个 JSON 对象：{"reply": "一两句中文说明", "ops": [{"tool": "工具名", "args": {...}}]}。
+#: 角色与规则那一段是**可配的**（设置页「AI 提示词」→「AI 导演」），内置默认在
+#: `app/ai/prompts.py::DIRECTOR_TASK`。这里只负责把它取出来用。
+FALLBACK_SHAPE = """你现在没有工具可用。根据用户的要求与下面给出的工程现状，输出一个 JSON 对象：
+{"reply": "一两句中文说明", "ops": [{"tool": "工具名", "args": {...}}]}。
 
 可用的工具名与参数：
 %s
@@ -51,12 +42,18 @@ FALLBACK_SYSTEM = """你是一部 AI 生成短片的助理导演。根据用户�
 
 
 def _fallback_system() -> str:
-    lines = [
+    """不支持工具的端用的系统提示词。
+
+    形状那一段（`FALLBACK_SHAPE`）永远由代码拼在最后，用户改不到——和
+    `prompts.breakdown()` 同一条规矩。工具清单也得由代码生成：写死一份迟早和
+    `tools.py` 打架。
+    """
+    lines = "\n".join(
         f"- {name}: {spec['desc']} 参数：{'、'.join(spec['params']) or '（无）'}"
         for name, spec in TOOLS.items()
         if spec["kind"] == "write"
-    ]
-    return FALLBACK_SYSTEM % "\n".join(lines)
+    )
+    return f"{prompts.director()}\n\n{FALLBACK_SHAPE % lines}"
 
 
 async def _snapshot(pid: str) -> str:
@@ -76,7 +73,7 @@ async def propose(pid: str, message: str, history: list[dict[str, Any]]) -> dict
     if not llm.supports_tools():
         return await _propose_without_tools(pid, message)
 
-    messages: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM}]
+    messages: list[dict[str, Any]] = [{"role": "system", "content": prompts.director()}]
     messages.extend(history)
     messages.append({"role": "user", "content": message})
     ops: list[dict[str, Any]] = []

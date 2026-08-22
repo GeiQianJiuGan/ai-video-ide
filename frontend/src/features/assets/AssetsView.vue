@@ -62,14 +62,20 @@ function thumb(a: Asset): string {
   return a.missing ? '' : fileUrl(pid.value, a.path)
 }
 
-/** 删除结果拼成一句话：磁盘文件删掉没有、强删破了几处，都要说出来。 */
+/** 删除结果拼成一句话：磁盘文件删掉没有、强删破了几处、连带删了几张临时帧，都要说出来。 */
 const deleteSummary = computed(() => {
   const r = store.lastDelete
   if (!r) return ''
   const head = r.file_removed
     ? '已删除登记，磁盘上的文件也删掉了'
     : '已删除登记，但磁盘文件没能删掉（可能被别的程序占用）'
-  return r.broken_refs ? `${head}；破坏了 ${r.broken_refs} 处引用，这些地方现在会缺图` : head
+  const parts = [head]
+  if (r.broken_refs) parts.push(`破坏了 ${r.broken_refs} 处引用，这些地方现在会缺图`)
+  // 抽出来的首尾帧是临时资源，源片一删就跟着删。删了几张要说出来，不静默连带删除。
+  if (r.derived_removed.length) {
+    parts.push(`连带删掉了 ${r.derived_removed.length} 张从它抽出来的临时帧（需要时可以重抽）`)
+  }
+  return parts.join('；')
 })
 
 async function reload(): Promise<void> {

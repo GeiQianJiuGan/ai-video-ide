@@ -9,6 +9,8 @@
  *   3. API Key 输入框永远是空的（后端不回明文），敲了才提交；要清除有专门的按钮；
  *   4. **「自动获取」是按 `field.fetch` 画的**，不在这里硬编码「模型这一项特殊」；协议的
  *      默认地址 / 要不要密钥 / 支不支持工具也全部来自后端的协议表，前端不抄一份。
+ *   5. **系统提示词（`kind === 'text'`）的内置文案只有后端一份**：灰字占位与「填入内置默认」
+ *      都读 `field.builtin`，这一页绝不抄第二份文案。
  *
  * 旧的 Workflow 绑定页降级成了高级/兼容路径，入口收在最后的折叠区里。
  */
@@ -17,6 +19,7 @@ import {
   Check,
   ChevronRight,
   Download,
+  FileText,
   PlugZap,
   RefreshCw,
   RotateCcw,
@@ -44,9 +47,12 @@ const DEP_TITLE: Record<string, string> = {
 
 const GROUP_HINT: Record<string, string> = {
   llm: '给「幕」页面的 AI 协作栏用。不配也行——手动编排能走完全程。',
+  prompt:
+    '「AI 拆出来的场景不够好」多半是这段话不够好，所以它可改。留空 = 用内置默认；JSON 输出形状由系统始终追加，改不坏。',
   video:
     'comfy_preset 直接连 ComfyUI 并按节点标题注参数，模型端的图由模型端维护；http_api 走通用合同。',
   comfy: 'comfy_preset 方式下的目标地址，同时也是节点探测与状态栏用的那一个。',
+  scene: '一幕里挂多少个人物 / 地点小节点的上限。prompt 是必填的那一个，不受它限制。',
   runtime: '并发数与 FFmpeg。FFmpeg 留空或裸名字表示用应用自带的那份。',
 }
 
@@ -76,6 +82,16 @@ function fetchTitle(): string {
   const proto = cfg.draftProtocol
   if (!proto || proto.name === 'none') return '先在上面选一个协议，再来自动获取模型列表'
   return `列出 ${proto.label} 上可用的模型（${proto.models_hint}）`
+}
+
+/**
+ * 把内置默认那一段填进输入框——给「我想在它基础上改」用。
+ *
+ * 它和右边那个「恢复内置默认」**不是一回事**：填进来再保存会存成一份覆盖（来源变成配置文件），
+ * 而「恢复内置默认」是清除覆盖、回到代码里那一份。文案只有后端一份（`field.builtin`）。
+ */
+function fillBuiltin(field: SettingField): void {
+  cfg.draft[field.key] = field.builtin
 }
 
 async function onPickPreset(ev: Event): Promise<void> {
@@ -111,7 +127,7 @@ async function pastePreset(): Promise<void> {
         </AppButton>
       </template>
 
-      <p class="text-fg-4 border-line-1 border-b px-3 py-1.5 text-2xs">
+      <p v-if="GROUP_HINT[group.id]" class="text-fg-4 border-line-1 border-b px-3 py-1.5 text-2xs">
         {{ GROUP_HINT[group.id] }}
       </p>
       <!-- 协议的能力说明来自后端的协议表：加一个协议不用改这一页 -->
@@ -132,109 +148,169 @@ async function pastePreset(): Promise<void> {
 
       <ul class="divide-line-1 divide-y">
         <li v-for="field in cfg.fieldsOf(group.id)" :key="field.key" class="px-3 py-1.5">
-          <div class="flex items-center gap-2">
-            <span class="text-fg-2 w-20 shrink-0 text-xs">{{ field.label }}</span>
-
-            <select
-              v-if="field.kind === 'enum'"
-              :value="cfg.draft[field.key]"
-              class="border-line-1 bg-base-2 text-fg-1 focus:border-accent/60 h-5 min-w-40 border px-1 text-2xs outline-none"
-              @change="cfg.setOne(field.key, ($event.target as HTMLSelectElement).value)"
-            >
-              <option v-for="(c, i) in field.choices" :key="c" :value="c">
-                {{ field.choice_labels[i] || c }}
-              </option>
-            </select>
-
-            <input
-              v-else
-              v-model="cfg.draft[field.key]"
-              :type="
-                field.kind === 'secret' ? 'password' : field.kind === 'int' ? 'number' : 'text'
-              "
-              :placeholder="
-                field.kind === 'secret'
-                  ? field.has_value
-                    ? `已保存 ${field.masked}（留空表示不改）`
-                    : '未设置'
-                  : '留空表示用环境变量 / 默认值'
-              "
-              class="border-line-1 bg-base-2 text-fg-1 placeholder:text-fg-4 focus:border-accent/60 h-5 min-w-0 flex-1 border px-1.5 text-2xs outline-none"
-              @keyup.enter="cfg.save()"
-            />
-
-            <AppButton
-              v-if="field.fetch"
-              size="sm"
-              :disabled="!canFetch() || cfg.fetched.busy || cfg.busy"
-              :title="fetchTitle()"
-              @click="cfg.fetchOptions(field)"
-            >
-              <Download :size="10" />
-              {{ cfg.fetched.busy && cfg.fetched.key === field.key ? '获取中…' : '自动获取' }}
-            </AppButton>
-
-            <AppBadge :tone="tone(field)">{{ SOURCE_LABEL[field.source] }}</AppBadge>
-            <AppBadge v-if="cfg.isDirty(field.key)" tone="warn">未保存</AppBadge>
-            <AppButton
-              size="sm"
-              variant="ghost"
-              :disabled="field.source !== 'file' || cfg.busy"
-              title="清除这项覆盖，回到环境变量或默认值"
-              @click="cfg.clear(field.key)"
-            >
-              <RotateCcw :size="10" />
-            </AppButton>
-          </div>
-          <p v-if="field.impact" class="text-fg-4 mt-0.5 pl-22 text-2xs">{{ field.impact }}</p>
-
-          <!-- 自动获取的结果：挑一个只是填进输入框，手打照旧可用 -->
-          <div v-if="cfg.fetched.key === field.key" class="mt-1 pl-22">
-            <ErrorPanel :error="cfg.fetched.error" @dismiss="cfg.clearFetched()" />
-            <div v-if="cfg.fetched.listing" class="border-line-1 bg-base-2 border">
-              <p class="text-fg-4 border-line-1 flex gap-2 border-b px-1.5 py-1 text-2xs">
-                <span class="text-fg-2">
-                  {{ cfg.fetched.listing.label }} · {{ cfg.fetched.listing.count }} 个模型
-                </span>
-                <span class="min-w-0 flex-1 truncate font-mono">
-                  {{ cfg.fetched.listing.target }}
-                </span>
-              </p>
-              <p
-                v-if="cfg.fetched.listing.current_present === false"
-                class="text-st-failed border-line-1 border-b px-1.5 py-1 text-2xs"
+          <!-- 长文本（系统提示词）：整行一个 textarea，标签与按钮摆在上面那一行 -->
+          <template v-if="field.kind === 'text'">
+            <div class="flex items-center gap-2">
+              <span class="text-fg-2 text-xs">{{ field.label }}</span>
+              <AppBadge :tone="tone(field)">{{ SOURCE_LABEL[field.source] }}</AppBadge>
+              <AppBadge v-if="cfg.isDirty(field.key)" tone="warn">未保存</AppBadge>
+              <span class="flex-1"></span>
+              <AppButton
+                size="sm"
+                variant="ghost"
+                title="把内置那段文案填进下面的框，好在它基础上改（改完记得点保存）"
+                @click="fillBuiltin(field)"
               >
-                连得上，但这个端上没有
-                <span class="font-mono">{{ cfg.fetched.listing.current }}</span>
-                —— 现在这样调用时才会失败，从下面挑一个。
-              </p>
-              <ul class="max-h-40 overflow-auto">
-                <li v-for="m in cfg.fetched.listing.items" :key="m.id">
-                  <button
-                    class="hover:bg-base-3 flex w-full items-center gap-1.5 px-1.5 py-1 text-left text-2xs"
-                    @click="cfg.pickOption(field.key, m.id)"
-                  >
-                    <Check
-                      :size="10"
-                      :class="
-                        String(cfg.draft[field.key] ?? '') === m.id ? 'text-accent' : 'opacity-0'
-                      "
-                    />
-                    <span class="text-fg-1">{{ m.label }}</span>
-                    <span v-if="m.label !== m.id" class="text-fg-4 truncate font-mono">
-                      {{ m.id }}
-                    </span>
-                  </button>
-                </li>
-                <li v-if="!cfg.fetched.listing.items.length" class="text-fg-4 px-1.5 py-1 text-2xs">
-                  这个端一个模型都没列出来。自建端有时不提供列表——直接把模型名填进上面的输入框。
-                </li>
-              </ul>
-              <p class="text-fg-4 border-line-1 border-t px-1.5 py-1 text-2xs">
-                挑一个只是填进输入框，记得点下面的「保存」。列不出来的模型直接手打也一样能用。
-              </p>
+                <FileText :size="10" />填入内置默认
+              </AppButton>
+              <AppButton
+                size="sm"
+                variant="ghost"
+                :disabled="field.source !== 'file' || cfg.busy"
+                title="清除这项覆盖，回到代码里那段内置提示词"
+                @click="cfg.clear(field.key)"
+              >
+                <RotateCcw :size="10" />恢复内置默认
+              </AppButton>
             </div>
-          </div>
+            <p v-if="field.impact" class="text-fg-4 mt-0.5 text-2xs">{{ field.impact }}</p>
+            <textarea
+              :value="String(cfg.draft[field.key] ?? '')"
+              rows="10"
+              :placeholder="field.builtin"
+              class="border-line-1 bg-base-2 text-fg-1 placeholder:text-fg-4 focus:border-accent/60 mt-1 w-full border px-1.5 py-1 text-2xs leading-relaxed outline-none"
+              @input="cfg.draft[field.key] = ($event.target as HTMLTextAreaElement).value"
+            ></textarea>
+            <p class="text-fg-4 mt-0.5 text-2xs">
+              框里是空的就是在用内置默认（上面那段灰字就是它，一字不差）。清空并保存 =
+              恢复内置默认。
+            </p>
+          </template>
+
+          <template v-else>
+            <div class="flex items-center gap-2">
+              <span class="text-fg-2 w-20 shrink-0 text-xs">{{ field.label }}</span>
+
+              <select
+                v-if="field.kind === 'enum'"
+                :value="cfg.draft[field.key]"
+                class="border-line-1 bg-base-2 text-fg-1 focus:border-accent/60 h-5 min-w-40 border px-1 text-2xs outline-none"
+                @change="cfg.setOne(field.key, ($event.target as HTMLSelectElement).value)"
+              >
+                <option v-for="(c, i) in field.choices" :key="c" :value="c">
+                  {{ field.choice_labels[i] || c }}
+                </option>
+              </select>
+
+              <!-- 开关：勾上就是开。不给「留空 = 默认」那套语义——bool 没有第三种状态 -->
+              <label
+                v-else-if="field.kind === 'bool'"
+                class="text-fg-2 flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 text-2xs"
+              >
+                <input
+                  type="checkbox"
+                  :checked="Boolean(cfg.draft[field.key])"
+                  class="accent-accent"
+                  @change="
+                    cfg.setOne(field.key, ($event.target as HTMLInputElement).checked)
+                  "
+                />
+                {{ Boolean(cfg.draft[field.key]) ? '开启' : '关闭' }}
+              </label>
+
+              <input
+                v-else
+                v-model="cfg.draft[field.key]"
+                :type="
+                  field.kind === 'secret' ? 'password' : field.kind === 'int' ? 'number' : 'text'
+                "
+                :placeholder="
+                  field.kind === 'secret'
+                    ? field.has_value
+                      ? `已保存 ${field.masked}（留空表示不改）`
+                      : '未设置'
+                    : '留空表示用环境变量 / 默认值'
+                "
+                class="border-line-1 bg-base-2 text-fg-1 placeholder:text-fg-4 focus:border-accent/60 h-5 min-w-0 flex-1 border px-1.5 text-2xs outline-none"
+                @keyup.enter="cfg.save()"
+              />
+
+              <AppButton
+                v-if="field.fetch"
+                size="sm"
+                :disabled="!canFetch() || cfg.fetched.busy || cfg.busy"
+                :title="fetchTitle()"
+                @click="cfg.fetchOptions(field)"
+              >
+                <Download :size="10" />
+                {{ cfg.fetched.busy && cfg.fetched.key === field.key ? '获取中…' : '自动获取' }}
+              </AppButton>
+
+              <AppBadge :tone="tone(field)">{{ SOURCE_LABEL[field.source] }}</AppBadge>
+              <AppBadge v-if="cfg.isDirty(field.key)" tone="warn">未保存</AppBadge>
+              <AppButton
+                size="sm"
+                variant="ghost"
+                :disabled="field.source !== 'file' || cfg.busy"
+                title="清除这项覆盖，回到环境变量或默认值"
+                @click="cfg.clear(field.key)"
+              >
+                <RotateCcw :size="10" />
+              </AppButton>
+            </div>
+            <p v-if="field.impact" class="text-fg-4 mt-0.5 pl-22 text-2xs">{{ field.impact }}</p>
+
+            <!-- 自动获取的结果：挑一个只是填进输入框，手打照旧可用 -->
+            <div v-if="cfg.fetched.key === field.key" class="mt-1 pl-22">
+              <ErrorPanel :error="cfg.fetched.error" @dismiss="cfg.clearFetched()" />
+              <div v-if="cfg.fetched.listing" class="border-line-1 bg-base-2 border">
+                <p class="text-fg-4 border-line-1 flex gap-2 border-b px-1.5 py-1 text-2xs">
+                  <span class="text-fg-2">
+                    {{ cfg.fetched.listing.label }} · {{ cfg.fetched.listing.count }} 个模型
+                  </span>
+                  <span class="min-w-0 flex-1 truncate font-mono">
+                    {{ cfg.fetched.listing.target }}
+                  </span>
+                </p>
+                <p
+                  v-if="cfg.fetched.listing.current_present === false"
+                  class="text-st-failed border-line-1 border-b px-1.5 py-1 text-2xs"
+                >
+                  连得上，但这个端上没有
+                  <span class="font-mono">{{ cfg.fetched.listing.current }}</span>
+                  —— 现在这样调用时才会失败，从下面挑一个。
+                </p>
+                <ul class="max-h-40 overflow-auto">
+                  <li v-for="m in cfg.fetched.listing.items" :key="m.id">
+                    <button
+                      class="hover:bg-base-3 flex w-full items-center gap-1.5 px-1.5 py-1 text-left text-2xs"
+                      @click="cfg.pickOption(field.key, m.id)"
+                    >
+                      <Check
+                        :size="10"
+                        :class="
+                          String(cfg.draft[field.key] ?? '') === m.id ? 'text-accent' : 'opacity-0'
+                        "
+                      />
+                      <span class="text-fg-1">{{ m.label }}</span>
+                      <span v-if="m.label !== m.id" class="text-fg-4 truncate font-mono">
+                        {{ m.id }}
+                      </span>
+                    </button>
+                  </li>
+                  <li
+                    v-if="!cfg.fetched.listing.items.length"
+                    class="text-fg-4 px-1.5 py-1 text-2xs"
+                  >
+                    这个端一个模型都没列出来。自建端有时不提供列表——直接把模型名填进上面的输入框。
+                  </li>
+                </ul>
+                <p class="text-fg-4 border-line-1 border-t px-1.5 py-1 text-2xs">
+                  挑一个只是填进输入框，记得点下面的「保存」。列不出来的模型直接手打也一样能用。
+                </p>
+              </div>
+            </div>
+          </template>
         </li>
       </ul>
 
@@ -287,32 +363,46 @@ async function pastePreset(): Promise<void> {
         <li
           v-for="row in cfg.presets?.items ?? []"
           :key="row.name"
-          class="flex items-center gap-2 px-3 py-1.5"
+          class="px-3 py-1.5"
         >
-          <StatusDot :status="row.ready ? 'completed' : 'failed'" />
-          <span class="text-fg-1 text-xs">{{ row.name }}</span>
-          <AppBadge v-if="cfg.byKey['video.preset']?.value === row.name" tone="accent">
-            默认
-          </AppBadge>
-          <span class="text-fg-4 min-w-0 flex-1 truncate text-2xs">
-            {{ row.ready ? (row.found ?? []).join(' · ') : row.impact }}
-          </span>
-          <AppButton
-            size="sm"
-            variant="ghost"
-            :disabled="!row.ready || cfg.busy"
-            @click="cfg.setOne('video.preset', row.name)"
+          <div class="flex items-center gap-2">
+            <StatusDot :status="row.ready ? 'completed' : 'failed'" />
+            <span class="text-fg-1 text-xs">{{ row.name }}</span>
+            <AppBadge v-if="cfg.byKey['video.preset']?.value === row.name" tone="accent">
+              默认
+            </AppBadge>
+            <!-- 参考图槽位数：0 个也能生成，但角色表喂不进去，所以标出来而不是藏起来 -->
+            <AppBadge v-if="row.ready" :tone="row.ref_slots ? 'neutral' : 'warn'">
+              参考图 {{ row.ref_slots }} 槽
+            </AppBadge>
+            <span class="text-fg-4 min-w-0 flex-1 truncate text-2xs">
+              {{ row.ready ? (row.found ?? []).join(' · ') : row.impact }}
+            </span>
+            <AppButton
+              size="sm"
+              variant="ghost"
+              :disabled="!row.ready || cfg.busy"
+              @click="cfg.setOne('video.preset', row.name)"
+            >
+              设为默认
+            </AppButton>
+            <AppButton
+              size="sm"
+              variant="danger"
+              :disabled="cfg.busy"
+              @click="cfg.removePreset(row.name)"
+            >
+              <Trash2 :size="10" />
+            </AppButton>
+          </div>
+          <!-- 「人物形象跑偏」的原因常常就在这一句里，文案由后端给 -->
+          <p
+            v-if="row.ready && row.ref_hint"
+            class="mt-0.5 pl-4 text-2xs"
+            :class="row.ref_slots ? 'text-fg-4' : 'text-st-failed'"
           >
-            设为默认
-          </AppButton>
-          <AppButton
-            size="sm"
-            variant="danger"
-            :disabled="cfg.busy"
-            @click="cfg.removePreset(row.name)"
-          >
-            <Trash2 :size="10" />
-          </AppButton>
+            {{ row.ref_hint }}
+          </p>
         </li>
         <li v-if="!(cfg.presets?.items ?? []).length" class="text-fg-4 px-3 py-2 text-2xs">
           还没有预设。从 ComfyUI 里用「Save (API

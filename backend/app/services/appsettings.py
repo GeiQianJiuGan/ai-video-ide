@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from app.ai import prompts
 from app.ai.llm import client as llm
 from app.ai.llm import protocols as llm_protocols
 from app.core.config import Settings, settings
@@ -40,7 +41,7 @@ class FieldSpec:
     attr: str
     group: str
     label: str
-    kind: str = "str"  # str | int | float | bool | secret | enum
+    kind: str = "str"  # str | int | float | bool | secret | enum | text
     choices: tuple[str, ...] = ()
     #: 与 choices 一一对应的人话标签。空表示直接显示 choices 里的值。
     choice_labels: tuple[str, ...] = ()
@@ -49,11 +50,15 @@ class FieldSpec:
     #: 非空表示这个字段的取值**可以自动获取**（值就是 `POST /settings/models` 的 what）。
     #: 设置页照它画那个「自动获取」按钮，不在前端硬编码「模型这一项特殊」。
     fetch: str = ""
+    #: `kind="text"` 用：留空时实际生效的那段内置文本。设置页把它当占位与「恢复内置默认」
+    #: 的来源——内置提示词只有 `app/ai/prompts.py` 一份，前端绝不抄第二份。
+    builtin: str = ""
 
 
 #: 分组只影响配置页怎么摆，不影响存储结构。
 GROUPS: tuple[tuple[str, str], ...] = (
     ("llm", "LLM（AI 协作）"),
+    ("prompt", "AI 提示词"),
     ("video", "视频生成 API"),
     ("comfy", "ComfyUI"),
     ("scene", "幕（流程图节点）"),
@@ -83,6 +88,30 @@ FIELDS: tuple[FieldSpec, ...] = (
     ),
     FieldSpec("llm.api_key", "llm_api_key", "llm", "API Key", "secret"),
     FieldSpec(
+        "prompt.breakdown",
+        "prompt_breakdown",
+        "prompt",
+        "剧本拆解（分镜师）",
+        "text",
+        impact=(
+            "决定 AI 把剧本拆成什么样的幕与镜头。留空用内置默认；"
+            "JSON 输出形状由系统始终追加，改不坏。"
+        ),
+        builtin=prompts.BREAKDOWN_TASK,
+    ),
+    FieldSpec(
+        "prompt.director",
+        "prompt_director",
+        "prompt",
+        "AI 导演（协作栏）",
+        "text",
+        impact=(
+            "流程图右侧那个协作栏的角色与规则。留空用内置默认；"
+            "「写工具只出提案、不落库」这条边界在代码里，提示词改不动它。"
+        ),
+        builtin=prompts.DIRECTOR_TASK,
+    ),
+    FieldSpec(
         "video.provider",
         "video_provider",
         "video",
@@ -108,6 +137,28 @@ FIELDS: tuple[FieldSpec, ...] = (
         impact="comfy_preset 时指哪一份图；缺它无法生成。",
     ),
     FieldSpec("video.timeout", "video_timeout", "video", "单次超时（秒）", "int"),
+    FieldSpec(
+        "video.ref_limit",
+        "video_ref_limit",
+        "video",
+        "参考图上限（张）",
+        "int",
+        impact=(
+            "一次生成最多喂几张参考图（含当首帧那张）。调小会先丢优先级低的道具图；"
+            "真正能收几张由模型端那份图决定（预设里数 AIVS_REF_* 槽位）。"
+        ),
+    ),
+    FieldSpec(
+        "video.ref_labels",
+        "video_ref_labels",
+        "video",
+        "在 prompt 里写明参考图是谁",
+        "bool",
+        impact=(
+            "把「参考图1=林小雨（常服）」拼到 prompt 末尾。ComfyUI 那类图收不到标签，"
+            "只能靠这句话让模型知道哪张是主角；不想让它动 prompt 就关掉。"
+        ),
+    ),
     FieldSpec("comfy.base_url", "comfy_base_url", "comfy", "地址"),
     FieldSpec(
         "scene.node_limit",
@@ -227,6 +278,8 @@ class AppSettingsService:
                     "choice_labels": list(spec.choice_labels),
                     "fetch": spec.fetch,
                     "impact": spec.impact,
+                    #: 留空时实际生效的那段内置文本（只有 kind="text" 有）。
+                    "builtin": spec.builtin,
                     "source": self._source_of(spec.key, overrides),
                     "value": None if secret else value,
                     "masked": mask(str(value)) if secret else None,
@@ -244,7 +297,11 @@ class AppSettingsService:
         }
 
     async def patch(self, patch: dict[str, Any]) -> dict[str, Any]:
-        """写覆盖。值为 `null` 表示**清除覆盖**，回到环境变量或默认。"""
+        """写覆盖。值为 `null` 表示**清除覆盖**，回到环境变量或默认。
+
+        密钥与长文本（提示词）额外把 `""` 也当成清除：那两种字段的输入框在界面上就是
+        「清空 = 恢复默认」，`""` 落盘只会变成一把空密钥或一段空提示词。
+        """
         unknown = [k for k in patch if k not in BY_KEY]
         if unknown:
             raise AppError(
@@ -257,7 +314,7 @@ class AppSettingsService:
         overrides = self._read()
         for key, raw in patch.items():
             spec = BY_KEY[key]
-            if raw is None or (spec.kind == "secret" and raw == ""):
+            if raw is None or (spec.kind in ("secret", "text") and str(raw).strip() == ""):
                 overrides.pop(key, None)
                 continue
             overrides[key] = _coerce(spec, raw)

@@ -3,7 +3,13 @@
 这是「本工具不维护模型端的图」这条约束的落点。做法只有一条约定：
 
     用户在 ComfyUI 里把入口节点的**标题**改成 AIVS_FIRST_FRAME / AIVS_LAST_FRAME /
-    AIVS_PROMPT / AIVS_NEGATIVE / AIVS_DURATION / AIVS_SEED，然后导出 API 格式的 json。
+    AIVS_PROMPT / AIVS_NEGATIVE / AIVS_DURATION / AIVS_SEED / AIVS_REF_1…AIVS_REF_9，
+    然后导出 API 格式的 json。
+
+`AIVS_REF_*` 是**参考图**槽位，与首尾帧分开：首尾帧是「画面从哪一格开始 / 结束」，
+参考图是「谁出场、在哪儿」。只有首帧时人物形象只能靠那一张图带，很容易在几秒里跑掉——
+所以账单里算出来的角色表 / 地点参考图按序号填进这些槽位。图里标了几个就用几个，
+一个都没标也能生成（只是丢形象的风险照旧）。
 
 我们只按标题找这几个节点、只往里填值。图里挂了多少 lora、加了什么加速节点、
 采样器换成了什么——一概不看、不校验、不改写。模型端想怎么调就怎么调，
@@ -25,20 +31,33 @@ from app.core.errors import AppError, ErrorCode
 
 #: 入口标题 → 该往节点的哪个输入里填。按顺序取第一个命中的键，
 #: 这样 LoadImage / CLIPTextEncode / 各家的原生节点都能覆盖，而不必认识它们的 class_type。
+IMAGE_FIELDS = ("image", "filename", "url", "value")
+
+#: 参考图槽位的上限。9 是「一眼能数清」的数目，也刚好覆盖多参考图模型的常见入参
+#: （例如 ref_image_0..8）。图里有几个就用几个，不必凑满。
+REF_SLOTS = 9
+#: 参考图槽位的标题，按序号排好——`ref_slots()` 取的就是这个顺序。
+REF_MARKERS: tuple[str, ...] = tuple(f"AIVS_REF_{i}" for i in range(1, REF_SLOTS + 1))
+
 MARKERS: dict[str, tuple[str, ...]] = {
-    "AIVS_FIRST_FRAME": ("image", "filename", "url", "value"),
-    "AIVS_LAST_FRAME": ("image", "filename", "url", "value"),
+    "AIVS_FIRST_FRAME": IMAGE_FIELDS,
+    "AIVS_LAST_FRAME": IMAGE_FIELDS,
     "AIVS_PROMPT": ("text", "prompt", "string", "value"),
     "AIVS_NEGATIVE": ("text", "prompt", "string", "value"),
     "AIVS_DURATION": ("length", "duration", "frames", "seconds", "num_frames", "value"),
     "AIVS_SEED": ("seed", "noise_seed", "value"),
+    #: 参考图：角色表 / 地点参考图从这里进去。首帧只能是一张，参考图想喂几张标几个。
+    **dict.fromkeys(REF_MARKERS, IMAGE_FIELDS),
 }
 
 #: 少了这两个就没法做 R2V；其余入口缺了只是「那一项用图里原来的值」。
+#: 参考图槽位一个都没有也照样能生成——只是人物形象只能靠首帧带，容易跑偏。
 REQUIRED = ("AIVS_FIRST_FRAME", "AIVS_PROMPT")
 
 HOW_TO = [
     "在 ComfyUI 里右键入口节点 → Title，改成 AIVS_FIRST_FRAME / AIVS_PROMPT 等",
+    "想让角色表 / 地点参考图一起喂进去：把接参考图的节点标题改成 AIVS_REF_1、AIVS_REF_2…"
+    f"（最多 {REF_SLOTS} 个，有几个标几个）",
     "再用「Save (API Format)」导出，重新上传这份预设",
 ]
 
@@ -93,16 +112,35 @@ def entry_points(graph: dict[str, Any]) -> dict[str, dict[str, str]]:
     return found
 
 
+def ref_slots(points: dict[str, dict[str, str]]) -> list[str]:
+    """这份图能收几张参考图——按 AIVS_REF_1、AIVS_REF_2… 的序号排好。
+
+    刻意按声明顺序（`REF_MARKERS`）而不是字典顺序：账单里优先级最高的那张要进 1 号槽，
+    「第几张是谁」才对得上（`base.ref_hint` 拼给模型的那句说明也是这个顺序）。
+    中间空一号（只标了 1 和 3）也不算错，就是两个槽位——我们不去猜用户为什么跳号。
+    """
+    return [m for m in REF_MARKERS if m in points]
+
+
 def inspect(graph: dict[str, Any]) -> dict[str, Any]:
     """预设的体检报告：找到哪些入口、缺哪些、缺了会怎样。"""
     points = entry_points(graph)
     missing = [m for m in REQUIRED if m not in points]
+    slots = ref_slots(points)
     return {
         "node_count": len(graph),
         "entry_points": points,
         "found": sorted(points),
         "missing_required": missing,
         "ready": not missing,
+        #: 能收几张参考图。0 不影响 ready——只是这份图喂不进角色表，UI 要提醒。
+        "ref_slots": len(slots),
+        "ref_hint": (
+            f"能收 {len(slots)} 张参考图（{'、'.join(slots)}）"
+            if slots
+            else "没有参考图槽位：角色表 / 地点参考图喂不进去，人物形象只能靠首帧带。"
+            f"要支持就在图里加 AIVS_REF_1…AIVS_REF_{REF_SLOTS} 标题"
+        ),
         "impact": (
             None if not missing else f"缺少 {'、'.join(missing)}，这份预设无法用于 R2V 生成。"
         ),
@@ -166,7 +204,14 @@ def listing() -> list[dict[str, Any]]:
     """设置页的预设列表。坏文件不隐藏——标成 ready=false 并写清原因。"""
     rows: list[dict[str, Any]] = []
     for path in sorted(presets_dir().glob("*.json")):
-        item: dict[str, Any] = {"name": path.stem, "path": path.as_posix(), "ready": False}
+        # 坏文件也给全 UI 要用的键：形状不稳会让列表少画一块，而不是显示「这份图坏了」
+        item: dict[str, Any] = {
+            "name": path.stem,
+            "path": path.as_posix(),
+            "ready": False,
+            "ref_slots": 0,
+            "ref_hint": "",
+        }
         try:
             item.update(inspect(load(path.stem)))
         except AppError as err:

@@ -41,7 +41,7 @@ async def read() -> dict[str, Any]:
 
 @router.patch("/settings")
 async def patch(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
-    """按点号键提交覆盖。值为 `null`（密钥也可以是空串）表示清除覆盖，回到环境变量。"""
+    """按点号键提交覆盖。值为 `null`（密钥与提示词也可以是空串）表示清除覆盖，回到内置默认。"""
     return {**await app_settings.patch(payload), "providers": registry.listing()}
 
 

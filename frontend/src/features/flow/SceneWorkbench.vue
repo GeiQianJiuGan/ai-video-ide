@@ -13,6 +13,11 @@
  *   2. **账单里没被采用的照样列出来**。和镜头编辑器同一个理由：用户问的是「为什么没进去」。
  *   3. **整幕入队会返回一张账单式结果**（入队了几条、跳过了哪几条与原因），
  *      跳过不当成失败弹红叉——它是设计里的门槛。
+ *
+ * 采用的每一张都标出**它当首帧还是当参考图**（`item.role`，规则只在后端的
+ * `services/context.py::_assign_roles`）；版本卡上则显示当次**真正喂进去几张**
+ * 与适配器的降级说明（冻结在 `params.refs` / `params.ref_notes` 里）——
+ * 账单说 5 张、只喂了 3 张，这件事必须在界面上看得见。
  */
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
@@ -40,8 +45,11 @@ import ErrorPanel from '@/shared/ui/ErrorPanel.vue'
 import FeatureHeader from '@/shared/ui/FeatureHeader.vue'
 import { ApiError } from '@/shared/api/client'
 import { fileUrl } from '@/shared/api/files'
-import { assetsApi, type Asset } from '@/shared/api/assets'
-import { CONTEXT_KIND_LABEL } from '@/shared/api/generation'
+import {
+  CONTEXT_KIND_LABEL,
+  CONTEXT_ROLE_LABEL,
+  type GenerationVersion,
+} from '@/shared/api/generation'
 import { SHOT_STATUS, SHOT_STATUS_LABEL, type ShotStatus } from '@/shared/api/story'
 import { useConsoleStore } from '@/stores/console'
 import { useSceneStore } from '@/stores/scene'
@@ -54,7 +62,6 @@ const consolePanel = useConsoleStore()
 const pid = computed(() => String(route.params.pid ?? ''))
 const sid = computed(() => String(route.params.sid ?? ''))
 
-const assets = ref<Asset[]>([])
 const sideError = ref<ApiError | null>(null)
 const busyFile = ref(false)
 const frameInput = ref<HTMLInputElement | null>(null)
@@ -66,7 +73,6 @@ const sceneRun = ref<{ queued: string[]; skipped: unknown[] } | null>(null)
 const scene = computed(() => workbench.scene)
 const shot = computed(() => workbench.shot)
 const bill = computed(() => workbench.bill)
-const assetById = computed(() => new Map(assets.value.map((a) => [a.id, a])))
 const castIds = computed(() => new Set((shot.value?.cast ?? []).map((c) => c.appearance_id)))
 /** 同一件事只报一次（后端重启后两边都会 404「项目未打开」）。 */
 const showSideError = computed(
@@ -82,35 +88,46 @@ const sceneVariant = computed(
   () => workbench.variants.find((v) => v.id === scene.value?.location_variant_id) ?? null,
 )
 
-function thumb(assetId: string | null): string {
-  if (!assetId) return ''
-  const asset = assetById.value.get(assetId)
-  if (!asset || asset.missing) return ''
-  return fileUrl(pid.value, asset.path)
-}
-
 /** 账单条目自带相对路径，不用再查资产表。 */
 function itemThumb(path: string | null): string {
   return path ? fileUrl(pid.value, path) : ''
+}
+
+/**
+ * 版本轨上那一格。**视频走 `<video>`、图片走 `<img>`**，两个字段由后端分开给
+ * （`generation._version_media`）——以前这里拿版本的 `asset_id` 直接塞进 `<img>`，
+ * 而版本的资产几乎总是一段 `.mp4`，于是每一格都是一个坏图标。
+ */
+function versionVideo(v: GenerationVersion): string {
+  return v.video_path ? fileUrl(pid.value, v.video_path) : ''
+}
+
+function versionPoster(v: GenerationVersion): string {
+  return v.thumbnail_path ? fileUrl(pid.value, v.thumbnail_path) : ''
 }
 
 function fmt(n: number | null | undefined): string {
   return n === null || n === undefined ? '—' : `${Math.round(n * 10) / 10}s`
 }
 
-async function loadAssets(): Promise<void> {
-  if (!pid.value) return
-  try {
-    assets.value = await assetsApi.list(pid.value)
-    sideError.value = null
-  } catch (err) {
-    sideError.value = err instanceof ApiError ? err : null
-  }
+/**
+ * 这个版本实际喂进去了几张参考图 —— 冻结在 `params.refs` 里，不是现在重算的。
+ * 账单上标了 5 张而这里只有 3 张，就是模型端那份图槽位不够（说明在 `ref_notes` 里）。
+ */
+function refCount(params: Record<string, unknown>): number {
+  const refs = params.refs
+  return Array.isArray(refs) ? refs.length : 0
+}
+
+/** 适配器的降级说明，原样显示：喂少了几张必须看得见，不能悄悄过去。 */
+function refNotes(params: Record<string, unknown>): string[] {
+  const notes = params.ref_notes
+  return Array.isArray(notes) ? notes.map(String) : []
 }
 
 async function reload(): Promise<void> {
   if (!pid.value) return
-  await Promise.all([workbench.load(pid.value, sid.value).catch(() => {}), loadAssets()])
+  await workbench.load(pid.value, sid.value).catch(() => {})
 }
 
 onMounted(reload)
@@ -159,7 +176,6 @@ async function addShot(): Promise<void> {
   const title = newShotTitle.value.trim() || `镜头 ${workbench.realShots.length + 1}`
   newShotTitle.value = ''
   await workbench.addShot(pid.value, title).catch(() => {})
-  await loadAssets()
 }
 
 async function onPickFrame(event: Event): Promise<void> {
@@ -170,7 +186,6 @@ async function onPickFrame(event: Event): Promise<void> {
   busyFile.value = true
   try {
     await workbench.uploadFirstFrame(pid.value, file)
-    await loadAssets()
   } catch (err) {
     sideError.value = err instanceof ApiError ? err : null
   } finally {
@@ -187,7 +202,6 @@ async function onPickVersion(event: Event): Promise<void> {
   busyFile.value = true
   try {
     await workbench.addVersion(pid.value, file)
-    await loadAssets()
   } catch (err) {
     sideError.value = err instanceof ApiError ? err : null
   } finally {
@@ -606,7 +620,11 @@ async function generateScene(): Promise<void> {
                   </div>
                   <div class="p-1">
                     <div class="flex items-center gap-1">
-                      <AppBadge tone="accent">
+                      <!-- 这一张是当首帧还是当参考图：规则在后端，这里只把它标出来 -->
+                      <AppBadge :tone="item.role === 'first_frame' ? 'ok' : 'accent'">
+                        {{ CONTEXT_ROLE_LABEL[item.role ?? ''] ?? '参考图' }}
+                      </AppBadge>
+                      <AppBadge tone="neutral">
                         {{ CONTEXT_KIND_LABEL[item.kind] ?? item.kind }}
                       </AppBadge>
                       <AppBadge v-if="item.manual" tone="warn">人工</AppBadge>
@@ -699,25 +717,51 @@ async function generateScene(): Promise<void> {
                   <button
                     v-if="!v.is_current"
                     class="text-fg-4 hover:text-accent ml-auto"
-                    title="设为当前版本（下游镜头抽末帧、时间线取片段都用它）"
+                    title="采用这一段：设为本镜头的当前版本（时间线装配、下游镜头抽末帧都只认它）"
                     @click="workbench.setCurrent(pid, v.id).catch(() => {})"
                   >
                     <Star :size="10" />
                   </button>
-                  <Star v-else :size="10" class="text-accent ml-auto" />
+                  <Star
+                    v-else
+                    :size="10"
+                    class="text-accent ml-auto"
+                    title="本镜头采用的就是这一段"
+                  />
                 </div>
+                <!-- 视频给播放器，图片才走 <img>：两个字段绝不混用 -->
                 <div
-                  v-if="thumb(v.asset_id)"
+                  v-if="versionVideo(v) || versionPoster(v)"
                   class="bg-base-3 mt-1 flex h-16 items-center justify-center overflow-hidden"
                 >
+                  <video
+                    v-if="versionVideo(v)"
+                    :src="versionVideo(v)"
+                    :poster="versionPoster(v) || undefined"
+                    controls
+                    preload="metadata"
+                    class="max-h-full max-w-full"
+                  />
                   <img
-                    :src="thumb(v.asset_id)"
+                    v-else
+                    :src="versionPoster(v)"
                     class="max-h-full max-w-full object-contain"
                     :alt="`v${v.version_no}`"
                   />
                 </div>
                 <p class="text-fg-4 mt-0.5 text-2xs">
                   {{ v.kind }} · {{ fmt(v.duration) }} · {{ v.created_at.slice(0, 16) }}
+                  <template v-if="refCount(v.params)">
+                    · 参考图 {{ refCount(v.params) }} 张
+                  </template>
+                </p>
+                <!-- 适配器说「少喂了几张」时原样显示：这就是形象跑偏的现场证据 -->
+                <p
+                  v-for="note in refNotes(v.params)"
+                  :key="note"
+                  class="text-st-review mt-0.5 text-2xs"
+                >
+                  {{ note }}
                 </p>
                 <p v-if="v.error" class="text-st-review mt-0.5 text-2xs">这个版本是失败现场</p>
               </li>
@@ -733,7 +777,7 @@ async function generateScene(): Promise<void> {
             <textarea
               :value="shot.prompt ?? ''"
               rows="3"
-              placeholder="上下文里的参考图会和它一起喂给模型。本轮只做 R2V：必须有首帧。"
+              placeholder="账单里「参考图」那几张会连标签一起喂给模型（要求预设图里有 AIVS_REF_* 槽位）。本轮只做 R2V：必须有首帧。"
               class="border-line-1 bg-base-2 text-fg-1 placeholder:text-fg-4 focus:border-accent/60 mt-px w-full resize-none border px-1.5 py-1 text-2xs outline-none"
               @change="saveShotText('prompt', ($event.target as HTMLTextAreaElement).value)"
             />

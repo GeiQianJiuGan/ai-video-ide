@@ -3,12 +3,16 @@
 与旧的 Workflow 绑定路径的区别只有一处，但很关键：**我们不维护图**。
 预设里已经按标题标好了入口（见 `presets.py`），这里做四件事：
 
-  1. 把首/末帧上传到 ComfyUI 的 input 目录（图在我们这边，ComfyUI 只认它自己的文件名）；
-  2. 按标题把首帧 / 末帧 / prompt / 负向 / 时长 / 种子填进去；
+  1. 把首/末帧与参考图上传到 ComfyUI 的 input 目录（图在我们这边，ComfyUI 只认它自己的文件名）；
+  2. 按标题把首帧 / 末帧 / 参考图 / prompt / 负向 / 时长 / 种子填进去；
   3. 提交，拿 prompt_id 当 task_id；
   4. 轮询 history，取最后一个产物。
 
 图里的 lora、加速节点、采样器我们不看也不校验——那是模型端的事。
+
+参考图（`AIVS_REF_1…`）与首尾帧分开处理，且**槽位不够不是失败**：图里只标了 3 个槽位、
+账单给了 5 张，就填前 3 张并把这件事写进 `req.notes` 冻结进版本——降级要说出来，
+但不该让整个任务跑不了。
 """
 
 from __future__ import annotations
@@ -21,7 +25,7 @@ from app.core.config import settings
 from app.core.errors import AppError, ErrorCode
 from app.core.logging import get_logger
 from app.generation.comfy.client import ComfyClient, comfy, outputs_of
-from app.generation.providers import presets
+from app.generation.providers import base, presets
 from app.generation.providers.base import TaskState, VideoRequest
 
 log = get_logger("provider.comfy_preset")
@@ -117,6 +121,7 @@ class ComfyPresetProvider:
                     )
                 continue
             values[marker] = await self._upload(path)
+        values.update(await self._refs(req, name, points))
         for marker, spot in points.items():
             value = values.get(marker)
             if value is None or value == "":
@@ -124,8 +129,54 @@ class ComfyPresetProvider:
             graph[spot["node_id"]]["inputs"][spot["field"]] = value
         prompt_id = await self._client.submit(graph, client_id=client_id)
         self._used[prompt_id] = name
-        log.info("provider.submitted", preset=name, prompt_id=prompt_id, mode=req.mode)
+        log.info(
+            "provider.submitted",
+            preset=name,
+            prompt_id=prompt_id,
+            mode=req.mode,
+            refs=len(req.refs),
+        )
         return prompt_id
+
+    async def _refs(
+        self, req: VideoRequest, name: str, points: dict[str, dict[str, str]]
+    ) -> dict[str, Any]:
+        """把账单里的参考图按序号填进 `AIVS_REF_*`，顺便把「谁是谁」告诉模型。
+
+        三条取舍：
+          · **槽位不够只降级，不失败**——图是模型端维护的，我们没资格因为它只标了 3 个槽位
+            就拒绝生成；少喂的那几张写进 `req.notes`，跟着版本一起冻结，事后查得到。
+          · **一个槽位都没有时也照样跑**，但要留一条 note：那种图只能靠首帧带形象，
+            这正是「人物形象丢失」的现场，用户得看得见原因。
+          · **顺序即语义**：账单已按优先级排好，1 号槽放优先级最高的那张；
+            要不要在 prompt 末尾附一句「参考图1=林小雨」由设置里的 `video.ref_labels` 决定
+            （ComfyUI 这类图收不到标签，只能靠这句话对上号）。
+        """
+        slots = presets.ref_slots(points)
+        if not req.refs:
+            return {}
+        if not slots:
+            req.notes.append(
+                f"预设 {name} 里没有 AIVS_REF_* 槽位，账单里 {len(req.refs)} 张参考图"
+                "（角色表 / 地点参考图）没有喂进去——人物形象只能靠首帧带。"
+            )
+            log.info("provider.refs_unsupported", preset=name, refs=len(req.refs))
+            return {}
+        sent = req.refs[: len(slots)]
+        if len(req.refs) > len(slots):
+            dropped = "、".join(r.label or r.path.name for r in req.refs[len(slots) :])
+            req.notes.append(
+                f"预设 {name} 只有 {len(slots)} 个参考图槽位，账单里这几张没喂进去：{dropped}。"
+            )
+            log.info("provider.refs_truncated", preset=name, slots=len(slots), refs=len(req.refs))
+        values: dict[str, Any] = {}
+        for marker, ref in zip(slots, sent, strict=False):
+            values[marker] = await self._upload(ref.path)
+        hint = base.ref_hint(sent) if settings.video_ref_labels else ""
+        if hint:
+            values["AIVS_PROMPT"] = f"{req.prompt}\n{hint}".strip()
+            req.notes.append(f"已把参考图对应关系写进 prompt：{hint}")
+        return values
 
     async def _upload(self, path: Path) -> str:
         if not path.is_file():  # noqa: ASYNC240 - 本地文件检查，开销可忽略
