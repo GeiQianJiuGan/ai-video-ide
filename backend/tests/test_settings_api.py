@@ -110,25 +110,26 @@ def test_probe_failures_name_the_target_and_the_way_out(client: TestClient) -> N
     assert error_of(resp)["title"]
 
 
-def test_reference_image_limit_and_labels_are_configurable(client: TestClient) -> None:
-    """「只喂一张首帧就丢人物形象」的两个旋钮都得能在设置页调。"""
+def test_reference_labels_are_configurable_but_the_count_is_not(client: TestClient) -> None:
+    """「只喂一张首帧就丢人物形象」的两个旋钮：标签那一个在设置页，张数那一个刻意不在。"""
     fields = fields_of(client)
-    assert fields["video.ref_limit"]["value"] == 8
+    assert "video.ref_limit" not in fields, "能收几张是模型端那份图的事实，不是我们配的数字"
     assert fields["video.ref_labels"]["kind"] == "bool"
     assert fields["video.ref_labels"]["value"] is True
 
-    resp = client.patch("/api/v1/settings", json={"video.ref_limit": 3, "video.ref_labels": False})
+    resp = client.patch("/api/v1/settings", json={"video.ref_labels": False})
     assert resp.status_code == 200, resp.text
-    assert settings.video_ref_limit == 3
     assert settings.video_ref_labels is False
 
-    from app.services.context import ref_limit
-
-    assert ref_limit() == 3, "账单的参考图上限就读这一项"
-
-    resp = client.patch("/api/v1/settings", json={"video.ref_limit": 0})
+    resp = client.patch("/api/v1/settings", json={"video.ref_limit": 3})
     assert resp.status_code == 422
-    assert error_of(resp)["related_ids"]["key"] == "video.ref_limit"
+    assert error_of(resp)["related_ids"]["unknown"] == ["video.ref_limit"]
+
+    from app.services.context import ref_capacity
+
+    cap = ref_capacity()
+    assert cap.limit is None, "还没选预设时不限张数——绝不用一个猜的数字去丢用户的角色图"
+    assert cap.detail, "为什么是这个上限得说出来，界面上要显示"
 
 
 def test_legacy_provider_is_offered_but_marked(client: TestClient) -> None:

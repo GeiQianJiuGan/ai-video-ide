@@ -44,6 +44,60 @@ POLL_LIMIT = 1800  # 30 分钟上限，超时也要给出结构化错误而不�
 _NO_MEDIA: dict[str, Any] = {"video_path": None, "thumbnail_path": None}
 
 
+def drop_entry(shot: Shot, capacity: dict[str, Any]) -> dict[str, Any] | None:
+    """这个镜头会不会有参考图喂不进去。装得下时回 None。
+
+    `capacity` 就是账单里的那一块（`context._capacity_of`）——**能收几张由适配层回答**，
+    这里不再有任何应用级上限可看。
+    """
+    if not capacity.get("over"):
+        return None
+    return {
+        "shot_id": shot.id,
+        "index_no": shot.index_no,
+        "title": shot.title,
+        "ref_count": int(capacity.get("ref_count") or 0),
+        "limit": capacity.get("limit"),
+        "dropped": int(capacity.get("dropped") or 0),
+        "labels": [str(x) for x in (capacity.get("dropped_labels") or [])],
+        "source": str(capacity.get("source") or ""),
+    }
+
+
+def over_capacity_error(drops: list[dict[str, Any]]) -> AppError:
+    """「会丢几张图，还继续吗」——**这不是失败，是一次确认**。
+
+    所以它必须在入队**任何一个任务之前**抛出来（批量路径先整体扫一遍再动手）：
+    一半已经入队、另一半等确认的话，用户点了确认就会把前一半再入队一遍。
+    确认的样子是重新调一次同一个入口并带上 `allow_ref_drop=true`，
+    之后按槽位顺序喂前 N 张，少喂了哪几张照旧记进 `params.ref_notes`。
+    """
+    total = sum(int(d["dropped"]) for d in drops)
+    lines = "；".join(
+        f"Shot {d['index_no']} 采用了 {d['ref_count']} 张参考图，这里只能喂 {d['limit']} 张，"
+        f"会丢 {d['dropped']} 张" + (f"（{'、'.join(d['labels'])}）" if d["labels"] else "")
+        for d in drops
+    )
+    source = next((str(d["source"]) for d in drops if d.get("source")), "")
+    where = f"（能收几张由{source}决定）" if source else ""
+    return AppError(
+        ErrorCode.REF_OVER_CAPACITY,
+        f"有 {len(drops)} 个镜头的参考图装不下，会丢 {total} 张",
+        f"{lines}{where}。丢的是账单里优先级最低的那几张——角色图最先保住，道具图最先被挤掉。",
+        [
+            "确认后继续：按槽位顺序喂前几张，丢掉哪几张会记进版本参数，事后查得到",
+            "不想丢：在 ComfyUI 里给这份图多标几个 AIVS_REF_n 标题，重新上传预设",
+            "或在上下文检查器里手动移除不重要的参考图，自己决定丢哪几张",
+        ],
+        {
+            "shot_ids": [str(d["shot_id"]) for d in drops],
+            "dropped": total,
+            #: 前端据此知道「这条错误可以确认过去」——带上这个参数再调一次同一个入口。
+            "confirm": "allow_ref_drop",
+        },
+    )
+
+
 class GenerationService:
     def __init__(self) -> None:
         self._pumps: dict[str, asyncio.Task[None]] = {}
@@ -61,6 +115,7 @@ class GenerationService:
         priority: int = 100,
         workflow_id: str | None = None,
         check_context: bool = True,
+        allow_ref_drop: bool = False,
         first_frame_asset_id: str | None = None,
         last_frame_asset_id: str | None = None,
         extra: dict[str, Any] | None = None,
@@ -81,6 +136,12 @@ class GenerationService:
         if check_context:
             await context.require_complete(pid, shot_id)
         snapshot = await context.snapshot(pid, shot_id)
+        # 参考图比模型端那份图能收的多时先问一句。**不是失败**：确认（allow_ref_drop）后
+        # 照旧生成，只是按槽位顺序喂前几张。悄悄少喂两张图，事后没人查得出形象为什么跑偏。
+        if not allow_ref_drop:
+            over = drop_entry(shot, snapshot.get("capacity") or {})
+            if over:
+                raise over_capacity_error([over])
 
         depends_on, wait_reason = None, None
         if shot.prev_shot_id:
@@ -124,7 +185,28 @@ class GenerationService:
         self.ensure_pump(pid)
         return as_dict(row)
 
-    async def enqueue_scene(self, pid: str, scene_id: str, priority: int = 100) -> dict[str, Any]:
+    async def ref_drops(self, pid: str, shot_ids: list[str]) -> list[dict[str, Any]]:
+        """这些镜头里哪几个的参考图装不进模型端那份图。只读，给「先账单再动手」用。
+
+        某个镜头连账单都算不出来（缺地点、被删了）时跳过它：那件事有它自己的四要素错误，
+        真入队时照旧会被跳过并说明原因，不该在这里被含含糊糊地归成「图太多」。
+        """
+        db = db_of(pid)
+        out: list[dict[str, Any]] = []
+        for shot_id in shot_ids:
+            try:
+                shot = await fetch(db, Shot, shot_id, "镜头")
+                ctx = await context.resolve(pid, shot_id)
+            except AppError:
+                continue
+            entry = drop_entry(shot, ctx["capacity"])
+            if entry:
+                out.append(entry)
+        return out
+
+    async def enqueue_scene(
+        self, pid: str, scene_id: str, priority: int = 100, *, allow_ref_drop: bool = False
+    ) -> dict[str, Any]:
         db = db_of(pid)
         await fetch(db, Scene, scene_id, "场景")
         shots = [
@@ -138,10 +220,17 @@ class GenerationService:
                 ["先在分镜板里添加镜头"],
                 {"scene_id": scene_id},
             )
+        # 整幕先扫一遍再动手：一半入队、一半等确认的话，用户点了确认会把前一半再入队一遍。
+        if not allow_ref_drop:
+            drops = await self.ref_drops(pid, [s.id for s in shots])
+            if drops:
+                raise over_capacity_error(drops)
         queued, skipped = [], []
         for shot in shots:
             try:
-                job = await self.enqueue_shot(pid, shot.id, priority=priority)
+                job = await self.enqueue_shot(
+                    pid, shot.id, priority=priority, allow_ref_drop=allow_ref_drop
+                )
                 queued.append(job["id"])
             except AppError as err:
                 skipped.append(

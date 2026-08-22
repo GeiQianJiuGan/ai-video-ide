@@ -16,15 +16,30 @@ from app.services.generation import generation
 router = APIRouter(tags=["generation"])
 
 
+#: 「参考图装不下，确认丢弃并继续」——两个入队端点共用这一句描述，口径只有一份。
+#: 写成函数而不是共享一个 `Field(...)` 实例：同一个 FieldInfo 挂到两个模型上是自找麻烦。
+def _allow_ref_drop() -> Any:
+    return Field(
+        default=False,
+        description=(
+            "账单里采用的参考图比模型端那份图能收的多时，默认不入队，先回 REF_OVER_CAPACITY "
+            "说明会丢几张；带上 true 就是「确认丢弃并继续」，按槽位顺序喂前几张，"
+            "丢了哪几张记进版本参数 ref_notes。"
+        ),
+    )
+
+
 class EnqueueShotBody(BaseModel):
     kind: str | None = Field(default=None, description="能力名；留空按是否有上游自动判断")
     priority: int = 100
     workflow_id: str | None = None
     check_context: bool = Field(default=True, description="false 表示跳过上下文完整性门槛")
+    allow_ref_drop: bool = _allow_ref_drop()
 
 
 class EnqueueSceneBody(BaseModel):
     priority: int = 100
+    allow_ref_drop: bool = _allow_ref_drop()
 
 
 class PriorityBody(BaseModel):
@@ -57,13 +72,16 @@ async def enqueue_shot(pid: str, shot_id: str, body: EnqueueShotBody) -> dict[st
         priority=body.priority,
         workflow_id=body.workflow_id,
         check_context=body.check_context,
+        allow_ref_drop=body.allow_ref_drop,
     )
 
 
 @router.post("/projects/{pid}/scenes/{scene_id}/generate", status_code=201)
 async def enqueue_scene(pid: str, scene_id: str, body: EnqueueSceneBody) -> dict[str, Any]:
     """整场生成。逐个镜头入队，被跳过的镜头连结构化原因一起返回。"""
-    return await generation.enqueue_scene(pid, scene_id, body.priority)
+    return await generation.enqueue_scene(
+        pid, scene_id, body.priority, allow_ref_drop=body.allow_ref_drop
+    )
 
 
 @router.post("/projects/{pid}/queue/pause")

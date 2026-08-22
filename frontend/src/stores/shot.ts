@@ -144,10 +144,13 @@ export const useShotStore = defineStore('shot', () => {
   /**
    * 入队生成。`checkContext=false` 是「我确认无误」的显式跳过，不是默认值。
    * 被拒时把账单重拉一次——错误里写着缺什么，页面上也得能一条条看到。
+   *
+   * `allowRefDrop` 是另一种显式确认：参考图比模型端那份图能收的多时后端先回
+   * `REF_OVER_CAPACITY`（还没入队），用户看清会丢哪几张后带这个标志重来一次。
    */
   async function enqueue(
     pid: string,
-    opts: { workflowId?: string | null; checkContext?: boolean } = {},
+    opts: { workflowId?: string | null; checkContext?: boolean; allowRefDrop?: boolean } = {},
   ): Promise<Job | null> {
     const id = shot.value?.id
     if (!id) return null
@@ -156,6 +159,7 @@ export const useShotStore = defineStore('shot', () => {
       lastJob.value = await generationApi.enqueueShot(pid, id, {
         workflow_id: opts.workflowId ?? null,
         check_context: opts.checkContext ?? true,
+        allow_ref_drop: opts.allowRefDrop ?? false,
       })
       lastError.value = null
       return lastJob.value

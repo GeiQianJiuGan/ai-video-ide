@@ -250,13 +250,23 @@ export const useSceneStore = defineStore('scene', () => {
   /**
    * 入队生成。`checkContext=false` 是「我确认无误」的显式跳过，不是默认值。
    * 被拒时把账单重拉一次——错误里写着缺什么，页面上也得能一条条看到。
+   *
+   * `allowRefDrop=true` 是**另一种**显式确认：参考图比模型端那份图能收的多时后端先回
+   * `REF_OVER_CAPACITY`（一个任务都没入队），用户看清会丢哪几张之后带这个标志重来一次。
    */
-  async function enqueue(pid: string, checkContext = true): Promise<Job | null> {
+  async function enqueue(
+    pid: string,
+    checkContext = true,
+    allowRefDrop = false,
+  ): Promise<Job | null> {
     const id = selectedShotId.value
     if (!id) return null
     busy.value = true
     try {
-      lastJob.value = await generationApi.enqueueShot(pid, id, { check_context: checkContext })
+      lastJob.value = await generationApi.enqueueShot(pid, id, {
+        check_context: checkContext,
+        allow_ref_drop: allowRefDrop,
+      })
       lastError.value = null
       return lastJob.value
     } catch (err) {
@@ -272,11 +282,12 @@ export const useSceneStore = defineStore('scene', () => {
   /** 整幕入队。返回后端的账单式结果（入队了几条、跳过了哪几条与原因）。 */
   async function enqueueScene(
     pid: string,
+    allowRefDrop = false,
   ): Promise<{ queued: string[]; skipped: unknown[] } | null> {
     const sid = scene.value?.id
     if (!sid) return null
     try {
-      const out = await guarded(() => generationApi.enqueueScene(pid, sid))
+      const out = await guarded(() => generationApi.enqueueScene(pid, sid, 100, allowRefDrop))
       await loadShots(pid, sid)
       await refresh(pid)
       return out

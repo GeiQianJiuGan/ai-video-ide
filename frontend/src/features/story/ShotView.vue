@@ -23,7 +23,7 @@ import EmptyState from '@/shared/ui/EmptyState.vue'
 import ErrorPanel from '@/shared/ui/ErrorPanel.vue'
 import FeatureHeader from '@/shared/ui/FeatureHeader.vue'
 import { fileUrl } from '@/shared/api/files'
-import { ApiError } from '@/shared/api/client'
+import { ApiError, confirmFlagOf } from '@/shared/api/client'
 import { assetsApi, type Asset } from '@/shared/api/assets'
 import { castApi, type AppearanceRow, type Character } from '@/shared/api/cast'
 import { worldApi, type Prop } from '@/shared/api/world'
@@ -60,6 +60,21 @@ const contextInput = ref<HTMLInputElement | null>(null)
 
 const shot = computed(() => editor.shot)
 const bill = computed(() => editor.bill)
+/**
+ * 这一次模型端能收几张参考图。上限不是我们配的数字，而是那份图的事实
+ * （预设里标了几个 `AIVS_REF_*`；REST 合同与「还没选预设」都是不限张数）。
+ */
+const cap = computed(() => bill.value?.capacity ?? null)
+const capText = computed(() => {
+  const c = cap.value
+  if (!c) return ''
+  return c.limit === null ? `参考图 ${c.ref_count} 张 · 不限` : `参考图 ${c.ref_count} / ${c.limit}`
+})
+/** 装不下时那一次确认：记住刚才是不是「跳过检查」，确认后原样重来。 */
+const pendingDrop = ref<{ skipContext: boolean } | null>(null)
+const askDrop = computed(
+  () => pendingDrop.value !== null && Boolean(confirmFlagOf(editor.lastError)),
+)
 const assetById = computed(() => new Map(assets.value.map((a) => [a.id, a])))
 const castIds = computed(() => new Set((shot.value?.cast ?? []).map((c) => c.appearance_id)))
 const propState = computed(
@@ -220,12 +235,20 @@ async function onPickVersionFile(event: Event): Promise<void> {
   }
 }
 
-async function generate(skipContext: boolean): Promise<void> {
+async function generate(skipContext: boolean, allowRefDrop = false): Promise<void> {
   const job = await editor.enqueue(pid.value, {
     workflowId: shot.value?.workflow_id ?? null,
     checkContext: !skipContext,
+    allowRefDrop,
   })
+  pendingDrop.value = confirmFlagOf(editor.lastError) ? { skipContext } : null
   if (job) await story.loadBoard(pid.value).catch(() => {})
+}
+
+/** 「知道会丢图，继续」：把刚才那一次原样重来，只多带一个 `allow_ref_drop`。 */
+async function confirmDrop(): Promise<void> {
+  const pending = pendingDrop.value
+  if (pending) await generate(pending.skipContext, true)
 }
 </script>
 
@@ -286,7 +309,21 @@ async function generate(skipContext: boolean): Promise<void> {
       class="mx-2 mt-2"
       :error="editor.lastError"
       @dismiss="editor.clearError()"
-    />
+    >
+      <!-- 参考图装不下不是失败，是一次确认：这颗按钮把刚才那一次原样重来 -->
+      <template #actions>
+        <AppButton
+          v-if="askDrop"
+          size="sm"
+          variant="primary"
+          :disabled="editor.busy"
+          title="按模型端那份图的槽位顺序喂前几张；少喂了哪几张会记进版本参数，事后查得到"
+          @click="confirmDrop()"
+        >
+          <Sparkles :size="10" />知道会丢图，继续生成
+        </AppButton>
+      </template>
+    </ErrorPanel>
     <ErrorPanel
       v-if="showSideError"
       class="mx-2 mt-2"
@@ -439,9 +476,12 @@ async function generate(skipContext: boolean): Promise<void> {
         <!-- 中：上下文账单。没被采用的照样列出来，理由写在旁边 -->
         <AppPanel title="上下文检查器" class="min-w-0 flex-1">
           <template #actions>
-            <span v-if="bill" class="text-fg-4 tnum text-2xs">
-              {{ bill.included_count }} / {{ bill.limit }} 张参考
+            <span v-if="cap" class="text-fg-4 tnum text-2xs" :title="cap.detail">
+              {{ capText }}
             </span>
+            <AppBadge v-if="cap?.over" tone="warn" :title="cap.detail">
+              会丢 {{ cap.dropped }} 张
+            </AppBadge>
             <AppButton
               size="sm"
               variant="ghost"
@@ -478,9 +518,17 @@ async function generate(skipContext: boolean): Promise<void> {
                 <li v-for="p in bill.problems" :key="p">· {{ p }}</li>
               </ul>
             </div>
-            <p v-else-if="bill" class="text-st-done mb-2 text-2xs">
-              上下文完整{{ bill.at_limit ? '（已到参考图上限，多出来的会被省略）' : '' }}。
-            </p>
+            <p v-else-if="bill" class="text-st-done mb-2 text-2xs">上下文完整。</p>
+            <!-- 装不下不是 blocker：生成前会先问一句，确认了照样能生成 -->
+            <div v-if="cap?.over" class="border-st-review/40 bg-base-2 mb-2 border p-1.5">
+              <p class="text-st-review text-2xs">
+                采用了 {{ cap.ref_count }} 张参考图，这里只能喂 {{ cap.limit }} 张，会丢
+                {{ cap.dropped }} 张（{{ cap.dropped_labels.join('、') }}）。
+              </p>
+              <p class="text-fg-4 mt-0.5 text-2xs">
+                {{ cap.detail }}不想丢就在下面移除不重要的那几张，自己决定丢哪张。
+              </p>
+            </div>
 
             <p class="text-fg-3 text-2xs tracking-wide uppercase">
               已采用（{{ editor.included.length }}）
@@ -517,6 +565,14 @@ async function generate(skipContext: boolean): Promise<void> {
                       {{ CONTEXT_KIND_LABEL[item.kind] ?? item.kind }}
                     </AppBadge>
                     <AppBadge v-if="item.manual" tone="warn">人工</AppBadge>
+                    <!-- 采用了、但模型端那份图收不下它。和「未采用」是两件事 -->
+                    <AppBadge
+                      v-if="item.over_capacity"
+                      tone="fail"
+                      title="槽位不够，提交时这一张会被挤掉——生成前会先问一次"
+                    >
+                      装不下
+                    </AppBadge>
                     <span class="text-fg-4 tnum ml-auto text-2xs">P{{ item.priority }}</span>
                     <button
                       class="text-fg-4 hover:text-st-failed"

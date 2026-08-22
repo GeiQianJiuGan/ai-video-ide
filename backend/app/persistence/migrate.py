@@ -34,6 +34,7 @@ REVISION_SCHEMA: dict[str, int] = {
     "0004_scene_flow": 4,
     "0005_scene_nodes": 5,
     "0006_shot_adopted_video": 6,
+    "0007_timeline_audio": 7,
 }
 
 

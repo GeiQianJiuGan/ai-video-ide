@@ -122,6 +122,44 @@ def ref_slots(points: dict[str, dict[str, str]]) -> list[str]:
     return [m for m in REF_MARKERS if m in points]
 
 
+#: 文件路径 → (mtime_ns, 字节数, 槽位数)。「这份图能收几张」是一句会被反复问的话
+#: （上下文账单、编排账单、界面上每一处都要问），一次解析一份几十万字节的图太贵。
+#: key 里带上 mtime 与大小：文件一改缓存自然失效，所以这不是「可能过期的快照」，
+#: 而是「同一份文件不重复解析」。
+_slot_cache: dict[str, tuple[int, int, int]] = {}
+
+
+def reset_cache() -> None:
+    """清掉槽位数缓存。测试与 `registry.reset()` 用——预设目录会整体换掉。"""
+    _slot_cache.clear()
+
+
+def slot_count(name: str) -> int | None:
+    """这份预设标了几个 `AIVS_REF_*` 槽位。数不出来时回 `None`（= 别拿它当上限）。
+
+    数不出来有三种：没给名字、文件不在、文件坏了 / 缺必需入口。**一律不抛**——
+    问这句话的地方全是只读路径（上下文账单、编排账单、界面），在那里因为预设坏了就
+    500，人连「哪里坏了」都看不到；真正提交时 `submit()` 会拿同一份文件把话说清楚。
+    """
+    if not name:
+        return None
+    try:
+        path = _path_of(name)
+        stat = path.stat()
+    except (AppError, OSError):
+        return None
+    key = path.as_posix()
+    hit = _slot_cache.get(key)
+    if hit is not None and hit[0] == stat.st_mtime_ns and hit[1] == stat.st_size:
+        return hit[2]
+    try:
+        count = len(ref_slots(entry_points(load(name))))
+    except AppError:
+        return None
+    _slot_cache[key] = (stat.st_mtime_ns, stat.st_size, count)
+    return count
+
+
 def inspect(graph: dict[str, Any]) -> dict[str, Any]:
     """预设的体检报告：找到哪些入口、缺哪些、缺了会怎样。"""
     points = entry_points(graph)

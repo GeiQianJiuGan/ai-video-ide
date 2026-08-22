@@ -46,17 +46,46 @@ export interface ContextItem {
   role?: string
   /** 手动添加的，或被手动移除的——两种都算人工干预过。 */
   manual: boolean
+  /**
+   * 采用了、但模型端那份图收不下它（提交时会按槽位顺序被挤掉）。
+   * 「装不下」和「没采用」是两件事，界面上必须分开标。
+   */
+  over_capacity?: boolean
   asset_path: string | null
   /** 登记过但文件已经不在磁盘上。 */
   missing_file: boolean
+}
+
+/**
+ * 这一次模型端能收几张参考图，以及会不会有图喂不进去。
+ *
+ * **不是应用级设置**：ComfyUI 预设数自己标了几个 `AIVS_REF_*`，通用 REST 合同不限张数，
+ * 没选预设时也不限（`limit === null`）。`limit === 0` 是有意义的答案——那份图一张参考图
+ * 都收不了，人物形象只能靠首帧带。
+ */
+export interface ContextCapacity {
+  /** null = 不限张数。 */
+  limit: number | null
+  /** 这个数字哪来的（预设名 / 「REST 合同」）。 */
+  source: string
+  /** 为什么是这个上限，直接显示给用户。 */
+  detail: string
+  /** 账单里算作「参考图」的条数（首帧那一张不占槽位）。 */
+  ref_count: number
+  /** 会喂不进去几张。 */
+  dropped: number
+  /** 会被挤掉的是哪几张（账单末尾、优先级最低的那几条）。 */
+  dropped_labels: string[]
+  /** true 时生成前会先要一次确认（`REF_OVER_CAPACITY`）。 */
+  over: boolean
 }
 
 export interface ContextBill {
   shot_id: string
   items: ContextItem[]
   included_count: number
-  limit: number
-  at_limit: boolean
+  /** 以前这里是应用级上限 `limit` / `at_limit`，现在换成这一整块。 */
+  capacity: ContextCapacity
   /** false 时 `problems` 就是入队会被拒的理由。 */
   complete: boolean
   problems: string[]
@@ -186,10 +215,18 @@ export const generationApi = {
       priority?: number
       workflow_id?: string | null
       check_context?: boolean
+      /**
+       * 「参考图装不下也继续」。默认 false：后端先回 `REF_OVER_CAPACITY` 说明会丢几张，
+       * 用户确认后带上 true 再调一次同一个入口（`related_ids.confirm` 就是这个参数名）。
+       */
+      allow_ref_drop?: boolean
     } = {},
   ) => api.post<Job>(`/projects/${pid}/shots/${shotId}/generate`, body),
-  enqueueScene: (pid: string, sceneId: string, priority = 100) =>
-    api.post<EnqueueSceneResult>(`/projects/${pid}/scenes/${sceneId}/generate`, { priority }),
+  enqueueScene: (pid: string, sceneId: string, priority = 100, allowRefDrop = false) =>
+    api.post<EnqueueSceneResult>(`/projects/${pid}/scenes/${sceneId}/generate`, {
+      priority,
+      allow_ref_drop: allowRefDrop,
+    }),
 
   queue: (pid: string) => api.get<QueueState>(`/projects/${pid}/queue`),
   jobs: (pid: string, status?: string) =>

@@ -61,6 +61,14 @@ class TimelineClip(Base):
     in_point: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     out_point: Mapped[float | None] = mapped_column(Float)
     label: Mapped[str | None] = mapped_column(String(200))
+    #: 这一段不出声（0/1）。**把声音拆到音频轨之后源片段会被置 1**——声音已经挪出去了，
+    #: 再让画面自己也出一遍就会听见两次。整条轨道的静音是 `Track.muted`，两者独立生效。
+    muted: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    #: 音量倍数（1 = 原样）。音频轨叠加时靠它配比例，导出时变成 filter 里的 volume。
+    volume: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
+    #: 这一段音频是从哪个片段拆出来的（只有音频轨上的片段有值）。刻意不加外键：
+    #: 源片段被删掉或重新装配之后它照旧能播，只是不再知道出处。
+    source_clip_id: Mapped[str | None] = mapped_column(String(40), index=True)
 
 
 class Transition(Base):

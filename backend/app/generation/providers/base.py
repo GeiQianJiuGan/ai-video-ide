@@ -12,6 +12,10 @@ T2V 暂不做——没有首帧的镜头在编排时就会被账单挡下来，�
 **首尾帧和参考图不是一回事**，所以是两个字段：首尾帧决定「画面从哪一格开始 / 结束」，
 参考图决定「谁出场、长什么样、在哪儿」。只喂一张首帧时最容易丢的就是人物形象——
 账单里算出来的角色表 / 地点参考图必须能一起送到模型端，这就是 `refs` 存在的理由。
+
+**能收几张参考图由适配器回答**（`RefCapacity` + `ref_capacity()`），不是应用级设置：
+真实上限写在模型端那份图里（`comfy_preset` 数 `AIVS_REF_*` 槽位），我们这边配一个数字
+只会和它打架。没有一份可数的图时就是「不限制」，不凭空造上限。
 """
 
 from __future__ import annotations
@@ -38,6 +42,33 @@ class RefImage:
     path: Path
     label: str = ""
     kind: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class RefCapacity:
+    """这条生成路径一次能收几张参考图（**首尾帧不算在内**）。
+
+    「最多喂几张」不是本工具的偏好，而是模型端那份图的事实，所以它由适配器回答，
+    不再是应用级设置——设置里那个数字只会和真实槽位数打架，还得用户自己去对。
+
+    `limit is None` = **不限制**：这条路上没有一份可数的图（通用 REST 合同天生收多张，
+    旧的绑定路径压根不注入图片），此时凭空造一个上限只会白丢用户的图。
+    `limit == 0` 是一个有意义的答案，不是「没查到」：那份图一个 `AIVS_REF_*` 都没标，
+    角色表 / 地点图全都进不去——这正是人物形象跑偏的现场，必须说出来。
+
+    `source` 是这个数字从哪来的（预设名 / 合同），`detail` 是给人看的一句话，
+    两个都会一路传到界面上：「预设只有 3 槽」和「这条路不限张数」的处置方式完全不同。
+    """
+
+    limit: int | None = None
+    source: str = ""
+    detail: str = ""
+
+    def dropped(self, count: int) -> int:
+        """账单给了 `count` 张时，会有几张喂不进去。"""
+        if self.limit is None:
+            return 0
+        return max(0, count - self.limit)
 
 
 @dataclass(slots=True)
@@ -83,9 +114,16 @@ class TaskState:
 
 
 class VideoProvider(Protocol):
-    """一个视频生成服务要能做的四件事。"""
+    """一个视频生成服务要能做的四件事 + 一个问句。"""
 
     name: str
+
+    def ref_capacity(self) -> RefCapacity:
+        """一次能收几张参考图。**同步**，因为它只读本地那份图，不出网——
+        上下文账单、编排账单、界面上每一处都要问它，出网的话这些只读路径全得变慢。
+        查不出来（没选预设、文件坏了）一律回「不限制」，绝不在只读路径上抛错。
+        """
+        ...
 
     async def probe(self) -> dict[str, Any]:
         """配置页的「测试连接」。连不上要抛带建议的 AppError，不要返回 False。"""

@@ -425,8 +425,10 @@ def test_context_lists_every_problem_when_empty(client: TestClient, pid: str) ->
     ]
     assert ctx["items"] == []
     assert ctx["included_count"] == 0
-    assert ctx["limit"] == 8  # 应用级设置 video.ref_limit 的默认值
-    assert ctx["at_limit"] is False
+    # 「能收几张参考图」不再是应用级设置，而是问适配层；没选预设时就是不限张数。
+    assert ctx["capacity"]["limit"] is None
+    assert ctx["capacity"]["over"] is False
+    assert ctx["capacity"]["ref_count"] == 0
 
 
 def test_context_bill_explains_priority_and_source(client: TestClient, pid: str) -> None:
@@ -542,7 +544,9 @@ def test_context_snapshot_records_included_and_omitted(client: TestClient, pid: 
     # 首帧那一张也冻结进账单：地点参考是唯一剩下的采用条目，所以它就是首帧
     assert [i["role"] for i in snap["included"]] == ["first_frame"]
     assert [(i["key"], i["reason"]) for i in snap["omitted"]] == [(sheet_key, "手动移除")]
-    assert snap["limit"] == 8
+    # 当时模型端能收几张也一起冻结，事后才说得清「为什么少喂了两张」
+    assert snap["capacity"]["limit"] is None
+    assert [i["over_capacity"] for i in snap["included"]] == [False]
     assert snap["resolved_at"]
 
 

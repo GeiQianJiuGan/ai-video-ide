@@ -38,7 +38,7 @@ import EmptyState from '@/shared/ui/EmptyState.vue'
 import ErrorPanel from '@/shared/ui/ErrorPanel.vue'
 import FeatureHeader from '@/shared/ui/FeatureHeader.vue'
 import { fileUrl } from '@/shared/api/files'
-import { ApiError } from '@/shared/api/client'
+import { ApiError, confirmFlagOf } from '@/shared/api/client'
 import {
   SHOT_STATUS,
   SHOT_STATUS_LABEL,
@@ -172,14 +172,20 @@ const enqueuing = ref(false)
 const enqueueError = ref<ApiError | null>(null)
 const enqueueNote = ref('')
 const skipped = ref<EnqueueSceneResult['skipped']>([])
+/**
+ * 参考图装不下时那一次确认：记住刚才点的是「这个镜头」还是「整场」，
+ * 用户确认后原样重来一次，只多带一个 `allow_ref_drop`。
+ */
+const pendingDrop = ref<'shot' | 'scene' | null>(null)
 
 function resetEnqueue(): void {
   enqueueError.value = null
   enqueueNote.value = ''
   skipped.value = []
+  pendingDrop.value = null
 }
 
-async function generateShot(): Promise<void> {
+async function generateShot(allowRefDrop = false): Promise<void> {
   const shot = story.shot
   if (!shot) return
   resetEnqueue()
@@ -187,32 +193,45 @@ async function generateShot(): Promise<void> {
   try {
     const job = await generationApi.enqueueShot(pid.value, shot.id, {
       workflow_id: shot.workflow_id ?? null,
+      allow_ref_drop: allowRefDrop,
     })
     enqueueNote.value = `已入队：${shot.index_no}. ${shot.title}（${job.kind}）`
     await reload()
   } catch (err) {
     enqueueError.value = err instanceof ApiError ? err : null
+    pendingDrop.value = confirmFlagOf(err) ? 'shot' : null
   } finally {
     enqueuing.value = false
   }
 }
 
 /** 整场生成：按当前选中镜头所在的场入队。 */
-async function generateScene(): Promise<void> {
+async function generateScene(allowRefDrop = false): Promise<void> {
   const sceneId = story.shot?.scene_id
   if (!sceneId) return
   resetEnqueue()
   enqueuing.value = true
   try {
-    const out = await generationApi.enqueueScene(pid.value, sceneId)
+    const out = await generationApi.enqueueScene(pid.value, sceneId, 100, allowRefDrop)
     enqueueNote.value = `整场入队：${out.queued.length} / ${out.total} 个镜头排进队列`
     skipped.value = out.skipped
     await reload()
   } catch (err) {
     enqueueError.value = err instanceof ApiError ? err : null
+    pendingDrop.value = confirmFlagOf(err) ? 'scene' : null
   } finally {
     enqueuing.value = false
   }
+}
+
+/**
+ * 「知道会丢图，继续」：把刚才那一次原样重来，只多带一个 `allow_ref_drop`。
+ * 整场那一次也安全——后端是先整体扫完再动手，被拦下时一个任务都还没入队。
+ */
+async function confirmDrop(): Promise<void> {
+  const pending = pendingDrop.value
+  if (pending === 'scene') await generateScene(true)
+  else if (pending === 'shot') await generateShot(true)
 }
 </script>
 
@@ -288,7 +307,21 @@ async function generateScene(): Promise<void> {
       class="mx-2 mt-2"
       :error="enqueueError"
       @dismiss="enqueueError = null"
-    />
+    >
+      <!-- 参考图装不下不是失败，是一次确认：这颗按钮把刚才那一次原样重来 -->
+      <template #actions>
+        <AppButton
+          v-if="pendingDrop"
+          size="sm"
+          variant="primary"
+          :disabled="enqueuing"
+          title="按模型端那份图的槽位顺序喂前几张；少喂了哪几张会记进版本参数，事后查得到"
+          @click="confirmDrop()"
+        >
+          <Sparkles :size="10" />知道会丢图，继续生成
+        </AppButton>
+      </template>
+    </ErrorPanel>
     <div
       v-if="posterResult"
       class="border-line-1 bg-base-2 mx-2 mt-2 flex items-start gap-2 border p-1.5"

@@ -15,7 +15,7 @@ class Settings(BaseSettings):
 
     app_name: str = "AI Video Studio"
     version: str = "0.1.0"
-    schema_version: int = 6
+    schema_version: int = 7
 
     # --- 网络：只监听回环，绝不对外暴露工程数据 ---
     host: str = "127.0.0.1"
@@ -44,7 +44,7 @@ class Settings(BaseSettings):
 
     # --- 幕（流程图上的一个节点）---
     # 一幕里人物 / 地点这类小节点各自的上限。9 是「一眼能数清」的默认值，
-    # 上下文参考图上限（context 的 ref_limit）是另一件事，别混为一谈。
+    # 与「一次能喂几张参考图」无关——后者不是设置，由模型端那份图决定。
     scene_node_limit: int = 9
 
     # --- 视频生成：本工具不维护模型端的图，只按约定调它 ---
@@ -56,10 +56,9 @@ class Settings(BaseSettings):
     video_api_key: str = ""
     video_preset: str = ""  # comfy_preset 用哪一份图（presets 目录里的文件名）
     video_timeout: int = 900  # 单次生成的等待上限（秒）
-    # 一次生成最多喂几张参考图（含被当成首帧的那一张）。只喂首帧最容易丢人物形象，
-    # 所以默认放宽到 8：角色表 + 地点参考 + 道具通常就是这个量级。真正能收几张由模型端
-    # 那份图决定（comfy_preset 数 AIVS_REF_* 槽位），这里只管账单算到第几张。
-    video_ref_limit: int = 8
+    # 参考图**没有应用级上限**：能收几张是模型端那份图的事实（comfy_preset 数
+    # AIVS_REF_* 槽位），由适配层的 ref_capacity() 回答。这里再配一个数字只会和它打架，
+    # 还得用户自己去对——超出槽位时改成生成前警告 + 确认（REF_OVER_CAPACITY）。
     # 把「参考图1=林小雨（常服）」这句对应关系拼到 prompt 末尾。ComfyUI 那类图收不到
     # 标签，只能靠这句话让模型知道哪张是主角；不想让它动 prompt 就关掉。
     video_ref_labels: bool = True

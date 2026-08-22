@@ -41,6 +41,39 @@ class ComfyPresetProvider:
 
     # --- 探测 ---
 
+    def ref_capacity(self) -> base.RefCapacity:
+        """能收几张参考图 = 默认预设里标了几个 `AIVS_REF_*`。
+
+        看的是**设置里的默认预设**：问这句话的时机（算账单、给警告）都在入队之前，
+        那时还没有任务、也就没有 `extra["preset"]`。某个任务临时换了预设时，真正喂了
+        几张仍然由 `_refs` 如实写进 `params.ref_notes`——账单说的是「按当前设置会怎样」。
+        """
+        name = str(settings.video_preset or "")
+        count = presets.slot_count(name)
+        if count is None:
+            return base.RefCapacity(
+                None,
+                name,
+                (
+                    f"读不到预设 {name}（文件不在或填不进去），这里先不限张数；"
+                    "真正生成时会先报出这份图的问题。"
+                    if name
+                    else "还没有选默认预设，这里先不限张数；真正生成时会报「还没有选生成预设」。"
+                ),
+            )
+        if count == 0:
+            return base.RefCapacity(
+                0,
+                name,
+                f"预设 {name} 里一个 AIVS_REF_* 都没标——角色图 / 场景图全都喂不进去，"
+                "人物形象只能靠首帧带。",
+            )
+        return base.RefCapacity(
+            count,
+            name,
+            f"预设 {name} 标了 {count} 个 AIVS_REF_* 槽位，一次最多喂 {count} 张参考图。",
+        )
+
     async def probe(self) -> dict[str, Any]:
         ping = await self._client.ping()
         if not ping["online"]:

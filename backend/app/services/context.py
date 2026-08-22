@@ -7,14 +7,19 @@
 
 被采用的条目还带一个 `role`：**哪一张当首帧、剩下的当参考图**。这条规则只写在这里，
 `services/generation.py` 照账单读它，不再自己挑一遍——否则界面上标的和真正喂进去的会分叉。
+
+**账单不截断。** 「能收几张参考图」不是我们的设置，而是模型端那份图的事实
+（`ref_capacity()` 问适配层）。采用的照样全采用，超出槽位的部分变成 `capacity` 块里的
+一句警告，生成前要用户确认（`REF_OVER_CAPACITY`）——悄悄少喂两张图，事后没人查得出
+人物形象为什么跑偏。
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-from app.core.config import settings
 from app.core.errors import AppError, ErrorCode
+from app.generation.providers.base import RefCapacity
 from app.persistence.models import utc_now
 from app.persistence.models_cast import Appearance, Character, SheetVersion
 from app.persistence.models_gen import GenerationVersion
@@ -39,13 +44,19 @@ PRIORITY = {
 }
 
 
-def ref_limit() -> int:
-    """一次生成最多算到第几张参考图（含当首帧那一张）。
+def ref_capacity() -> RefCapacity:
+    """模型端这一次能收几张参考图。**不是设置项**——问的是适配层。
 
-    运行期可配（设置页 `video.ref_limit`）：真实上限取决于模型端那份图有几个参考图槽位，
-    我们这边只负责别把账单算得比它还满。
+    以前这里有个应用级上限 `video.ref_limit`，账单算到第 N 张就把剩下的划掉。那个数字
+    与模型端那份图的真实槽位数是两回事，配错一边就白丢用户的角色图 / 场景图，
+    还得自己去数 `AIVS_REF_*`。现在账单**不再截断**：采用的照样全采用，
+    超出槽位的部分变成生成前的一次警告 + 确认（`REF_OVER_CAPACITY`），
+    真正的截断只发生在提交那一刻，并如实写进 `params.ref_notes`。
+    没有一份可数的图（通用 REST 合同 / 没选预设）就是不限张数。
     """
-    return max(1, int(settings.video_ref_limit))
+    from app.generation.providers import registry  # 延迟导入：context 不在模块级依赖生成层
+
+    return registry.ref_capacity()
 
 
 def _assign_roles(items: list[dict[str, Any]], has_prev: bool) -> None:
@@ -65,6 +76,35 @@ def _assign_roles(items: list[dict[str, Any]], has_prev: bool) -> None:
         return
     first = next((i for i in used if i["kind"] == "prev_frame"), None) if has_prev else None
     (first or used[0])["role"] = "first_frame"
+
+
+def _capacity_of(items: list[dict[str, Any]], cap: RefCapacity) -> dict[str, Any]:
+    """账单这一次会不会有图喂不进去——**只报，不删**。
+
+    数的是 `role == "reference"` 那几条：当首帧的那张走 `AIVS_FIRST_FRAME`，不占参考图槽位。
+    喂不进去的一定是**末尾**几条，因为适配器按账单顺序填槽位（`comfy_preset._refs` 取前 N 张），
+    优先级最低的先被挤掉。它们照旧 `included=True`，只是多一个 `over_capacity` 标记——
+    「这张我采用了、但这份图收不下」和「这张我没采用」是两件事，界面上得分得开。
+
+    这是一份估算：真正喂了哪几张由提交那一刻的 `params.refs` / `params.ref_notes` 记录
+    （显式指定首帧、同一张图重复出现都会让数量差一张），出入只会更少不会更多。
+    """
+    refs = [i for i in items if i.get("role") == "reference"]
+    dropped = cap.dropped(len(refs))
+    tail = refs[len(refs) - dropped :] if dropped else []
+    over = {id(i) for i in tail}
+    for item in items:
+        item["over_capacity"] = id(item) in over
+    return {
+        #: None = 不限制。0 是有意义的答案（那份图一个参考图槽位都没标）。
+        "limit": cap.limit,
+        "source": cap.source,
+        "detail": cap.detail,
+        "ref_count": len(refs),
+        "dropped": dropped,
+        "dropped_labels": [str(i["label"]) for i in tail],
+        "over": dropped > 0,
+    }
 
 
 def _extracted_frame(assets: Any, from_asset_id: str | None) -> str | None:
@@ -284,9 +324,8 @@ class ContextService:
                 }
             )
 
-        # 排序 → 应用覆写 → 卡上限
+        # 排序 → 应用覆写（**不再卡上限**：能收几张是模型端的事，超了在生成前问用户）
         items.sort(key=lambda i: (-int(i["priority"]), str(i["key"])))
-        limit = ref_limit()
         included = 0
         for item in items:
             item["manual"] = item["kind"] == "manual" or item["key"] in removed
@@ -298,9 +337,6 @@ class ContextService:
             elif item["asset_id"] is None:
                 item["included"] = False
                 item["reason"] = "没有可用的图片资产"
-            elif included >= limit:
-                item["included"] = False
-                item["reason"] = f"已达参考图上限 {limit} 张（可在设置页的「视频生成 API」里调整）"
             else:
                 item["included"] = True
                 included += 1
@@ -309,6 +345,7 @@ class ContextService:
             item["missing_file"] = bool(item["asset_id"]) and asset is None
             item.pop("eligible", None)
         _assign_roles(items, bool(shot.prev_shot_id))
+        capacity = _capacity_of(items, ref_capacity())
 
         problems = []
         if not scene.location_variant_id:
@@ -327,8 +364,9 @@ class ContextService:
             "shot_id": shot_id,
             "items": items,
             "included_count": included,
-            "limit": limit,
-            "at_limit": included >= limit,
+            #: 「模型端能收几张、这次会不会有图喂不进去」。以前这里是应用级上限 `limit` /
+            #: `at_limit`，现在换成这一整块——上限不再是我们配的数字。
+            "capacity": capacity,
             "complete": not problems,
             "problems": problems,
             "overrides": overrides,
@@ -431,7 +469,9 @@ class ContextService:
         ctx = await self.resolve(pid, shot_id)
         return {
             "resolved_at": ctx["resolved_at"],
-            "limit": ctx["limit"],
+            #: 当时模型端能收几张、这次算出要丢几张。冻结它，事后才说得清
+            #: 「为什么少喂了两张」——真正喂了哪几张在 `params.refs` / `params.ref_notes`。
+            "capacity": ctx["capacity"],
             "included": [
                 {
                     "key": i["key"],
@@ -441,6 +481,8 @@ class ContextService:
                     "priority": i["priority"],
                     #: 这一张是当首帧还是当参考图。冻结它，事后才说得清「喂了什么」。
                     "role": i.get("role") or "reference",
+                    #: 采用了、但这份图收不下（会在提交时按顺序被挤掉）。
+                    "over_capacity": bool(i.get("over_capacity")),
                 }
                 for i in ctx["items"]
                 if i["included"]

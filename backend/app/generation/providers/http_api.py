@@ -33,6 +33,7 @@ import httpx
 from app.core.config import settings
 from app.core.errors import AppError, ErrorCode
 from app.core.logging import get_logger
+from app.generation.providers import base
 from app.generation.providers.base import STATUSES, TaskState, VideoRequest
 
 log = get_logger("provider.http_api")
@@ -93,6 +94,17 @@ class HttpApiProvider:
         return httpx.Timeout(float(settings.video_timeout), connect=connect)
 
     # --- 探测 ---
+
+    def ref_capacity(self) -> base.RefCapacity:
+        """**不限张数。** 这条合同由我们定，`refs` 是整组带过去的，没有槽位这回事。
+
+        真限制在服务端（它能吃几张），可那件事我们既问不到也不该猜——猜低了白丢用户的图。
+        """
+        return base.RefCapacity(
+            None,
+            "REST 合同",
+            "通用 REST 合同把参考图整组发过去，不存在槽位不够：账单算出几张就发几张。",
+        )
 
     async def probe(self) -> dict[str, Any]:
         base = self._require_base()

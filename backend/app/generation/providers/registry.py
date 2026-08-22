@@ -11,7 +11,8 @@ from typing import Any
 
 from app.core.config import settings
 from app.core.errors import AppError, ErrorCode
-from app.generation.providers.base import VideoProvider
+from app.generation.providers import presets
+from app.generation.providers.base import RefCapacity, VideoProvider
 from app.generation.providers.comfy_preset import ComfyPresetProvider
 from app.generation.providers.http_api import HttpApiProvider
 
@@ -77,6 +78,30 @@ def provider(name: str | None = None) -> VideoProvider:
     return _cache[chosen]
 
 
+def ref_capacity(name: str | None = None) -> RefCapacity:
+    """当前这条路一次能收几张参考图。**绝不抛错**，因为问它的全是只读路径。
+
+    「上限」不再是应用级设置里的一个数字，而是这条路的事实：
+    ComfyUI 预设数它自己的 `AIVS_REF_*` 槽位；REST 合同整组发过去、不限张数；
+    旧的绑定路径压根不注入图片，也没有上限可言。查不出来一律「不限制」——
+    凭空造一个数字只会白丢用户的角色图 / 场景图。
+    """
+    chosen = name or settings.video_provider
+    if chosen in LEGACY:
+        return RefCapacity(
+            None,
+            LABELS.get(chosen, chosen),
+            "旧的工作流绑定路径不注入任何图片（连首帧都不注入），谈不上参考图上限。"
+            "要真的喂角色图 / 场景图请改用「ComfyUI 预设」或「通用 REST API」。",
+        )
+    try:
+        return provider(chosen).ref_capacity()
+    except AppError:
+        #: 不认识的调用方式：设置页那边会用四要素错误说清楚，这里不跟着把只读页面打断。
+        return RefCapacity(None, chosen, "读不到这条调用方式的参考图槽位，先不限张数。")
+
+
 def reset() -> None:
     """测试用：换掉 settings 之后丢掉缓存的实例。"""
     _cache.clear()
+    presets.reset_cache()

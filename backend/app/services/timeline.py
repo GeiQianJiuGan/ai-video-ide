@@ -2,6 +2,13 @@
 
 这一层完全不依赖 AI：即使 ComfyUI 和 LLM 都不在，装配、剪辑、导出照样能跑。
 撤销栈用整轨快照实现——片段数量是几十到几百的量级，快照比逐条反向操作更不容易错。
+**快照连轨道一起存**：轨道也能增删（拆声音会自动开新的音频轨），只存片段的话，
+撤销之后会剩下一堆挂在已经不存在的轨道上的片段——`_shape` 会把它们悄悄跳过，
+用户看到的就是「撤销把我的片段吃掉了」。
+
+声音有两个来源，各自独立：**没被静音的视频片段自带的音轨**，与**音频轨上的片段**
+（`services/audio.py` 从画面里拆出来的，或用户导入的配乐）。音频轨之间可以随意重叠，
+导出时用 `amix` 叠在一起——重叠是音频轨存在的意义，不是错误。
 """
 
 from __future__ import annotations
@@ -17,6 +24,7 @@ from app.core.logging import get_logger
 from app.events.bus import Channel, bus
 from app.persistence.models import utc_now
 from app.persistence.models_edit import (
+    TRACK_KINDS,
     TRANSITION_KINDS,
     ExportRecord,
     Timeline,
@@ -28,6 +36,7 @@ from app.persistence.models_gen import GenerationVersion
 from app.persistence.models_story import Scene, Shot
 from app.persistence.models_world import Asset
 from app.services.assets import assets as asset_service
+from app.services.audio import audio as audio_service
 from app.services.base import as_dict, db_of, dump_json, fetch, fetch_all, load_json, project_of
 
 log = get_logger("timeline")
@@ -35,12 +44,31 @@ log = get_logger("timeline")
 #: 吸附阈值（秒）：剪短片段后自动贴到前一段末尾，中间不留黑帧。
 SNAP = 0.08
 UNDO_DEPTH = 50
+#: 自动起名用的前缀（V1 / A2 / S1）。轨道名是给人看的，可以随便改。
+TRACK_PREFIX = {"video": "V", "audio": "A", "subtitle": "S"}
+#: 音量倍数的上限。再往上不是「更响」而是削波，拦在这里比让人导出一坨爆音好。
+MAX_VOLUME = 4.0
+#: 导出音频统一 aac。
+EXPORT_AUDIO_BITRATE = "192k"
+#: 成片的声音**必须是一个定死的格式**，不能是「素材恰好是什么就是什么」。
+#:
+#: 两个理由，第二个是踩出来的：
+#:   1. 混音的每一路来自不同素材（生成的视频多是单声道 44.1k，导入的配乐常是立体声 48k）。
+#:      不收口的话成片声道数取决于第一路素材，同一条时间线换一段素材就变一次。
+#:   2. **单声道 + 192k 会让 FFmpeg 的原生 aac 编码器停在原地**（本机 ffmpeg 8.0：
+#:      `amix` 之后接单声道 192k，画面写到 3.97s 就再也不前进，进程不退也不报错，
+#:      内存一路涨）。降到 160k 或者收成立体声都好，所以这里收成立体声——
+#:      顺便把上面第 1 条也解决了。改动它之前先跑一遍 12 秒的真实导出。
+EXPORT_AUDIO_FORMAT = "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo"
+
+#: 一次撤销快照：轨道 + 片段两张表的整体状态。
+Snapshot = dict[str, list[dict[str, Any]]]
 
 
 class TimelineService:
     def __init__(self) -> None:
-        self._undo: dict[str, list[list[dict[str, Any]]]] = {}
-        self._redo: dict[str, list[list[dict[str, Any]]]] = {}
+        self._undo: dict[str, list[Snapshot]] = {}
+        self._redo: dict[str, list[Snapshot]] = {}
 
     # --- 时间线与轨道 ---
 
@@ -92,6 +120,14 @@ class TimelineService:
         assets_by_id = {a.id: a for a in await fetch_all(db, Asset)}
         shots = {s.id: s for s in await fetch_all(db, Shot)}
         versions = {v.id: v for v in await fetch_all(db, GenerationVersion)}
+        kind_by_track = {t.id: t.kind for t in tracks}
+        known_clips = {c.id for c in clips}
+        # 「这段画面的声音已经拆出去了」是双向的：源片段要能指到那条音频，
+        # 音频要能说出自己是从哪来的。两边都在这里一次算好，前端不再自己配对。
+        detached: dict[str, str] = {}
+        for clip in clips:
+            if clip.source_clip_id and clip.source_clip_id not in detached:
+                detached[clip.source_clip_id] = clip.id
         by_track: dict[str, list[dict[str, Any]]] = {t.id: [] for t in tracks}
         for clip in clips:
             if clip.track_id not in by_track:
@@ -102,10 +138,17 @@ class TimelineService:
             by_track[clip.track_id].append(
                 {
                     **as_dict(clip),
+                    "track_kind": kind_by_track.get(clip.track_id),
                     "shot_index_no": shot.index_no if shot else None,
                     "version_no": version.version_no if version else None,
                     "asset_path": asset.path if asset else None,
                     "missing_file": bool(clip.asset_id) and asset is None,
+                    #: 这段画面的声音被拆到了哪个片段上（没拆过是 None）。
+                    "detached_audio_clip_id": detached.get(clip.id),
+                    #: 拆声音的那段画面已经不在了（删掉或重新装配过）。声音照旧能播，
+                    #: 但界面上要标出来——不然用户不知道它为什么对不上任何画面。
+                    "source_missing": bool(clip.source_clip_id)
+                    and clip.source_clip_id not in known_clips,
                 }
             )
         total = max(
@@ -121,22 +164,47 @@ class TimelineService:
 
     # --- 撤销栈 ---
 
+    async def _snapshot(self, pid: str) -> Snapshot:
+        """当前的轨道 + 片段。**两张表必须一起存**，理由见模块开头。"""
+        db = db_of(pid)
+        return {
+            "tracks": [as_dict(t) for t in await fetch_all(db, Track)],
+            "clips": [as_dict(c) for c in await fetch_all(db, TimelineClip)],
+        }
+
     async def _capture(self, pid: str) -> None:
-        clips = [as_dict(c) for c in await fetch_all(db_of(pid), TimelineClip)]
         stack = self._undo.setdefault(pid, [])
-        stack.append(clips)
+        stack.append(await self._snapshot(pid))
         del stack[:-UNDO_DEPTH]
         self._redo.pop(pid, None)
 
-    async def _restore(self, pid: str, clips: list[dict[str, Any]]) -> None:
+    async def _restore(self, pid: str, snap: Snapshot) -> None:
         db = db_of(pid)
-        current = await fetch_all(db, TimelineClip)
+        current_clips = await fetch_all(db, TimelineClip)
+        current_tracks = await fetch_all(db, Track)
+        want_tracks = {t["id"]: t for t in snap["tracks"]}
         async with db.write() as session:
-            for row in current:
+            # 片段全删了重建：轨道是它的外键父，顺序反了会撞外键。
+            for row in current_clips:
                 fresh = await session.get(TimelineClip, row.id)
                 if fresh is not None:
                     await session.delete(fresh)
-            for data in clips:
+            await session.flush()
+            for row in current_tracks:
+                fresh = await session.get(Track, row.id)
+                if fresh is None:  # pragma: no cover - 同一事务内不该消失
+                    continue
+                data = want_tracks.pop(row.id, None)
+                if data is None:  # 快照之后新建的轨道
+                    await session.delete(fresh)
+                    continue
+                for key, value in data.items():
+                    setattr(fresh, key, value)
+            await session.flush()
+            for data in want_tracks.values():  # 快照之后被删掉的轨道，原样补回
+                session.add(Track(**data))
+            await session.flush()
+            for data in snap["clips"]:
                 session.add(TimelineClip(**data))
 
     async def undo(self, pid: str) -> dict[str, Any]:
@@ -148,7 +216,7 @@ class TimelineService:
                 "撤销栈是空的（重启应用后会清空）。",
                 ["继续编辑后再撤销"],
             )
-        current = [as_dict(c) for c in await fetch_all(db_of(pid), TimelineClip)]
+        current = await self._snapshot(pid)
         await self._restore(pid, stack.pop())
         self._redo.setdefault(pid, []).append(current)
         return await self.get(pid)
@@ -162,10 +230,105 @@ class TimelineService:
                 "恢复栈是空的。",
                 ["先撤销一次再恢复"],
             )
-        current = [as_dict(c) for c in await fetch_all(db_of(pid), TimelineClip)]
+        current = await self._snapshot(pid)
         await self._restore(pid, stack.pop())
         self._undo.setdefault(pid, []).append(current)
         return await self.get(pid)
+
+    # --- 轨道 ---
+
+    async def add_track(
+        self, pid: str, *, kind: str = "audio", name: str | None = None
+    ) -> dict[str, Any]:
+        """加一条轨道。名字不给就自动编号（A1 已占用就叫 A2）。"""
+        if kind not in TRACK_KINDS:
+            raise AppError(
+                ErrorCode.VALIDATION_ERROR,
+                "未知的轨道类型",
+                f"{kind} 不在 {'、'.join(TRACK_KINDS)} 里。",
+                ["用列表里的轨道类型"],
+            )
+        timeline = await self.get(pid)
+        db = db_of(pid)
+        rows = await fetch_all(db, Track, where=Track.timeline_id == timeline["id"])
+        await self._capture(pid)
+        row = Track(
+            id=new_id("track"),
+            timeline_id=timeline["id"],
+            kind=kind,
+            index_no=max((t.index_no for t in rows), default=-1) + 1,
+            name=(name or "").strip() or self._next_name(kind, rows),
+        )
+        async with db.write() as session:
+            session.add(row)
+        return {"track": as_dict(row), "timeline": await self.get(pid)}
+
+    async def update_track(
+        self,
+        pid: str,
+        track_id: str,
+        *,
+        name: str | None = None,
+        muted: bool | None = None,
+        locked: bool | None = None,
+    ) -> dict[str, Any]:
+        db = db_of(pid)
+        await fetch(db, Track, track_id, "轨道")
+        await self._capture(pid)
+        async with db.write() as session:
+            row = await session.get(Track, track_id)
+            assert row is not None
+            if name is not None and name.strip():
+                row.name = name.strip()
+            if muted is not None:
+                row.muted = int(muted)
+            if locked is not None:
+                row.locked = int(locked)
+        return await self.get(pid)
+
+    async def delete_track(self, pid: str, track_id: str, *, force: bool = False) -> dict[str, Any]:
+        """删一条轨道。上面还有片段时先问一句——那是一次点击毁掉一堆剪辑的操作。"""
+        db = db_of(pid)
+        track = await fetch(db, Track, track_id, "轨道")
+        tracks = await fetch_all(db, Track, where=Track.timeline_id == track.timeline_id)
+        if track.kind == "video" and len([t for t in tracks if t.kind == "video"]) <= 1:
+            raise AppError(
+                ErrorCode.CONFLICT,
+                "不能删掉唯一的视频轨",
+                f"{track.name} 是最后一条视频轨，删了就没有画面可导出了。",
+                ["要清空画面请删掉轨道上的片段", "或者先加一条新的视频轨"],
+                {"track_id": track_id},
+            )
+        clips = await fetch_all(db, TimelineClip, where=TimelineClip.track_id == track_id)
+        if clips and not force:
+            raise AppError(
+                ErrorCode.CONFLICT,
+                "这条轨道上还有片段",
+                f"{track.name} 上有 {len(clips)} 段，删除轨道会把它们一起删掉。",
+                ["确认要连片段一起删，请再按一次", "或者先把这些片段移到别的轨道上"],
+                #: confirm 告诉前端「重放这次请求时加上哪个开关」，与生成层的
+                #: allow_ref_drop 是同一套约定：需要确认不是失败。
+                {"track_id": track_id, "clips": len(clips), "confirm": "force"},
+            )
+        await self._capture(pid)
+        async with db.write() as session:
+            for clip in clips:
+                stale = await session.get(TimelineClip, clip.id)
+                if stale is not None:
+                    await session.delete(stale)
+            await session.flush()
+            fresh = await session.get(Track, track_id)
+            if fresh is not None:
+                await session.delete(fresh)
+        return await self.get(pid)
+
+    def _next_name(self, kind: str, existing: list[Track]) -> str:
+        prefix = TRACK_PREFIX.get(kind, "T")
+        used = {t.name for t in existing}
+        n = 1
+        while f"{prefix}{n}" in used:
+            n += 1
+        return f"{prefix}{n}"
 
     # --- 装配 ---
 
@@ -232,16 +395,9 @@ class TimelineService:
         db = db_of(pid)
         clip = await fetch(db, TimelineClip, clip_id, "片段")
         await self._capture(pid)
-        siblings = [
-            c
-            for c in await fetch_all(db, TimelineClip, where=TimelineClip.track_id == clip.track_id)
-            if c.id != clip_id
-        ]
-        snapped = max(0.0, float(start))
-        for other in siblings:  # 吸附到邻居边界
-            for edge in (other.start, other.start + other.duration):
-                if abs(snapped - edge) <= SNAP:
-                    snapped = edge
+        snapped = self._snap_to_neighbours(
+            float(start), await self._siblings(pid, clip.track_id, clip_id)
+        )
         async with db.write() as session:
             row = await session.get(TimelineClip, clip_id)
             assert row is not None
@@ -256,8 +412,16 @@ class TimelineService:
         *,
         in_point: float | None = None,
         out_point: float | None = None,
+        start: float | None = None,
         ripple: bool = True,
     ) -> dict[str, Any]:
+        """裁剪。
+
+        `start` 是为**拖左边缘**准备的：往右拖左边缘要同时改「从源素材的哪里开始」
+        （in_point）和「在时间线上的哪里开始」（start），否则画面会往前跳。这两件事
+        必须在一次请求里做完——分两次调不但会在中间留下一个错的状态，还会在撤销栈上
+        留两格，撤销一次只回到一半。
+        """
         db = db_of(pid)
         clip = await fetch(db, TimelineClip, clip_id, "片段")
         new_in = clip.in_point if in_point is None else max(0.0, float(in_point))
@@ -271,6 +435,11 @@ class TimelineService:
                 ["把出点调到入点之后", "或撤销这次裁切"],
                 {"clip_id": clip_id},
             )
+        new_start = clip.start
+        if start is not None:
+            new_start = self._snap_to_neighbours(
+                float(start), await self._siblings(pid, clip.track_id, clip_id)
+            )
         await self._capture(pid)
         async with db.write() as session:
             row = await session.get(TimelineClip, clip_id)
@@ -278,6 +447,7 @@ class TimelineService:
             row.in_point = new_in
             row.out_point = new_out
             row.duration = new_out - new_in
+            row.start = new_start
         if ripple:
             await self._close_gaps(pid, clip.track_id)
         return await self.get(pid)
@@ -310,6 +480,10 @@ class TimelineService:
                 in_point=clip.in_point + offset,
                 out_point=clip.out_point,
                 label=clip.label,
+                # 混音设置跟着走：切一刀不该让后半段忽然出声或者变响。
+                muted=clip.muted,
+                volume=clip.volume,
+                source_clip_id=clip.source_clip_id,
             )
             head.duration = offset
             head.out_point = clip.in_point + offset
@@ -318,6 +492,12 @@ class TimelineService:
         return await self.get(pid)
 
     async def delete_clip(self, pid: str, clip_id: str, *, ripple: bool = True) -> dict[str, Any]:
+        """删一个片段。
+
+        **不连带删拆出去的声音**：声音一旦独立成一段，它就是音频轨上的一段素材，
+        用户完全可能是想「换掉这段画面、留住这段声音」。留下来的那段会被标成
+        `source_missing`，界面上说清楚它的来源片段已经不在了。
+        """
         db = db_of(pid)
         clip = await fetch(db, TimelineClip, clip_id, "片段")
         await self._capture(pid)
@@ -329,6 +509,200 @@ class TimelineService:
             await self._close_gaps(pid, clip.track_id)
         else:
             await self._reindex(pid, clip.track_id)
+        return await self.get(pid)
+
+    async def add_clip(
+        self,
+        pid: str,
+        track_id: str,
+        asset_id: str,
+        *,
+        start: float = 0.0,
+        duration: float | None = None,
+        label: str | None = None,
+    ) -> dict[str, Any]:
+        """把一个已登记的资产放到轨道上（导入的配乐 / 音效走这条路）。
+
+        长度按「显式给的 → 资产上记的 → ffprobe 探出来的」取，**一个都拿不到就报错**：
+        随便填 4 秒会让用户以为音乐只有 4 秒长，那是猜出来的假数据。
+        """
+        db = db_of(pid)
+        track = await fetch(db, Track, track_id, "轨道")
+        asset = await fetch(db, Asset, asset_id, "资产")
+        proj = project_of(pid)
+        src = proj.dir / asset.path
+        if not src.is_file():
+            raise AppError(
+                ErrorCode.MISSING_ASSET,
+                "素材文件不在磁盘上",
+                f"{asset.path} 找不到，放到轨道上也没法播放或导出。",
+                ["重新导入这个文件", "或从备份恢复它"],
+                {"asset_id": asset_id},
+            )
+        probe = await audio_service.peek(src)
+        if track.kind == "audio" and probe is not None and not probe.has_audio:
+            raise AppError(
+                ErrorCode.VALIDATION_ERROR,
+                "这个文件没有声音",
+                f"{asset.path} 里没有音频流，放到音频轨上不会有任何声音。",
+                ["选一个音频文件（mp3 / wav / m4a）", "视频的声音请用「拆出声音」而不是直接放"],
+                {"asset_id": asset_id, "track_id": track_id},
+            )
+        length = duration if duration is not None else (asset.duration or None)
+        if length is None and probe is not None:
+            length = probe.duration
+        if not length or length <= 0:
+            raise AppError(
+                ErrorCode.VALIDATION_ERROR,
+                "不知道这段素材有多长",
+                f"{asset.path} 上没有记录时长，ffprobe 也没能探出来。",
+                [
+                    "手动填一个时长再放上去",
+                    "或安装 / 配置 FFmpeg 后重试（设置页可以看用的是哪一份）",
+                ],
+                {"asset_id": asset_id},
+            )
+        await self._capture(pid)
+        row = TimelineClip(
+            id=new_id("timeline_clip"),
+            track_id=track_id,
+            asset_id=asset_id,
+            index_no=0,
+            start=self._snap_to_neighbours(float(start), await self._siblings(pid, track_id, None)),
+            duration=float(length),
+            in_point=0.0,
+            out_point=float(length),
+            label=(label or "").strip() or _asset_label(asset),
+        )
+        async with db.write() as session:
+            session.add(row)
+        await self._reindex(pid, track_id)
+        return {"clip_id": row.id, "timeline": await self.get(pid)}
+
+    async def detach_audio(self, pid: str, clip_id: str) -> dict[str, Any]:
+        """把一段画面的声音拆成音频轨上的独立片段。
+
+        三件事一次做完：拆出音频文件（`services/audio.py`，没有音轨时明确报错）、
+        找一条**这个时间段还空着**的音频轨（都占着就新开一条，所以音频天然可以叠）、
+        把源片段静音（声音已经挪走了，再让画面自己出一遍就是听两遍）。
+        """
+        db = db_of(pid)
+        clip = await fetch(db, TimelineClip, clip_id, "片段")
+        track = await fetch(db, Track, clip.track_id, "轨道")
+        if track.kind != "video":
+            raise AppError(
+                ErrorCode.VALIDATION_ERROR,
+                "只有视频轨上的片段能拆声音",
+                f"{track.name} 是{'音频轨' if track.kind == 'audio' else track.kind}。",
+                ["在视频轨上选一段再拆", "音频片段本身就是独立的，不需要拆"],
+                {"clip_id": clip_id},
+            )
+        if not clip.asset_id:
+            raise AppError(
+                ErrorCode.MISSING_ASSET,
+                "这个片段没有素材",
+                "片段上没有关联任何文件，拆不出声音。",
+                ["先给这个镜头换一个有素材的版本"],
+                {"clip_id": clip_id},
+            )
+        existing = next(
+            (
+                c
+                for c in await fetch_all(
+                    db, TimelineClip, where=TimelineClip.source_clip_id == clip_id
+                )
+            ),
+            None,
+        )
+        if existing is not None:
+            raise AppError(
+                ErrorCode.CONFLICT,
+                "这段的声音已经拆出来了",
+                "音频轨上已经有一段是从它拆出来的，再拆一次会得到两份一样的声音。",
+                ["在音频轨上找到那一段直接调整", "或者先删掉那一段再重新拆"],
+                {"clip_id": clip_id, "audio_clip_id": existing.id, "track_id": existing.track_id},
+            )
+
+        extracted = await audio_service.extract(pid, clip.asset_id)
+        timeline = await self.get(pid)
+        clip_end = clip.start + clip.duration
+        target = next(
+            (
+                t
+                for t in timeline["tracks"]
+                if t["kind"] == "audio" and not _occupied(t["clips"], clip.start, clip_end)
+            ),
+            None,
+        )
+        created = False
+        if target is None:
+            # 所有音频轨在这个时间段都占着：新开一条。音频轨之间可以叠加，
+            # 「叠加」在数据上就是「同一时间有多条轨道各有一段」。
+            target = (await self.add_track(pid, kind="audio"))["track"]
+            created = True
+        await self._capture(pid)
+        row = TimelineClip(
+            id=new_id("timeline_clip"),
+            track_id=target["id"],
+            shot_id=clip.shot_id,
+            asset_id=extracted["id"],
+            index_no=0,
+            start=clip.start,
+            duration=clip.duration,
+            in_point=clip.in_point,
+            out_point=clip.out_point
+            if clip.out_point is not None
+            else clip.in_point + clip.duration,
+            label=f"{clip.label or '片段'} 的声音",
+            volume=1.0,
+            source_clip_id=clip.id,
+        )
+        async with db.write() as session:
+            session.add(row)
+            source = await session.get(TimelineClip, clip_id)
+            assert source is not None
+            source.muted = 1
+        await self._reindex(pid, target["id"])
+        log.info("timeline.audio_detached", project_id=pid, clip_id=clip_id, track_id=target["id"])
+        return {
+            "audio_clip_id": row.id,
+            "track_id": target["id"],
+            "track_name": target["name"],
+            #: 为了放下它新开了一条轨道（原来的音频轨在这个时间段都被占着）。
+            "created_track": created,
+            #: 之前已经拆过同一段素材，复用了那份音频文件（没有重跑 FFmpeg）。
+            "reused_file": bool(extracted.get("reused")),
+            "asset_id": extracted["id"],
+            "timeline": await self.get(pid),
+        }
+
+    async def set_mix(
+        self,
+        pid: str,
+        clip_id: str,
+        *,
+        muted: bool | None = None,
+        volume: float | None = None,
+    ) -> dict[str, Any]:
+        """调一个片段的静音 / 音量。视频片段与音频片段用同一个入口。"""
+        db = db_of(pid)
+        await fetch(db, TimelineClip, clip_id, "片段")
+        if volume is not None and not 0.0 <= float(volume) <= MAX_VOLUME:
+            raise AppError(
+                ErrorCode.VALIDATION_ERROR,
+                "音量超出范围",
+                f"{volume} 不在 0 ~ {MAX_VOLUME} 之间。",
+                [f"把音量填在 0（无声）到 {MAX_VOLUME} 之间", "要更响请在导出后用音频软件处理"],
+                {"clip_id": clip_id},
+            )
+        await self._capture(pid)
+        async with db.write() as session:
+            row = await session.get(TimelineClip, clip_id)
+            assert row is not None
+            if muted is not None:
+                row.muted = int(muted)
+            if volume is not None:
+                row.volume = float(volume)
         return await self.get(pid)
 
     async def replace_version(self, pid: str, clip_id: str, version_id: str) -> dict[str, Any]:
@@ -359,6 +733,21 @@ class TimelineService:
             row.version_id = version_id
             row.asset_id = version.asset_id
         return await self.get(pid)
+
+    async def _siblings(
+        self, pid: str, track_id: str, exclude_id: str | None
+    ) -> list[TimelineClip]:
+        rows = await fetch_all(db_of(pid), TimelineClip, where=TimelineClip.track_id == track_id)
+        return [c for c in rows if c.id != exclude_id]
+
+    def _snap_to_neighbours(self, value: float, siblings: list[TimelineClip]) -> float:
+        """吸附到同轨邻居的边界。手拖的坐标永远差那么几毫秒，靠它对齐。"""
+        out = max(0.0, float(value))
+        for other in siblings:
+            for edge in (other.start, other.start + other.duration):
+                if abs(out - edge) <= SNAP:
+                    return max(0.0, edge)
+        return out
 
     async def _reindex(self, pid: str, track_id: str) -> None:
         db = db_of(pid)
@@ -497,7 +886,17 @@ class TimelineService:
         }
 
     async def build_command(self, pid: str, out_path: str | None = None) -> dict[str, Any]:
-        """产出 FFmpeg 命令。用原始素材而不是代理。"""
+        """产出 FFmpeg 命令。用原始素材而不是代理。
+
+        画面来自视频轨；声音有两个来源——**没被静音的视频片段自带的音轨**与
+        **音频轨上的片段**，各按自己在时间线上的起点 `adelay` 之后用 `amix` 叠起来
+        （`normalize=0`：叠加不该把每一条都自动压小，那样加一条配乐会让对白变轻）。
+        一段声音都没有时回到从前的样子（`a=0`、不 map 音频），而不是塞一条静音轨。
+
+        拿不准的事情一律写进 `warnings` 让人看见：ffprobe 不在所以不知道某段画面
+        有没有声音、某条音频轨是静音的所以里面的片段不会进成片、音频比画面长会被截断。
+        这些都不该拦住导出，但**更不该悄悄发生**。
+        """
         timeline = await self.get(pid)
         video = next((t for t in timeline["tracks"] if t["kind"] == "video"), None)
         clips = sorted((video or {}).get("clips") or [], key=lambda c: c["start"])
@@ -509,8 +908,34 @@ class TimelineService:
                 ["先点「自动装配」", "或手动把片段拖到轨道上"],
             )
         proj = project_of(pid)
+        warnings: list[str] = []
+        # 画面用 concat 一段接一段：视频轨上的空档会被合掉，不会变成黑帧。
+        # 轨道区和预览器把空档画出来（那是时间线上的真实位置），所以这件事必须说，
+        # 不然「预览里有 2 秒黑场，导出后没有」会被当成 bug。
+        gaps, prev_end = 0.0, 0.0
+        for clip in clips:
+            gaps += max(0.0, clip["start"] - prev_end)
+            prev_end = clip["start"] + clip["duration"]
+        audio_clips: list[dict[str, Any]] = []
+        for track in timeline["tracks"]:
+            if track["kind"] != "audio" or not track["clips"]:
+                continue
+            if track["muted"]:
+                warnings.append(
+                    f"音频轨 {track['name']} 是静音的，上面 {len(track['clips'])} 段不会进入成片。"
+                )
+                continue
+            audio_clips += [c for c in track["clips"] if not c["muted"] and c["volume"] > 0]
+        if gaps > 0.05:
+            warnings.append(
+                f"视频轨上有 {gaps:.2f} 秒空档，导出会把它们合掉（画面一段接一段）——"
+                "要真的留白请在那里放一段黑场素材。"
+                + ("音频轨按时间线上的绝对位置放，所以合掉空档后会对不上。" if audio_clips else "")
+            )
         missing = [
-            c for c in clips if not c["asset_path"] or not (proj.dir / c["asset_path"]).is_file()
+            c
+            for c in [*clips, *audio_clips]
+            if not c["asset_path"] or not (proj.dir / c["asset_path"]).is_file()
         ]
         if missing:
             raise AppError(
@@ -534,43 +959,89 @@ class TimelineService:
         target.parent.mkdir(parents=True, exist_ok=True)
 
         args: list[str] = [self._ffmpeg(), "-y"]
-        for clip in clips:
-            src = proj.dir / clip["asset_path"]
+        for clip in [*clips, *audio_clips]:
             args += [
                 "-ss",
                 f"{clip['in_point']:.3f}",
                 "-t",
                 f"{clip['duration']:.3f}",
                 "-i",
-                str(src),
+                str(proj.dir / clip["asset_path"]),
             ]
-        parts = []
+        graph = []
         for i, _ in enumerate(clips):
-            parts.append(
+            graph.append(
                 f"[{i}:v]scale={timeline['width']}:{timeline['height']}:force_original_aspect_ratio=decrease,"
                 f"pad={timeline['width']}:{timeline['height']}:-1:-1,setsar=1,"
                 f"fps={timeline['fps']}[v{i}]"
             )
         concat = "".join(f"[v{i}]" for i in range(len(clips)))
-        filter_complex = ";".join(parts) + f";{concat}concat=n={len(clips)}:v=1:a=0[vout]"
-        args += [
-            "-filter_complex",
-            filter_complex,
-            "-map",
-            "[vout]",
-            "-c:v",
-            "libx264",
-            "-pix_fmt",
-            "yuv420p",
-            "-crf",
-            "18",
-            str(target),
-        ]
+        graph.append(f"{concat}concat=n={len(clips)}:v=1:a=0[vout]")
+
+        # 声音第一路：视频片段自带的音轨。concat 后的时间轴是「一段接一段」，所以延迟
+        # 用累计游标算，不是 clip["start"]——视频轨上有空隙时那两个数不一样。
+        sources: list[tuple[int, float, float]] = []
+        video_muted = bool((video or {}).get("muted"))
+        cursor = 0.0
+        unknown = 0
+        for i, clip in enumerate(clips):
+            offset, cursor = cursor, cursor + clip["duration"]
+            if video_muted or clip["muted"] or clip["volume"] <= 0:
+                continue
+            probe = await audio_service.peek(proj.dir / clip["asset_path"])
+            if probe is None:
+                unknown += 1
+                continue
+            if probe.has_audio:
+                sources.append((i, offset, float(clip["volume"])))
+        if unknown:
+            warnings.append(
+                f"有 {unknown} 段画面无法确认是否自带声音（ffprobe 不可用），"
+                "这次按「没有声音」处理。"
+            )
+        # 声音第二路：音频轨。它们的时间是绝对时间，直接用 start。
+        picture_total = cursor
+        overrun = 0.0
+        for j, clip in enumerate(audio_clips):
+            sources.append((len(clips) + j, float(clip["start"]), float(clip["volume"])))
+            overrun = max(overrun, clip["start"] + clip["duration"] - picture_total)
+        if overrun > 0.05:
+            warnings.append(
+                f"音频比画面长 {overrun:.2f} 秒，导出会按画面长度截断——"
+                "需要留白请在视频轨末尾补一段。"
+            )
+
+        aout = ""
+        for k, (index, delay, volume) in enumerate(sources):
+            graph.append(
+                f"[{index}:a]adelay={int(round(delay * 1000))}:all=1,volume={volume:.3f}[a{k}]"
+            )
+        # 混完（或只有一路时直接）把格式收口成立体声 48k，理由见 EXPORT_AUDIO_FORMAT。
+        if len(sources) > 1:
+            mix = "".join(f"[a{k}]" for k in range(len(sources)))
+            graph.append(f"{mix}amix=inputs={len(sources)}:normalize=0,{EXPORT_AUDIO_FORMAT}[aout]")
+            aout = "[aout]"
+        elif sources:
+            graph.append(f"[a0]{EXPORT_AUDIO_FORMAT}[aout]")
+            aout = "[aout]"
+
+        args += ["-filter_complex", ";".join(graph), "-map", "[vout]"]
+        if aout:
+            # -t 收在画面长度上：混音的每一路都可能比画面长（adelay 之后更是）。
+            args += ["-map", aout, "-c:a", "aac", "-b:a", EXPORT_AUDIO_BITRATE]
+        args += ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18"]
+        if aout:
+            args += ["-t", f"{picture_total:.3f}"]
+        args.append(str(target))
         return {
             "path": str(target),
             "args": args,
             "command": " ".join(args),
             "clips": clips,
+            #: 参与混音的音频片段（音频轨上的那些）。视频自带的声音不在这张表里。
+            "audio_clips": audio_clips,
+            #: 这次导出有哪些「说不准 / 会被丢掉」的地方。空列表是常态。
+            "warnings": warnings,
             "version_ids": [c["version_id"] for c in clips if c["version_id"]],
         }
 
@@ -651,6 +1122,23 @@ class TimelineService:
             }
             for r in rows
         ]
+
+
+def _occupied(clips: list[dict[str, Any]], start: float, end: float) -> bool:
+    """这条轨道的 [start, end) 区间上已经有片段了吗（用于给拆出来的声音找位置）。"""
+    eps = 1e-6
+    return any(c["start"] < end - eps and start < c["start"] + c["duration"] - eps for c in clips)
+
+
+def _asset_label(asset: Asset) -> str:
+    """轨道上显示的名字：优先用户导入时那个文件名。
+
+    落盘用的是内容哈希名（`assets.content_name`），把它摆到轨道上等于什么都没说——
+    「c72d5eb2b494.m4a」和「片头曲.m4a」是同一个文件，但只有后者能让人认出来。
+    原名记在 `meta_json.filename` 里（生成物没有这一项，退回文件名）。
+    """
+    name = str(load_json(asset.meta_json, {}).get("filename") or "").strip()
+    return Path(name).name or Path(asset.path).name
 
 
 timeline = TimelineService()

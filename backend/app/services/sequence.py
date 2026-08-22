@@ -47,7 +47,7 @@ from app.persistence.models_world import Asset
 from app.services.assets import kind_of_suffix
 from app.services.base import as_dict, db_of, fetch, fetch_all
 from app.services.context import context
-from app.services.generation import generation
+from app.services.generation import drop_entry, generation, over_capacity_error
 from app.services.story import node_limit, story
 
 MODES = ("parallel", "sequential")
@@ -397,6 +397,8 @@ class SequenceService:
 
         rows: list[dict[str, Any]] = []
         blockers: list[dict[str, Any]] = []
+        #: 参考图装不下的镜头。**不是 blocker**：确认一下就能继续，只是丢几张图。
+        ref_drops: list[dict[str, Any]] = []
         total = 0
         # 单线程模式下只有链头要过上下文门槛（其余的首帧要等上游出片），所以先认出链头是谁。
         chain_head = next(
@@ -414,6 +416,9 @@ class SequenceService:
             ready = 0
             for shot in real:
                 ctx = await context.resolve(pid, shot.id)
+                over = drop_entry(shot, ctx["capacity"])
+                if over:
+                    ref_drops.append({**over, "scene_index_no": scene.index_no})
                 # 「等上游末帧」不算缺失：那是编排本身要解决的事，不是配置错误。
                 own = [p for p in ctx["problems"] if "上游" not in p and "末帧" not in p]
                 missing += [f"Shot {shot.index_no}：{p}" for p in own]
@@ -500,6 +505,13 @@ class SequenceService:
             notes.append("单线程续接不需要转场，链上每一段都直接接上一段的真末帧。")
             if ignored:
                 notes.append(f"图上有 {ignored} 条转场衔接，这次会被当成「续接末帧」处理。")
+        if ref_drops:
+            dropped = sum(int(d["dropped"]) for d in ref_drops)
+            notes.append(
+                f"有 {len(ref_drops)} 个镜头采用的参考图超出模型端能收的张数，"
+                f"一共会丢 {dropped} 张（丢的是优先级最低的那几张）——"
+                "执行编排时要先确认这一点。"
+            )
         return {
             "mode": mode,
             "scenes": rows,
@@ -508,16 +520,30 @@ class SequenceService:
             "ignored_transitions": ignored,
             "total_jobs": total,
             "blockers": blockers,
+            "ref_drops": ref_drops,
             "notes": notes,
         }
 
-    async def run(self, pid: str, mode: str = "parallel", priority: int = 100) -> dict[str, Any]:
-        """按账单入队。跳过的每一条都带结构化原因，绝不静默少做一件事。"""
+    async def run(
+        self,
+        pid: str,
+        mode: str = "parallel",
+        priority: int = 100,
+        *,
+        allow_ref_drop: bool = False,
+    ) -> dict[str, Any]:
+        """按账单入队。跳过的每一条都带结构化原因，绝不静默少做一件事。
+
+        账单里有「参考图装不下」的镜头时**一个任务都不入队**，先要一次确认
+        （`allow_ref_drop`）：入一半、剩下的等确认的话，确认之后前一半会被再入队一遍。
+        """
         self._require_mode(mode)
         bill = await self.plan(pid, mode)
+        if bill["ref_drops"] and not allow_ref_drop:
+            raise over_capacity_error(bill["ref_drops"])
         if mode == "sequential":
-            return {**await self._run_sequential(pid, priority), "plan": bill}
-        return {**await self._run_parallel(pid, bill, priority), "plan": bill}
+            return {**await self._run_sequential(pid, priority, allow_ref_drop), "plan": bill}
+        return {**await self._run_parallel(pid, bill, priority, allow_ref_drop), "plan": bill}
 
     def _require_mode(self, mode: str) -> None:
         if mode not in MODES:
@@ -533,7 +559,9 @@ class SequenceService:
 
     # --- 两种模式的执行 ---
 
-    async def _run_parallel(self, pid: str, bill: dict[str, Any], priority: int) -> dict[str, Any]:
+    async def _run_parallel(
+        self, pid: str, bill: dict[str, Any], priority: int, allow_ref_drop: bool = False
+    ) -> dict[str, Any]:
         db = db_of(pid)
         queued: list[str] = []
         skipped: list[dict[str, Any]] = []
@@ -545,7 +573,9 @@ class SequenceService:
             ]
             for shot in shots:
                 try:
-                    job = await generation.enqueue_shot(pid, shot.id, priority=priority)
+                    job = await generation.enqueue_shot(
+                        pid, shot.id, priority=priority, allow_ref_drop=allow_ref_drop
+                    )
                     queued.append(job["id"])
                 except AppError as err:
                     skipped.append(
@@ -556,12 +586,14 @@ class SequenceService:
             if not edge["will_create_transition"]:
                 continue
             try:
-                made.append(await self._make_transition(pid, edge, priority))
+                made.append(await self._make_transition(pid, edge, priority, allow_ref_drop))
             except AppError as err:
                 skipped.append({"link": edge, "error": err.to_dict()})
         return {"mode": "parallel", "queued": queued, "transitions": made, "skipped": skipped}
 
-    async def _run_sequential(self, pid: str, priority: int) -> dict[str, Any]:
+    async def _run_sequential(
+        self, pid: str, priority: int, allow_ref_drop: bool = False
+    ) -> dict[str, Any]:
         """把全片的镜头串成一条链再入队。链头要真首帧，其余等上游末帧。"""
         db = db_of(pid)
         scenes = await fetch_all(db, Scene, order_by=Scene.index_no)
@@ -588,7 +620,11 @@ class SequenceService:
                 # 链头必须自己有首帧，所以照常过门槛；后面的首帧要等上游出片，
                 # 硬检查只会把整条链拒在门外——它们的等待由 wait_reason 表达。
                 job = await generation.enqueue_shot(
-                    pid, shot.id, priority=priority, check_context=i == 0
+                    pid,
+                    shot.id,
+                    priority=priority,
+                    check_context=i == 0,
+                    allow_ref_drop=allow_ref_drop,
                 )
                 queued.append(job["id"])
             except AppError as err:
@@ -619,7 +655,7 @@ class SequenceService:
         return True, ""
 
     async def _make_transition(
-        self, pid: str, edge: dict[str, Any], priority: int
+        self, pid: str, edge: dict[str, Any], priority: int, allow_ref_drop: bool = False
     ) -> dict[str, Any]:
         """造一个 `kind="transition"` 的镜头并入队。它属于上一幕、排在最后。
 
@@ -698,6 +734,9 @@ class SequenceService:
             kind="first_last_frame",
             priority=priority,
             check_context=False,
+            # 转场镜头是 run 期间才造出来的，账单里数不到它，所以这里跟着整次编排的确认走：
+            # 没确认过又恰好装不下时，它会带着「怎么确认」的四要素错误进 skipped。
+            allow_ref_drop=allow_ref_drop,
             last_frame_asset_id=last_frame,
             extra={"transition": True},
         )

@@ -23,6 +23,9 @@ class ErrorCode(StrEnum):
     DEPENDENCY_CYCLE = "DEPENDENCY_CYCLE"
     UPSTREAM_NOT_READY = "UPSTREAM_NOT_READY"
     CONTEXT_INCOMPLETE = "CONTEXT_INCOMPLETE"
+    #: 账单里的参考图比模型端那份图能收的多。**这不是错，是一次确认**：
+    #: 用户点了确认就按槽位顺序喂前 N 张，所以它必须先挡下来而不是悄悄丢图。
+    REF_OVER_CAPACITY = "REF_OVER_CAPACITY"
     # 外部依赖
     COMFY_OFFLINE = "COMFY_OFFLINE"
     COMFY_NODE_MISSING = "COMFY_NODE_MISSING"
@@ -48,6 +51,9 @@ _STATUS = {
     # schema 不匹配本质上也是冲突：文件在那里，但和当前应用对不上
     ErrorCode.SCHEMA_MISMATCH: 409,
     ErrorCode.VALIDATION_ERROR: 422,
+    #: 要用户点一下「确认丢弃并继续」才能过——语义上和「状态冲突」是一回事：
+    #: 现在这个状态下不能直接做，换个参数（allow_ref_drop）就能做。
+    ErrorCode.REF_OVER_CAPACITY: 409,
     ErrorCode.UNAUTHORIZED: 401,
     ErrorCode.COMFY_OFFLINE: 503,
     ErrorCode.LLM_UNAVAILABLE: 503,

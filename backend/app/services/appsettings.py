@@ -137,17 +137,9 @@ FIELDS: tuple[FieldSpec, ...] = (
         impact="comfy_preset 时指哪一份图；缺它无法生成。",
     ),
     FieldSpec("video.timeout", "video_timeout", "video", "单次超时（秒）", "int"),
-    FieldSpec(
-        "video.ref_limit",
-        "video_ref_limit",
-        "video",
-        "参考图上限（张）",
-        "int",
-        impact=(
-            "一次生成最多喂几张参考图（含当首帧那张）。调小会先丢优先级低的道具图；"
-            "真正能收几张由模型端那份图决定（预设里数 AIVS_REF_* 槽位）。"
-        ),
-    ),
+    # 这里刻意**没有**「参考图上限」这一项：能收几张是模型端那份图的事实
+    # （预设里数 AIVS_REF_* 槽位），由适配层的 ref_capacity() 回答。配一个数字只会和
+    # 真实槽位打架，还得用户自己去对；超出槽位时改成生成前警告 + 确认。
     FieldSpec(
         "video.ref_labels",
         "video_ref_labels",

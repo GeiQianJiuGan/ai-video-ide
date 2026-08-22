@@ -40,6 +40,9 @@ KIND_DIR = {
     #: 老工程里已经在 assets/frames/ 的那些帧路径记在库里，照旧能读（cache/ 优先），
     #: 只是新抽的帧不再进 assets/。见 services/frames.py 与下面的 delete() 级联清理。
     "frame": "cache/frames",
+    #: 从视频里拆出来的音频（时间线的音频轨靠它）——同样是**临时资源，不算资产**。
+    #: 理由与帧完全一样：派生的、能重拆的、源成片一没它就没意义。见 services/audio.py。
+    "clip_audio": "cache/audio",
     "audio": "assets/audio",
     "upload": "assets/uploads",
     "generated_image": "generations/images",
@@ -50,10 +53,11 @@ KIND_DIR = {
 IMAGE_SUFFIX = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
 VIDEO_SUFFIX = {".mp4", ".mov", ".mkv", ".webm", ".avi"}
 
-#: **临时资源**：登记在 asset 表里（生成层要靠 asset_id → path 把它喂给模型），
+#: **临时资源**：登记在 asset 表里（生成层与时间线都要靠 asset_id → path 找文件），
 #: 但不算「工程资产」——资产页与孤儿扫描一律不列它们，它们的生命周期挂在源文件上
-#: （源成片一删，派生的帧跟着删，见 `AssetService.delete`）。
-TRANSIENT_KINDS = frozenset({"frame"})
+#: （源成片一删，从它派生的帧与音频跟着删，见 `AssetService.delete`）。
+#: 用户自己导入的音乐是 `audio`（真资产），从画面里拆出来的是 `clip_audio`（临时）。
+TRANSIENT_KINDS = frozenset({"frame", "clip_audio"})
 
 
 def sniff_size(path: Path) -> tuple[int | None, int | None]:
@@ -290,9 +294,11 @@ class AssetService:
     async def list_assets(self, pid: str, kind: str | None = None) -> list[dict[str, Any]]:
         """工程资产总账。
 
-        **临时资源不在这张账上**（`TRANSIENT_KINDS`，目前只有抽出来的首尾帧）：
-        它们是从成片派生的、可以重抽的，生命周期跟着源文件走，列进资产页只会让人
-        以为「这里多了一堆我没导入过的图，是不是能删」。要看它们得显式传 `kind="frame"`。
+        **临时资源不在这张账上**（`TRANSIENT_KINDS`：抽出来的首尾帧 `frame`、从视频里
+        拆出来的声音 `clip_audio`）：它们都是从成片派生的、可以重来一次的，生命周期跟着
+        源文件走，列进资产页只会让人以为「这里多了一堆我没导入过的东西，是不是能删」。
+        要看它们得显式传 `kind="frame"` / `kind="clip_audio"`。用户自己导入的音乐是
+        `kind="audio"` 的真资产，照常在账上。
         """
         db = db_of(pid)
         proj = project_of(pid)
@@ -327,9 +333,10 @@ class AssetService:
     async def delete(self, pid: str, asset_id: str, force: bool = False) -> dict[str, Any]:
         """删除资产。仍被引用时默认拒绝，并告诉用户是谁在用。
 
-        删成功时会**连带删掉从它派生的临时帧**（首帧 / 末帧）：那些帧只有配合这段视频
-        才有意义，源片没了还留着一堆孤零零的 PNG 是垃圾。连带删除的每一条都写进返回值的
-        `derived_removed`——「绝不静默连带删除」说的是不静默，不是不删。
+        删成功时会**连带删掉从它派生的临时文件**（抽出来的首 / 末帧、拆出来的音频）：
+        那些东西只有配合这段视频才有意义，源片没了还留着一堆孤零零的 PNG / m4a 是垃圾。
+        连带删除的每一条都写进返回值的 `derived_removed`——「绝不静默连带删除」说的是
+        不静默，不是不删。
         """
         db = db_of(pid)
         proj = project_of(pid)
@@ -348,7 +355,7 @@ class AssetService:
                 ],
                 {"asset_id": asset_id},
             )
-        derived = [] if row.kind in TRANSIENT_KINDS else await self._derived_frames(pid, asset_id)
+        derived = [] if row.kind in TRANSIENT_KINDS else await self._derived(pid, asset_id)
         file_path = proj.dir / row.path
         async with db.write() as session:
             for extra in derived:  # 派生的帧没有引用，直接跟着走
@@ -370,15 +377,24 @@ class AssetService:
             "id": asset_id,
             "file_removed": removed,
             "broken_refs": len(refs) if force else 0,
-            #: 跟着一起删掉的临时帧。空列表是常态（大多数资产没派生过帧）。
+            #: 跟着一起删掉的临时文件（抽出来的帧、拆出来的音频）。
+            #: 空列表是常态（大多数资产没派生过东西）。
             "derived_removed": derived_removed,
         }
 
-    async def _derived_frames(self, pid: str, asset_id: str) -> list[Asset]:
-        """从这个资产抽出来的临时帧。出处的解读只在 services/frames.py 一处。"""
-        from app.services.frames import derived_frames  # 延迟导入：frames 依赖本模块
+    async def _derived(self, pid: str, asset_id: str) -> list[Asset]:
+        """从这个资产派生出来的所有临时文件。
 
-        return derived_frames(await fetch_all(db_of(pid), Asset), asset_id)
+        出处（`meta_json.from_asset_id`）的解读**只放在各自的模块里**：帧在
+        `services/frames.py`，音频在 `services/audio.py`。这里只负责把它们串起来，
+        绝不在本模块里再解一遍 meta——两处各解一遍，迟早有一处漏掉级联。
+        """
+        # 延迟导入：frames / audio 都依赖本模块
+        from app.services.audio import derived_audio
+        from app.services.frames import derived_frames
+
+        rows = await fetch_all(db_of(pid), Asset)
+        return [*derived_frames(rows, asset_id), *derived_audio(rows, asset_id)]
 
     def _unlink(self, pid: str, asset_id: str, file_path: Path) -> bool:
         if not file_path.is_file():

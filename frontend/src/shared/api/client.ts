@@ -16,6 +16,8 @@ export type ErrorCode =
   | 'DEPENDENCY_CYCLE'
   | 'UPSTREAM_NOT_READY'
   | 'CONTEXT_INCOMPLETE'
+  /** 参考图比模型端那份图能收的多。**不是失败，是一次确认**（见 isConfirmable）。 */
+  | 'REF_OVER_CAPACITY'
   | 'COMFY_OFFLINE'
   | 'COMFY_NODE_MISSING'
   | 'COMFY_LOST'
@@ -72,6 +74,18 @@ export class ApiError extends Error {
  */
 export function isProjectNotOpen(err: unknown): boolean {
   return err instanceof ApiError && err.code === 'NOT_FOUND' && 'project_id' in err.relatedIds
+}
+
+/**
+ * 「确认一下就能继续」判定，返回要带回去的那个参数名（不是确认类错误时是空串）。
+ *
+ * 有些拦截不是失败而是一次确认：参考图比模型端那份图能收的多时后端回
+ * `REF_OVER_CAPACITY`，**一个任务都还没入队**，说明会丢几张、丢哪几张；用户点确认后
+ * 带上 `related_ids.confirm` 里写的那个参数（值 true）重新调同一个入口即可。
+ * 判定看的是这个字段而不是 code 白名单——以后再多一种确认，UI 一行都不用改。
+ */
+export function confirmFlagOf(err: unknown): string {
+  return err instanceof ApiError ? (err.relatedIds.confirm ?? '') : ''
 }
 
 function networkError(cause: unknown): ApiError {

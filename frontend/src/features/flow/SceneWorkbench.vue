@@ -43,7 +43,7 @@ import AppThumb from '@/shared/ui/AppThumb.vue'
 import EmptyState from '@/shared/ui/EmptyState.vue'
 import ErrorPanel from '@/shared/ui/ErrorPanel.vue'
 import FeatureHeader from '@/shared/ui/FeatureHeader.vue'
-import { ApiError } from '@/shared/api/client'
+import { ApiError, confirmFlagOf } from '@/shared/api/client'
 import { fileUrl } from '@/shared/api/files'
 import {
   CONTEXT_KIND_LABEL,
@@ -73,6 +73,25 @@ const sceneRun = ref<{ queued: string[]; skipped: unknown[] } | null>(null)
 const scene = computed(() => workbench.scene)
 const shot = computed(() => workbench.shot)
 const bill = computed(() => workbench.bill)
+/**
+ * 这一次模型端能收几张参考图。**不是应用级设置**：ComfyUI 预设里标了几个 `AIVS_REF_*`
+ * 就是几张，通用 REST 合同与「还没选预设」都是不限张数（`limit === null`）。
+ * 所以界面上连「这个数字哪来的」（`source` / `detail`）一起显示——上限变了要能看懂为什么。
+ */
+const cap = computed(() => bill.value?.capacity ?? null)
+const capText = computed(() => {
+  const c = cap.value
+  if (!c) return ''
+  return c.limit === null ? `参考图 ${c.ref_count} 张 · 不限` : `参考图 ${c.ref_count} / ${c.limit}`
+})
+/**
+ * 参考图装不下时的那一次确认：记住刚才想干什么，用户点确认就带 `allow_ref_drop` 重来一次。
+ * 后端此时**一个任务都没入队**（批量路径是先扫完再动手），所以重来一次不会重复生成。
+ */
+const pendingDrop = ref<{ scope: 'shot'; skipContext: boolean } | { scope: 'scene' } | null>(null)
+const askDrop = computed(
+  () => pendingDrop.value !== null && Boolean(confirmFlagOf(workbench.lastError)),
+)
 const castIds = computed(() => new Set((shot.value?.cast ?? []).map((c) => c.appearance_id)))
 /** 同一件事只报一次（后端重启后两边都会 404「项目未打开」）。 */
 const showSideError = computed(
@@ -209,12 +228,25 @@ async function onPickVersion(event: Event): Promise<void> {
   }
 }
 
-async function generate(skipContext: boolean): Promise<void> {
-  await workbench.enqueue(pid.value, !skipContext)
+async function generate(skipContext: boolean, allowRefDrop = false): Promise<void> {
+  await workbench.enqueue(pid.value, !skipContext, allowRefDrop)
+  pendingDrop.value = confirmFlagOf(workbench.lastError) ? { scope: 'shot', skipContext } : null
 }
 
-async function generateScene(): Promise<void> {
-  sceneRun.value = await workbench.enqueueScene(pid.value)
+async function generateScene(allowRefDrop = false): Promise<void> {
+  sceneRun.value = await workbench.enqueueScene(pid.value, allowRefDrop)
+  pendingDrop.value = confirmFlagOf(workbench.lastError) ? { scope: 'scene' } : null
+}
+
+/**
+ * 「知道会丢图，继续」——把刚才那一次原样重来，只多带一个 `allow_ref_drop`。
+ * 绝不自动重试：丢掉哪几张角色图 / 场景图这件事必须是用户点下去的。
+ */
+async function confirmDrop(): Promise<void> {
+  const pending = pendingDrop.value
+  if (!pending) return
+  if (pending.scope === 'scene') await generateScene(true)
+  else await generate(pending.skipContext, true)
 }
 </script>
 
@@ -292,7 +324,21 @@ async function generateScene(): Promise<void> {
       class="mx-2 mt-2"
       :error="workbench.lastError"
       @dismiss="workbench.clearError()"
-    />
+    >
+      <!-- 参考图装不下不是失败，是一次确认：这颗按钮把刚才那一次原样重来 -->
+      <template #actions>
+        <AppButton
+          v-if="askDrop"
+          size="sm"
+          variant="primary"
+          :disabled="workbench.busy"
+          title="按模型端那份图的槽位顺序喂前几张；少喂了哪几张会记进版本参数，事后查得到"
+          @click="confirmDrop()"
+        >
+          <Sparkles :size="10" />知道会丢图，继续生成
+        </AppButton>
+      </template>
+    </ErrorPanel>
     <ErrorPanel
       v-if="showSideError"
       class="mx-2 mt-2"
@@ -493,9 +539,12 @@ async function generateScene(): Promise<void> {
         <!-- 中：首帧来源 + 上下文账单 -->
         <AppPanel title="首帧与上下文" class="min-w-0 flex-1">
           <template #actions>
-            <span v-if="bill" class="text-fg-4 tnum text-2xs">
-              {{ bill.included_count }} / {{ bill.limit }} 张参考
+            <span v-if="cap" class="text-fg-4 tnum text-2xs" :title="cap.detail">
+              {{ capText }}
             </span>
+            <AppBadge v-if="cap?.over" tone="warn" :title="cap.detail">
+              会丢 {{ cap.dropped }} 张
+            </AppBadge>
             <AppButton
               size="sm"
               variant="ghost"
@@ -589,9 +638,17 @@ async function generateScene(): Promise<void> {
                   <li v-for="p in bill.problems" :key="p">· {{ p }}</li>
                 </ul>
               </div>
-              <p v-else-if="bill" class="text-st-done mt-3 text-2xs">
-                上下文完整{{ bill.at_limit ? '（已到参考图上限，多出来的会被省略）' : '' }}。
-              </p>
+              <p v-else-if="bill" class="text-st-done mt-3 text-2xs">上下文完整。</p>
+              <!-- 装不下不是 blocker：生成前会问一次，确认了照样能生成 -->
+              <div v-if="cap?.over" class="border-st-review/40 bg-base-2 mt-1.5 border p-1.5">
+                <p class="text-st-review text-2xs">
+                  采用了 {{ cap.ref_count }} 张参考图，这里只能喂 {{ cap.limit }} 张，会丢
+                  {{ cap.dropped }} 张（{{ cap.dropped_labels.join('、') }}）。
+                </p>
+                <p class="text-fg-4 mt-0.5 text-2xs">
+                  {{ cap.detail }}生成时会先问一次；不想丢就在下面把不重要的那几张移除，自己决定丢哪张。
+                </p>
+              </div>
 
               <p class="text-fg-3 mt-3 text-2xs tracking-wide uppercase">
                 已采用（{{ workbench.included.length }}）
@@ -628,6 +685,14 @@ async function generateScene(): Promise<void> {
                         {{ CONTEXT_KIND_LABEL[item.kind] ?? item.kind }}
                       </AppBadge>
                       <AppBadge v-if="item.manual" tone="warn">人工</AppBadge>
+                      <!-- 采用了、但模型端那份图收不下它。和「未采用」是两件事 -->
+                      <AppBadge
+                        v-if="item.over_capacity"
+                        tone="fail"
+                        title="槽位不够，提交时这一张会被挤掉——生成前会先问一次"
+                      >
+                        装不下
+                      </AppBadge>
                       <button
                         class="text-fg-4 hover:text-st-failed ml-auto"
                         title="从这次上下文里移除（记成人工覆写，可「恢复自动」撤销）"

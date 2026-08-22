@@ -27,6 +27,13 @@ class LinkBody(BaseModel):
 class RunBody(BaseModel):
     mode: str = Field(default="parallel", description="parallel 各幕并发 / sequential 单线程续接")
     priority: int = 100
+    allow_ref_drop: bool = Field(
+        default=False,
+        description=(
+            "账单里有镜头的参考图超出模型端能收的张数时，默认整次编排一个任务都不入队，"
+            "先回 REF_OVER_CAPACITY 让用户确认；带上 true 就是「确认丢弃并继续」。"
+        ),
+    )
 
 
 @router.get("/projects/{pid}/flow")
@@ -72,11 +79,11 @@ async def delete_link(pid: str, link_id: str) -> None:
 
 @router.post("/projects/{pid}/sequence/plan")
 async def plan(pid: str, body: RunBody) -> dict[str, Any]:
-    """只出账单，不入队任何任务。"""
+    """只出账单，不入队任何任务。`ref_drops` 里是「参考图装不下」的镜头。"""
     return await sequence.plan(pid, body.mode)
 
 
 @router.post("/projects/{pid}/sequence/run", status_code=201)
 async def run(pid: str, body: RunBody) -> dict[str, Any]:
     """按账单入队。返回里带上那份账单，界面上「说好的」与「做了的」能对上。"""
-    return await sequence.run(pid, body.mode, body.priority)
+    return await sequence.run(pid, body.mode, body.priority, allow_ref_drop=body.allow_ref_drop)

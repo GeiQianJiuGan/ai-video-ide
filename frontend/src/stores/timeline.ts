@@ -20,10 +20,13 @@ import {
   timelineApi,
   type AssembleResult,
   type Clip,
+  type DetachResult,
   type ExportPlan,
   type ExportRecord,
   type Timeline,
+  type Track,
   type Transition,
+  type TrimBody,
 } from '@/shared/api/timeline'
 
 export const useTimelineStore = defineStore('timeline', () => {
@@ -35,6 +38,8 @@ export const useTimelineStore = defineStore('timeline', () => {
   const placedCount = ref<number | null>(null)
   /** 导出预检结果；`null` 表示还没预检过。 */
   const plan = ref<ExportPlan | null>(null)
+  /** 最近一次「拆出声音」的结果，界面要据此说明新开了轨 / 复用了文件。 */
+  const lastDetach = ref<DetachResult | null>(null)
 
   const busy = ref(false)
   const lastError = ref<ApiError | null>(null)
@@ -44,6 +49,16 @@ export const useTimelineStore = defineStore('timeline', () => {
   const missing = computed(() => clips.value.filter((c) => c.missing_file))
   const canUndo = computed(() => timeline.value?.can_undo ?? false)
   const canRedo = computed(() => timeline.value?.can_redo ?? false)
+  /**
+   * 画面来自**第一条视频轨**——和导出（`timeline.build_command`）同一条规矩。
+   * 预览器要是自己另挑一条，看到的就不是将要导出的东西。
+   */
+  const videoTrack = computed<Track | null>(
+    () => timeline.value?.tracks.find((t) => t.kind === 'video') ?? null,
+  )
+  const audioTracks = computed<Track[]>(
+    () => timeline.value?.tracks.filter((t) => t.kind === 'audio') ?? [],
+  )
 
   function clearError(): void {
     lastError.value = null
@@ -109,11 +124,11 @@ export const useTimelineStore = defineStore('timeline', () => {
     })
   }
 
-  async function trim(
-    pid: string,
-    clipId: string,
-    body: { in_point?: number | null; out_point?: number | null; ripple?: boolean },
-  ): Promise<void> {
+  /**
+   * 裁切。**拖左边缘时 `in_point` 与 `start` 在同一个 body 里**：一次请求、一格撤销——
+   * 分两次发的话「撤销」只能退回一半，边缘会停在一个用户从来没见过的位置。
+   */
+  async function trim(pid: string, clipId: string, body: TrimBody): Promise<void> {
     await guarded(async () => {
       timeline.value = await timelineApi.trim(pid, clipId, body)
     })
@@ -137,6 +152,64 @@ export const useTimelineStore = defineStore('timeline', () => {
     await guarded(async () => {
       timeline.value = await timelineApi.replaceVersion(pid, clipId, versionId)
     })
+  }
+
+  // --- 声音 ---
+
+  async function setMix(
+    pid: string,
+    clipId: string,
+    body: { muted?: boolean; volume?: number },
+  ): Promise<void> {
+    await guarded(async () => {
+      timeline.value = await timelineApi.setMix(pid, clipId, body)
+    })
+  }
+
+  /**
+   * 把画面的声音拆成独立音频片段。返回值留一份给界面说话：
+   * 新开了一条轨、或者复用了上次拆好的文件，都是用户该知道的事。
+   */
+  async function detachAudio(pid: string, clipId: string): Promise<DetachResult> {
+    const out = await guarded(() => timelineApi.detachAudio(pid, clipId))
+    timeline.value = out.timeline
+    lastDetach.value = out
+    return out
+  }
+
+  // --- 轨道 ---
+
+  async function addTrack(pid: string, kind = 'audio', name?: string | null): Promise<Track> {
+    const out = await guarded(() => timelineApi.addTrack(pid, kind, name))
+    timeline.value = out.timeline
+    return out.track
+  }
+
+  async function patchTrack(
+    pid: string,
+    trackId: string,
+    body: { name?: string; muted?: boolean; locked?: boolean },
+  ): Promise<void> {
+    await guarded(async () => {
+      timeline.value = await timelineApi.patchTrack(pid, trackId, body)
+    })
+  }
+
+  /** 轨道上还有片段时后端先回 CONFLICT + `confirm: "force"`，界面确认后再带 `force` 重放。 */
+  async function removeTrack(pid: string, trackId: string, force = false): Promise<void> {
+    await guarded(async () => {
+      timeline.value = await timelineApi.removeTrack(pid, trackId, force)
+    })
+  }
+
+  async function addClip(
+    pid: string,
+    trackId: string,
+    body: { asset_id: string; start?: number; duration?: number | null; label?: string | null },
+  ): Promise<string> {
+    const out = await guarded(() => timelineApi.addClip(pid, trackId, body))
+    timeline.value = out.timeline
+    return out.clip_id
   }
 
   async function addTransition(
@@ -182,12 +255,15 @@ export const useTimelineStore = defineStore('timeline', () => {
     skipped,
     placedCount,
     plan,
+    lastDetach,
     busy,
     lastError,
     clips,
     missing,
     canUndo,
     canRedo,
+    videoTrack,
+    audioTracks,
     load,
     assemble,
     undo,
@@ -197,6 +273,12 @@ export const useTimelineStore = defineStore('timeline', () => {
     split,
     remove,
     replaceVersion,
+    setMix,
+    detachAudio,
+    addTrack,
+    patchTrack,
+    removeTrack,
+    addClip,
     addTransition,
     removeTransition,
     loadPlan,
