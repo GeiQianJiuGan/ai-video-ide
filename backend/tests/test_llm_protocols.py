@@ -3,14 +3,16 @@
 盯的是**我们这一侧的翻译**，不是某个模型的脾气：所有出网请求都从
 `protocols._client` 这个唯一出口换成 `httpx.MockTransport`，一个字节都不出机器。
 
-四件事：
+五件事：
 
   1. **模型列表认得出四种方言**——「自动获取」的全部价值就是省掉手抄模型名，
      Gemini 的 `models/` 前缀、Anthropic 的 display_name、Ollama 的体积都得对；
   2. **密钥只走请求头，绝不进 URL**——进了 URL 就会跟着日志与四要素错误一起漏出去；
   3. **翻译不能让请求 400**：Anthropic 的 system 要提到顶层、相邻工具结果并成一条；
      Gemini 的 `functionResponse` 认名字不认 id，无参工具要整个省掉 `parameters`；
-  4. **先试再存**：`POST /settings/models` 带的是还没保存的那份配置，它绝不落盘。
+  4. **先试再存**：`POST /settings/models` 带的是还没保存的那份配置，它绝不落盘；
+  5. **慢不等于连不上**：剧本拆解那条路要等够久（读超时 5 分钟），撞上超时时报的是
+     「超时」而不是「连不上」——后者会让用户去改一个本来就对的地址。
 """
 
 from __future__ import annotations
@@ -330,6 +332,45 @@ async def test_unreachable_endpoint_points_at_the_default_address(
     err = caught.value
     assert err.code is ErrorCode.LLM_UNAVAILABLE
     assert any("11434" in s for s in err.suggestions), "要说出默认地址，不然用户不知道该填什么"
+
+
+async def test_a_slow_script_is_a_timeout_not_a_dead_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """剧本拆解要一口气写完十几幕的 JSON，「慢」和「连不上」得分开报。
+
+    盯三件事：生成那条路等够久（读超时 300 秒——调小了现场就是「拆解到一半断掉」），
+    列模型那条路只等 20 秒（点一下就该有反应，不能跟生成一样等几分钟），
+    以及撞上超时时**不许**建议去改地址：地址本来是通的，指错方向只会白改一遍配置。
+    """
+    waited: list[httpx.Timeout] = []
+
+    def too_slow(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("read timeout", request=request)
+
+    def build(limit: httpx.Timeout) -> httpx.AsyncClient:
+        waited.append(limit)
+        return httpx.AsyncClient(transport=httpx.MockTransport(too_slow), timeout=limit)
+
+    monkeypatch.setattr(protocols, "_client", build)
+    proto = protocols.BY_NAME["openai_compatible"]
+
+    with pytest.raises(AppError) as caught:
+        await proto.complete_tools(
+            cfg("openai_compatible", model="写得很慢的模型"), CONVERSATION, []
+        )
+    err = caught.value
+    assert err.code is ErrorCode.LLM_UNAVAILABLE
+    assert "超时" in err.title
+    assert "300" in err.title, "等了多久要写在标题里，用户才知道是不是该调它"
+    assert protocols.MANUAL_WAY_OUT in err.suggestions
+    assert not any("地址与端口" in s for s in err.suggestions), "超时不是地址写错，别指错方向"
+    assert waited[0].read == 300.0, "剧本拆解等 5 分钟：调小了就会拆到一半被掐断"
+    assert waited[0].connect == 5.0, "地址写错该立刻知道，不该陪着干等"
+
+    with pytest.raises(AppError):
+        await proto.list_models(cfg("openai_compatible"))
+    assert waited[-1].read == 20.0, "列模型是「点一下就该有反应」的动作"
 
 
 def test_models_endpoint_tries_before_saving(

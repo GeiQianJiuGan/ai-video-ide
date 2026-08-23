@@ -42,8 +42,11 @@ from app.core.logging import get_logger
 
 log = get_logger("llm.protocols")
 
-TIMEOUT = httpx.Timeout(120.0, connect=5.0)
-#: 列模型是「点一下就该有反应」的动作，不能跟生成一样等两分钟。
+#: 一次生成等多久。剧本拆解要一口气写完十几幕的 JSON，本地模型 / 带思考的模型上
+#: 两分钟远远不够（超时的现场就是「拆解到一半断掉」），所以放到 5 分钟。
+#: 连接超时照旧只有 5 秒——地址写错该立刻知道，不该陪着干等。
+TIMEOUT = httpx.Timeout(300.0, connect=5.0)
+#: 列模型是「点一下就该有反应」的动作，不能跟生成一样等几分钟。
 LIST_TIMEOUT = httpx.Timeout(20.0, connect=5.0)
 #: Anthropic 的 /messages 要求必填 max_tokens：给一个够写完一份提案的值。
 MAX_TOKENS = 4096
@@ -254,8 +257,9 @@ class LlmProtocol:
         # 而它是 httpx 自己那套连接 / 读取超时。
         http_timeout: httpx.Timeout | None = None,
     ) -> Any:
+        limit = http_timeout or TIMEOUT
         try:
-            async with _client(http_timeout or TIMEOUT) as http:
+            async with _client(limit) as http:
                 resp = await http.request(
                     method,
                     url,
@@ -263,6 +267,20 @@ class LlmProtocol:
                     json=json_body,
                     params=params or None,
                 )
+        except httpx.TimeoutException as exc:
+            # 超时和「连不上」不是一回事：地址是通的，模型只是写得比 TIMEOUT 还慢
+            # （剧本拆解 + 本地模型最容易撞上）。下一步动作完全不同，所以分开报。
+            raise AppError(
+                ErrorCode.LLM_UNAVAILABLE,
+                f"LLM 服务超时（等了 {limit.read or limit.connect or 0:.0f} 秒）",
+                f"{url}：{type(exc).__name__}: {exc}",
+                [
+                    "这个端 / 这个模型这次写得太慢：换一个更快的模型，或把要拆的剧本分段再来一次",
+                    "本地模型（Ollama / LM Studio）第一次加载权重很慢，等它加载完再重试通常就过了",
+                    MANUAL_WAY_OUT,
+                ],
+                {"url": url, "provider": self.name, "timeout": limit.read},
+            ) from exc
         except httpx.HTTPError as exc:
             raise AppError(
                 ErrorCode.LLM_UNAVAILABLE,

@@ -9,7 +9,10 @@
  *     这是为「能引用设定图的模型做不了严格首尾帧」准备的那条路；
  *   - 配了却还没出片时线上写一行**转场暂未生成**——判断只认后端的 `pending`，
  *     界面不自己拿 `transition_shot_id` 再算一遍（镜头造出来了但任务还在排队，
- *     那仍然是「暂未生成」）。
+ *     那仍然是「暂未生成」）；
+ *   - **接缝两侧都出片了才补得出来**：转场是把上一镜真末帧接到下一镜真首帧，少一头就无从下手。
+ *     那个「生成」能不能点只看后端的 `can_generate`，拦下来的原因写在 `blocked` /
+ *     `blocked_how` 上——按钮灰着却不说为什么，和静默失败一样糟。
  *
  * 补出来的转场镜头**不在卡片行里**：它照旧在 `lane.shots` 里（导出顺序与时间线装配靠它），
  * 这里只是把它画到那条线上，免得它混在导演排的戏中间。
@@ -42,8 +45,17 @@ const allCards = computed(() => story.lanes.flatMap((lane) => lane.shots))
 const realCards = computed(() => allCards.value.filter((s) => s.kind !== 'transition'))
 const total = computed(() => ({ shots: realCards.value.length, transitions: allCards.value.length - realCards.value.length, duration: allCards.value.reduce((n, s) => n + s.duration, 0), issues: allCards.value.filter((s) => !s.context_ok).length }))
 const pendingPosters = computed(() => allCards.value.filter((s) => s.poster_pending))
-/** 两级衔接里「配了转场却还没出片」的条数，就是一键生成转场要补的那些。 */
+/** 两级衔接里「配了转场却还没出片」的条数。 */
 const pendingLinks = computed(() => story.lanes.flatMap((lane) => [...lane.links, ...(lane.next_link ? [lane.next_link] : [])]).filter((l) => l.pending))
+/** 其中现在真能补的那些（接缝两侧都已出片），就是一键生成转场这一次要做的。 */
+const readyLinks = computed(() => pendingLinks.value.filter((l) => l.can_generate))
+/** 其中在等成片的那些。数量要显示出来，否则「按钮灰着」看起来像坏了。 */
+const blockedLinks = computed(() => pendingLinks.value.filter((l) => !l.can_generate))
+const transitionTitle = computed(() => {
+  if (readyLinks.value.length) return `补齐 ${readyLinks.value.length} 条已经能补的衔接（镜头之间与幕之间一起）；已经有成片的一条都不重做${blockedLinks.value.length ? `。另外 ${blockedLinks.value.length} 条在等成片，这一次不做` : ''}`
+  if (blockedLinks.value.length) return `${blockedLinks.value.length} 条衔接配了转场，但接缝两侧还没都生成过视频——${blockedLinks.value[0].blocked_how ?? '先把这两个镜头各自生成出来'}`
+  return '没有配成转场却还没出片的衔接'
+})
 
 function realShots(lane: StoryboardLane): StoryboardCard[] { return lane.shots.filter((s) => s.kind !== 'transition') }
 function visible(shots: StoryboardCard[]): StoryboardCard[] {
@@ -201,7 +213,7 @@ async function confirmDrop(): Promise<void> {
       <span class="text-fg-3 text-2xs">{{ total.shots }} Shot<span v-if="total.transitions"> · {{ total.transitions }} 段转场</span> · {{ fmtDuration(total.duration) }}<span v-if="total.issues" class="text-st-review"> · {{ total.issues }} 个缺上下文</span></span>
       <AppButton size="sm" :disabled="!story.shot || enqueuing || story.busy" title="生成当前 Shot 所在场景的全部镜头" @click="generateScene()"><Sparkles :size="10" />生成本场 Shot</AppButton>
       <AppButton size="sm" variant="primary" :disabled="enqueuing || story.busy || !realCards.length" title="按 Shot 顺序串行生成；上一条完成并产出末帧后才执行下一条" @click="runSequential()"><Sparkles :size="10" />单线程续接</AppButton>
-      <AppButton size="sm" :disabled="enqueuing || story.busy || !pendingLinks.length" :title="pendingLinks.length ? `补齐 ${pendingLinks.length} 条配了转场却还没出片的衔接（镜头之间与幕之间一起）；已经有成片的一条都不重做` : '没有配成转场却还没出片的衔接'" @click="runTransitions()"><Sparkles :size="10" />一键生成转场<span v-if="pendingLinks.length" class="tnum"> {{ pendingLinks.length }}</span></AppButton>
+      <AppButton size="sm" :disabled="enqueuing || story.busy || !readyLinks.length" :title="transitionTitle" @click="runTransitions()"><Sparkles :size="10" />一键生成转场<span v-if="readyLinks.length" class="tnum"> {{ readyLinks.length }}</span><span v-else-if="blockedLinks.length" class="text-st-review tnum"> 等 {{ blockedLinks.length }}</span></AppButton>
       <AppButton v-if="pendingPosters.length" size="sm" variant="ghost" :disabled="posterBusy" @click="extractPosters()"><Image :size="10" />补首帧 {{ pendingPosters.length }}</AppButton>
       <AppButton size="sm" variant="ghost" @click="consolePanel.openWith('jobs')"><ListVideo :size="10" />任务</AppButton>
       <AppButton size="sm" variant="ghost" class="ml-auto" :disabled="story.busy" @click="reload()"><RefreshCw :size="10" />刷新</AppButton>
@@ -244,8 +256,9 @@ async function confirmDrop(): Promise<void> {
                   <select :value="row.link.mode" :disabled="linkBusy === linkKey(row.link) || story.busy" class="border-line-1 bg-base-2 text-fg-1 h-5 w-full border px-1 text-2xs outline-none" :title="row.link.mode === 'cut' ? '无转场：两镜直接硬切，不生成任何东西' : '转场：在这两镜之间补一段过渡视频（上一镜真末帧 → 下一镜真首帧）'" @change="saveLink(row.link!, { mode: ($event.target as HTMLSelectElement).value })"><option v-for="m in SHOT_LINK_MODES" :key="m" :value="m">{{ SHOT_LINK_MODE_LABEL[m] }}</option></select>
                   <template v-if="row.link.mode !== 'cut'">
                     <label class="flex w-full items-center gap-1"><span class="text-fg-4 text-2xs">时长</span><input :value="row.link.duration ?? 1.5" type="number" min="0.5" max="4" step="0.1" :disabled="linkBusy === linkKey(row.link) || story.busy" class="border-line-1 bg-base-2 text-fg-1 tnum h-5 min-w-0 flex-1 border px-1 text-2xs outline-none" title="这段转场几秒（0.5 ~ 4）" @change="onDuration(row.link!, ($event.target as HTMLInputElement).value)" /></label>
-                    <p v-if="row.link.pending" class="text-st-review w-full text-center text-2xs">转场暂未生成</p>
-                    <AppButton v-if="row.link.pending" size="sm" variant="primary" :disabled="enqueuing || story.busy" title="只生成这一条转场" @click="runTransitions([row.link!.id!])"><Sparkles :size="10" />生成</AppButton>
+                    <p v-if="row.link.pending" class="text-st-review w-full text-center text-2xs">{{ row.link.blocked ? '等前后出片' : '转场暂未生成' }}</p>
+                    <p v-if="row.link.blocked" class="text-fg-4 w-full text-center text-2xs">{{ row.link.blocked_how }}</p>
+                    <AppButton v-if="row.link.pending" size="sm" variant="primary" :disabled="enqueuing || story.busy || !row.link.can_generate" :title="row.link.blocked ?? '只生成这一条转场'" @click="runTransitions([row.link!.id!])"><Sparkles :size="10" />生成</AppButton>
                     <button v-else-if="transitionOf(lane, row.link)" class="bg-base-3 border-line-1 h-10 w-full overflow-hidden border" title="预览这段转场" @click="previewShot(transitionOf(lane, row.link!)!)"><img v-if="thumb(transitionOf(lane, row.link)!)" :src="thumb(transitionOf(lane, row.link)!)" alt="" class="h-full w-full object-cover" /><span v-else class="text-fg-4 text-2xs">转场已生成</span></button>
                   </template>
                   <template v-else-if="row.link.transition_shot_id">
@@ -259,8 +272,9 @@ async function confirmDrop(): Promise<void> {
               <span class="text-fg-4 text-2xs">接第 {{ lane.next_link.to_index_no }} 幕{{ lane.next_link.to_title ? ` · ${lane.next_link.to_title}` : '' }}</span>
               <select :value="lane.next_link.mode" :disabled="linkBusy === linkKey(lane.next_link) || story.busy" class="border-line-1 bg-base-2 text-fg-1 h-5 border px-1 text-2xs outline-none" title="幕与幕之间怎么接：无转场硬切 / 补一段转场 / 让下一幕首镜续接这一幕末帧" @change="saveLink(lane.next_link!, { mode: ($event.target as HTMLSelectElement).value })"><option v-for="m in LINK_MODES" :key="m" :value="m">{{ LINK_MODE_LABEL[m] }}</option></select>
               <label v-if="lane.next_link.mode === 'transition'" class="flex items-center gap-1"><span class="text-fg-4 text-2xs">时长</span><input :value="lane.next_link.duration ?? 1.5" type="number" min="0.5" max="4" step="0.1" :disabled="linkBusy === linkKey(lane.next_link) || story.busy" class="border-line-1 bg-base-2 text-fg-1 tnum h-5 w-16 border px-1 text-2xs outline-none" @change="onDuration(lane.next_link!, ($event.target as HTMLInputElement).value)" /></label>
-              <span v-if="lane.next_link.pending" class="text-st-review text-2xs">转场暂未生成</span>
-              <AppButton v-if="lane.next_link.pending" size="sm" variant="primary" :disabled="enqueuing || story.busy" title="只生成这一条转场" @click="runTransitions([lane.next_link!.id!])"><Sparkles :size="10" />生成转场</AppButton>
+              <span v-if="lane.next_link.pending" class="text-st-review text-2xs">{{ lane.next_link.blocked ?? '转场暂未生成' }}</span>
+              <span v-if="lane.next_link.blocked" class="text-fg-4 text-2xs">{{ lane.next_link.blocked_how }}</span>
+              <AppButton v-if="lane.next_link.pending" size="sm" variant="primary" :disabled="enqueuing || story.busy || !lane.next_link.can_generate" :title="lane.next_link.blocked ?? '只生成这一条转场'" @click="runTransitions([lane.next_link!.id!])"><Sparkles :size="10" />生成转场</AppButton>
               <span v-else-if="lane.next_link.generated" class="text-fg-3 text-2xs">{{ lane.next_link.mode === 'cut' ? '改成无转场了，但之前补出来的那段还在，导出照旧带上它' : '转场已生成，排在这一幕最后' }}</span>
               <AppButton v-if="lane.next_link.mode === 'cut' && lane.next_link.transition_shot_id" size="sm" variant="ghost" :disabled="story.busy" title="删掉那个转场镜头（成片版本一起没了，不可撤销）" @click="removeShot(lane.next_link!.transition_shot_id!)"><Trash2 :size="10" />删掉那段转场</AppButton>
             </footer>

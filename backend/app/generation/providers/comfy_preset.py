@@ -134,26 +134,25 @@ class ComfyPresetProvider:
             "AIVS_DURATION": req.duration,
             "AIVS_SEED": req.seed,
         }
-        for marker, path in (
-            ("AIVS_FIRST_FRAME", req.first_frame),
-            ("AIVS_LAST_FRAME", req.last_frame),
-        ):
-            if path is None:
-                continue
-            if marker not in points:
-                if marker == "AIVS_LAST_FRAME":
-                    raise AppError(
-                        ErrorCode.INVALID_WORKFLOW,
-                        "这份预设不支持首尾帧",
-                        f"预设 {name} 里没有标题为 {marker} 的节点，无法接收末帧。",
-                        [
-                            "换一份支持首尾帧的预设（转场与单线程续接都要用它）",
-                            *presets.HOW_TO,
-                        ],
-                        {"preset": name, "found": sorted(points)},
-                    )
-                continue
-            values[marker] = await self._upload(path)
+        # 首帧**没有槽位就降级成参考图 1**（`_refs` 里插队）：出正片的 R2V 图往往只有
+        # AIVS_REF_*，为此拒绝生成等于把这类模型整个挡在外面。
+        if req.first_frame is not None and "AIVS_FIRST_FRAME" in points:
+            values["AIVS_FIRST_FRAME"] = await self._upload(req.first_frame)
+        # 末帧相反，要的是**严格首尾帧**，图里没这个入口就只能换一份预设——这条不降级：
+        # 悄悄丢掉末帧的话，补出来的转场接不上下一镜，而界面上会显示「已生成」。
+        if req.last_frame is not None:
+            if "AIVS_LAST_FRAME" not in points:
+                raise AppError(
+                    ErrorCode.INVALID_WORKFLOW,
+                    "这份预设不支持首尾帧",
+                    f"预设 {name} 里没有标题为 AIVS_LAST_FRAME 的节点，无法接收末帧。",
+                    [
+                        "换一份支持首尾帧的预设（转场与单线程续接都要用它）",
+                        *presets.HOW_TO,
+                    ],
+                    {"preset": name, "found": sorted(points)},
+                )
+            values["AIVS_LAST_FRAME"] = await self._upload(req.last_frame)
         values.update(await self._refs(req, name, points))
         for marker, spot in points.items():
             value = values.get(marker)
@@ -176,9 +175,12 @@ class ComfyPresetProvider:
     ) -> dict[str, Any]:
         """把账单里的参考图按序号填进 `AIVS_REF_*`，顺便把「谁是谁」告诉模型。
 
-        三条取舍：
+        四条取舍：
           · **槽位不够只降级，不失败**——图是模型端维护的，我们没资格因为它只标了 3 个槽位
             就拒绝生成；少喂的那几张写进 `req.notes`，跟着版本一起冻结，事后查得到。
+          · **图里没有首帧入口时，首帧插到参考图 1**：分工是「首尾帧那类模型补转场，
+            R2V 出正片」，而多参考图的 R2V 图常常没有 `AIVS_FIRST_FRAME`。这时把首帧
+            当第一张参考图送进去，并写一条 note——绝不静默丢掉那一张。
           · **一个槽位都没有时也照样跑**，但要留一条 note：那种图只能靠首帧带形象，
             这正是「人物形象丢失」的现场，用户得看得见原因。
           · **顺序即语义**：账单已按优先级排好，1 号槽放优先级最高的那张；
@@ -186,22 +188,37 @@ class ComfyPresetProvider:
             （ComfyUI 这类图收不到标签，只能靠这句话对上号）。
         """
         slots = presets.ref_slots(points)
-        if not req.refs:
+        refs = list(req.refs)
+        first_as_ref = req.first_frame is not None and "AIVS_FIRST_FRAME" not in points
+        if first_as_ref and req.first_frame is not None:
+            refs.insert(0, base.RefImage(req.first_frame, "首帧", "first_frame"))
+        if not refs:
             return {}
         if not slots:
-            req.notes.append(
-                f"预设 {name} 里没有 AIVS_REF_* 槽位，账单里 {len(req.refs)} 张参考图"
-                "（角色表 / 地点参考图）没有喂进去——人物形象只能靠首帧带。"
-            )
-            log.info("provider.refs_unsupported", preset=name, refs=len(req.refs))
+            if first_as_ref:
+                req.notes.append(
+                    f"预设 {name} 既没有 AIVS_FIRST_FRAME 也没有 AIVS_REF_* 槽位，"
+                    f"首帧与账单里 {len(req.refs)} 张参考图一张都没喂进去——这一版只有提示词起作用。"
+                )
+            else:
+                req.notes.append(
+                    f"预设 {name} 里没有 AIVS_REF_* 槽位，账单里 {len(req.refs)} 张参考图"
+                    "（角色表 / 地点参考图）没有喂进去——人物形象只能靠首帧带。"
+                )
+            log.info("provider.refs_unsupported", preset=name, refs=len(refs))
             return {}
-        sent = req.refs[: len(slots)]
-        if len(req.refs) > len(slots):
-            dropped = "、".join(r.label or r.path.name for r in req.refs[len(slots) :])
+        if first_as_ref:
+            req.notes.append(
+                f"预设 {name} 没有 AIVS_FIRST_FRAME 槽位，首帧已当作参考图 1 送进去"
+                "（这份图做不了严格首尾帧，补转场请另选一份）。"
+            )
+        sent = refs[: len(slots)]
+        if len(refs) > len(slots):
+            dropped = "、".join(r.label or r.path.name for r in refs[len(slots) :])
             req.notes.append(
                 f"预设 {name} 只有 {len(slots)} 个参考图槽位，账单里这几张没喂进去：{dropped}。"
             )
-            log.info("provider.refs_truncated", preset=name, slots=len(slots), refs=len(req.refs))
+            log.info("provider.refs_truncated", preset=name, slots=len(slots), refs=len(refs))
         values: dict[str, Any] = {}
         for marker, ref in zip(slots, sent, strict=False):
             values[marker] = await self._upload(ref.path)

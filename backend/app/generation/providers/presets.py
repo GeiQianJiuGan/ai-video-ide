@@ -11,6 +11,11 @@
 所以账单里算出来的角色表 / 地点参考图按序号填进这些槽位。图里标了几个就用几个，
 一个都没标也能生成（只是丢形象的风险照旧）。
 
+**首尾帧槽位也是可选的**：分工是「首尾帧那类模型补转场，R2V 出正片」，而能收多参考图的
+R2V 图往往根本没有首帧入口。所以必需入口只剩 `AIVS_PROMPT` 一个——没有
+`AIVS_FIRST_FRAME` 的图照样能存、能选、能生成，那张首帧会当参考图 1 送进去
+（降级说明写进 `req.notes`，界面上看得见），只有转场（严格首尾帧）需要标全三个。
+
 我们只按标题找这几个节点、只往里填值。图里挂了多少 lora、加了什么加速节点、
 采样器换成了什么——一概不看、不校验、不改写。模型端想怎么调就怎么调，
 本工具不需要跟着更新任何绑定表（这正是旧 Workflow 绑定路径太重的地方）。
@@ -50,15 +55,18 @@ MARKERS: dict[str, tuple[str, ...]] = {
     **dict.fromkeys(REF_MARKERS, IMAGE_FIELDS),
 }
 
-#: 少了这两个就没法做 R2V；其余入口缺了只是「那一项用图里原来的值」。
+#: 少了这一个就没法生成（提示词填不进去）；其余入口缺了只是「那一项用图里原来的值」。
 #: 参考图槽位一个都没有也照样能生成——只是人物形象只能靠首帧带，容易跑偏。
-REQUIRED = ("AIVS_FIRST_FRAME", "AIVS_PROMPT")
-FLF_REQUIRED = (*REQUIRED, "AIVS_LAST_FRAME")
+#: **首帧槽位刻意不是必需的**：没有它时首帧会当参考图 1 送进去（`comfy_preset._refs`），
+#: 严格首尾帧只有转场要用，所以只写进 `FLF_REQUIRED`。
+REQUIRED = ("AIVS_PROMPT",)
+FLF_REQUIRED = ("AIVS_PROMPT", "AIVS_FIRST_FRAME", "AIVS_LAST_FRAME")
 
 HOW_TO = [
-    "在 ComfyUI 里右键入口节点 → Title，改成 AIVS_FIRST_FRAME / AIVS_PROMPT 等",
+    "在 ComfyUI 里右键入口节点 → Title，改成 AIVS_PROMPT / AIVS_FIRST_FRAME 等",
     "想让角色表 / 地点参考图一起喂进去：把接参考图的节点标题改成 AIVS_REF_1、AIVS_REF_2…"
     f"（最多 {REF_SLOTS} 个，有几个标几个）",
+    "只有补转场的那份图需要标全 AIVS_FIRST_FRAME + AIVS_LAST_FRAME；出正片的 R2V 图不标也能用",
     "再用「Save (API Format)」导出，重新上传这份预设",
 ]
 
@@ -161,12 +169,34 @@ def slot_count(name: str) -> int | None:
     return count
 
 
+def _image_hint(slots: list[str], first_frame: bool) -> str:
+    """这份图怎么收图——UI 上那一句话。四种情况分开说，别只说「有几个参考图槽位」。"""
+    if not first_frame:
+        if not slots:
+            return (
+                "这份图收不进任何图：首帧与角色表 / 地点参考图都喂不进去，只有提示词起作用。"
+                f"要收图就加 AIVS_FIRST_FRAME 或 AIVS_REF_1…AIVS_REF_{REF_SLOTS} 标题"
+            )
+        return (
+            f"没有首帧槽位：首帧会当参考图 1 送进去，这份图一共收 {len(slots)} 张"
+            f"（{'、'.join(slots)}）。补转场要用的严格首尾帧请另存一份标了"
+            "AIVS_FIRST_FRAME + AIVS_LAST_FRAME 的预设"
+        )
+    if slots:
+        return f"能收 {len(slots)} 张参考图（{'、'.join(slots)}）"
+    return (
+        "没有参考图槽位：角色表 / 地点参考图喂不进去，人物形象只能靠首帧带。"
+        f"要支持就在图里加 AIVS_REF_1…AIVS_REF_{REF_SLOTS} 标题"
+    )
+
+
 def inspect(graph: dict[str, Any]) -> dict[str, Any]:
     """预设的体检报告：找到哪些入口、缺哪些、缺了会怎样。"""
     points = entry_points(graph)
     missing = [m for m in REQUIRED if m not in points]
     missing_flf = [m for m in FLF_REQUIRED if m not in points]
     slots = ref_slots(points)
+    first_frame = "AIVS_FIRST_FRAME" in points
     return {
         "node_count": len(graph),
         "entry_points": points,
@@ -175,6 +205,8 @@ def inspect(graph: dict[str, Any]) -> dict[str, Any]:
         "ready": not missing,
         "r2v_ready": not missing,
         "flf_ready": not missing_flf,
+        #: 有没有首帧入口。没有不影响 ready，但首帧只能当参考图送——UI 要标出来。
+        "first_frame_ok": first_frame,
         "capabilities": [
             capability
             for capability, available in (
@@ -185,14 +217,11 @@ def inspect(graph: dict[str, Any]) -> dict[str, Any]:
         ],
         #: 能收几张参考图。0 不影响 ready——只是这份图喂不进角色表，UI 要提醒。
         "ref_slots": len(slots),
-        "ref_hint": (
-            f"能收 {len(slots)} 张参考图（{'、'.join(slots)}）"
-            if slots
-            else "没有参考图槽位：角色表 / 地点参考图喂不进去，人物形象只能靠首帧带。"
-            f"要支持就在图里加 AIVS_REF_1…AIVS_REF_{REF_SLOTS} 标题"
-        ),
+        "ref_hint": _image_hint(slots, first_frame),
         "impact": (
-            None if not missing else f"缺少 {'、'.join(missing)}，这份预设无法用于 R2V 生成。"
+            None
+            if not missing
+            else f"缺少 {'、'.join(missing)}，提示词填不进这份图，无法用它生成。"
         ),
     }
 
@@ -261,6 +290,7 @@ def listing() -> list[dict[str, Any]]:
             "ready": False,
             "r2v_ready": False,
             "flf_ready": False,
+            "first_frame_ok": False,
             "capabilities": [],
             "ref_slots": 0,
             "ref_hint": "",

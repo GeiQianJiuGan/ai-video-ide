@@ -9,7 +9,11 @@
      （`wait_reason` 写明在等谁），不是卡住；
   4. 单线程模式下图上的 `transition` 会被忽略——这件事必须写在账单里，不能默默换掉；
   5. **镜头之间那条线**（`ShotLink`）与幕之间那条是同一套东西：默认无转场、配了转场却还没
-     出片时分镜板上要说「暂未生成」（连接器的 `pending`），一键生成两级一起补。
+     出片时分镜板上要说「暂未生成」（连接器的 `pending`），一键生成两级一起补；
+  6. **转场要接缝两侧都已经生成过视频才补得出来**（`story.footage_blocker`，两级共用一条）：
+     上游没出片就没有真末帧、下游没出片就没有真首帧，此时补一段两头都对不上的过渡只会让
+     接缝更明显。所以凡是要真补出一段转场的用例，都得先用 `give_footage` 让两头出片；
+     被拦下来的那些必须带上「谁还没出片」，绝不静默少做。
 
 所有入队的用例先 `POST /queue/pause`，pump 就不会真去连 ComfyUI。
 """
@@ -69,6 +73,22 @@ def cast(client: TestClient, pid: str, shot_id: str, app_id: str) -> None:
         f"{API}/projects/{pid}/shots/{shot_id}/cast", json={"appearance_ids": [app_id]}
     )
     assert resp.status_code == 200, resp.text
+
+
+def give_footage(client: TestClient, pid: str, shot_id: str, name: str) -> str:
+    """手工给一个镜头造一段「已经出片」的成片版本，返回那一版的 id。
+
+    转场的门槛是**接缝两侧都已经生成过视频**（`story.footage_blocker`），所以凡是要真补出
+    一段转场的用例都得先让两头出片——这是那件事的最短写法：新版本入库即当前版本
+    （硬约束 3），于是这个镜头立刻算「已出片」。
+    """
+    asset_id = upload_png(client, pid, "generated_video", name)
+    resp = client.post(
+        f"{API}/projects/{pid}/shots/{shot_id}/versions",
+        json={"asset_id": asset_id, "kind": "video"},
+    )
+    assert resp.status_code == 201, resp.text
+    return str(resp.json()["id"])
 
 
 def two_scenes(client: TestClient, pid: str) -> tuple[str, str, str, str]:
@@ -196,7 +216,11 @@ def test_parallel_puts_the_transition_at_the_end_of_the_first_scene(
     client: TestClient, pid: str
 ) -> None:
     assert client.post(f"{API}/projects/{pid}/queue/pause").status_code == 200
-    a, b, sa, _ = two_scenes(client, pid)
+    a, b, sa, sb = two_scenes(client, pid)
+    # 转场要接缝两侧都出片才补得出来，所以先让这两镜各自有成片；
+    # 只有这样账单里那一条才会真的算进 total_jobs。
+    give_footage(client, pid, sa, "head.png")
+    give_footage(client, pid, sb, "tail.png")
     client.put(
         f"{API}/projects/{pid}/links",
         json={"from_scene_id": a, "to_scene_id": b, "mode": "transition", "duration": 1.2},
@@ -226,22 +250,23 @@ def test_parallel_puts_the_transition_at_the_end_of_the_first_scene(
     tail = next(lane for lane in lanes if lane["id"] == b)
     assert all(card["id"] != made for card in tail["shots"]), "转场不属于下一幕"
 
-    # 转场任务在等上游出片，而且等待原因是可解释的
+    # 门槛已经保证上游出片了，所以这段转场没有可等的上游——直接排进队列
     jobs = client.get(f"{API}/projects/{pid}/jobs").json()
-    waiting = [j for j in jobs if j["shot_id"] == made]
-    assert len(waiting) == 1
-    assert waiting[0]["status"] == "waiting"
-    assert "末帧" in (waiting[0]["wait_reason"] or "")
+    mine = [j for j in jobs if j["shot_id"] == made]
+    assert len(mine) == 1
+    assert mine[0]["status"] == "queued", "两侧都有成片，转场不需要再等谁的末帧"
+    assert mine[0]["wait_reason"] is None
 
 
-def test_transition_needs_a_first_frame_on_the_next_scene(client: TestClient, pid: str) -> None:
+def test_transition_needs_footage_on_both_sides(client: TestClient, pid: str) -> None:
+    """接缝少一头没出片就**不生成**，并说清是谁还没出片。
+
+    以前这里会退回「当初喂给下一幕的那张设定图」凑一张末帧——R2V 生成出来的画面和设定图
+    并不一样，接缝反而更明显。现在宁可这一轮不补，也不悄悄接一段两头对不上的过渡。
+    """
     assert client.post(f"{API}/projects/{pid}/queue/pause").status_code == 200
-    variant, app_id = make_world(client, pid)
-    a = make_scene(client, pid, "雨夜追车", location_variant_id=variant)
-    b = make_scene(client, pid, "天台对峙")  # 没有地点变体
-    sa = make_shot(client, pid, a, "车灯划过水面")
-    make_shot(client, pid, b, "推门上天台")  # 也没有出场角色，于是一张首帧图都取不到
-    cast(client, pid, sa, app_id)
+    a, b, sa, _ = two_scenes(client, pid)
+    give_footage(client, pid, sa, "head.png")  # 只有上一幕出片，下一幕还没有
     client.put(
         f"{API}/projects/{pid}/links",
         json={"from_scene_id": a, "to_scene_id": b, "mode": "transition"},
@@ -250,8 +275,19 @@ def test_transition_needs_a_first_frame_on_the_next_scene(client: TestClient, pi
     assert bill["transitions_to_create"] == 0
     edge = bill["links"][0]
     assert edge["will_create_transition"] is False
-    assert "首帧图" in edge["blocked"]
+    assert "还没有生成视频" in edge["blocked"], "要说清是谁把这条拦下来的"
     assert any("硬切" in row["how"] for row in bill["blockers"]), "做不出来时要指出另一条路"
+    assert any("接缝两侧" in note for note in bill["notes"]), "账单要写明这一轮为什么不补转场"
+
+    # 这一轮只入队镜头：一段两头对不上的转场都不会被造出来
+    out = client.post(f"{API}/projects/{pid}/sequence/run", json={"mode": "parallel"}).json()
+    assert out["transitions"] == []
+    assert len(out["queued"]) == 2, "转场补不了不影响这两个镜头照常入队"
+    assert all(
+        card["kind"] != "transition"
+        for lane in client.get(f"{API}/projects/{pid}/storyboard").json()
+        for card in lane["shots"]
+    )
 
 
 def test_sequential_chains_the_shots_and_explains_the_wait(client: TestClient, pid: str) -> None:
@@ -259,10 +295,13 @@ def test_sequential_chains_the_shots_and_explains_the_wait(client: TestClient, p
     a, b, sa, sb = two_scenes(client, pid)
     # 上游即使已经有旧版本，本次续接也必须等本次新任务完成，不能拿旧指针提前放行。
     old_asset = upload_png(client, pid, "generated_video", "old-head.png")
-    assert client.post(
-        f"{API}/projects/{pid}/shots/{sa}/versions",
-        json={"asset_id": old_asset, "kind": "video"},
-    ).status_code == 201
+    assert (
+        client.post(
+            f"{API}/projects/{pid}/shots/{sa}/versions",
+            json={"asset_id": old_asset, "kind": "video"},
+        ).status_code
+        == 201
+    )
     client.put(
         f"{API}/projects/{pid}/links",
         json={"from_scene_id": a, "to_scene_id": b, "mode": "transition"},
@@ -307,6 +346,16 @@ def one_scene_two_shots(client: TestClient, pid: str) -> tuple[str, str, str, st
     return a, s1, s2, b
 
 
+def first_shot_of(client: TestClient, pid: str, scene_id: str) -> str:
+    """这一幕的第一张卡片。幕之间那条转场接的就是「上一幕末镜头 → 这一个」。"""
+    return next(
+        card["id"]
+        for lane in client.get(f"{API}/projects/{pid}/storyboard").json()
+        if lane["id"] == scene_id
+        for card in lane["shots"]
+    )
+
+
 def test_shot_link_modes_round_trip(client: TestClient, pid: str) -> None:
     """镜头之间那条线：默认「无转场」，配成转场时能带时长，同一对镜头只有一条。"""
     _, s1, s2, _ = one_scene_two_shots(client, pid)
@@ -339,12 +388,7 @@ def test_shot_link_modes_round_trip(client: TestClient, pid: str) -> None:
 def test_bad_shot_link_says_what_is_allowed(client: TestClient, pid: str) -> None:
     a, s1, s2, b = one_scene_two_shots(client, pid)
     s3 = make_shot(client, pid, a, "车头撞上护栏")
-    other = next(
-        card["id"]
-        for lane in client.get(f"{API}/projects/{pid}/storyboard").json()
-        if lane["id"] == b
-        for card in lane["shots"]
-    )
+    other = first_shot_of(client, pid, b)
 
     bad = client.put(
         f"{API}/projects/{pid}/shot-links",
@@ -416,6 +460,10 @@ def test_storyboard_draws_the_connectors_and_marks_pending(client: TestClient, p
 def test_one_click_covers_both_levels(client: TestClient, pid: str) -> None:
     assert client.post(f"{API}/projects/{pid}/queue/pause").status_code == 200
     a, s1, s2, b = one_scene_two_shots(client, pid)
+    # 两级的接缝一共牵扯三个镜头（s1→s2 与 s2→下一幕首镜头），都得先出片
+    give_footage(client, pid, s1, "s1.png")
+    give_footage(client, pid, s2, "s2.png")
+    give_footage(client, pid, first_shot_of(client, pid, b), "s3.png")
     shot_link = client.put(
         f"{API}/projects/{pid}/shot-links",
         json={"from_shot_id": s1, "to_shot_id": s2, "mode": "transition", "duration": 1.2},
@@ -473,17 +521,76 @@ def test_one_click_covers_both_levels(client: TestClient, pid: str) -> None:
     )
     assert done["generated"] is True and done["pending"] is False
 
-    # 转场任务在等上游出片，而且等待原因是可解释的
-    waiting = [j for j in client.get(f"{API}/projects/{pid}/jobs").json() if j["shot_id"] == made]
-    assert len(waiting) == 1 and waiting[0]["status"] == "waiting"
-    assert "末帧" in (waiting[0]["wait_reason"] or "")
+    # 门槛保证了 s1 已经出片，所以这段转场直接排进队列，不再等谁的末帧
+    mine = [j for j in client.get(f"{API}/projects/{pid}/jobs").json() if j["shot_id"] == made]
+    assert len(mine) == 1 and mine[0]["status"] == "queued"
+    assert mine[0]["wait_reason"] is None
     assert scene_link  # 幕级那条线的 id 在账单里认得出来
     assert {item["link_id"] for item in out["plan"]["items"]} == {shot_link, scene_link}
+
+
+def test_shot_transition_is_blocked_until_both_shots_have_footage(
+    client: TestClient, pid: str
+) -> None:
+    """分镜板上那个「生成」能不能点，只看连接器的 `can_generate`。
+
+    `pending`（配了转场却还没出片）与 `blocked`（现在还不能生成）是两件事：前者说的是
+    「还没生成」，后者说的是「接缝两侧没都出片」。按钮灰着却不说为什么和静默失败一样糟，
+    所以 `blocked` / `blocked_how` 必须一起给出来。
+    """
+    assert client.post(f"{API}/projects/{pid}/queue/pause").status_code == 200
+    a, s1, s2, _ = one_scene_two_shots(client, pid)
+    link_id = client.put(
+        f"{API}/projects/{pid}/shot-links",
+        json={"from_shot_id": s1, "to_shot_id": s2, "mode": "transition"},
+    ).json()["id"]
+
+    def connector() -> dict[str, Any]:
+        lanes = client.get(f"{API}/projects/{pid}/storyboard").json()
+        lane = next(row for row in lanes if row["id"] == a)
+        return next(row for row in lane["links"] if row["id"] == link_id)
+
+    row = connector()
+    assert row["pending"] is True, "配了转场却还没出片，这行字照旧要显示"
+    assert row["can_generate"] is False, "两侧都还没出片，那个「生成」按钮不能点"
+    assert "Shot 1、Shot 2 还没有生成视频" in row["blocked"], "要说清是谁还没出片"
+    assert row["blocked_how"], "拦下来就得给下一步动作"
+
+    # 账单也是同一条规矩：这条进 blocked，一件事都不做（跳过不是失败）
+    bill = client.post(f"{API}/projects/{pid}/sequence/transitions/plan", json={}).json()
+    assert bill["total"] == 0
+    assert any(row["link_id"] == link_id and row["how"] for row in bill["blocked"])
+    assert any("接缝两侧" in note for note in bill["notes"])
+
+    # 点名它也不会悄悄补出来：跳过的那条带原因
+    out = client.post(
+        f"{API}/projects/{pid}/sequence/transitions/run", json={"only": [link_id]}
+    ).json()
+    assert out["transitions"] == [] and out["queued"] == []
+    assert "还没有生成视频" in out["skipped"][0]["reason"]
+
+    give_footage(client, pid, s1, "s1.png")  # 只有上游出片时话要说得更准
+    row = connector()
+    assert row["can_generate"] is False
+    assert "Shot 2 还没有生成视频" in row["blocked"]
+
+    give_footage(client, pid, s2, "s2.png")
+    row = connector()
+    assert row["blocked"] is None and row["blocked_how"] is None
+    assert row["can_generate"] is True, "两侧都出片了才轮到那个按钮亮起来"
+    assert row["pending"] is True, "能生成 ≠ 已生成"
+
+    made = client.post(
+        f"{API}/projects/{pid}/sequence/transitions/run", json={"only": [link_id]}
+    ).json()
+    assert made["skipped"] == [] and len(made["transitions"]) == 1
 
 
 def test_one_click_takes_only_and_never_redoes(client: TestClient, pid: str) -> None:
     assert client.post(f"{API}/projects/{pid}/queue/pause").status_code == 200
     a, s1, s2, b = one_scene_two_shots(client, pid)
+    give_footage(client, pid, s1, "s1.png")  # 镜头级那条线的两头
+    give_footage(client, pid, s2, "s2.png")
     shot_link = client.put(
         f"{API}/projects/{pid}/shot-links",
         json={"from_shot_id": s1, "to_shot_id": s2, "mode": "transition"},
@@ -524,7 +631,9 @@ def test_one_click_takes_only_and_never_redoes(client: TestClient, pid: str) -> 
 
 def test_transition_with_a_version_is_not_regenerated(client: TestClient, pid: str) -> None:
     assert client.post(f"{API}/projects/{pid}/queue/pause").status_code == 200
-    a, b, _, _ = two_scenes(client, pid)
+    a, b, sa, sb = two_scenes(client, pid)
+    give_footage(client, pid, sa, "head.png")  # 两侧都出片，这条转场才补得出来
+    give_footage(client, pid, sb, "tail.png")
     client.put(
         f"{API}/projects/{pid}/links",
         json={"from_scene_id": a, "to_scene_id": b, "mode": "transition"},
@@ -532,14 +641,7 @@ def test_transition_with_a_version_is_not_regenerated(client: TestClient, pid: s
     first = client.post(f"{API}/projects/{pid}/sequence/run", json={"mode": "parallel"}).json()
     made = first["transitions"][0]["shot_id"]
     # 手工给转场造一个成片版本，模拟「这段已经出片了」
-    asset_id = upload_png(client, pid, "generated_video", "trans.png")
-    assert (
-        client.post(
-            f"{API}/projects/{pid}/shots/{made}/versions",
-            json={"asset_id": asset_id, "kind": "video"},
-        ).status_code
-        == 201
-    )
+    give_footage(client, pid, made, "trans.png")
     again = client.post(f"{API}/projects/{pid}/sequence/run", json={"mode": "parallel"}).json()
     reused = again["transitions"][0]
     assert reused["shot_id"] == made

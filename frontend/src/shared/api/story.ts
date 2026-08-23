@@ -223,11 +223,14 @@ export interface StoryboardCard {
  * 分镜板上两张卡片之间那条线。镜头之间（`level: 'shot'`）与幕之间（`level: 'scene'`）
  * 是同一种形状，界面上也是同一条线。
  *
- * 三件事只有这一个来源：
+ * 四件事只有这一个来源：
  *   - **没配过就是无转场**——`id === null` / `mode === 'cut'`，后端连行都没有；
  *   - `pending` 就是「配了转场但还没出片」，分镜板上那行「转场暂未生成」照它显示，
  *     **不要**在界面里用 `transition_shot_id` 再算一遍（镜头造出来了但任务还在排队时，
  *     它仍然是「暂未生成」）；
+ *   - `can_generate` 才是那个「生成」按钮能不能点：转场要**接缝两侧都已经生成过视频**
+ *     才补得出来（否则两头都对不上），拦下来的原因在 `blocked`，下一步动作在
+ *     `blocked_how`——按钮灰着却不说为什么，和静默失败一样糟；
  *   - `transition_shot_id` 指的那个镜头**照旧在 `shots` 里**（导出顺序、补首帧、
  *     时间线装配都靠它在那儿），前端把它从卡片行里拿出来画在线上而已。
  */
@@ -244,6 +247,12 @@ export interface StoryboardConnector {
   generated: boolean
   /** 配了转场却还没出片——「转场暂未生成」那行字的唯一依据。 */
   pending: boolean
+  /** 现在还不能生成的原因（谁还没出片）；能生成时是 null。 */
+  blocked: string | null
+  /** 被拦下来时的下一步动作，文案在后端写一遍。 */
+  blocked_how: string | null
+  /** = `pending && !blocked`。「生成」按钮的可点状态只看它。 */
+  can_generate: boolean
   from_shot_id?: string
   to_shot_id?: string
   from_scene_id?: string

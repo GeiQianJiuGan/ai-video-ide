@@ -292,8 +292,12 @@ export interface ShotLinkBody {
  * `shot` 是镜头之间那条线，`scene` 是幕与幕之间那条。
  *
  * `first_frame` / `last_frame` 说的是这段转场两头的图从哪来
- * （`real_frame` 真帧 / `extract` 生成前会抽 / `reference_image` 只能退回设定图 /
- * `waiting` 上游还没出片 / `none` 取不到），界面照它解释「接缝准不准」。
+ * （`real_frame` 真帧 / `extract` 生成前会抽一张 / `none` 取不到），界面照它解释
+ * 「接缝准不准」。**取不到就不生成**：转场是把上一镜真末帧接到下一镜真首帧，
+ * 退回设定图接不上，所以这里没有 `reference_image` 这条路了。
+ *
+ * `blocked` 是这一条这次做不了的原因（最常见的就是接缝两侧还没都出片），
+ * 有它就说明 `will_generate === false`。
  */
 export interface TransitionPlanItem {
   level: 'shot' | 'scene'
@@ -366,12 +370,21 @@ export const sequenceApi = {
   deleteShotLink: (pid: string, linkId: string) =>
     api.del<void>(`/projects/${pid}/shot-links/${linkId}`),
 
-  /** 一键生成转场的账单：两级一起列，只读，不抽帧也不入队。 */
+  /**
+   * 一键生成转场的账单：两级一起列，只读，不抽帧也不入队。
+   *
+   * **转场要接缝两侧都已经生成过视频才补得出来**（少一头就没有真帧可接），
+   * 等成片的那几条 `will_generate === false` 并在 `blocked` 里写明是谁还没生成；
+   * 分镜板上那个「生成」能不能点看的是 `StoryboardConnector.can_generate`。
+   */
   transitionPlan: (pid: string) =>
     api.post<TransitionPlan>(`/projects/${pid}/sequence/transitions/plan`, {}),
   /**
    * 按账单补转场。`only` 给的是衔接 id（镜头级 / 幕级都认 id），
    * 分镜板上单条转场的「生成」按钮走的就是它；不传就是全部。
+   *
+   * 接缝两侧没都出片的那几条**一条都不会做**：不传 `only` 时它们进 `plan.blocked`
+   * （跳过不是失败），显式指名一条却还没出片时报 `MISSING_INPUT`「转场要等前后都出片」。
    */
   transitionRun: (
     pid: string,

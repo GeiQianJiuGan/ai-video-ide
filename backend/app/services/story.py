@@ -99,6 +99,46 @@ def _guard_node_limit(what: str, ids: list[str]) -> None:
         )
 
 
+#: 「转场必须前后都已经出片」这条门槛的下一步动作，只写一遍：
+#: 分镜板上那条线、两级转场账单、`sequence._make_*transition` 的四要素错误共用它。
+FOOTAGE_HOW = "先把这两个镜头各自生成出来，再补它们之间的转场"
+
+
+def has_footage(
+    shot: Shot, versions: dict[str, GenerationVersion], assets: dict[str, Asset]
+) -> bool:
+    """这个镜头**已经出片了吗**——转场门槛的唯一口径。
+
+    「出片」= 它有采用的那一版（`Shot.current_version_id`，硬约束 3 下新版本入库即当前版本），
+    那一版跑完了（`status == "done"`）且产物还登记在册。**刻意不按后缀分视频 / 图片**：
+    采用的那一版本身是一张图时（占位、手工挂进来的定版画面）它照样是「这一格画面已经定了」，
+    而转场要的就是两侧那两格真实画面；后缀在这里只会把手工定版的工程挡在外面。
+    """
+    version = versions.get(shot.current_version_id or "")
+    if version is None or version.status != "done":
+        return False
+    return bool(version.asset_id and version.asset_id in assets)
+
+
+def footage_blocker(
+    head: Shot,
+    tail: Shot,
+    versions: dict[str, GenerationVersion],
+    assets: dict[str, Asset],
+) -> str:
+    """两头都出片了吗？没有就回一句「谁还没出片」，都出片了回空串。
+
+    转场是**把两段真实成片接上**的东西：上游没出片就没有真末帧、下游没出片就没有真首帧，
+    此时补出来的那一段两头都对不上，接缝反而更明显。所以这不是「先做也行」，
+    而是**不让做**——调用方拿这句话去写 `blocked`，绝不静默少做或悄悄用设定图凑。
+    """
+    late = [s for s in (head, tail) if not has_footage(s, versions, assets)]
+    if not late:
+        return ""
+    who = "、".join(f"Shot {s.index_no}" for s in late)
+    return f"{who} 还没有生成视频——转场要把前后两段真实成片接上"
+
+
 def _image_path(asset_id: str | None, assets: dict[str, Asset]) -> str | None:
     """asset id → 相对路径，**只认图片**。
 
@@ -189,9 +229,12 @@ def _shot_media(
 
 
 def _connector(
-    row: ShotLink | SceneLink | None, made: Shot | None, extra: dict[str, Any]
+    row: ShotLink | SceneLink | None,
+    made: Shot | None,
+    extra: dict[str, Any],
+    blocked: str = "",
 ) -> dict[str, Any]:
-    """分镜板上两张卡片之间那一行：这里配的是什么，转场生成了没有。
+    """分镜板上两张卡片之间那一行：这里配的是什么，转场生成了没有，现在能不能生成。
 
     **没有行就等于「无转场」**（`cut`）——这正是这两张表出现之前的行为，
     所以老工程打开来一条线都不会凭空多出东西。
@@ -200,9 +243,15 @@ def _connector(
     但那个 `Shot.kind="transition"` 的镜头还没有当前版本。判断只看
     `current_version_id`，和 `sequence._make_*transition` 的「要不要重做」
     是同一个口径（版本永不覆盖，已出片的转场不会被一键生成重做）。
+
+    `blocked` / `can_generate` 是**门槛**，与 `pending` 是两件事：pending 说的是
+    「还没生成」，blocked 说的是「现在还不能生成」（两侧没都出片，见
+    `footage_blocker`）。界面照 `can_generate` 决定那个「生成」按钮的可点状态，
+    并把 `blocked` 写进 tooltip——按钮灰着却不说为什么，和静默失败一样糟。
     """
     mode = row.mode if row is not None else "cut"
     generated = bool(made is not None and made.current_version_id)
+    pending = mode == "transition" and not generated
     return {
         "id": row.id if row is not None else None,
         "mode": mode,
@@ -210,7 +259,10 @@ def _connector(
         "prompt": row.prompt if row is not None else None,
         "transition_shot_id": made.id if made is not None else None,
         "generated": generated,
-        "pending": mode == "transition" and not generated,
+        "pending": pending,
+        "blocked": blocked or None,
+        "blocked_how": FOOTAGE_HOW if blocked else None,
+        "can_generate": pending and not blocked,
         **extra,
     }
 
@@ -856,6 +908,10 @@ class StoryService:
         转场镜头**照旧留在 `shots` 里**（导出顺序、补首帧、时间线装配都靠它在那儿），
         连接器只额外指出「这条线的转场是哪个镜头、生成了没有」，前端据此把它从卡片行里
         拿出来画在线上。两处读的是同一条记录，不会各说一套。
+
+        连接器上还带**门槛**（`blocked` / `can_generate`，见 `footage_blocker`）：
+        转场要等接缝两侧都出片了才能补，否则两头都对不上。前端照它禁用那个「生成」
+        按钮并把原因写出来，和 `sequence.transition_plan` 认的是同一条规矩。
         """
         db = db_of(pid)
         scenes = await fetch_all(db, Scene, order_by=Scene.index_no)
@@ -947,6 +1003,7 @@ class StoryService:
                             "from_index_no": head.index_no,
                             "to_index_no": tail.index_no,
                         },
+                        footage_blocker(head, tail, versions, assets),
                     )
                 )
             nxt = next((s for s in scenes if s.index_no > scene.index_no), None)
@@ -960,6 +1017,16 @@ class StoryService:
                     ),
                     None,
                 )
+                # 幕之间那条线接的是「上一幕末镜头 → 下一幕首镜头」，门槛也就落在这两个镜头上
+                # （和 `sequence.transition_plan` 认的是同一对，两处不会各说一套）。
+                head_shot = real[-1] if real else None
+                nxt_real = [s for s in shots if s.scene_id == nxt.id and s.kind != "transition"]
+                tail_shot = nxt_real[0] if nxt_real else None
+                if head_shot is None or tail_shot is None:
+                    which = scene if head_shot is None else nxt
+                    gate = f"第 {which.index_no} 幕还没有镜头，取不到接缝两侧的画面"
+                else:
+                    gate = footage_blocker(head_shot, tail_shot, versions, assets)
                 next_link = _connector(
                     row,
                     by_id.get(row.shot_id or "") if row is not None else None,
@@ -971,6 +1038,7 @@ class StoryService:
                         "to_index_no": nxt.index_no,
                         "to_title": nxt.title,
                     },
+                    gate,
                 )
             lanes.append(
                 {

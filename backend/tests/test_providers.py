@@ -276,12 +276,53 @@ def test_preset_inspection_reports_how_many_reference_images_it_takes() -> None:
 
 
 def test_preset_missing_required_titles_is_rejected_on_save() -> None:
+    """必需的只剩提示词入口：连 AIVS_PROMPT 都没有的图填不进任何东西，才算体检不过。"""
     with pytest.raises(AppError) as caught:
         presets.save("缺入口", json.dumps({"1": {"class_type": "KSampler", "inputs": {"seed": 0}}}))
     err = caught.value
     assert err.code == "INVALID_WORKFLOW"
-    assert "AIVS_FIRST_FRAME" in err.detail
+    assert "AIVS_PROMPT" in err.detail
     assert presets.listing() == [], "体检不过的图绝不留在预设目录里"
+
+
+def test_preset_without_frame_titles_is_accepted_and_says_the_first_frame_becomes_a_ref() -> None:
+    """R2V 出正片的图常常一个首尾帧入口都没有——这种图必须能存、能选、能生成。
+
+    分工是「首尾帧那类模型补转场，R2V 出正片」，所以缺首尾帧入口不再是体检不过；
+    它只影响两件事：不能拿它补转场（严格首尾帧），以及那张首帧会当参考图 1 送进去。
+    """
+    r2v = {k: v for k, v in with_ref_slots(2).items() if k not in {"1", "2"}}
+    presets.save("纯R2V", json.dumps(r2v, ensure_ascii=False))
+    row = next(r for r in presets.listing() if r["name"] == "纯R2V")
+    assert row["ready"] is True, "没有首尾帧入口不算体检不过"
+    assert row["first_frame_ok"] is False
+    assert row["flf_ready"] is False, "补转场要的是严格首尾帧，这份图做不了"
+    assert row["r2v_ready"] is True
+    assert "参考图 1" in row["ref_hint"], "要说清首帧会怎么被喂进去"
+
+
+async def test_preset_without_a_first_frame_title_sends_it_as_reference_one(tmp_path: Path) -> None:
+    """降级要说出来：首帧当了参考图 1，这句话进 req.notes 一起冻结进版本。"""
+    r2v = {k: v for k, v in with_ref_slots(2).items() if k not in {"1", "2"}}
+    write_preset("纯R2V", r2v)
+    first = tmp_path / "first.png"
+    first.write_bytes(b"A")
+    fake = FakeComfy()
+    provider = ComfyPresetProvider(client=fake)  # type: ignore[arg-type]
+    req = VideoRequest(
+        mode="i2v",
+        prompt="雨夜推门",
+        first_frame=first,
+        refs=make_refs(tmp_path, "林小雨（常服）"),
+        extra={"preset": "纯R2V"},
+    )
+
+    await provider.submit(req, client_id="aivs-test")
+    graph = fake.submitted or {}
+    assert graph["11"]["inputs"]["image"] == "aivs/first.png", "首帧插到参考图 1"
+    assert graph["12"]["inputs"]["image"] == "aivs/ref1.png"
+    assert fake.uploaded == ["first.png", "ref1.png"], "一张都不能丢"
+    assert any("当作参考图 1" in n for n in req.notes), "降级绝不静默"
 
 
 def test_preset_rejects_the_ui_workflow_with_the_real_reason() -> None:

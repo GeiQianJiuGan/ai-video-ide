@@ -21,10 +21,15 @@
 
   - `parallel` —— 各幕并发生成，幕与幕之间按 `SceneLink` 的模式接；`transition` 的那条边
     会造一个 `Shot.kind="transition"` 的镜头挂在上一幕末尾（首帧取上一幕真末帧，
-    末帧取下一幕首镜头的首帧图），于是时间线自动装配的顺序天然正确。
+    末帧取下一幕首镜头的真首帧），于是时间线自动装配的顺序天然正确。
   - `sequential` —— 单线程续接：把全片的镜头串成一条链，上一段的真末帧当下一段首帧。
     这条路**不需要转场**，所以图上的 `transition` 边会被忽略——账单里必须写出来这一点，
     不能默默换掉用户配的东西。
+
+**转场是补的，不是同一轮做的**（门槛在 `story.footage_blocker`，两级共用一条）：
+接缝两侧都出片了才补得出来——上游没出片就没有真末帧，下游没出片就没有真首帧，
+此时补一段两头都对不上的过渡只会让接缝更明显。所以第一次 `run()` 通常只入队镜头，
+账单里那几条转场标成「等成片」；等这一轮出片后在分镜页按一次「一键生成转场」就补上。
 
 关于 `check_context`：链上除了头一个，其余镜头入队时都跳过上下文门槛。原因是它们的
 首帧要等上游出片才存在，硬检查只会把整条链拒在门外——「等上游末帧」本来就是
@@ -49,7 +54,7 @@ from app.services.base import as_dict, db_of, fetch, fetch_all
 from app.services.context import context
 from app.services.frames import frames, start_frame_index
 from app.services.generation import drop_entry, generation, over_capacity_error
-from app.services.story import node_limit, story
+from app.services.story import FOOTAGE_HOW, footage_blocker, node_limit, story
 
 MODES = ("parallel", "sequential")
 
@@ -533,6 +538,8 @@ class SequenceService:
                 ["先在流程图里加一幕", "或让 AI 协作栏根据剧情提几幕"],
             )
         shots = await fetch_all(db, Shot, order_by=Shot.index_no)
+        versions = {v.id: v for v in await fetch_all(db, GenerationVersion)}
+        assets = {a.id: a for a in await fetch_all(db, Asset)}
         links = {(r.from_scene_id, r.to_scene_id): r for r in await fetch_all(db, SceneLink)}
 
         rows: list[dict[str, Any]] = []
@@ -618,7 +625,7 @@ class SequenceService:
                 "duration": link.duration if link else None,
             }
             if effective == "transition":
-                ready, why = await self._transition_ready(pid, head, tail, shots)
+                ready, why = self._transition_ready(head, tail, shots, versions, assets)
                 entry["will_create_transition"] = ready
                 if ready:
                     transitions += 1
@@ -631,7 +638,7 @@ class SequenceService:
                             "scene_id": head.id,
                             "index_no": head.index_no,
                             "why": f"{span}的转场做不出来：{why}",
-                            "how": "把这条衔接改成硬切或续接末帧，或给下一幕的首镜头挑一张首帧图",
+                            "how": FOOTAGE_HOW + "；不想等就把这条衔接改成硬切或续接末帧",
                         }
                     )
             edges.append(entry)
@@ -645,6 +652,12 @@ class SequenceService:
             notes.append("单线程续接不需要转场，链上每一段都直接接上一段的真末帧。")
             if ignored:
                 notes.append(f"图上有 {ignored} 条转场衔接，这次会被当成「续接末帧」处理。")
+        gated = len([e for e in edges if e.get("blocked")])
+        if gated:
+            notes.append(
+                f"有 {gated} 条转场衔接这次补不了：转场要接缝两侧都生成过视频才能补。"
+                "等这一轮的镜头出片后，在分镜页按一次「一键生成转场」就会补上。"
+            )
         if ref_drops:
             dropped = sum(int(d["dropped"]) for d in ref_drops)
             notes.append(
@@ -798,10 +811,17 @@ class SequenceService:
 
         和 `plan()` 一样是只读的：**不抽帧、不入队**，还没抽过的首帧只标一句
         「生成前会抽」。
+
+        门槛只有一条（`story.footage_blocker`）：**接缝两侧都出片了才能补转场**。
+        没出片的那一侧既没有真末帧也没有真首帧，补出来的一段两头都对不上——
+        所以这类条目一律 `will_generate=false` 并带上「谁还没出片」，
+        不再退回设定图凑一张（那正是接缝跳一下的来源）。
         """
         db = db_of(pid)
         scenes = await fetch_all(db, Scene, order_by=Scene.index_no)
         shots = await fetch_all(db, Shot, order_by=Shot.index_no)
+        versions = {v.id: v for v in await fetch_all(db, GenerationVersion)}
+        assets = {a.id: a for a in await fetch_all(db, Asset)}
         by_id = {s.id: s for s in shots}
         items: list[dict[str, Any]] = []
         blocked: list[dict[str, Any]] = []
@@ -818,7 +838,6 @@ class SequenceService:
         ) -> dict[str, Any]:
             made = by_id.get(made_shot_id or "")
             generated = bool(made is not None and made.current_version_id)
-            last_asset, last_source = await self._last_frame_asset(pid, tail, extract=False)
             row: dict[str, Any] = {
                 "level": level,
                 "link_id": link_id,
@@ -833,33 +852,25 @@ class SequenceService:
                 "prompt": prompt,
                 "shot_id": made.id if made is not None else None,
                 "generated": generated,
-                "first_frame": "real_frame" if head.current_version_id else "waiting",
-                "last_frame": last_source,
+                "first_frame": "waiting",
+                "last_frame": "none",
                 "will_generate": False,
             }
             if generated:
                 row["note"] = "这段转场已经有成片了，一键生成不会重做它。"
                 return row
-            if last_source == "none":
-                row["blocked"] = f"{where}：下一个镜头既没有成片也没有可用的首帧图，取不到末帧"
-                blocked.append(
-                    {
-                        "link_id": link_id,
-                        "why": row["blocked"],
-                        "how": "先把下一个镜头生成出来，或给它挑一张首帧图；也可以把这条改成无转场",
-                    }
-                )
+            gate = footage_blocker(head, tail, versions, assets)
+            if gate:
+                row["blocked"] = f"{where}：{gate}"
+                blocked.append({"link_id": link_id, "why": row["blocked"], "how": FOOTAGE_HOW})
                 return row
+            # 走到这里两侧都出片了：末帧要么已经抽过（real_frame），要么生成前抽（extract）。
+            _, last_source = await self._last_frame_asset(pid, tail, extract=False)
+            row["first_frame"] = "real_frame"
+            row["last_frame"] = last_source
             row["will_generate"] = True
-            if last_source == "reference_image":
-                row["note"] = (
-                    "下一个镜头还没有成片，末帧只能用它的首帧图——"
-                    "等它出片后重跑这段转场，接缝会更准。"
-                )
-            if row["first_frame"] == "waiting":
-                row["note"] = (
-                    (row.get("note") or "") + "上一个镜头还没有成片，这条任务会排队等它的末帧。"
-                ).strip()
+            if last_source == "extract":
+                row["note"] = "下一个镜头的真首帧还没抽过，生成前会先抽一张。"
             return row
 
         for scene in scenes:
@@ -933,6 +944,7 @@ class SequenceService:
 
         total = len([i for i in items if i["will_generate"]])
         reused = len([i for i in items if i["generated"]])
+        waiting = len([i for i in items if i.get("blocked")])
         notes = ["以下是账单，还没有入队任何任务。"]
         if not items:
             notes.append(
@@ -941,6 +953,11 @@ class SequenceService:
         else:
             notes.append(
                 f"配成转场的一共 {len(items)} 条：这次会生成 {total} 条，跳过已出片的 {reused} 条。"
+            )
+        if waiting:
+            notes.append(
+                f"有 {waiting} 条在等成片：转场要接缝两侧都生成过视频才能补，"
+                "把那几个镜头先生成出来，这张账单里就会出现它们。"
             )
         return {
             "items": items,
@@ -1012,19 +1029,52 @@ class SequenceService:
             "plan": bill,
         }
 
-    async def _transition_ready(
-        self, pid: str, head: Scene, tail: Scene, shots: list[Shot]
+    def _transition_ready(
+        self,
+        head: Scene,
+        tail: Scene,
+        shots: list[Shot],
+        versions: dict[str, GenerationVersion],
+        assets: dict[str, Asset],
     ) -> tuple[bool, str]:
+        """幕级转场现在能不能补。门槛与镜头级同一条（`story.footage_blocker`）。"""
         upstream = self._last_real(shots, head.id)
         if upstream is None:
             return False, f"第 {head.index_no} 幕没有镜头，取不到末帧"
         downstream = self._first_real(shots, tail.id)
         if downstream is None:
-            return False, f"第 {tail.index_no} 幕没有镜头，取不到首帧图"
-        _, source = await self._last_frame_asset(pid, downstream, extract=False)
-        if source == "none":
-            return False, f"第 {tail.index_no} 幕的首镜头既没有成片也没有可用的首帧图"
+            return False, f"第 {tail.index_no} 幕没有镜头，取不到首帧"
+        gate = footage_blocker(upstream, downstream, versions, assets)
+        if gate:
+            return False, gate
         return True, ""
+
+    def _footage_gate(
+        self,
+        head: Shot,
+        tail: Shot,
+        versions: dict[str, GenerationVersion],
+        assets: dict[str, Asset],
+        where: str,
+    ) -> None:
+        """写路径上的同一道门槛。账单已经拦过，这里是「入队前最后一遍」——
+
+        单条生成（`only`）、AI 协作栏、以后任何别的入口都会经过这两个 `_make_*` 方法，
+        门槛只写在账单里的话，绕过账单的那条路就会悄悄补出一段两头都对不上的转场。
+        """
+        gate = footage_blocker(head, tail, versions, assets)
+        if not gate:
+            return
+        raise AppError(
+            ErrorCode.MISSING_INPUT,
+            "转场要等前后都出片",
+            f"{where}：{gate}。",
+            [
+                FOOTAGE_HOW,
+                "先看一眼「一键生成转场」的账单：等成片的那几条会写明是谁还没生成",
+                "这条接缝不想等，就把它改成无转场（硬切）",
+            ],
+        )
 
     async def _make_transition(
         self, pid: str, edge: dict[str, Any], priority: int, allow_ref_drop: bool = False
@@ -1049,13 +1099,22 @@ class SequenceService:
         upstream = self._last_real(shots, head.id)
         downstream = self._first_real(shots, tail.id)
         assert upstream is not None and downstream is not None  # plan 已经拦过
+        versions = {v.id: v for v in await fetch_all(db, GenerationVersion)}
+        assets = {a.id: a for a in await fetch_all(db, Asset)}
+        self._footage_gate(
+            upstream,
+            downstream,
+            versions,
+            assets,
+            f"第 {head.index_no} 幕 → 第 {tail.index_no} 幕",
+        )
         last_frame, _ = await self._last_frame_asset(pid, downstream, extract=True)
-        if last_frame is None:  # pragma: no cover - plan 已经拦过
+        if last_frame is None:  # pragma: no cover - 上面那道门槛已经拦过
             raise AppError(
                 ErrorCode.MISSING_INPUT,
                 "转场缺末帧",
-                f"第 {tail.index_no} 幕的首镜头没有可用的首帧图。",
-                ["给下一幕的首镜头挑一张首帧图", "或把这条衔接改成硬切"],
+                f"第 {tail.index_no} 幕的首镜头取不到真首帧。",
+                ["重新生成一次下一幕的首镜头", "或把这条衔接改成硬切"],
             )
 
         existing: Shot | None = None
@@ -1126,13 +1185,18 @@ class SequenceService:
         db = db_of(pid)
         head = await fetch(db, Shot, link.from_shot_id, "镜头")
         tail = await fetch(db, Shot, link.to_shot_id, "镜头")
+        versions = {v.id: v for v in await fetch_all(db, GenerationVersion)}
+        assets = {a.id: a for a in await fetch_all(db, Asset)}
+        self._footage_gate(
+            head, tail, versions, assets, f"Shot {head.index_no} → Shot {tail.index_no}"
+        )
         last_frame, _ = await self._last_frame_asset(pid, tail, extract=True)
-        if last_frame is None:  # pragma: no cover - plan 已经拦过
+        if last_frame is None:  # pragma: no cover - 上面那道门槛已经拦过
             raise AppError(
                 ErrorCode.MISSING_INPUT,
                 "转场缺末帧",
-                f"Shot {tail.index_no} 既没有成片也没有可用的首帧图。",
-                ["先把下一个镜头生成出来", "或把这条衔接改成无转场"],
+                f"Shot {tail.index_no} 取不到真首帧。",
+                ["重新生成一次这个镜头", "或把这条衔接改成无转场"],
             )
 
         existing: Shot | None = None
@@ -1212,14 +1276,14 @@ class SequenceService:
     ) -> tuple[str | None, str]:
         """转场的**末帧**是哪张——「下一个镜头真正的第一格」。
 
-        顺序 **采用那一版的真首帧 → 上下文账单里的首帧图**：
-        本工具的转场是用来把两段真实成片接上的，所以只要下一镜已经出片，
-        就该用它的第一格，而不是当初喂给它的设定图（R2V 生成出来的画面和设定图并不一样，
-        拿设定图收尾会在接缝处跳一下）。下一镜还没出片时才退回设定图。
+        只认**采用那一版的真首帧**：本工具的转场是用来把两段真实成片接上的，
+        所以下一镜必须已经出片（这道门槛在 `story.footage_blocker`，调用方先过）。
+        以前这里还会退回「当初喂给它的设定图」——那正是接缝处跳一下的来源
+        （R2V 生成出来的画面和设定图并不一样），现在宁可不让生成也不拿设定图凑。
 
         `extract=False` 是只读路径：还没抽过的帧只回一个 `"extract"` 标记，
         **绝不在读路径上起 FFmpeg**（同 `context.py` 那条规矩）。
-        返回 `(asset_id, source)`，`source ∈ real_frame / extract / reference_image / none`。
+        返回 `(asset_id, source)`，`source ∈ real_frame / extract / none`。
         """
         db = db_of(pid)
         version = None
@@ -1234,19 +1298,18 @@ class SequenceService:
             )
         assets = {a.id: a for a in await fetch_all(db, Asset)}
         asset = assets.get(version.asset_id or "") if version else None
-        if asset is not None:
-            if kind_of_suffix(Path(asset.path).suffix) == "image":
-                # 采用的那一版本身就是一张图：它就是第一格，没什么可抽的。
-                return str(asset.id), "real_frame"
-            done = start_frame_index(list(assets.values())).get(str(asset.id))
-            if done is not None:
-                return str(done.id), "real_frame"
-            if extract:
-                made = await frames.extract(pid, str(asset.id), "start")
-                return str(made["id"]), "real_frame"
-            return None, "extract"
-        fallback = await self._first_frame_asset(pid, shot.id)
-        return fallback, ("reference_image" if fallback else "none")
+        if asset is None:
+            return None, "none"
+        if kind_of_suffix(Path(asset.path).suffix) == "image":
+            # 采用的那一版本身就是一张图：它就是第一格，没什么可抽的。
+            return str(asset.id), "real_frame"
+        done = start_frame_index(list(assets.values())).get(str(asset.id))
+        if done is not None:
+            return str(done.id), "real_frame"
+        if extract:
+            made = await frames.extract(pid, str(asset.id), "start")
+            return str(made["id"]), "real_frame"
+        return None, "extract"
 
     def _last_real(self, shots: list[Shot], scene_id: str) -> Shot | None:
         mine = [s for s in shots if s.scene_id == scene_id and s.kind != "transition"]
@@ -1255,14 +1318,6 @@ class SequenceService:
     def _first_real(self, shots: list[Shot], scene_id: str) -> Shot | None:
         mine = [s for s in shots if s.scene_id == scene_id and s.kind != "transition"]
         return mine[0] if mine else None
-
-    async def _first_frame_asset(self, pid: str, shot_id: str) -> str | None:
-        """这个镜头的首帧图是哪张——就是上下文账单里被包含的第一张图。"""
-        ctx = await context.resolve(pid, shot_id)
-        for item in ctx["items"]:
-            if item["included"] and item["asset_id"] and not item.get("missing_file"):
-                return str(item["asset_id"])
-        return None
 
 
 sequence = SequenceService()

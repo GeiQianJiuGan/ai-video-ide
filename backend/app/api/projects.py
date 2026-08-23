@@ -142,13 +142,18 @@ async def set_project_preset(pid: str, payload: dict[str, str | None]) -> dict[s
         raise AppError(
             ErrorCode.INVALID_WORKFLOW,
             "预设不可用",
-            (
-                f"预设 {name} 不存在或不能用于"
-                f"{'首尾帧 / FL2VA' if role == 'flf' else 'R2V'}。"
-            ),
+            (f"预设 {name} 不存在或不能用于{'首尾帧 / FL2VA' if role == 'flf' else 'R2V'}。"),
             [
                 "到左侧「预设 Workflow」导入并修复这份图",
-                "FL2VA 预设必须同时标出 AIVS_FIRST_FRAME、AIVS_LAST_FRAME、AIVS_PROMPT",
+                # 两个角色要的东西不一样，说错一句用户就会去改一个本来没问题的标题：
+                # R2V 只要一个提示词入口（首尾帧节点可以一个都没有），
+                # 补转场要的是严格首尾帧，缺哪一头都接不上。
+                (
+                    "FL2VA 预设必须同时标出 AIVS_FIRST_FRAME、AIVS_LAST_FRAME、AIVS_PROMPT"
+                    if role == "flf"
+                    else "R2V 预设至少要标出 AIVS_PROMPT；首尾帧节点没有也行，"
+                    "首帧会当作参考图 1 送进去"
+                ),
                 "再回项目选择它",
             ],
             {"preset": name, "role": role},
