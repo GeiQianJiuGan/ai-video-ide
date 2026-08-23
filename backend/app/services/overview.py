@@ -366,10 +366,13 @@ class OverviewService:
         generation: dict[str, Any] | None = None
         if pid:
             project = (await fetch_all(db_of(pid), Project))[0]
-            selected = project.preset_name or ""
-            item = (
-                next((x for x in presets.listing() if x["name"] == selected), None)
-                if selected
+            listing = presets.listing()
+            selected = project.r2v_preset_name or project.preset_name or ""
+            flf_selected = project.flf_preset_name or project.preset_name or ""
+            item = next((x for x in listing if x["name"] == selected), None) if selected else None
+            flf_item = (
+                next((x for x in listing if x["name"] == flf_selected), None)
+                if flf_selected
                 else None
             )
             generation = {
@@ -377,8 +380,13 @@ class OverviewService:
                 "preset_name": selected or None,
                 "preset_ready": bool(item and item.get("ready")),
                 "ref_slots": item.get("ref_slots") if item else None,
+                "r2v_name": selected or None,
+                "r2v_ready": bool(item and item.get("r2v_ready")),
+                "r2v_ref_slots": item.get("ref_slots") if item else None,
+                "flf_name": flf_selected or None,
+                "flf_ready": bool(flf_item and flf_item.get("flf_ready")),
                 "detail": (
-                    f"项目使用预设 Workflow：{selected}"
+                    f"R2V：{selected or '未绑定'}；FL2VA：{flf_selected or '未绑定'}"
                     if selected
                     else "项目尚未绑定预设 Workflow"
                 ),

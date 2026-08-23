@@ -127,6 +127,9 @@ export interface PresetRow {
   name: string
   path: string
   ready: boolean
+  r2v_ready?: boolean
+  flf_ready?: boolean
+  capabilities?: Array<'r2v' | 'flf'>
   impact: string | null
   found?: string[]
   missing_required?: string[]

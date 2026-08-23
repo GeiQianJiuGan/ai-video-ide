@@ -231,6 +231,12 @@ class ComfyPresetProvider:
         if str(status.get("status_str") or "") == "error":
             return TaskState("failed", 1.0, _error_detail(status), raw=history)
         if not outputs_of(history):
+            if str(status.get("status_str") or "").lower() not in {
+                "success",
+                "completed",
+                "complete",
+            }:
+                return TaskState("running", 0.0, "ComfyUI 正在跑", raw=history)
             return TaskState(
                 "failed",
                 1.0,

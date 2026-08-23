@@ -29,6 +29,7 @@ import {
 import AppPanel from '@/shared/ui/AppPanel.vue'
 import AppButton from '@/shared/ui/AppButton.vue'
 import AppBadge from '@/shared/ui/AppBadge.vue'
+import AppDialog from '@/shared/ui/AppDialog.vue'
 import EmptyState from '@/shared/ui/EmptyState.vue'
 import ErrorPanel from '@/shared/ui/ErrorPanel.vue'
 import FeatureHeader from '@/shared/ui/FeatureHeader.vue'
@@ -54,10 +55,13 @@ const pid = computed(() => String(route.params.pid ?? ''))
 const comfyReady = computed(() => sys.deps.find((d) => d.name === 'comfyui')?.ok ?? false)
 
 const newName = ref('')
+const createOpen = ref(false)
+const createAssetId = ref('')
 const deriveName = ref('')
 const picking = ref(false)
 const uploading = ref(false)
 const fileInput = ref<HTMLInputElement | null>(null)
+const createFileInput = ref<HTMLInputElement | null>(null)
 /**
  * 工程内资产总账：sheet 行上只有 asset_id，缩略图要靠 path。
  *
@@ -69,6 +73,15 @@ const assets = ref<Asset[]>([])
 const assetError = ref<ApiError | null>(null)
 
 const assetById = computed(() => new Map(assets.value.map((a) => [a.id, a])))
+const imageAssets = computed(() =>
+  assets.value.filter(
+    (asset) =>
+      !asset.missing &&
+      (asset.mime?.startsWith('image/') ||
+        /\.(png|jpe?g|webp|gif|bmp)$/i.test(asset.path)) &&
+      asset.kind !== 'audio',
+  ),
+)
 /**
  * 两个面板都在说同一件事时只留一个。
  *
@@ -129,9 +142,38 @@ watch(pid, reload)
 
 async function createCharacter(): Promise<void> {
   const name = newName.value.trim()
-  if (!name) return
+  if (!name || !createAssetId.value) return
   newName.value = ''
-  await cast.create(pid.value, name).catch(() => {})
+  await cast.create(pid.value, name, createAssetId.value).catch(() => {})
+  if (!cast.lastError) {
+    createAssetId.value = ''
+    createOpen.value = false
+  }
+}
+
+function openCreate(): void {
+  cast.clearError()
+  assetError.value = null
+  newName.value = ''
+  createAssetId.value = ''
+  createOpen.value = true
+}
+
+async function onCreateFile(event: Event): Promise<void> {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  input.value = ''
+  if (!file) return
+  uploading.value = true
+  try {
+    const asset = await assetsApi.upload(pid.value, file, 'character_sheet')
+    createAssetId.value = asset.id
+    await loadAssets()
+  } catch (err) {
+    assetError.value = err instanceof ApiError ? err : null
+  } finally {
+    uploading.value = false
+  }
 }
 
 async function derive(): Promise<void> {
@@ -184,18 +226,12 @@ async function saveCharacterField(key: string, value: string): Promise<void> {
     <FeatureHeader />
 
     <div class="border-line-1 bg-base-1 flex h-row shrink-0 items-center gap-1 border-b px-2">
-      <input
-        v-model="newName"
-        placeholder="新角色名字，例如 林昭"
-        class="border-line-1 bg-base-2 text-fg-1 placeholder:text-fg-4 h-5 w-44 border px-1.5 text-2xs outline-none focus:border-accent/60"
-        @keyup.enter="createCharacter()"
-      />
       <AppButton
         size="sm"
         variant="primary"
-        :disabled="cast.busy || !newName.trim()"
-        :title="newName.trim() ? `建一个叫「${newName.trim()}」的角色` : '先在左边填一个角色名字'"
-        @click="createCharacter()"
+        :disabled="cast.busy"
+        title="新建角色并绑定默认定妆图"
+        @click="openCreate()"
       >
         <Plus :size="10" />新建角色
       </AppButton>
@@ -469,5 +505,44 @@ async function saveCharacterField(key: string, value: string): Promise<void> {
     </div>
 
     <LibraryPickDialog v-model:open="picking" :pid="pid" kind="character" @adopted="reload()" />
+    <input ref="createFileInput" type="file" accept="image/*" class="hidden" @change="onCreateFile" />
+    <AppDialog
+      :open="createOpen"
+      title="新建角色"
+      subtitle="必须绑定一张默认定妆图"
+      size="sm"
+      @update:open="createOpen = $event"
+    >
+      <form id="create-character" class="space-y-3 p-3" @submit.prevent="createCharacter()">
+        <label class="block">
+          <span class="text-fg-3 text-2xs">角色名称</span>
+          <input v-model="newName" autofocus placeholder="林昭" class="border-line-1 bg-base-2 text-fg-1 mt-0.5 h-row w-full border px-2 text-xs outline-none" />
+        </label>
+        <section>
+          <div class="flex items-center justify-between">
+            <span class="text-fg-3 text-2xs">默认定妆图（必选）</span>
+            <AppButton size="sm" variant="ghost" :disabled="uploading" @click="createFileInput?.click()">
+              <Upload :size="10" />{{ uploading ? '上传中' : '上传图片' }}
+            </AppButton>
+          </div>
+          <div v-if="createAssetId && thumb(createAssetId)" class="border-line-1 bg-base-2 mt-1.5 flex h-32 items-center justify-center overflow-hidden border">
+            <img :src="thumb(createAssetId)" alt="默认定妆图" class="size-full object-contain" />
+          </div>
+          <p v-else class="text-fg-4 mt-1.5 text-2xs">请上传一张角色定妆图后再创建。</p>
+          <div v-if="imageAssets.length" class="mt-2 grid max-h-40 grid-cols-4 gap-1.5 overflow-auto">
+            <button v-for="asset in imageAssets" :key="asset.id" type="button" class="bg-base-2 aspect-square overflow-hidden border" :class="createAssetId === asset.id ? 'border-accent/70 ring-1 ring-accent/30' : 'border-line-1'" title="使用项目中的这张图片" @click="createAssetId = asset.id">
+              <img :src="fileUrl(pid, asset.path)" alt="" class="size-full object-cover" />
+            </button>
+          </div>
+        </section>
+      </form>
+      <template #footer>
+        <span class="flex-1" />
+        <AppButton variant="ghost" @click="createOpen = false">取消</AppButton>
+        <AppButton type="submit" form="create-character" variant="primary" :disabled="cast.busy || uploading || !newName.trim() || !createAssetId">
+          <Plus :size="11" />新建角色
+        </AppButton>
+      </template>
+    </AppDialog>
   </div>
 </template>

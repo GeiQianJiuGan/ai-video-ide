@@ -398,6 +398,25 @@ async function confirmTrim(): Promise<void> {
   trimDrafts.value = next
 }
 
+async function isolateAudioSelection(): Promise<void> {
+  const clip = menuClip.value ?? selected.value
+  if (!clip || clip.track_kind !== 'audio' || !hasTrimDraft(clip)) return
+  const draft = trimBounds(clip)
+  const out = await tl
+    .isolateAudioSelection(pid.value, clip.id, {
+      in_point: draft.inOffset,
+      out_point: draft.outOffset,
+    })
+    .catch(() => null)
+  if (!out) return
+  const next = { ...trimDrafts.value }
+  delete next[clip.id]
+  trimDrafts.value = next
+  selectedId.value = out.selectedClipId
+  note.value = `选中音频已独立切成一段，本次共拆为 ${out.segments} 段。`
+  closeClipMenu()
+}
+
 const splitAt = ref('')
 
 async function doSplit(): Promise<void> {
@@ -1174,6 +1193,15 @@ function goShot(shotId: string | null): void {
                 <Undo2 :size="11" />取消裁切草稿
               </button>
               <button
+                v-if="menuClip.track_kind === 'audio' && hasTrimDraft(menuClip)"
+                class="text-fg-1 hover:bg-base-2 flex w-full items-center gap-1.5 px-2 py-1 text-left text-2xs"
+                :disabled="tl.busy"
+                title="保留全部音频，把两条裁切线之间的选区独立成一段"
+                @click="isolateAudioSelection()"
+              >
+                <Scissors :size="11" />选中切断
+              </button>
+              <button
                 v-if="menuClip.track_kind === 'video'"
                 class="text-fg-1 hover:bg-base-2 flex w-full items-center gap-1.5 px-2 py-1 text-left text-2xs"
                 :disabled="tl.busy || !menuClip.asset_path || menuClip.missing_file"
@@ -1293,6 +1321,17 @@ function goShot(shotId: string | null): void {
             <p v-if="hasTrimDraft(selected)" class="text-st-review mt-1 text-2xs">
               待确认保留 {{ fmt(trimBounds(selected).inOffset) }} → {{ fmt(trimBounds(selected).outOffset) }}；右键片段选择“确认裁切”。
             </p>
+            <AppButton
+              v-if="selected.track_kind === 'audio' && hasTrimDraft(selected)"
+              size="sm"
+              variant="ghost"
+              class="mt-1"
+              :disabled="tl.busy"
+              title="不删除选区外音频，把选中范围独立为一段"
+              @click="isolateAudioSelection()"
+            >
+              <Scissors :size="10" />选中切断
+            </AppButton>
             <div class="mt-1 flex items-end gap-1">
               <label class="block min-w-0 flex-1">
                 <span class="text-fg-4 text-2xs">在第几秒切开（时间线绝对秒数）</span>

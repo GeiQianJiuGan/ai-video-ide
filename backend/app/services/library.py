@@ -614,6 +614,41 @@ class LibraryService:
         lib = await self.current()
         row = await fetch(lib.db, LibAsset, aid, "库素材")
         refs = await self.refs_of(aid)
+        protected: list[dict[str, Any]] = []
+        for ref in refs:
+            if ref["owner_kind"] == "appearance":
+                appearance = await fetch(lib.db, LibAppearance, ref["owner_id"], "形象预设")
+                sheets = await fetch_all(
+                    lib.db, LibSheet, where=LibSheet.appearance_id == appearance.id
+                )
+                current = next((sheet for sheet in sheets if sheet.is_current), None)
+                if appearance.is_default and current is not None and current.asset_id == aid:
+                    protected.append(ref)
+            elif ref["owner_kind"] == "location_variant":
+                variant = await fetch(lib.db, LibLocationVariant, ref["owner_id"], "地点变体")
+                variant_refs = await fetch_all(
+                    lib.db,
+                    LibLocationReference,
+                    where=LibLocationReference.variant_id == variant.id,
+                )
+                current = next((item for item in variant_refs if item.is_current), None)
+                if variant.name == "默认场景" and current is not None and current.asset_id == aid:
+                    protected.append(ref)
+            elif ref["owner_kind"] == "prop":
+                prop_refs = await fetch_all(
+                    lib.db, LibPropReference, where=LibPropReference.prop_id == ref["owner_id"]
+                )
+                current = next((item for item in prop_refs if item.is_current), None)
+                if current is not None and current.asset_id == aid:
+                    protected.append(ref)
+        if protected:
+            raise AppError(
+                ErrorCode.CONFLICT,
+                "默认参考图不能删除",
+                "这是角色、地点或道具的默认定妆图 / 参考图，必须先替换默认图。",
+                ["在对应预设上挂一张新图替换默认图", "其余历史定妆图可以单独删除"],
+                {"asset_id": aid, "protected_refs": protected, "protected_default": True},
+            )
         if refs and not force:
             owners = "、".join(sorted({f"{r['owner_kind']}:{r['owner_id']}" for r in refs}))
             raise AppError(
@@ -753,6 +788,7 @@ class LibraryService:
             "overrides": sorted(f for f in (row.overrides or "").split(",") if f),
             "sheet_count": len(mine),
             "current_sheet": as_dict(current) if current else None,
+            "sheets": [as_dict(sheet) for sheet in sorted(mine, key=lambda item: item.version_no)],
         }
 
     async def list_characters(self) -> list[dict[str, Any]]:
@@ -775,6 +811,8 @@ class LibraryService:
     async def create_character(self, patch: dict[str, Any]) -> dict[str, Any]:
         lib = await self.current()
         name = require_name(patch.get("name"), "角色预设", "林昭")
+        default_asset_id = str(patch.get("default_asset_id") or "").strip()
+        await self._default_asset(default_asset_id, "character_sheet")
         now = utc_now()
         row = LibCharacter(
             id=new_id("library_character"),
@@ -785,9 +823,28 @@ class LibraryService:
         )
         async with lib.db.write() as session:
             session.add(row)
-        # 与工程侧同构：没有形象的角色引用不了，建的时候顺手给一个根形象
-        await self.create_appearance(row.id, {"name": "默认形象"}, default=True)
+        appearance = await self.create_appearance(row.id, {"name": "默认形象"}, default=True)
+        await self.add_sheet(appearance["id"], default_asset_id)
         return as_dict(row)
+
+    async def _default_asset(self, asset_id: str, expected_kind: str) -> dict[str, Any]:
+        if not asset_id:
+            raise AppError(
+                ErrorCode.VALIDATION_ERROR,
+                "必须设置默认参考图",
+                "新建角色、地点或道具时必须选择一张默认定妆图 / 参考图。",
+                [f"先上传 {expected_kind} 类型素材", "再在新建弹窗中选择默认图"],
+            )
+        lib = await self.current()
+        asset = await fetch(lib.db, LibAsset, asset_id, "库素材")
+        if asset.kind not in {expected_kind, "upload"}:
+            raise AppError(
+                ErrorCode.VALIDATION_ERROR,
+                "默认参考图类型不匹配",
+                f"当前素材类型是 {asset.kind}，不能作为 {expected_kind} 使用。",
+                [f"选择 {expected_kind} 类型素材", "或重新上传并选择正确类型"],
+            )
+        return as_dict(asset)
 
     async def update_character(self, cid: str, patch: dict[str, Any]) -> dict[str, Any]:
         lib = await self.current()
@@ -870,7 +927,14 @@ class LibraryService:
 
     async def delete_appearance(self, aid: str) -> None:
         lib = await self.current()
-        await fetch(lib.db, LibAppearance, aid, "形象预设")
+        appearance = await fetch(lib.db, LibAppearance, aid, "形象预设")
+        if appearance.is_default:
+            raise AppError(
+                ErrorCode.CONFLICT,
+                "默认形象不能删除",
+                "角色必须保留一个默认形象及其定妆图。",
+                ["修改默认形象", "另建形象后删除非默认形象"],
+            )
         await self._unlink_owner(aid)
         async with lib.db.write() as session:
             fresh = await session.get(LibAppearance, aid)
@@ -901,6 +965,59 @@ class LibraryService:
         await self.link(asset_id, "appearance", aid, role="sheet")
         return as_dict(row)
 
+    async def delete_sheet(self, sheet_id: str) -> None:
+        lib = await self.current()
+        sheet = await fetch(lib.db, LibSheet, sheet_id, "定妆图")
+        appearance = await fetch(lib.db, LibAppearance, sheet.appearance_id, "形象预设")
+        if appearance.is_default and sheet.is_current:
+            raise AppError(
+                ErrorCode.CONFLICT,
+                "默认定妆图不能删除",
+                "默认形象必须始终保留一张当前定妆图；挂新图即可替换它。",
+                ["先给默认形象挂一张新定妆图", "再删除旧的历史版本"],
+                {"protected_default": True},
+            )
+        siblings = await fetch_all(
+            lib.db, LibSheet, where=LibSheet.appearance_id == appearance.id
+        )
+        await self._unlink_asset_ref(sheet.asset_id, "appearance", appearance.id, "sheet")
+        async with lib.db.write() as session:
+            if sheet.is_current:
+                previous = max(
+                    (item for item in siblings if item.id != sheet.id),
+                    key=lambda item: item.version_no,
+                    default=None,
+                )
+                if previous is not None:
+                    held_previous = await session.get(LibSheet, previous.id)
+                    if held_previous is not None:
+                        held_previous.is_current = 1
+            fresh = await session.get(LibSheet, sheet_id)
+            if fresh is not None:
+                await session.delete(fresh)
+
+    async def _unlink_asset_ref(
+        self, asset_id: str | None, owner_kind: str, owner_id: str, role: str
+    ) -> None:
+        if not asset_id:
+            return
+        lib = await self.current()
+        refs = await fetch_all(
+            lib.db,
+            LibAssetRef,
+            where=(
+                (LibAssetRef.asset_id == asset_id)
+                & (LibAssetRef.owner_kind == owner_kind)
+                & (LibAssetRef.owner_id == owner_id)
+                & (LibAssetRef.role == role)
+            ),
+        )
+        async with lib.db.write() as session:
+            if refs:
+                held = await session.get(LibAssetRef, refs[0].id)
+                if held is not None:
+                    await session.delete(held)
+
     # --- 地点预设 ---
     # 库里删地点不需要像工程那样查 Scene 引用：库不持有任何镜头数据。
 
@@ -920,6 +1037,21 @@ class LibraryService:
                     {
                         **as_dict(v),
                         "reference_count": len([r for r in refs if r.variant_id == v.id]),
+                        "references": [
+                            as_dict(r)
+                            for r in sorted(
+                                [item for item in refs if item.variant_id == v.id],
+                                key=lambda item: item.created_at,
+                            )
+                        ],
+                        "current_reference": next(
+                            (
+                                as_dict(r)
+                                for r in refs
+                                if r.variant_id == v.id and r.is_current
+                            ),
+                            None,
+                        ),
                     }
                     for v in variants
                     if v.location_id == loc.id
@@ -930,6 +1062,8 @@ class LibraryService:
 
     async def create_location(self, patch: dict[str, Any]) -> dict[str, Any]:
         lib = await self.current()
+        default_asset_id = str(patch.get("default_asset_id") or "").strip()
+        await self._default_asset(default_asset_id, "location_reference")
         now = utc_now()
         row = LibLocation(
             id=new_id("library_location"),
@@ -941,6 +1075,8 @@ class LibraryService:
         )
         async with lib.db.write() as session:
             session.add(row)
+        variant = await self.create_variant(row.id, {"name": "默认场景"})
+        await self.add_variant_reference(variant["id"], default_asset_id)
         return as_dict(row)
 
     async def update_location(self, lid: str, patch: dict[str, Any]) -> dict[str, Any]:
@@ -999,7 +1135,15 @@ class LibraryService:
 
     async def delete_variant(self, vid: str) -> None:
         lib = await self.current()
-        await fetch(lib.db, LibLocationVariant, vid, "地点变体预设")
+        variant = await fetch(lib.db, LibLocationVariant, vid, "地点变体预设")
+        if variant.name == "默认场景":
+            raise AppError(
+                ErrorCode.CONFLICT,
+                "默认场景不能删除",
+                "地点必须保留默认场景及其当前参考图。",
+                ["修改默认场景", "新增其他场景变体"],
+                {"protected_default": True},
+            )
         await self._unlink_owner(vid)
         async with lib.db.write() as session:
             fresh = await session.get(LibLocationVariant, vid)
@@ -1012,6 +1156,11 @@ class LibraryService:
         lib = await self.current()
         await fetch(lib.db, LibLocationVariant, vid, "地点变体预设")
         await fetch(lib.db, LibAsset, asset_id, "库素材")
+        existing = await fetch_all(
+            lib.db,
+            LibLocationReference,
+            where=LibLocationReference.variant_id == vid,
+        )
         row = LibLocationReference(
             id=new_id("library_location_reference"),
             variant_id=vid,
@@ -1022,6 +1171,10 @@ class LibraryService:
             created_at=utc_now(),
         )
         async with lib.db.write() as session:
+            for old in existing:
+                held = await session.get(LibLocationReference, old.id)
+                if held is not None:
+                    held.is_current = 0
             session.add(row)
         await self.link(asset_id, "location_variant", vid, role="reference")
         return as_dict(row)
@@ -1035,6 +1188,45 @@ class LibraryService:
             order_by=LibLocationReference.created_at,
         )
         return [as_dict(r) for r in rows]
+
+    async def delete_variant_reference(self, reference_id: str) -> None:
+        lib = await self.current()
+        reference = await fetch(
+            lib.db, LibLocationReference, reference_id, "地点参考图"
+        )
+        variant = await fetch(
+            lib.db, LibLocationVariant, reference.variant_id, "地点变体预设"
+        )
+        if variant.name == "默认场景" and reference.is_current:
+            raise AppError(
+                ErrorCode.CONFLICT,
+                "默认参考图不能删除",
+                "默认场景必须始终保留一张当前参考图；挂新图即可替换它。",
+                ["先给默认场景挂一张新参考图", "再删除旧的历史版本"],
+                {"protected_default": True},
+            )
+        siblings = await fetch_all(
+            lib.db,
+            LibLocationReference,
+            where=LibLocationReference.variant_id == variant.id,
+        )
+        await self._unlink_asset_ref(
+            reference.asset_id, "location_variant", variant.id, "reference"
+        )
+        async with lib.db.write() as session:
+            if reference.is_current:
+                previous = max(
+                    (item for item in siblings if item.id != reference.id),
+                    key=lambda item: item.created_at,
+                    default=None,
+                )
+                if previous is not None:
+                    held_previous = await session.get(LibLocationReference, previous.id)
+                    if held_previous is not None:
+                        held_previous.is_current = 1
+            fresh = await session.get(LibLocationReference, reference_id)
+            if fresh is not None:
+                await session.delete(fresh)
 
     # --- 道具预设 ---
 
@@ -1053,12 +1245,15 @@ class LibraryService:
                     "tags": tags.get(prop.id, []),
                     "reference_count": len(mine),
                     "current_reference": as_dict(current) if current else None,
+                    "references": [as_dict(item) for item in mine],
                 }
             )
         return out
 
     async def create_prop(self, patch: dict[str, Any]) -> dict[str, Any]:
         lib = await self.current()
+        default_asset_id = str(patch.get("default_asset_id") or "").strip()
+        await self._default_asset(default_asset_id, "prop_reference")
         now = utc_now()
         row = LibProp(
             id=new_id("library_prop"),
@@ -1070,6 +1265,7 @@ class LibraryService:
         )
         async with lib.db.write() as session:
             session.add(row)
+        await self.add_prop_reference(row.id, default_asset_id)
         return as_dict(row)
 
     async def update_prop(self, prop_id: str, patch: dict[str, Any]) -> dict[str, Any]:
@@ -1120,6 +1316,23 @@ class LibraryService:
             session.add(row)
         await self.link(asset_id, "prop", prop_id, role="reference")
         return as_dict(row)
+
+    async def delete_prop_reference(self, reference_id: str) -> None:
+        lib = await self.current()
+        reference = await fetch(lib.db, LibPropReference, reference_id, "道具参考图")
+        if reference.is_current:
+            raise AppError(
+                ErrorCode.CONFLICT,
+                "默认参考图不能删除",
+                "道具必须始终保留一张当前参考图；挂新图即可替换它。",
+                ["先给道具挂一张新参考图", "再删除旧的历史版本"],
+                {"protected_default": True},
+            )
+        await self._unlink_asset_ref(reference.asset_id, "prop", reference.prop_id, "reference")
+        async with lib.db.write() as session:
+            fresh = await session.get(LibPropReference, reference_id)
+            if fresh is not None:
+                await session.delete(fresh)
 
     # --- 采用用的整份快照（services/adopt.py 照着它在工程里建副本） ---
 

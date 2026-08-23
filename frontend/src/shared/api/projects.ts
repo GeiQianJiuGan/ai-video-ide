@@ -28,6 +28,10 @@ export interface Project {
 export interface ProjectPreset {
   name: string | null
   preset: import('./settings').PresetRow | null
+  r2v_name: string | null
+  r2v_preset: import('./settings').PresetRow | null
+  flf_name: string | null
+  flf_preset: import('./settings').PresetRow | null
 }
 
 export interface RecentProject {
@@ -60,4 +64,6 @@ export const projectsApi = {
   preset: (pid: string) => api.get<ProjectPreset>(`/projects/${pid}/preset`),
   setPreset: (pid: string, name: string | null) =>
     api.put<ProjectPreset>(`/projects/${pid}/preset`, { name }),
+  setVideoPresets: (pid: string, r2v_name: string | null, flf_name: string | null) =>
+    api.put<ProjectPreset>(`/projects/${pid}/preset`, { r2v_name, flf_name }),
 }

@@ -26,7 +26,7 @@
  */
 import { computed } from 'vue'
 import { RouterLink, useRoute, useRouter } from 'vue-router'
-import { ArrowLeft, CornerUpLeft, Lock, Settings } from '@lucide/vue'
+import { ArrowLeft, Lock, Settings } from '@lucide/vue'
 import {
   APP_NAV_FEATURES,
   GROUPS,
@@ -51,17 +51,20 @@ const openPid = computed(() => routePid.value ?? proj.current?.id ?? null)
 /** 应用级功能只在没打开工程时出现——这就是「两级」的那道界。 */
 const appItems = computed<Feature[]>(() => (openPid.value ? [] : APP_NAV_FEATURES))
 
+/** 概览固定放在项目列表下方，不参与素材层 / 叙事层分组。 */
+const overviewItem = computed<Feature | null>(() => {
+  if (!openPid.value) return null
+  return PROJECT_NAV_FEATURES.find((feature) => feature.id === 'dashboard') ?? null
+})
+
 /** 项目内分组：没打开工程时整段为空，模板里连标题都不画。 */
 const grouped = computed<{ title: string; items: Feature[] }[]>(() => {
   if (!openPid.value) return []
   return GROUPS.map((g) => ({
     title: g.title,
-    items: PROJECT_NAV_FEATURES.filter((f) => f.group === g.id),
+    items: PROJECT_NAV_FEATURES.filter((f) => f.id !== 'dashboard' && f.group === g.id),
   })).filter((g) => g.items.length > 0)
 })
-
-/** 人在应用级页面上，但工程还开着——给一条回去的路，不然设置页就是个单向门。 */
-const resumable = computed(() => (routePid.value ? null : proj.current))
 
 function tip(f: Feature): string {
   return `${f.title} · ${f.purpose}${f.ready ? '' : `（${f.milestone} 启用）`}`
@@ -93,15 +96,18 @@ function leaveProject(): void {
       <span class="w-full truncate text-center text-[9px] leading-none">项目列表</span>
     </button>
 
-    <!-- 工程还开着但人在应用级页面上：回去的路 -->
+    <!-- 概览是工程入口，固定在项目列表之下、所有创作层级之上。 -->
     <RouterLink
-      v-if="resumable"
-      :to="{ name: 'dashboard', params: { pid: resumable.id } }"
-      class="text-accent hover:bg-base-2 flex w-10 shrink-0 flex-col items-center gap-0.5 rounded-sm py-1 transition-colors"
-      :title="`回到《${resumable.name}》· 这个工程还开着，没有退出`"
+      v-if="overviewItem"
+      :to="{ name: overviewItem.route, params: { pid: openPid } }"
+      class="text-fg-3 hover:text-fg-1 hover:bg-base-2 relative flex w-10 shrink-0 flex-col items-center gap-0.5 rounded-sm py-1 transition-colors"
+      exact-active-class="text-accent bg-base-2"
+      :title="tip(overviewItem)"
     >
-      <CornerUpLeft :size="16" :stroke-width="1.6" />
-      <span class="w-full truncate text-center text-[9px] leading-none">返回工程</span>
+      <component :is="overviewItem.icon" :size="16" :stroke-width="1.6" />
+      <span class="w-full truncate text-center text-[9px] leading-none">
+        {{ NAV_LABEL[overviewItem.id] ?? overviewItem.title }}
+      </span>
     </RouterLink>
 
     <!-- 没打开工程时才有应用级功能：项目管理 / 素材库 -->
@@ -131,7 +137,7 @@ function leaveProject(): void {
         :key="f.id"
         :to="{ name: f.route, params: { pid: openPid } }"
         class="text-fg-3 hover:text-fg-1 hover:bg-base-2 relative flex w-10 flex-col items-center gap-0.5 rounded-sm py-1 transition-colors"
-        active-class="text-accent bg-base-2"
+        exact-active-class="text-accent bg-base-2"
         :title="tip(f)"
       >
         <component :is="f.icon" :size="16" :stroke-width="1.6" />

@@ -151,12 +151,13 @@ export const useLibraryStore = defineStore('library', () => {
   async function createPreset(
     kind: 'character' | 'location' | 'prop',
     name: string,
+    defaultAssetId: string,
   ): Promise<void> {
     busy.value = true
     try {
-      if (kind === 'character') await libraryApi.createCharacter({ name })
-      else if (kind === 'location') await libraryApi.createLocation({ name })
-      else await libraryApi.createProp({ name })
+      if (kind === 'character') await libraryApi.createCharacter({ name, default_asset_id: defaultAssetId })
+      else if (kind === 'location') await libraryApi.createLocation({ name, default_asset_id: defaultAssetId })
+      else await libraryApi.createProp({ name, default_asset_id: defaultAssetId })
       await reload()
     } catch (err) {
       fail(err)
@@ -202,6 +203,22 @@ export const useLibraryStore = defineStore('library', () => {
       if (target.kind === 'appearance') await libraryApi.addSheet(target.id, assetId)
       else if (target.kind === 'variant') await libraryApi.addVariantReference(target.id, assetId)
       else await libraryApi.addPropReference(target.id, assetId)
+      await reload()
+    } catch (err) {
+      fail(err)
+    } finally {
+      busy.value = false
+    }
+  }
+
+  async function deleteReference(
+    target: { kind: 'sheet' | 'variant' | 'prop'; id: string },
+  ): Promise<void> {
+    busy.value = true
+    try {
+      if (target.kind === 'sheet') await libraryApi.deleteSheet(target.id)
+      else if (target.kind === 'variant') await libraryApi.deleteVariantReference(target.id)
+      else await libraryApi.deletePropReference(target.id)
       await reload()
     } catch (err) {
       fail(err)
@@ -278,6 +295,7 @@ export const useLibraryStore = defineStore('library', () => {
     createVariant,
     deletePreset,
     attachReference,
+    deleteReference,
     createTag,
     tagAsset,
     adoptPlan,

@@ -45,6 +45,10 @@ class Project(Base):
     generation_mode: Mapped[str] = mapped_column(String(20), nullable=False, default="comfy_preset")
     #: 项目唯一生成预设；预设由应用级管理，项目只选择其中一份。
     preset_name: Mapped[str | None] = mapped_column(String(100))
+    #: 普通 Shot 的 R2V 预设；为空时回退到旧的 preset_name。
+    r2v_preset_name: Mapped[str | None] = mapped_column(String(100))
+    #: 首尾帧 / FL2VA 衔接预设；为空时回退到旧的 preset_name。
+    flf_preset_name: Mapped[str | None] = mapped_column(String(100))
     default_prompt_style: Mapped[str | None] = mapped_column(Text)
     negative_prompt: Mapped[str | None] = mapped_column(Text)
 

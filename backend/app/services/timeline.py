@@ -544,6 +544,109 @@ class TimelineService:
         await self._reindex(pid, clip.track_id)
         return await self.get(pid)
 
+    async def isolate_audio_selection(
+        self,
+        pid: str,
+        clip_id: str,
+        *,
+        in_point: float,
+        out_point: float,
+    ) -> dict[str, Any]:
+        """把音频裁切线之间的选区独立成一段，选区外内容原样保留。"""
+        db = db_of(pid)
+        clip = await fetch(db, TimelineClip, clip_id, "片段")
+        track = await fetch(db, Track, clip.track_id, "轨道")
+        if track.kind != "audio":
+            raise AppError(
+                ErrorCode.VALIDATION_ERROR,
+                "选中切断只用于音频片段",
+                f"{track.name} 不是音频轨。",
+                ["在音频轨上拖出选区后再切断"],
+            )
+        source_in = float(clip.in_point)
+        source_out = float(
+            clip.out_point if clip.out_point is not None else clip.in_point + clip.duration
+        )
+        selected_in = float(in_point)
+        selected_out = float(out_point)
+        if (
+            selected_in < source_in - 0.001
+            or selected_out > source_out + 0.001
+            or selected_out - selected_in < 0.05
+        ):
+            raise AppError(
+                ErrorCode.VALIDATION_ERROR,
+                "音频选区无效",
+                f"原片段范围 {source_in:.3f}~{source_out:.3f}，收到 {selected_in:.3f}~{selected_out:.3f}。",
+                ["把两条裁切线放在原音频范围内", "选区至少保留 0.05 秒"],
+                {"clip_id": clip_id},
+            )
+        before = max(0.0, selected_in - source_in)
+        selected_duration = selected_out - selected_in
+        after = max(0.0, source_out - selected_out)
+        if before < 0.001 and after < 0.001:
+            raise AppError(
+                ErrorCode.VALIDATION_ERROR,
+                "还没有可切断的边界",
+                "当前选区就是完整音频片段。",
+                ["先拖动左边或右边的裁切线形成选区"],
+            )
+
+        def piece(
+            *, piece_id: str, start: float, duration: float, start_in: float, end_out: float
+        ) -> TimelineClip:
+            return TimelineClip(
+                id=piece_id,
+                track_id=clip.track_id,
+                shot_id=clip.shot_id,
+                version_id=clip.version_id,
+                asset_id=clip.asset_id,
+                index_no=clip.index_no,
+                start=start,
+                duration=duration,
+                in_point=start_in,
+                out_point=end_out,
+                label=clip.label,
+                muted=clip.muted,
+                volume=clip.volume,
+                source_clip_id=clip.source_clip_id,
+            )
+
+        await self._capture(pid)
+        async with db.write() as session:
+            selected = await session.get(TimelineClip, clip_id)
+            assert selected is not None
+            selected.start = clip.start + before
+            selected.duration = selected_duration
+            selected.in_point = selected_in
+            selected.out_point = selected_out
+            if before >= 0.001:
+                session.add(
+                    piece(
+                        piece_id=new_id("timeline_clip"),
+                        start=clip.start,
+                        duration=before,
+                        start_in=source_in,
+                        end_out=selected_in,
+                    )
+                )
+            if after >= 0.001:
+                session.add(
+                    piece(
+                        piece_id=new_id("timeline_clip"),
+                        start=clip.start + before + selected_duration,
+                        duration=after,
+                        start_in=selected_out,
+                        end_out=source_out,
+                    )
+                )
+        await self._reindex(pid, clip.track_id)
+        return {
+            "selected_clip_id": clip_id,
+            "segments": 1 + int(before >= 0.001) + int(after >= 0.001),
+            "timeline": await self.get(pid),
+        }
+
     async def delete_clip(self, pid: str, clip_id: str, *, ripple: bool = True) -> dict[str, Any]:
         """删一个片段。
 

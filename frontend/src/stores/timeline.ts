@@ -140,6 +140,16 @@ export const useTimelineStore = defineStore('timeline', () => {
     })
   }
 
+  async function isolateAudioSelection(
+    pid: string,
+    clipId: string,
+    body: { in_point: number; out_point: number },
+  ): Promise<{ selectedClipId: string; segments: number }> {
+    const out = await guarded(() => timelineApi.isolateAudioSelection(pid, clipId, body))
+    timeline.value = out.timeline
+    return { selectedClipId: out.selected_clip_id, segments: out.segments }
+  }
+
   async function remove(pid: string, clipId: string, ripple = true): Promise<void> {
     await guarded(async () => {
       timeline.value = await timelineApi.remove(pid, clipId, ripple)
@@ -307,6 +317,7 @@ export const useTimelineStore = defineStore('timeline', () => {
     move,
     trim,
     split,
+    isolateAudioSelection,
     remove,
     replaceVersion,
     setMix,

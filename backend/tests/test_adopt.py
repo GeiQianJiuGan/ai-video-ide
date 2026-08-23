@@ -103,8 +103,15 @@ def test_adopted_character_keeps_its_appearance_chain(
     client: TestClient, pid: str, project_dir: Path, library: dict[str, Any]
 ) -> None:
     """角色预设连形象链一起搬：继承关系要保住，且不能多出一个谁也没填的空形象。"""
+    root_asset = lib_png(client, kind="character_sheet", name="root-sheet.png")
     char = client.post(
-        "/api/v1/library/characters", json={"name": "林昭", "gender": "女", "personality": "沉默"}
+        "/api/v1/library/characters",
+        json={
+            "name": "林昭",
+            "gender": "女",
+            "personality": "沉默",
+            "default_asset_id": root_asset,
+        },
     ).json()
     root = client.get("/api/v1/library/characters").json()[0]["appearances"][0]
     client.patch(f"/api/v1/library/appearances/{root['id']}", json={"face": "圆脸", "age": "12"})
@@ -148,8 +155,14 @@ def test_adopted_character_keeps_its_appearance_chain(
 def test_adopted_location_and_prop_bring_their_references(
     client: TestClient, pid: str, project_dir: Path, library: dict[str, Any]
 ) -> None:
+    loc_default = lib_png(client, kind="location_reference", name="loc-default.png")
     loc = client.post(
-        "/api/v1/library/locations", json={"name": "城南旧宅", "description": "青砖"}
+        "/api/v1/library/locations",
+        json={
+            "name": "城南旧宅",
+            "description": "青砖",
+            "default_asset_id": loc_default,
+        },
     ).json()
     variant = client.post(
         f"/api/v1/library/locations/{loc['id']}/variants",
@@ -159,7 +172,11 @@ def test_adopted_location_and_prop_bring_their_references(
         f"/api/v1/library/variants/{variant['id']}/references",
         json={"asset_id": lib_png(client, kind="location_reference", name="loc.png")},
     )
-    prop = client.post("/api/v1/library/props", json={"name": "油纸伞"}).json()
+    prop_default = lib_png(client, kind="prop_reference", name="prop-default.png")
+    prop = client.post(
+        "/api/v1/library/props",
+        json={"name": "油纸伞", "default_asset_id": prop_default},
+    ).json()
     client.post(
         f"/api/v1/library/props/{prop['id']}/references",
         json={"asset_id": lib_png(client, kind="prop_reference", name="prop.png")},
@@ -171,15 +188,15 @@ def test_adopted_location_and_prop_bring_their_references(
     locs = client.get(f"/api/v1/projects/{pid}/locations").json()
     assert locs[0]["name"] == "城南旧宅"
     assert locs[0]["origin_library_id"] == loc["id"]
-    assert [v["name"] for v in locs[0]["variants"]] == ["雨夜"]
-    assert locs[0]["variants"][0]["weather"] == "雨"
-    vid = locs[0]["variants"][0]["id"]
-    refs = client.get(f"/api/v1/projects/{pid}/variants/{vid}/references").json()
-    assert len(refs) == 1
+    assert [v["name"] for v in locs[0]["variants"]] == ["默认场景", "雨夜"]
+    assert locs[0]["variants"][1]["weather"] == "雨"
+    for variant in locs[0]["variants"]:
+        refs = client.get(f"/api/v1/projects/{pid}/variants/{variant['id']}/references").json()
+        assert len(refs) == 1
 
     props = client.get(f"/api/v1/projects/{pid}/props").json()
     assert props[0]["origin_library_id"] == prop["id"]
-    assert props[0]["reference_count"] == 1
+    assert props[0]["reference_count"] == 2
 
     for row in _assets(client, pid):
         assert (project_dir / row["path"]).is_file()

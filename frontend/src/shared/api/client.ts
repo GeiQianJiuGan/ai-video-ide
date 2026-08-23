@@ -40,7 +40,7 @@ export interface ErrorPayload {
   title: string
   detail: string
   suggestions: string[]
-  related_ids: Record<string, string>
+  related_ids: Record<string, unknown>
 }
 
 export class ApiError extends Error {
@@ -49,7 +49,7 @@ export class ApiError extends Error {
   readonly title: string
   readonly detail: string
   readonly suggestions: string[]
-  readonly relatedIds: Record<string, string>
+  readonly relatedIds: Record<string, unknown>
   readonly status: number
 
   constructor(payload: ErrorPayload, status: number) {
@@ -85,7 +85,7 @@ export function isProjectNotOpen(err: unknown): boolean {
  * 判定看的是这个字段而不是 code 白名单——以后再多一种确认，UI 一行都不用改。
  */
 export function confirmFlagOf(err: unknown): string {
-  return err instanceof ApiError ? (err.relatedIds.confirm ?? '') : ''
+  return err instanceof ApiError ? String(err.relatedIds.confirm ?? '') : ''
 }
 
 function networkError(cause: unknown): ApiError {

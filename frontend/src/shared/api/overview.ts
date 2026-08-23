@@ -116,6 +116,11 @@ export interface EnvironmentStatus {
     preset_name: string | null
     preset_ready: boolean
     ref_slots: number | null
+    r2v_name: string | null
+    r2v_ready: boolean
+    r2v_ref_slots: number | null
+    flf_name: string | null
+    flf_ready: boolean
     detail: string
   } | null
 }

@@ -251,6 +251,8 @@ class ProjectService:
                         aspect_ratio=aspect_ratio(width, height),
                         duration_unit=duration_unit,
                         preset_name=settings.video_preset or None,
+                        r2v_preset_name=settings.video_preset or None,
+                        flf_preset_name=settings.video_preset or None,
                         schema_version=settings.schema_version,
                         created_at=now,
                         updated_at=now,
@@ -367,11 +369,18 @@ class ProjectService:
 
             migrated_from = stored if stored < settings.schema_version else None
             inherited_preset = row.preset_name or settings.video_preset or None
-            if row.preset_name is None and inherited_preset:
+            missing_r2v = row.r2v_preset_name is None
+            missing_flf = row.flf_preset_name is None
+            if (row.preset_name is None or missing_r2v or missing_flf) and inherited_preset:
                 async with db.write() as session:
                     fresh = await session.get(Project, row.id)
                     if fresh is not None:
-                        fresh.preset_name = inherited_preset
+                        if fresh.preset_name is None:
+                            fresh.preset_name = inherited_preset
+                        if fresh.r2v_preset_name is None:
+                            fresh.r2v_preset_name = inherited_preset
+                        if fresh.flf_preset_name is None:
+                            fresh.flf_preset_name = inherited_preset
                         fresh.updated_at = utc_now()
             proj = OpenProject(
                 id=row.id,

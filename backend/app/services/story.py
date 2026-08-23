@@ -996,8 +996,18 @@ class StoryService:
                 shot_chars = [
                     str(c) for c in (shot.get("characters") or scene_char_names) if str(c).strip()
                 ]
-                visual_and_sound_prompt = (
-                    str(shot.get("prompt") or "").strip() or f"{description}，{scene_prompt}"
+                camera_motion = (
+                    str(shot.get("camera_motion") or "").strip()
+                    or f"{shot.get('camera') or '中景'}，{shot.get('movement') or '固定'}"
+                )
+                visual_prompt = (
+                    str(shot.get("visual_prompt") or "").strip()
+                    or str(shot.get("prompt") or "").strip()
+                    or f"{description}，{scene_prompt}"
+                )
+                audio_dialogue = str(shot.get("audio_dialogue") or "").strip()
+                visual_and_sound_prompt = prompts.format_shot_prompt(
+                    hi + 1, camera_motion, visual_prompt, audio_dialogue, description
                 )
                 base_negative = (
                     str(shot.get("negative_prompt") or "").strip() or default_negative
@@ -1014,6 +1024,9 @@ class StoryService:
                         "duration": float(shot.get("duration") or 4.0),
                         "camera": str(shot.get("camera") or "中景"),
                         "movement": str(shot.get("movement") or "固定"),
+                        "camera_motion": camera_motion,
+                        "visual_prompt": visual_prompt,
+                        "audio_dialogue": audio_dialogue,
                         "characters": shot_chars,
                         "prompt": shot_prompt,
                         "negative_prompt": shot_negative,

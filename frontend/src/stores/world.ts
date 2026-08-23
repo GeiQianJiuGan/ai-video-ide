@@ -130,9 +130,9 @@ export const useWorldStore = defineStore('world', () => {
     await guarded(() => loadVariantDetail(pid))
   }
 
-  async function createLocation(pid: string, name: string): Promise<Location> {
+  async function createLocation(pid: string, name: string, defaultAssetId: string): Promise<Location> {
     return guarded(async () => {
-      const row = await worldApi.createLocation(pid, { name })
+      const row = await worldApi.createLocation(pid, { name, default_asset_id: defaultAssetId })
       selectedLocationId.value = row.id
       selectedVariantId.value = ''
       await loadLocations(pid)
@@ -205,9 +205,9 @@ export const useWorldStore = defineStore('world', () => {
     await guarded(() => loadPropDetail(pid))
   }
 
-  async function createProp(pid: string, name: string): Promise<Prop> {
+  async function createProp(pid: string, name: string, defaultAssetId: string): Promise<Prop> {
     return guarded(async () => {
-      const row = await worldApi.createProp(pid, { name })
+      const row = await worldApi.createProp(pid, { name, default_asset_id: defaultAssetId })
       selectedPropId.value = row.id
       await loadProps(pid)
       return row

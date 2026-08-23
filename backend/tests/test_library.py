@@ -133,31 +133,61 @@ def test_generated_kinds_stay_out_of_the_library(
     assert any("character_sheet" in s for s in error_of(resp)["suggestions"])
 
 
+def test_presets_require_a_default_image(client: TestClient, library: dict[str, Any]) -> None:
+    for path in ("characters", "locations", "props"):
+        resp = client.post(f"/api/v1/library/{path}", json={"name": "缺图预设"})
+        assert resp.status_code == 422, resp.text
+        assert error_of(resp)["code"] == "VALIDATION_ERROR"
+
+
 def test_asset_delete_reports_who_uses_it(client: TestClient, library: dict[str, Any]) -> None:
     aid = lib_png(client, kind="character_sheet", name="sheet.png")
-    client.post("/api/v1/library/characters", json={"name": "林昭"})
-    app_id = client.get("/api/v1/library/characters").json()[0]["appearances"][0]["id"]
-    sheet = client.post(f"/api/v1/library/appearances/{app_id}/sheets", json={"asset_id": aid})
-    assert sheet.status_code == 201, sheet.text
+    created = client.post(
+        "/api/v1/library/characters", json={"name": "林昭", "default_asset_id": aid}
+    )
+    assert created.status_code == 201, created.text
+    appearance = client.get("/api/v1/library/characters").json()[0]["appearances"][0]
 
     blocked = client.delete(f"/api/v1/library/assets/{aid}")
     assert blocked.status_code == 409, blocked.text
     err = error_of(blocked)
-    assert any("采用是单向复制" in s for s in err["suggestions"])
+    assert err["related_ids"]["protected_default"] is True
 
     forced = client.delete(f"/api/v1/library/assets/{aid}?force=true")
-    assert forced.status_code == 200, forced.text
-    assert forced.json()["file_removed"] is True
+    assert forced.status_code == 409, forced.text
+
+    replacement = lib_png(client, kind="character_sheet", name="sheet-v2.png")
+    added = client.post(
+        f"/api/v1/library/appearances/{appearance['id']}/sheets",
+        json={"asset_id": replacement},
+    )
+    assert added.status_code == 201, added.text
+    old_sheet = next(
+        sheet
+        for sheet in client.get("/api/v1/library/characters").json()[0]["appearances"][0]["sheets"]
+        if sheet["asset_id"] == aid
+    )
+    assert client.delete(f"/api/v1/library/sheets/{old_sheet['id']}").status_code == 204
+    removed = client.delete(f"/api/v1/library/assets/{aid}")
+    assert removed.status_code == 200, removed.text
 
 
 def test_character_preset_crud(client: TestClient, library: dict[str, Any]) -> None:
     """角色预设与工程侧同构：建角色顺手给一个默认形象，派生形象只覆写自己填的字段。"""
+    default_sheet = lib_png(client, kind="character_sheet", name="default-character.png")
     char = client.post(
         "/api/v1/library/characters",
-        json={"name": "林昭", "gender": "女", "personality": "沉默"},
+        json={
+            "name": "林昭",
+            "gender": "女",
+            "personality": "沉默",
+            "default_asset_id": default_sheet,
+        },
     ).json()
     root = client.get("/api/v1/library/characters").json()[0]["appearances"][0]
     assert root["is_default"] == 1
+    assert root["current_sheet"]["asset_id"] == default_sheet
+    assert client.delete(f"/api/v1/library/appearances/{root['id']}").status_code == 409
 
     client.patch(f"/api/v1/library/appearances/{root['id']}", json={"face": "圆脸", "age": "12"})
     derived = client.post(
@@ -176,8 +206,14 @@ def test_character_preset_crud(client: TestClient, library: dict[str, Any]) -> N
 
 
 def test_location_and_prop_presets(client: TestClient, library: dict[str, Any]) -> None:
+    default_location = lib_png(client, kind="location_reference", name="loc-default.png")
     loc = client.post(
-        "/api/v1/library/locations", json={"name": "城南旧宅", "description": "青砖"}
+        "/api/v1/library/locations",
+        json={
+            "name": "城南旧宅",
+            "description": "青砖",
+            "default_asset_id": default_location,
+        },
     ).json()
     variant = client.post(
         f"/api/v1/library/locations/{loc['id']}/variants",
@@ -190,7 +226,11 @@ def test_location_and_prop_presets(client: TestClient, library: dict[str, Any]) 
     )
     assert ref.status_code == 201, ref.text
 
-    prop = client.post("/api/v1/library/props", json={"name": "油纸伞"}).json()
+    default_prop = lib_png(client, kind="prop_reference", name="prop-default.png")
+    prop = client.post(
+        "/api/v1/library/props",
+        json={"name": "油纸伞", "default_asset_id": default_prop},
+    ).json()
     assert (
         client.post(
             f"/api/v1/library/props/{prop['id']}/references",
@@ -200,8 +240,26 @@ def test_location_and_prop_presets(client: TestClient, library: dict[str, Any]) 
     )
 
     locs = client.get("/api/v1/library/locations").json()
-    assert locs[0]["variants"][0]["reference_count"] == 1
-    assert client.get("/api/v1/library/props").json()[0]["reference_count"] == 1
+    assert [variant["name"] for variant in locs[0]["variants"]] == ["默认场景", "雨夜"]
+    assert all(variant["reference_count"] == 1 for variant in locs[0]["variants"])
+    default_variant = locs[0]["variants"][0]
+    assert (
+        client.delete(
+            f"/api/v1/library/location-references/{default_variant['current_reference']['id']}"
+        ).status_code
+        == 409
+    )
+
+    prop_row = client.get("/api/v1/library/props").json()[0]
+    assert prop_row["reference_count"] == 2
+    assert (
+        client.delete(
+            f"/api/v1/library/prop-references/{prop_row['current_reference']['id']}"
+        ).status_code
+        == 409
+    )
+    historical = next(item for item in prop_row["references"] if not item["is_current"])
+    assert client.delete(f"/api/v1/library/prop-references/{historical['id']}").status_code == 204
 
 
 def test_tags_filter_assets(client: TestClient, library: dict[str, Any]) -> None:

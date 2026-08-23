@@ -30,7 +30,10 @@ def _allow_ref_drop() -> Any:
 
 
 class EnqueueShotBody(BaseModel):
-    kind: str | None = Field(default=None, description="能力名；留空按是否有上游自动判断")
+    kind: str | None = Field(
+        default=None,
+        description="能力名；留空生成普通 R2V Shot，首尾帧 / 转场请显式传 first_last_frame",
+    )
     priority: int = 100
     workflow_id: str | None = None
     check_context: bool = Field(default=True, description="false 表示跳过上下文完整性门槛")

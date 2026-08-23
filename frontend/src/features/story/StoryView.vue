@@ -9,14 +9,15 @@
  *   2. **序号是时间顺序**——Scene / Shot 的 index_no 由后端重排，前端只提交顺序。
  *   3. Scene 挂的是**地点变体**（雨夜 / 白天），不是地点本身，所以下拉框按地点分组。
  *
- * 镜头的提示词、Workflow、上下文不在这一页——那是镜头编辑器的活。这里只管
- * 「有哪些场、每场有哪些镜头、各多长」。
+ * 已落库的每个 Shot 都可以通过右侧编辑按钮在弹窗里查看剧情详情、AI 选中的角色和生成 Prompt；
+ * 需要上下文账单、版本轨等高级操作时，再进入单 Shot 工作台。
  */
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   ChevronDown,
   ChevronUp,
+  Pencil,
   Plus,
   RefreshCw,
   Save,
@@ -28,10 +29,12 @@ import {
 import AppPanel from '@/shared/ui/AppPanel.vue'
 import AppButton from '@/shared/ui/AppButton.vue'
 import AppBadge from '@/shared/ui/AppBadge.vue'
+import AppDialog from '@/shared/ui/AppDialog.vue'
 import EmptyState from '@/shared/ui/EmptyState.vue'
 import ErrorPanel from '@/shared/ui/ErrorPanel.vue'
 import FeatureHeader from '@/shared/ui/FeatureHeader.vue'
 import type { ProposedScene, ProposedShot } from '@/shared/api/story'
+import { castApi, type AppearanceRow, type Character } from '@/shared/api/cast'
 import { useStoryStore } from '@/stores/story'
 import { useWorldStore } from '@/stores/world'
 import { useQueueStore } from '@/stores/queue'
@@ -59,6 +62,39 @@ const newShotTitle = ref('')
 const proposal = computed(() => story.proposal)
 const llmReady = computed(() => story.llm?.configured ?? false)
 
+type ShotDraft = {
+  title: string
+  description: string
+  duration: number
+  camera: string
+  movement: string
+  prompt: string
+  negative_prompt: string
+}
+
+const shotDraft = ref<ShotDraft | null>(null)
+const shotCastIds = ref<string[]>([])
+const shotEditorBusy = ref(false)
+const shotEditorOpen = ref(false)
+const appearances = ref<{ row: AppearanceRow; character: Character }[]>([])
+
+const shotDirty = computed(() => {
+  const current = story.shot
+  const draft = shotDraft.value
+  if (!current || !draft) return false
+  return (
+    draft.title !== current.title ||
+    draft.description !== (current.description ?? '') ||
+    draft.duration !== current.duration ||
+    draft.camera !== (current.camera ?? '') ||
+    draft.movement !== (current.movement ?? '') ||
+    draft.prompt !== (current.prompt ?? '') ||
+    draft.negative_prompt !== (current.negative_prompt ?? '') ||
+    shotCastIds.value.slice().sort().join(',') !==
+      current.cast.map((row) => row.appearance_id).slice().sort().join(',')
+  )
+})
+
 /** 提案里被接受的条数——落库按钮上写清「要写几条」，别让人蒙着点。 */
 const accepted = computed(() => {
   const list = proposal.value?.scenes ?? []
@@ -72,6 +108,25 @@ const accepted = computed(() => {
 function syncDraft(): void {
   draftText.value = story.story?.raw_text ?? ''
   draftTitle.value = story.story?.title ?? ''
+}
+
+function syncShotDraft(): void {
+  const current = story.shot
+  if (!current) {
+    shotDraft.value = null
+    shotCastIds.value = []
+    return
+  }
+  shotDraft.value = {
+    title: current.title,
+    description: current.description ?? '',
+    duration: current.duration,
+    camera: current.camera ?? '',
+    movement: current.movement ?? '',
+    prompt: current.prompt ?? '',
+    negative_prompt: current.negative_prompt ?? '',
+  }
+  shotCastIds.value = current.cast.map((row) => row.appearance_id)
 }
 
 /**
@@ -89,11 +144,90 @@ async function reload(): Promise<void> {
   await story.load(pid.value).catch(() => {})
   await story.loadBoard(pid.value).catch(() => {})
   await world.loadWorld(pid.value).catch(() => {})
+  await loadAppearances()
   syncDraft()
 }
 
 onMounted(reload)
 watch(pid, reload)
+watch(
+  () => story.shot,
+  () => {
+    if (!shotEditorBusy.value) syncShotDraft()
+  },
+  { immediate: true },
+)
+
+async function loadAppearances(): Promise<void> {
+  if (!pid.value) return
+  try {
+    const chars = await castApi.characters(pid.value)
+    const nested = await Promise.all(
+      chars.map(async (character) => ({
+        character,
+        rows: await castApi.appearances(pid.value, character.id),
+      })),
+    )
+    appearances.value = nested.flatMap(({ character, rows }) =>
+      rows.map((row) => ({ row, character })),
+    )
+  } catch {
+    appearances.value = []
+  }
+}
+
+async function openShotEditor(shotId: string): Promise<void> {
+  if (shotDirty.value) {
+    await saveShotEditor()
+    if (shotDirty.value) return
+  }
+  if (story.selectedShotId !== shotId || story.shot?.id !== shotId) {
+    await story.selectShot(pid.value, shotId).catch(() => {})
+  }
+  if (story.shot?.id === shotId) shotEditorOpen.value = true
+}
+
+async function setShotEditorOpen(open: boolean): Promise<void> {
+  if (open) {
+    shotEditorOpen.value = true
+    return
+  }
+  if (shotDirty.value) syncShotDraft()
+  shotEditorOpen.value = false
+}
+
+function toggleShotAppearance(appearanceId: string): void {
+  shotCastIds.value = shotCastIds.value.includes(appearanceId)
+    ? shotCastIds.value.filter((id) => id !== appearanceId)
+    : [...shotCastIds.value, appearanceId]
+}
+
+async function saveShotEditor(): Promise<void> {
+  const current = story.shot
+  const draft = shotDraft.value
+  if (!current || !draft) return
+  const castIds = [...shotCastIds.value]
+  shotEditorBusy.value = true
+  try {
+    await story.updateShot(pid.value, current.id, {
+      title: draft.title.trim() || current.title,
+      description: draft.description || null,
+      duration: Number.isFinite(Number(draft.duration))
+        ? Math.max(0.1, Number(draft.duration))
+        : current.duration,
+      camera: draft.camera || null,
+      movement: draft.movement || null,
+      prompt: draft.prompt || null,
+      negative_prompt: draft.negative_prompt || null,
+    })
+    await story.setCast(pid.value, current.id, castIds)
+    syncShotDraft()
+  } catch {
+    // store 已经把可展示的 API 错误写进 lastError，保留草稿让用户修正后重试。
+  } finally {
+    shotEditorBusy.value = false
+  }
+}
 
 async function saveText(): Promise<void> {
   await story
@@ -318,18 +452,44 @@ function fmtDuration(n: number): string {
               <li
                 v-for="shot in scene.shots"
                 :key="shot.temp_id"
-                class="flex items-center gap-1.5 px-2 py-1 text-2xs"
+                class="space-y-1.5 px-2 py-2 text-2xs"
                 :class="shot.op === 'reject' ? 'opacity-50' : ''"
               >
-                <span class="text-fg-1 min-w-0 flex-1 truncate">{{ shot.title }}</span>
-                <span v-if="shot.camera" class="text-fg-4 shrink-0">{{ shot.camera }}</span>
-                <span class="text-fg-3 tnum shrink-0">{{ fmtDuration(shot.duration) }}</span>
-                <span v-if="shot.characters.length" class="text-fg-4 shrink-0 truncate">
-                  {{ shot.characters.join(' / ') }}
-                </span>
-                <AppButton size="sm" variant="ghost" @click="toggleShot(shot)">
-                  {{ shot.op === 'reject' ? '要它' : '不要' }}
-                </AppButton>
+                <div class="flex items-center gap-1.5">
+                  <span class="text-fg-1 min-w-0 flex-1 truncate">{{ shot.title }}</span>
+                  <span v-if="shot.camera" class="text-fg-4 shrink-0">{{ shot.camera }}</span>
+                  <span class="text-fg-3 tnum shrink-0">{{ fmtDuration(shot.duration) }}</span>
+                  <AppButton size="sm" variant="ghost" @click="toggleShot(shot)">
+                    {{ shot.op === 'reject' ? '要它' : '不要' }}
+                  </AppButton>
+                </div>
+                <div class="grid grid-cols-2 gap-1.5">
+                  <label class="block">
+                    <span class="text-fg-4">剧情详情</span>
+                    <textarea
+                      v-model="shot.description"
+                      rows="2"
+                      class="border-line-1 bg-base-1 text-fg-2 mt-px w-full resize-none border px-1.5 py-1 text-2xs outline-none"
+                      placeholder="这个镜头发生了什么"
+                    />
+                  </label>
+                  <label class="block">
+                    <span class="text-fg-4">生成 Prompt</span>
+                    <textarea
+                      v-model="shot.prompt"
+                      rows="2"
+                      class="border-line-1 bg-base-1 text-fg-2 mt-px w-full resize-none border px-1.5 py-1 text-2xs outline-none"
+                      placeholder="AI 生成的画面提示词"
+                    />
+                  </label>
+                </div>
+                <div class="flex items-center gap-1.5">
+                  <span class="text-fg-4 shrink-0">AI 选用角色</span>
+                  <span v-if="shot.characters.length" class="text-fg-2 min-w-0 truncate">
+                    {{ shot.characters.join(' / ') }}
+                  </span>
+                  <span v-else class="text-fg-4">未识别角色</span>
+                </div>
               </li>
             </ul>
           </section>
@@ -380,21 +540,37 @@ function fmtDuration(n: number): string {
               <li
                 v-for="card in sceneShots"
                 :key="card.id"
-                class="flex items-center gap-1.5 px-2 py-1 text-2xs"
+                class="text-2xs"
+                :class="card.id === story.selectedShotId ? 'bg-accent/5' : ''"
               >
-                <span class="text-fg-4 tnum shrink-0">{{ card.index_no }}</span>
-                <span class="text-fg-1 min-w-0 flex-1 truncate">{{ card.title }}</span>
-                <AppBadge
-                  v-if="!card.context_ok"
-                  tone="warn"
-                  :title="card.context_issues.join('；')"
-                >
-                  上下文缺 {{ card.context_issues.length }} 项
-                </AppBadge>
-                <span class="text-fg-3 tnum shrink-0">{{ fmtDuration(card.duration) }}</span>
-                <AppButton size="sm" variant="ghost" title="删除镜头" @click="removeShot(card.id)">
-                  <Trash2 :size="10" />
-                </AppButton>
+                <div class="flex items-center gap-1.5 px-2 py-1">
+                  <div
+                    class="flex min-w-0 flex-1 items-center gap-1.5 text-left"
+                    :title="`查看 ${card.title} 的摘要`"
+                  >
+                    <span class="text-fg-4 tnum shrink-0">{{ card.index_no }}</span>
+                    <span class="text-fg-1 min-w-0 flex-1 truncate">{{ card.title }}</span>
+                    <AppBadge
+                      v-if="!card.context_ok"
+                      tone="warn"
+                      :title="card.context_issues.join('；')"
+                    >
+                      上下文缺 {{ card.context_issues.length }} 项
+                    </AppBadge>
+                    <span class="text-fg-3 tnum shrink-0">{{ fmtDuration(card.duration) }}</span>
+                  </div>
+                  <AppButton
+                    size="sm"
+                    variant="ghost"
+                    title="编辑 Shot 剧情、角色和 Prompt"
+                    @click="openShotEditor(card.id)"
+                  >
+                    <Pencil :size="10" />编辑
+                  </AppButton>
+                  <AppButton size="sm" variant="ghost" title="删除镜头" @click="removeShot(card.id)">
+                    <Trash2 :size="10" />
+                  </AppButton>
+                </div>
               </li>
               <li class="flex items-center gap-1 px-2 py-1">
                 <input
@@ -515,23 +691,92 @@ function fmtDuration(n: number): string {
             </section>
 
             <section class="border-line-1 border-t pt-2">
-              <p class="text-fg-3 text-2xs tracking-wide uppercase">镜头细节</p>
+              <p class="text-fg-3 text-2xs tracking-wide uppercase">Shot 编辑</p>
               <p class="text-fg-4 mt-1 text-2xs">
-                提示词、Workflow、出场角色与上下文账单在镜头编辑器里改。这一页只管有哪些场、哪些镜。
+                在中间的 Shot 列表右侧点击“编辑”，即可在弹窗中查看和修改剧情、角色、Prompt；这里保留场景级属性。
               </p>
               <AppButton
                 size="sm"
                 class="mt-1.5"
                 :disabled="!story.shot"
-                title="去镜头编辑器改提示词、挂角色、看上下文账单"
+                title="去镜头工作台查看上下文账单、版本和生成参数"
                 @click="router.push({ name: 'shot', params: { pid, sid: story.shot?.id ?? '' } })"
               >
-                <Sparkles :size="10" />打开镜头编辑器
+                <Sparkles :size="10" />打开完整 Shot 工作台
               </AppButton>
             </section>
           </div>
         </template>
       </AppPanel>
     </div>
+
+    <AppDialog
+      :open="shotEditorOpen"
+      :title="story.shot ? `编辑 Shot · ${story.shot.title}` : '编辑 Shot'"
+      subtitle="查看并修改剧情详情、AI 角色选择与生成 Prompt"
+      size="lg"
+      @update:open="setShotEditorOpen"
+    >
+      <div v-if="shotDraft && story.shot" class="space-y-3 p-3">
+        <div class="grid grid-cols-[minmax(0,1fr)_6rem] gap-2">
+          <label class="block">
+            <span class="text-fg-4 text-2xs">Shot 标题</span>
+            <input v-model="shotDraft.title" class="border-line-1 bg-base-2 text-fg-1 mt-px h-7 w-full border px-2 text-xs outline-none" />
+          </label>
+          <label class="block">
+            <span class="text-fg-4 text-2xs">时长（秒）</span>
+            <input v-model.number="shotDraft.duration" type="number" min="0.1" step="0.1" class="border-line-1 bg-base-2 text-fg-1 mt-px h-7 w-full border px-2 text-xs outline-none" />
+          </label>
+        </div>
+        <label class="block">
+          <span class="text-fg-4 text-2xs">剧情详情</span>
+          <textarea v-model="shotDraft.description" rows="4" class="border-line-1 bg-base-2 text-fg-1 mt-px w-full resize-y border px-2 py-1.5 text-xs leading-relaxed outline-none" placeholder="动作、对白、情绪和剧情上下文" />
+        </label>
+        <div class="grid grid-cols-2 gap-2">
+          <label class="block">
+            <span class="text-fg-4 text-2xs">景别 / 镜头</span>
+            <input v-model="shotDraft.camera" class="border-line-1 bg-base-2 text-fg-1 mt-px h-7 w-full border px-2 text-xs outline-none" placeholder="中近景" />
+          </label>
+          <label class="block">
+            <span class="text-fg-4 text-2xs">镜头运动</span>
+            <input v-model="shotDraft.movement" class="border-line-1 bg-base-2 text-fg-1 mt-px h-7 w-full border px-2 text-xs outline-none" placeholder="缓慢推近" />
+          </label>
+        </div>
+        <section class="border-line-1 border-t pt-3">
+          <div class="flex items-center justify-between">
+            <span class="text-fg-3 text-2xs tracking-wide uppercase">AI 选用角色</span>
+            <span class="text-fg-4 text-2xs">{{ shotCastIds.length }} 个形象</span>
+          </div>
+          <div v-if="appearances.length" class="mt-2 grid grid-cols-2 gap-x-3 gap-y-1.5">
+            <label v-for="appearance in appearances" :key="appearance.row.id" class="text-fg-2 flex min-w-0 items-center gap-1.5 text-2xs">
+              <input type="checkbox" :checked="shotCastIds.includes(appearance.row.id)" @change="toggleShotAppearance(appearance.row.id)" />
+              <span class="truncate">{{ appearance.character.name }} · {{ appearance.row.name }}</span>
+            </label>
+          </div>
+          <p v-else class="text-fg-4 mt-2 text-2xs">还没有可用的角色形象，请先在角色页建立。</p>
+        </section>
+        <label class="block">
+          <span class="text-fg-4 text-2xs">生成 Prompt</span>
+          <textarea v-model="shotDraft.prompt" rows="5" class="border-line-1 bg-base-2 text-fg-1 mt-px w-full resize-y border px-2 py-1.5 text-xs leading-relaxed outline-none" placeholder="AI 生成或人工修订的画面 Prompt" />
+        </label>
+        <label class="block">
+          <span class="text-fg-4 text-2xs">负面 Prompt</span>
+          <textarea v-model="shotDraft.negative_prompt" rows="3" class="border-line-1 bg-base-2 text-fg-1 mt-px w-full resize-y border px-2 py-1.5 text-xs leading-relaxed outline-none" placeholder="不希望出现的内容" />
+        </label>
+        <div class="text-fg-4 flex items-center justify-between text-2xs">
+          <span>{{ story.shot.status }} · {{ story.shot.version_count }} 个版本</span>
+          <AppButton size="sm" variant="ghost" title="打开单 Shot 工作台查看上下文账单、版本和生成参数" @click="router.push({ name: 'shot', params: { pid, sid: story.shot.id } })">
+            <Sparkles :size="10" />打开完整工作台
+          </AppButton>
+        </div>
+      </div>
+      <template #footer>
+        <span class="text-fg-4 mr-auto text-2xs">{{ shotDirty ? '有未保存修改' : '内容已保存' }}</span>
+        <AppButton size="sm" variant="ghost" @click="setShotEditorOpen(false)">取消</AppButton>
+        <AppButton size="sm" variant="primary" :disabled="shotEditorBusy || !shotDirty" @click="saveShotEditor()">
+          <Save :size="10" />{{ shotDirty ? '保存 Shot' : '已保存' }}
+        </AppButton>
+      </template>
+    </AppDialog>
   </div>
 </template>

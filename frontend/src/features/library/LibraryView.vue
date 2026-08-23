@@ -71,6 +71,7 @@ const kindFilter = ref<'' | LibraryKind>('')
 const tagFilter = ref('')
 const uploadKind = ref<LibraryKind>('upload')
 const fileInput = ref<HTMLInputElement | null>(null)
+const presetFileInput = ref<HTMLInputElement | null>(null)
 const adopting = ref<{ kind: AdoptKind; id: string } | null>(null)
 const adopted = ref<AdoptResult | null>(null)
 /** 删素材被引用时后端会拒；记下这一条，错误面板才能给「仍然删除」。 */
@@ -79,6 +80,7 @@ const deleting = ref('')
 /** 弹窗：新建预设 / 新建标签 / 新建变体 / 挂图。同时只会开一个。 */
 const presetKind = ref<'' | PresetKind>('')
 const presetName = ref('')
+const presetDefaultAssetId = ref('')
 const tagging = ref(false)
 const newTag = ref('')
 const variantFor = ref<{ id: string; name: string } | null>(null)
@@ -129,6 +131,14 @@ const tabPreset = computed<PresetKind | ''>(() =>
         : '',
 )
 
+const presetAssetKind = computed<LibraryKind>(() =>
+  presetKind.value === 'character'
+    ? 'character_sheet'
+    : presetKind.value === 'location'
+      ? 'location_reference'
+      : 'prop_reference',
+)
+
 function kindLabel(kind: string): string {
   return LIBRARY_KIND_LABEL[kind as LibraryKind] ?? kind
 }
@@ -166,10 +176,24 @@ async function onFiles(ev: Event): Promise<void> {
   }
 }
 
+async function onPresetFile(ev: Event): Promise<void> {
+  const input = ev.target as HTMLInputElement
+  const file = input.files?.[0]
+  input.value = ''
+  if (!file || !presetKind.value) return
+  try {
+    const asset = await lib.upload(file, presetAssetKind.value, file.name)
+    presetDefaultAssetId.value = asset.id
+  } catch {
+    /* 错误已由 store 记入 lastError，弹窗内错误面板负责展示。 */
+  }
+}
+
 /** 下面四个开窗函数都先清错：一进来就看到上一次的红字会让人以为这次就失败了。 */
 function startPreset(kind: PresetKind): void {
   lib.clearError()
   presetName.value = ''
+  presetDefaultAssetId.value = ''
   presetKind.value = kind
 }
 
@@ -194,9 +218,9 @@ function startAttach(target: AttachTarget, id: string, title: string): void {
 async function addPreset(): Promise<void> {
   const kind = presetKind.value
   const name = presetName.value.trim()
-  if (!kind || !name) return
+  if (!kind || !name || !presetDefaultAssetId.value) return
   try {
-    await lib.createPreset(kind, name)
+    await lib.createPreset(kind, name, presetDefaultAssetId.value)
     presetKind.value = ''
   } catch {
     /* 错误已由 store 记入 lastError，弹窗内的错误面板负责展示 */
@@ -297,7 +321,7 @@ onMounted(() => void lib.refresh())
       <!-- 被预设占用的素材：说清破坏什么之后，才给硬删这条路 -->
       <template #actions>
         <AppButton
-          v-if="pageError.code === 'CONFLICT' && deleting"
+          v-if="pageError.code === 'CONFLICT' && deleting && pageError.relatedIds.protected_default !== true"
           size="sm"
           variant="danger"
           @click="removeAsset(deleting, true)"
@@ -514,7 +538,16 @@ onMounted(() => void lib.refresh())
                   size="sm"
                   @click="startAttach('appearance', a.id, `${c.name} · ${a.name}`)"
                 >
-                  <ImagePlus :size="10" />挂定妆图
+                  <ImagePlus :size="10" />修改定妆图
+                </AppButton>
+                <div v-if="a.sheets.length > 1" class="flex items-center gap-1">
+                  <button v-for="sheet in a.sheets" :key="sheet.id" type="button" class="relative" :title="sheet.is_current ? '当前定妆图' : '历史定妆图'">
+                    <img v-if="thumbOf(sheet.asset_id)" :src="thumbOf(sheet.asset_id)" alt="" class="size-6 border border-line-1 object-cover" />
+                    <span v-if="sheet.is_current" class="absolute right-0 bottom-0 size-1.5 bg-accent" />
+                  </button>
+                </div>
+                <AppButton v-for="sheet in a.sheets.filter((item) => !item.is_current)" :key="`delete-${sheet.id}`" size="sm" variant="ghost" title="删除历史定妆图" @click="lib.deleteReference({ kind: 'sheet', id: sheet.id })">
+                  <Trash2 :size="10" />
                 </AppButton>
               </li>
             </ul>
@@ -563,8 +596,12 @@ onMounted(() => void lib.refresh())
                 <AppBadge v-if="v.weather">{{ v.weather }}</AppBadge>
                 <AppBadge v-if="v.time_of_day">{{ v.time_of_day }}</AppBadge>
                 <span class="text-fg-4 text-2xs">参考图 {{ v.reference_count }}</span>
+                <AppBadge v-if="v.name === '默认场景'" tone="ok">默认</AppBadge>
                 <AppButton size="sm" @click="startAttach('variant', v.id, `${l.name} · ${v.name}`)">
-                  <ImagePlus :size="10" />挂参考图
+                  <ImagePlus :size="10" />修改参考图
+                </AppButton>
+                <AppButton v-for="reference in v.references.filter((item) => !item.is_current)" :key="`delete-${reference.id}`" size="sm" variant="ghost" title="删除历史参考图" @click="lib.deleteReference({ kind: 'variant', id: reference.id })">
+                  <Trash2 :size="10" />
                 </AppButton>
               </li>
             </ul>
@@ -590,7 +627,10 @@ onMounted(() => void lib.refresh())
             <AppBadge v-for="t in p.tags" :key="t.id" tone="accent">{{ t.name }}</AppBadge>
             <span class="text-fg-4 text-2xs">参考图 {{ p.reference_count }}</span>
             <AppButton size="sm" @click="startAttach('prop', p.id, p.name)">
-              <ImagePlus :size="10" />挂参考图
+              <ImagePlus :size="10" />修改参考图
+            </AppButton>
+            <AppButton v-for="reference in p.references.filter((item) => !item.is_current)" :key="`delete-${reference.id}`" size="sm" variant="ghost" title="删除历史参考图" @click="lib.deleteReference({ kind: 'prop', id: reference.id })">
+              <Trash2 :size="10" />
             </AppButton>
             <AppButton
               size="sm"
@@ -609,6 +649,13 @@ onMounted(() => void lib.refresh())
     </template>
 
     <input ref="fileInput" type="file" multiple class="hidden" @change="onFiles" />
+    <input
+      ref="presetFileInput"
+      type="file"
+      accept="image/*"
+      class="hidden"
+      @change="onPresetFile"
+    />
 
     <DirPicker
       :open="picking"
@@ -628,15 +675,15 @@ onMounted(() => void lib.refresh())
       @update:open="adopting = $event ? adopting : null"
       @adopted="onAdopted"
     />
-    <!-- 新建预设：只要一个名字，其余属性建完再改 -->
+    <!-- 新建预设：名称与默认定妆图 / 参考图缺一不可 -->
     <AppDialog
       :open="presetKind !== ''"
       :title="presetKind ? `新建${PRESET_LABEL[presetKind]}预设` : ''"
       subtitle="库里的预设是模板，采用进工程后是可再改的副本"
-      size="sm"
+      size="md"
       @update:open="presetKind = $event ? presetKind : ''"
     >
-      <form id="new-preset" class="p-3" @submit.prevent="addPreset()">
+      <form id="new-preset" class="space-y-3 p-3" @submit.prevent="addPreset()">
         <label class="block">
           <span class="text-fg-3 text-2xs">名称</span>
           <input
@@ -653,11 +700,46 @@ onMounted(() => void lib.refresh())
             class="border-line-1 bg-base-2 text-fg-1 placeholder:text-fg-4 focus:border-accent/60 mt-0.5 h-row w-full rounded-sm border px-2 text-xs outline-none"
           />
         </label>
-        <p v-if="presetKind === 'character'" class="text-fg-4 mt-1.5 text-2xs">
-          建好后会带一个默认形象，定妆图挂在形象上。
-        </p>
-        <p v-else-if="presetKind === 'location'" class="text-fg-4 mt-1.5 text-2xs">
-          建好后再加变体（雨夜 / 白天…），参考图挂在变体上。
+        <section>
+          <div class="flex items-center justify-between gap-2">
+            <span class="text-fg-3 text-2xs">默认{{ presetKind === 'character' ? '定妆图' : '参考图' }}（必选）</span>
+            <div class="flex items-center gap-1.5">
+              <span class="text-fg-4 text-2xs">创建后不可删除，可通过挂新图修改</span>
+              <AppButton
+                size="sm"
+                variant="ghost"
+                :disabled="lib.busy"
+                title="上传图片并设为默认参考图"
+                @click="presetFileInput?.click()"
+              >
+                <Upload :size="10" />上传
+              </AppButton>
+            </div>
+          </div>
+          <EmptyState
+            v-if="pickable(presetAssetKind).length === 0"
+            class="mt-1.5"
+            title="还没有可选图片"
+            body="可直接点击上方上传；没有默认图时不允许创建。"
+          />
+          <div v-else class="mt-1.5 grid gap-2 [grid-template-columns:repeat(auto-fill,minmax(7rem,1fr))]">
+            <button
+              v-for="asset in pickable(presetAssetKind)"
+              :key="asset.id"
+              type="button"
+              class="bg-base-2 overflow-hidden border text-left"
+              :class="presetDefaultAssetId === asset.id ? 'border-accent/60 ring-1 ring-accent/30' : 'border-line-1'"
+              @click="presetDefaultAssetId = asset.id"
+            >
+              <span class="bg-base-3 flex h-20 items-center justify-center overflow-hidden">
+                <img :src="libraryFileUrl(asset.path)" alt="" loading="lazy" class="size-full object-cover" />
+              </span>
+              <span class="text-fg-2 block truncate px-1.5 py-1 text-2xs">{{ asset.title || asset.path }}</span>
+            </button>
+          </div>
+        </section>
+        <p v-if="presetKind === 'location'" class="text-fg-4 text-2xs">
+          系统会同时建立“默认场景”，之后仍可新增雨夜、白天等其他变体。
         </p>
       </form>
 
@@ -675,7 +757,7 @@ onMounted(() => void lib.refresh())
           type="submit"
           form="new-preset"
           variant="primary"
-          :disabled="lib.busy || presetName.trim() === ''"
+          :disabled="lib.busy || presetName.trim() === '' || presetDefaultAssetId === ''"
         >
           <Plus :size="11" />新建
         </AppButton>

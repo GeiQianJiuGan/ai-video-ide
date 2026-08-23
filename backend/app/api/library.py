@@ -59,6 +59,10 @@ class CharacterBody(BaseModel):
     notes: str | None = None
 
 
+class CharacterCreateBody(CharacterBody):
+    default_asset_id: str = Field(description="默认形象必须使用的定妆图素材 id")
+
+
 class AppearanceBody(BaseModel):
     name: str | None = None
     face: str | None = None
@@ -83,6 +87,10 @@ class LocationBody(BaseModel):
     notes: str | None = None
 
 
+class LocationCreateBody(LocationBody):
+    default_asset_id: str = Field(description="默认场景变体必须使用的参考图素材 id")
+
+
 class VariantBody(BaseModel):
     name: str | None = None
     time_of_day: str | None = None
@@ -101,6 +109,10 @@ class PropBody(BaseModel):
     name: str | None = None
     description: str | None = None
     notes: str | None = None
+
+
+class PropCreateBody(PropBody):
+    default_asset_id: str = Field(description="道具必须使用的默认参考图素材 id")
 
 
 class AdoptBody(BaseModel):
@@ -203,7 +215,7 @@ async def list_characters() -> list[dict[str, Any]]:
 
 
 @router.post("/library/characters", status_code=201)
-async def create_character(body: CharacterBody) -> dict[str, Any]:
+async def create_character(body: CharacterCreateBody) -> dict[str, Any]:
     return await library.create_character(body.model_dump(exclude_none=True))
 
 
@@ -241,6 +253,11 @@ async def add_sheet(aid: str, body: SheetBody) -> dict[str, Any]:
     return await library.add_sheet(aid, body.asset_id)
 
 
+@router.delete("/library/sheets/{sheet_id}", status_code=204)
+async def delete_sheet(sheet_id: str) -> None:
+    await library.delete_sheet(sheet_id)
+
+
 # --- 地点预设 ---
 
 
@@ -250,7 +267,7 @@ async def list_locations() -> list[dict[str, Any]]:
 
 
 @router.post("/library/locations", status_code=201)
-async def create_location(body: LocationBody) -> dict[str, Any]:
+async def create_location(body: LocationCreateBody) -> dict[str, Any]:
     return await library.create_location(body.model_dump(exclude_none=True))
 
 
@@ -289,6 +306,11 @@ async def add_variant_reference(vid: str, body: ReferenceBody) -> dict[str, Any]
     return await library.add_variant_reference(vid, body.asset_id, body.camera, body.note)
 
 
+@router.delete("/library/location-references/{reference_id}", status_code=204)
+async def delete_variant_reference(reference_id: str) -> None:
+    await library.delete_variant_reference(reference_id)
+
+
 # --- 道具预设 ---
 
 
@@ -298,7 +320,7 @@ async def list_props() -> list[dict[str, Any]]:
 
 
 @router.post("/library/props", status_code=201)
-async def create_prop(body: PropBody) -> dict[str, Any]:
+async def create_prop(body: PropCreateBody) -> dict[str, Any]:
     return await library.create_prop(body.model_dump(exclude_none=True))
 
 
@@ -315,6 +337,11 @@ async def delete_prop(prop_id: str) -> None:
 @router.post("/library/props/{prop_id}/references", status_code=201)
 async def add_prop_reference(prop_id: str, body: ReferenceBody) -> dict[str, Any]:
     return await library.add_prop_reference(prop_id, body.asset_id, body.note)
+
+
+@router.delete("/library/prop-references/{reference_id}", status_code=204)
+async def delete_prop_reference(reference_id: str) -> None:
+    await library.delete_prop_reference(reference_id)
 
 
 # --- 采用：库 → 工程，单向复制 ---

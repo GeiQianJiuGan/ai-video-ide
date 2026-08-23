@@ -62,6 +62,7 @@ export interface LibraryAppearance {
   overrides: string[]
   sheet_count: number
   current_sheet: { id: string; asset_id: string; version_no: number } | null
+  sheets: { id: string; asset_id: string; version_no: number; is_current: number }[]
   [field: string]: unknown
 }
 
@@ -88,6 +89,8 @@ export interface LibraryVariant {
   lighting: string | null
   description: string | null
   reference_count: number
+  current_reference: { id: string; asset_id: string; is_current: number } | null
+  references: { id: string; asset_id: string; is_current: number; created_at: string }[]
 }
 
 export interface LibraryLocation {
@@ -109,6 +112,7 @@ export interface LibraryProp {
   tags: LibraryTag[]
   reference_count: number
   current_reference: { id: string; asset_id: string; version_no: number } | null
+  references: { id: string; asset_id: string; version_no: number; is_current: number }[]
 }
 
 export interface LibraryInfo {
@@ -200,26 +204,32 @@ export const libraryApi = {
     api.post<void>(`/library/tags/${tid}/detach`, { owner_kind: ownerKind, owner_id: ownerId }),
 
   characters: () => api.get<LibraryCharacter[]>('/library/characters'),
-  createCharacter: (patch: { name: string }) =>
+  createCharacter: (patch: { name: string; default_asset_id: string }) =>
     api.post<LibraryCharacter>('/library/characters', patch),
   deleteCharacter: (cid: string) => api.del<void>(`/library/characters/${cid}`),
   addSheet: (aid: string, assetId: string) =>
     api.post<unknown>(`/library/appearances/${aid}/sheets`, { asset_id: assetId }),
+  deleteSheet: (sheetId: string) => api.del<void>(`/library/sheets/${sheetId}`),
 
   locations: () => api.get<LibraryLocation[]>('/library/locations'),
-  createLocation: (patch: { name: string }) =>
+  createLocation: (patch: { name: string; default_asset_id: string }) =>
     api.post<LibraryLocation>('/library/locations', patch),
   deleteLocation: (lid: string) => api.del<void>(`/library/locations/${lid}`),
   createVariant: (lid: string, patch: { name: string }) =>
     api.post<LibraryVariant>(`/library/locations/${lid}/variants`, patch),
   addVariantReference: (vid: string, assetId: string) =>
     api.post<unknown>(`/library/variants/${vid}/references`, { asset_id: assetId }),
+  deleteVariantReference: (referenceId: string) =>
+    api.del<void>(`/library/location-references/${referenceId}`),
 
   props: () => api.get<LibraryProp[]>('/library/props'),
-  createProp: (patch: { name: string }) => api.post<LibraryProp>('/library/props', patch),
+  createProp: (patch: { name: string; default_asset_id: string }) =>
+    api.post<LibraryProp>('/library/props', patch),
   deleteProp: (pid: string) => api.del<void>(`/library/props/${pid}`),
   addPropReference: (propId: string, assetId: string) =>
     api.post<unknown>(`/library/props/${propId}/references`, { asset_id: assetId }),
+  deletePropReference: (referenceId: string) =>
+    api.del<void>(`/library/prop-references/${referenceId}`),
 
   adoptPlan: (pid: string, kind: AdoptKind, libraryId: string) =>
     api.post<AdoptPlan>(`/projects/${pid}/adopt/plan`, { kind, library_id: libraryId }),

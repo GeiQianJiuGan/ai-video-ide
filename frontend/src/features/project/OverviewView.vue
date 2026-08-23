@@ -72,10 +72,15 @@ async function reload(): Promise<void> {
   presets.value = (await settingsApi.presets().catch(() => ({ items: [] } as { items: PresetRow[] }))).items
 }
 
-async function selectPreset(name: string): Promise<void> {
+async function selectPreset(role: 'r2v' | 'flf', name: string): Promise<void> {
   presetBusy.value = true
   try {
-    await projectsApi.setPreset(pid.value, name || null)
+    const generation = ov.environment?.generation
+    await projectsApi.setVideoPresets(
+      pid.value,
+      role === 'r2v' ? name || null : generation?.r2v_name ?? null,
+      role === 'flf' ? name || null : generation?.flf_name ?? null,
+    )
     await ov.load(pid.value)
   } finally {
     presetBusy.value = false
@@ -358,23 +363,61 @@ function duration(sec: number): string {
               </div>
               <div v-if="ov.environment.generation" class="border-line-1 border-t pt-1.5">
                 <div class="flex items-center gap-1.5">
-                  <p class="text-fg-3 text-2xs tracking-wide uppercase">项目生成 Workflow</p>
-                  <AppBadge :tone="ov.environment.generation.preset_ready ? 'ok' : 'warn'">
-                    {{ ov.environment.generation.preset_ready ? '已绑定' : '未绑定' }}
+                  <p class="text-fg-3 text-2xs tracking-wide uppercase">项目视频 Workflow</p>
+                  <AppBadge
+                    :tone="
+                      ov.environment.generation.r2v_ready && ov.environment.generation.flf_ready
+                        ? 'ok'
+                        : 'warn'
+                    "
+                  >
+                    {{
+                      ov.environment.generation.r2v_ready && ov.environment.generation.flf_ready
+                        ? '双预设已就绪'
+                        : '绑定未完整'
+                    }}
                   </AppBadge>
                 </div>
-                <select
-                  :value="ov.environment.generation.preset_name ?? ''"
-                  class="border-line-1 bg-base-2 text-fg-1 mt-1 h-6 w-full border px-1.5 text-2xs outline-none"
-                  :disabled="presetBusy"
-                  @change="selectPreset(($event.target as HTMLSelectElement).value)"
-                >
-                  <option value="">未选择预设 Workflow</option>
-                  <option v-for="preset in presets.filter((row) => row.ready)" :key="preset.name" :value="preset.name">
-                    {{ preset.name }} · 参考图 {{ preset.ref_slots }} 槽
-                  </option>
-                </select>
+                <label class="mt-1 block">
+                  <span class="text-fg-4 text-2xs">SHOT · R2V</span>
+                  <select
+                    :value="ov.environment.generation.r2v_name ?? ''"
+                    class="border-line-1 bg-base-2 text-fg-1 mt-px h-6 w-full border px-1.5 text-2xs outline-none"
+                    :disabled="presetBusy"
+                    @change="selectPreset('r2v', ($event.target as HTMLSelectElement).value)"
+                  >
+                    <option value="">未选择 R2V 预设</option>
+                    <option
+                      v-for="preset in presets.filter((row) => row.r2v_ready ?? row.ready)"
+                      :key="preset.name"
+                      :value="preset.name"
+                    >
+                      {{ preset.name }} · 参考图 {{ preset.ref_slots }} 槽
+                    </option>
+                  </select>
+                </label>
+                <label class="mt-1 block">
+                  <span class="text-fg-4 text-2xs">衔接 · FL2VA 首尾帧</span>
+                  <select
+                    :value="ov.environment.generation.flf_name ?? ''"
+                    class="border-line-1 bg-base-2 text-fg-1 mt-px h-6 w-full border px-1.5 text-2xs outline-none"
+                    :disabled="presetBusy"
+                    @change="selectPreset('flf', ($event.target as HTMLSelectElement).value)"
+                  >
+                    <option value="">未选择 FL2VA 预设</option>
+                    <option
+                      v-for="preset in presets.filter((row) => row.flf_ready)"
+                      :key="preset.name"
+                      :value="preset.name"
+                    >
+                      {{ preset.name }}
+                    </option>
+                  </select>
+                </label>
                 <p class="text-fg-4 mt-1 text-2xs">{{ ov.environment.generation.detail }}</p>
+                <p class="text-fg-4 mt-1 text-2xs">
+                  两项可以选择同一份预设；普通 Shot 只用 R2V，明确生成衔接时才用 FL2VA。
+                </p>
                 <RouterLink :to="{ name: 'presets' }" class="text-accent mt-1 inline-block text-2xs">
                   管理预设 Workflow
                 </RouterLink>

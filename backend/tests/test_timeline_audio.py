@@ -559,6 +559,47 @@ def test_audio_cannot_overlap_on_one_track_but_can_move_to_a_new_track(
     assert [c["id"] for c in tracks[1]["clips"]] == [first.json()["clip_id"]]
 
 
+def test_audio_selection_isolated_into_three_or_two_segments(
+    client: TestClient, pid: str, fake_probe: None
+) -> None:
+    placed = add_music(client, pid, duration=6.0)
+    assert placed.status_code == 201, placed.text
+    clip_id = placed.json()["clip_id"]
+
+    middle = client.post(
+        f"/api/v1/projects/{pid}/clips/{clip_id}/isolate-audio-selection",
+        json={"in_point": 1.0, "out_point": 4.0},
+    )
+    assert middle.status_code == 200, middle.text
+    assert middle.json()["selected_clip_id"] == clip_id
+    assert middle.json()["segments"] == 3
+    audio = next(t for t in middle.json()["timeline"]["tracks"] if t["kind"] == "audio")
+    assert [(c["start"], c["duration"]) for c in audio["clips"]] == [
+        (0.0, 1.0),
+        (1.0, 3.0),
+        (4.0, 2.0),
+    ]
+    selected = clip_in(middle.json()["timeline"], clip_id)
+    assert (selected["in_point"], selected["out_point"]) == (1.0, 4.0)
+
+    undone = client.post(f"/api/v1/projects/{pid}/timeline/undo")
+    assert undone.status_code == 200, undone.text
+    restored = next(t for t in undone.json()["tracks"] if t["kind"] == "audio")
+    assert [(c["start"], c["duration"]) for c in restored["clips"]] == [(0.0, 6.0)]
+
+    edge = client.post(
+        f"/api/v1/projects/{pid}/clips/{clip_id}/isolate-audio-selection",
+        json={"in_point": 0.0, "out_point": 2.0},
+    )
+    assert edge.status_code == 200, edge.text
+    assert edge.json()["segments"] == 2
+    audio = next(t for t in edge.json()["timeline"]["tracks"] if t["kind"] == "audio")
+    assert [(c["start"], c["duration"]) for c in audio["clips"]] == [
+        (0.0, 2.0),
+        (2.0, 4.0),
+    ]
+
+
 def test_blank_video_segment_has_editable_duration_and_exports_as_black(
     client: TestClient, pid: str
 ) -> None:

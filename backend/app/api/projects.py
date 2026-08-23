@@ -100,33 +100,79 @@ async def get_project(pid: str) -> ProjectOut:
 @router.get("/projects/{pid}/preset")
 async def get_project_preset(pid: str) -> dict[str, Any]:
     row = (await fetch_all(db_of(pid), Project))[0]
-    name = row.preset_name
-    item = next((x for x in presets.listing() if x["name"] == name), None) if name else None
-    return {"name": name, "preset": item}
+    listing = presets.listing()
+    r2v_name = row.r2v_preset_name or row.preset_name
+    flf_name = row.flf_preset_name or row.preset_name
+
+    def item_of(name: str | None) -> dict[str, Any] | None:
+        return next((x for x in listing if x["name"] == name), None) if name else None
+
+    return {
+        # 兼容旧客户端：name / preset 仍表示普通 Shot 的 R2V 预设。
+        "name": r2v_name,
+        "preset": item_of(r2v_name),
+        "r2v_name": r2v_name,
+        "r2v_preset": item_of(r2v_name),
+        "flf_name": flf_name,
+        "flf_preset": item_of(flf_name),
+    }
 
 
 @router.put("/projects/{pid}/preset")
 async def set_project_preset(pid: str, payload: dict[str, str | None]) -> dict[str, Any]:
-    name = (payload.get("name") or "").strip() or None
-    if name and not any(x["name"] == name and x.get("ready") for x in presets.listing()):
+    listing = presets.listing()
+
+    def normalized(key: str) -> str | None:
+        return (payload.get(key) or "").strip() or None
+
+    legacy = normalized("name") if "name" in payload else None
+    explicit_roles = "r2v_name" in payload or "flf_name" in payload
+    requested_r2v = normalized("r2v_name") if "r2v_name" in payload else legacy
+    requested_flf = normalized("flf_name") if "flf_name" in payload else legacy
+
+    def validate(name: str | None, role: str) -> None:
+        if not name:
+            return
+        item = next((x for x in listing if x["name"] == name), None)
+        ready_key = "flf_ready" if role == "flf" else "r2v_ready"
+        if item and item.get(ready_key):
+            return
         from app.core.errors import AppError, ErrorCode
 
         raise AppError(
             ErrorCode.INVALID_WORKFLOW,
             "预设不可用",
-            f"预设 {name} 不存在或未通过入口检查。",
-            ["到左侧「预设 Workflow」导入并修复这份图", "再回项目选择它"],
-            {"preset": name},
+            (
+                f"预设 {name} 不存在或不能用于"
+                f"{'首尾帧 / FL2VA' if role == 'flf' else 'R2V'}。"
+            ),
+            [
+                "到左侧「预设 Workflow」导入并修复这份图",
+                "FL2VA 预设必须同时标出 AIVS_FIRST_FRAME、AIVS_LAST_FRAME、AIVS_PROMPT",
+                "再回项目选择它",
+            ],
+            {"preset": name, "role": role},
         )
+
+    validate(requested_r2v, "r2v")
+    validate(requested_flf, "flf")
     db = db_of(pid)
     async with db.write() as session:
         row = (await session.execute(select(Project))).scalars().first()
         assert row is not None
-        row.preset_name = name
+        if explicit_roles:
+            if "r2v_name" in payload:
+                row.r2v_preset_name = requested_r2v
+            if "flf_name" in payload:
+                row.flf_preset_name = requested_flf
+        else:
+            row.r2v_preset_name = requested_r2v
+            row.flf_preset_name = requested_flf
+        # 旧字段继续镜像 R2V，供旧版本应用打开工程时使用。
+        row.preset_name = row.r2v_preset_name
         row.generation_mode = "comfy_preset"
         row.updated_at = utc_now()
-    item = next((x for x in presets.listing() if x["name"] == name), None) if name else None
-    return {"name": name, "preset": item}
+    return await get_project_preset(pid)
 
 
 @router.post("/projects/{pid}/close", status_code=204)

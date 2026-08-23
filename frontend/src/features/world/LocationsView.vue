@@ -16,6 +16,7 @@ import { Library, Plus, RefreshCw, Sparkles, Trash2, Upload } from '@lucide/vue'
 import AppPanel from '@/shared/ui/AppPanel.vue'
 import AppButton from '@/shared/ui/AppButton.vue'
 import AppBadge from '@/shared/ui/AppBadge.vue'
+import AppDialog from '@/shared/ui/AppDialog.vue'
 import EmptyState from '@/shared/ui/EmptyState.vue'
 import ErrorPanel from '@/shared/ui/ErrorPanel.vue'
 import FeatureHeader from '@/shared/ui/FeatureHeader.vue'
@@ -35,17 +36,29 @@ const pid = computed(() => String(route.params.pid ?? ''))
 const comfyReady = computed(() => sys.deps.find((d) => d.name === 'comfyui')?.ok ?? false)
 
 const newName = ref('')
+const createOpen = ref(false)
+const createAssetId = ref('')
 const variantName = ref('')
 /** 上传时一并记下机位，之后镜头选参考图时才分得清正面 / 侧面 / 俯视。 */
 const camera = ref('')
 const picking = ref(false)
 const uploading = ref(false)
 const fileInput = ref<HTMLInputElement | null>(null)
+const createFileInput = ref<HTMLInputElement | null>(null)
 /** 资产总账当 id → path 字典用；不按 kind 过滤，sha1 去重会让 kind 停在首次登记的值。 */
 const assets = ref<Asset[]>([])
 const assetError = ref<ApiError | null>(null)
 
 const assetById = computed(() => new Map(assets.value.map((a) => [a.id, a])))
+const imageAssets = computed(() =>
+  assets.value.filter(
+    (asset) =>
+      !asset.missing &&
+      (asset.mime?.startsWith('image/') ||
+        /\.(png|jpe?g|webp|gif|bmp)$/i.test(asset.path)) &&
+      asset.kind !== 'audio',
+  ),
+)
 const variant = computed(() => world.selectedVariant)
 /**
  * 两个面板都在说同一件事时只留一个。
@@ -84,9 +97,38 @@ watch(pid, reload)
 
 async function createLocation(): Promise<void> {
   const name = newName.value.trim()
-  if (!name) return
+  if (!name || !createAssetId.value) return
   newName.value = ''
-  await world.createLocation(pid.value, name).catch(() => {})
+  await world.createLocation(pid.value, name, createAssetId.value).catch(() => {})
+  if (!world.lastError) {
+    createAssetId.value = ''
+    createOpen.value = false
+  }
+}
+
+function openCreate(): void {
+  world.clearError()
+  assetError.value = null
+  newName.value = ''
+  createAssetId.value = ''
+  createOpen.value = true
+}
+
+async function onCreateFile(event: Event): Promise<void> {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  input.value = ''
+  if (!file) return
+  uploading.value = true
+  try {
+    const asset = await assetsApi.upload(pid.value, file, 'location_reference')
+    createAssetId.value = asset.id
+    await loadAssets()
+  } catch (err) {
+    assetError.value = err instanceof ApiError ? err : null
+  } finally {
+    uploading.value = false
+  }
 }
 
 async function createVariant(): Promise<void> {
@@ -137,13 +179,7 @@ async function saveVariantField(key: keyof VariantPatch, value: string): Promise
     <FeatureHeader />
 
     <div class="border-line-1 bg-base-1 flex h-row shrink-0 items-center gap-1 border-b px-2">
-      <input
-        v-model="newName"
-        placeholder="新地点名字，例如 城南旧宅"
-        class="border-line-1 bg-base-2 text-fg-1 placeholder:text-fg-4 h-5 w-44 border px-1.5 text-2xs outline-none focus:border-accent/60"
-        @keyup.enter="createLocation()"
-      />
-      <AppButton size="sm" variant="primary" :disabled="world.busy" @click="createLocation()">
+      <AppButton size="sm" variant="primary" :disabled="world.busy" title="新建地点并绑定默认场景参考图" @click="openCreate()">
         <Plus :size="10" />新建地点
       </AppButton>
       <AppButton size="sm" @click="picking = true"> <Library :size="10" />从素材库采用 </AppButton>
@@ -401,5 +437,44 @@ async function saveVariantField(key: keyof VariantPatch, value: string): Promise
     </div>
 
     <LibraryPickDialog v-model:open="picking" :pid="pid" kind="location" @adopted="reload()" />
+    <input ref="createFileInput" type="file" accept="image/*" class="hidden" @change="onCreateFile" />
+    <AppDialog
+      :open="createOpen"
+      title="新建地点"
+      subtitle="必须绑定一张默认场景参考图"
+      size="sm"
+      @update:open="createOpen = $event"
+    >
+      <form id="create-location" class="space-y-3 p-3" @submit.prevent="createLocation()">
+        <label class="block">
+          <span class="text-fg-3 text-2xs">地点名称</span>
+          <input v-model="newName" autofocus placeholder="城南旧宅" class="border-line-1 bg-base-2 text-fg-1 mt-0.5 h-row w-full border px-2 text-xs outline-none" />
+        </label>
+        <section>
+          <div class="flex items-center justify-between">
+            <span class="text-fg-3 text-2xs">默认场景参考图（必选）</span>
+            <AppButton size="sm" variant="ghost" :disabled="uploading" @click="createFileInput?.click()">
+              <Upload :size="10" />{{ uploading ? '上传中' : '上传图片' }}
+            </AppButton>
+          </div>
+          <div v-if="createAssetId && thumb(createAssetId)" class="border-line-1 bg-base-2 mt-1.5 flex h-32 items-center justify-center overflow-hidden border">
+            <img :src="thumb(createAssetId)" alt="默认场景参考图" class="size-full object-contain" />
+          </div>
+          <p v-else class="text-fg-4 mt-1.5 text-2xs">请上传一张场景参考图后再创建。</p>
+          <div v-if="imageAssets.length" class="mt-2 grid max-h-40 grid-cols-4 gap-1.5 overflow-auto">
+            <button v-for="asset in imageAssets" :key="asset.id" type="button" class="bg-base-2 aspect-square overflow-hidden border" :class="createAssetId === asset.id ? 'border-accent/70 ring-1 ring-accent/30' : 'border-line-1'" title="使用项目中的这张图片" @click="createAssetId = asset.id">
+              <img :src="fileUrl(pid, asset.path)" alt="" class="size-full object-cover" />
+            </button>
+          </div>
+        </section>
+      </form>
+      <template #footer>
+        <span class="flex-1" />
+        <AppButton variant="ghost" @click="createOpen = false">取消</AppButton>
+        <AppButton type="submit" form="create-location" variant="primary" :disabled="world.busy || uploading || !newName.trim() || !createAssetId">
+          <Plus :size="11" />新建地点
+        </AppButton>
+      </template>
+    </AppDialog>
   </div>
 </template>

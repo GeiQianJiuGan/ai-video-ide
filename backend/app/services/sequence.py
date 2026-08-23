@@ -574,7 +574,11 @@ class SequenceService:
             for shot in shots:
                 try:
                     job = await generation.enqueue_shot(
-                        pid, shot.id, priority=priority, allow_ref_drop=allow_ref_drop
+                        pid,
+                        shot.id,
+                        kind="image2video",
+                        priority=priority,
+                        allow_ref_drop=allow_ref_drop,
                     )
                     queued.append(job["id"])
                 except AppError as err:
@@ -623,6 +627,7 @@ class SequenceService:
                 job = await generation.enqueue_shot(
                     pid,
                     shot.id,
+                    kind="first_last_frame" if i else "image2video",
                     priority=priority,
                     check_context=i == 0,
                     allow_ref_drop=allow_ref_drop,

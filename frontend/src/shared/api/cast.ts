@@ -114,6 +114,8 @@ export type CharacterPatch = Partial<
   >
 >
 
+export type CharacterCreatePatch = CharacterPatch & { default_asset_id: string }
+
 export type AppearancePatch = Partial<Record<InheritableField, string | null>> & {
   name?: string
   parent_id?: string | null
@@ -133,7 +135,7 @@ export const CHARACTER_TEXT_FIELDS: { key: keyof CharacterPatch; label: string }
 
 export const castApi = {
   characters: (pid: string) => api.get<Character[]>(`/projects/${pid}/characters`),
-  createCharacter: (pid: string, patch: CharacterPatch) =>
+  createCharacter: (pid: string, patch: CharacterCreatePatch) =>
     api.post<Character>(`/projects/${pid}/characters`, patch),
   updateCharacter: (pid: string, cid: string, patch: CharacterPatch) =>
     api.patch<Character>(`/projects/${pid}/characters/${cid}`, patch),

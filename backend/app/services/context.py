@@ -65,7 +65,7 @@ def ref_capacity(capacity: RefCapacity | None = None) -> RefCapacity:
 async def project_ref_capacity(pid: str) -> RefCapacity | None:
     """The selected preset Workflow is the project's only reference-image capacity source."""
     project = (await fetch_all(db_of(pid), Project))[0]
-    name = project.preset_name
+    name = project.r2v_preset_name or project.preset_name
     if not name:
         return None
     count = presets.slot_count(name)
@@ -141,7 +141,12 @@ def _extracted_frame(assets: Any, from_asset_id: str | None) -> str | None:
 
 class ContextService:
     async def resolve(
-        self, pid: str, shot_id: str, *, capacity_override: RefCapacity | None = None
+        self,
+        pid: str,
+        shot_id: str,
+        *,
+        capacity_override: RefCapacity | None = None,
+        include_prev: bool = True,
     ) -> dict[str, Any]:
         db = db_of(pid)
         shot = await fetch(db, Shot, shot_id, "镜头")
@@ -263,7 +268,7 @@ class ContextService:
         #    注意这里指的是**抽出来的那张图**，不是上游那整段视频——模型端拿一段视频当
         #    首帧是用不了的。抽帧要起 FFmpeg 进程，所以不在这条只读路径上做：还没抽的时候
         #    先标 pending_extract，真正抽取发生在入队前（services/generation.py）。
-        if shot.prev_shot_id:
+        if include_prev and shot.prev_shot_id:
             prev = next((s for s in await fetch_all(db, Shot) if s.id == shot.prev_shot_id), None)
             version = None
             if prev is not None and prev.current_version_id:
@@ -361,7 +366,7 @@ class ContextService:
             item["asset_path"] = asset.path if asset else None
             item["missing_file"] = bool(item["asset_id"]) and asset is None
             item.pop("eligible", None)
-        _assign_roles(items, bool(shot.prev_shot_id))
+        _assign_roles(items, bool(include_prev and shot.prev_shot_id))
         selected_capacity = capacity_override or await project_ref_capacity(pid)
         capacity = _capacity_of(items, ref_capacity(selected_capacity))
 
@@ -373,7 +378,7 @@ class ContextService:
         # 幕级 prompt 是镜头没写 prompt 时的兜底，取值口径与 generation.enqueue_shot 一致
         if not (shot.prompt or shot.description or scene.prompt):
             problems.append("既没有 prompt 也没有画面描述")
-        if shot.prev_shot_id and not any(
+        if include_prev and shot.prev_shot_id and not any(
             i["kind"] == "prev_frame" and i["included"] for i in items
         ):
             problems.append("需要上游末帧，但上游镜头还没有当前版本")
@@ -391,13 +396,15 @@ class ContextService:
             "resolved_at": utc_now(),
         }
 
-    async def ensure_frames(self, pid: str, shot_id: str) -> dict[str, Any]:
+    async def ensure_frames(
+        self, pid: str, shot_id: str, *, include_prev: bool = True
+    ) -> dict[str, Any]:
         """把「生成前会抽取」那些条目真的抽出来，然后重新出账单。
 
         单独一个方法而不是塞进 `resolve`：resolve 是只读的、UI 会频繁调，
         起 FFmpeg 进程不该发生在那条路径上。入队前调这个。
         """
-        ctx = await self.resolve(pid, shot_id)
+        ctx = await self.resolve(pid, shot_id, include_prev=include_prev)
         pending = [i for i in ctx["items"] if i.get("pending_extract") and i.get("from_asset_id")]
         if not pending:
             return ctx
@@ -405,11 +412,13 @@ class ContextService:
 
         for item in pending:
             await frames.extract(pid, str(item["from_asset_id"]), "end")
-        return await self.resolve(pid, shot_id)
+        return await self.resolve(pid, shot_id, include_prev=include_prev)
 
-    async def require_complete(self, pid: str, shot_id: str) -> dict[str, Any]:
+    async def require_complete(
+        self, pid: str, shot_id: str, *, include_prev: bool = True
+    ) -> dict[str, Any]:
         """生成前的门槛：上下文不完整就明确拒绝，而不是生成一张废图。"""
-        ctx = await self.ensure_frames(pid, shot_id)
+        ctx = await self.ensure_frames(pid, shot_id, include_prev=include_prev)
         if not ctx["complete"]:
             raise AppError(
                 ErrorCode.CONTEXT_INCOMPLETE,
@@ -482,9 +491,11 @@ class ContextService:
             row.updated_at = utc_now()
         return await self.resolve(pid, shot_id)
 
-    async def snapshot(self, pid: str, shot_id: str) -> dict[str, Any]:
+    async def snapshot(
+        self, pid: str, shot_id: str, *, include_prev: bool = True
+    ) -> dict[str, Any]:
         """冻结进 GenerationVersion.context_json 的那份账单。"""
-        ctx = await self.resolve(pid, shot_id)
+        ctx = await self.resolve(pid, shot_id, include_prev=include_prev)
         return {
             "resolved_at": ctx["resolved_at"],
             #: 当时模型端能收几张、这次算出要丢几张。冻结它，事后才说得清

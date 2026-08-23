@@ -39,7 +39,6 @@ log = get_logger("queue")
 
 ACTIVE = ("queued", "waiting", "running")
 POLL_INTERVAL = 1.0
-POLL_LIMIT = 1800  # 30 分钟上限，超时也要给出结构化错误而不是永远转圈
 
 #: 版本没有资产（失败现场、占位版本）时的媒体字段。**两个键永远都在**——
 #: 前端按「哪个非空」决定画 `<video>` 还是 `<img>`，键时有时无就得到处写可选判断。
@@ -130,18 +129,26 @@ class GenerationService:
         # 版本里的 prompt 却是空的」。
         scene_of_shot = await fetch(db, Scene, shot.scene_id, "场景")
         prompt = shot.prompt or shot.description or scene_of_shot.prompt or ""
+        # 直接调用旧接口时保留 prev_shot_id 的续接语义；新的批量编排会显式传
+        # image2video，让所有普通 SHOT 先独立生成，再单独创建 FL2VA 衔接任务。
         capability = kind or ("first_last_frame" if shot.prev_shot_id else "image2video")
         # 走适配层时不需要工作流：模型端那份图由模型端维护（预设 / 通用 REST 合同）。
         # 只有旧的 comfy_workflow 兼容路径才必须先解析出一份已校验的工作流。
         project = (await fetch_all(db, Project))[0]
         generation_mode = "comfy_preset"
-        preset_name = project.preset_name or settings.video_preset
+        legacy_preset = project.preset_name or settings.video_preset
+        preset_name = (
+            project.flf_preset_name or legacy_preset
+            if capability in {"first_last_frame", "transition", "fl2va"}
+            else project.r2v_preset_name or legacy_preset
+        )
         # 保留旧设置的明确错误提示；正常项目生成始终走项目选择的预设。
         if registry.is_legacy():
             await workflows.resolve(pid, capability, workflow_id or shot.workflow_id)
+        use_prev_frame = capability in {"first_last_frame", "transition", "fl2va"}
         if check_context:
-            await context.require_complete(pid, shot_id)
-        snapshot = await context.snapshot(pid, shot_id)
+            await context.require_complete(pid, shot_id, include_prev=use_prev_frame)
+        snapshot = await context.snapshot(pid, shot_id, include_prev=use_prev_frame)
         # 参考图比模型端那份图能收的多时先问一句。**不是失败**：确认（allow_ref_drop）后
         # 照旧生成，只是按槽位顺序喂前几张。悄悄少喂两张图，事后没人查得出形象为什么跑偏。
         if not allow_ref_drop:
@@ -150,7 +157,7 @@ class GenerationService:
                 raise over_capacity_error([over])
 
         depends_on, wait_reason = None, None
-        if shot.prev_shot_id:
+        if shot.prev_shot_id and capability in {"first_last_frame", "transition", "fl2va"}:
             prev = await fetch(db, Shot, shot.prev_shot_id, "上游镜头")
             if wait_for_job_id:
                 # 单线程续接等待的是本次编排中的上一条任务，而不是旧的当前版本。
@@ -532,7 +539,11 @@ class GenerationService:
         """默认路径：把请求交给适配器，轮询到出片。service 层不认识任何具体模型。"""
         provider = registry.provider("comfy_preset")
         first, last, refs = await self._images_of(pid, job, params)
-        mode = "flf" if last is not None else "i2v"
+        mode = (
+            "flf"
+            if job.kind in {"first_last_frame", "transition", "fl2va"} or last is not None
+            else "i2v"
+        )
         if mode == "i2v" and first is None:
             raise AppError(
                 ErrorCode.MISSING_INPUT,
@@ -563,7 +574,8 @@ class GenerationService:
         if req.notes:
             params["ref_notes"] = list(req.notes)
         state = TaskState("queued")
-        for tick in range(POLL_LIMIT):
+        tick = 0
+        while True:
             self._require_not_cancelled(job.id)
             state = await provider.poll(task_id)
             if state.status == "done":
@@ -592,14 +604,7 @@ class GenerationService:
                     project_id=pid,
                 )
             await asyncio.sleep(POLL_INTERVAL)
-        else:
-            raise AppError(
-                ErrorCode.WORKFLOW_ERROR,
-                "等生成结果超时",
-                f"等了 {POLL_LIMIT} 次仍未完成（最后状态：{state.detail or state.status}）。",
-                ["确认服务端仍在跑这个任务", "重试该任务", "或调大设置里的单次超时"],
-                {"task_id": task_id},
-            )
+            tick += 1
         filename, data = await provider.fetch(task_id)
         return filename, data, None
 
@@ -626,8 +631,9 @@ class GenerationService:
         explicit_last = params.get("last_frame_asset_id")
         included = [i for i in (params.get("context") or {}).get("included") or []]
         shot = await fetch(db, Shot, job.shot_id, "镜头")
-        if shot.prev_shot_id and not explicit_first:
-            fresh = await context.ensure_frames(pid, job.shot_id)
+        use_prev_frame = job.kind in {"first_last_frame", "transition", "fl2va"}
+        if use_prev_frame and shot.prev_shot_id and not explicit_first:
+            fresh = await context.ensure_frames(pid, job.shot_id, include_prev=True)
             included = [i for i in fresh["items"] if i.get("included")]
         usable = [i for i in included if i.get("asset_id")]
         if not explicit_first:
@@ -720,7 +726,8 @@ class GenerationService:
         prompt_id = await comfy.submit(graph, client_id=f"aivs-{pid}")
 
         history: dict[str, Any] = {}
-        for tick in range(POLL_LIMIT):
+        tick = 0
+        while True:
             self._require_not_cancelled(job.id)
             history = await comfy.history(prompt_id)
             if history:
@@ -733,6 +740,7 @@ class GenerationService:
                     project_id=pid,
                 )
             await asyncio.sleep(POLL_INTERVAL)
+            tick += 1
         files = outputs_of(history)
         if not files:
             raise AppError(

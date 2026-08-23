@@ -25,6 +25,7 @@ class CharacterBody(BaseModel):
     background: str | None = None
     voice_desc: str | None = None
     notes: str | None = None
+    default_asset_id: str | None = Field(default=None, description="默认形象使用的定妆图资产 id")
 
 
 class AppearanceBody(BaseModel):

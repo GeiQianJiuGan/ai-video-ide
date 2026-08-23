@@ -79,10 +79,12 @@ export interface VariantUsage {
 }
 
 export type LocationPatch = Partial<Pick<Location, 'name' | 'description' | 'notes'>>
+export type LocationCreatePatch = LocationPatch & { default_asset_id: string }
 export type VariantPatch = Partial<
   Pick<LocationVariant, 'name' | 'time_of_day' | 'weather' | 'lighting' | 'description'>
 >
 export type PropPatch = Partial<Pick<Prop, 'name' | 'description' | 'notes'>>
+export type PropCreatePatch = PropPatch & { default_asset_id: string }
 
 export const VARIANT_TEXT_FIELDS: { key: keyof VariantPatch; label: string; hint: string }[] = [
   { key: 'name', label: '变体名', hint: '雨夜' },
@@ -94,7 +96,7 @@ export const VARIANT_TEXT_FIELDS: { key: keyof VariantPatch; label: string; hint
 
 export const worldApi = {
   locations: (pid: string) => api.get<Location[]>(`/projects/${pid}/locations`),
-  createLocation: (pid: string, patch: LocationPatch) =>
+  createLocation: (pid: string, patch: LocationCreatePatch) =>
     api.post<Location>(`/projects/${pid}/locations`, patch),
   updateLocation: (pid: string, lid: string, patch: LocationPatch) =>
     api.patch<Location>(`/projects/${pid}/locations/${lid}`, patch),
@@ -116,7 +118,7 @@ export const worldApi = {
     }),
 
   props: (pid: string) => api.get<Prop[]>(`/projects/${pid}/props`),
-  createProp: (pid: string, patch: PropPatch) => api.post<Prop>(`/projects/${pid}/props`, patch),
+  createProp: (pid: string, patch: PropCreatePatch) => api.post<Prop>(`/projects/${pid}/props`, patch),
   updateProp: (pid: string, propId: string, patch: PropPatch) =>
     api.patch<Prop>(`/projects/${pid}/props/${propId}`, patch),
   deleteProp: (pid: string, propId: string) => api.del<void>(`/projects/${pid}/props/${propId}`),

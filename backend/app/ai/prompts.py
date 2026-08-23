@@ -37,7 +37,10 @@ title 用一句话概括这一镜在讲什么，summary 用一句话说清这一
 characters 只填**剧本里出现过的人名原文**，同一个人前后必须用同一个名字——系统靠它把角色
 对到角色库，名字一飘，形象就跟着飘。旁白、路人之类没有名字的不要填。
 location 写剧本中该幕的地点原文，location_variant 写更具体的地点变体线索（如「雨夜」「室内」）。
-prompt 是这一镜可以直接喂给视频模型的正向生成提示词，画面部分必须包含主体、动作、场景、光线、镜头语言；
+prompt 是兼容旧字段的完整提示词。新输出必须额外提供 camera_motion、visual_prompt、audio_dialogue：
+camera_motion 写机位、景别和运镜；visual_prompt 只写画面中可见的主体、动作、场景、光线与环境；
+audio_dialogue 写同期环境声、动作音效和对白（对白保留说话人、语气与原台词）。
+最终每个 Shot 会按 [SHOT]、Camera Motion、Visual Prompt、Audio / Dialogue 四段拼成可直接喂给视频模型的正向提示词；
 negative_prompt 是这一镜的负向提示词，写成逗号分隔的模型规避项。即使描述很短，也必须生成
 这两个字段。
 
@@ -52,7 +55,8 @@ BREAKDOWN_SHAPE = (
     '{"scenes":[{"title":"","summary":"","source_text":"","time_of_day":"",'
     '"location":"","location_variant":"","prompt":"","negative_prompt":"",'
     '"characters":["角色名"],"shots":[{"title":"","description":"","duration":4,"camera":"",'
-    '"movement":"","characters":["角色名"],"prompt":"","negative_prompt":""}]}]}。'
+    '"movement":"","camera_motion":"","visual_prompt":"","audio_dialogue":"",'
+    '"characters":["角色名"],"prompt":"","negative_prompt":""}]}]}。'
     "不要输出解释文字，不要用代码块包裹。"
 )
 
@@ -103,6 +107,25 @@ def with_shot_audio_policy(prompt: str, negative_prompt: str) -> tuple[str, str]
     if missing:
         negative = f"{negative}，{', '.join(missing)}" if negative else ", ".join(missing)
     return positive, negative
+
+
+def format_shot_prompt(
+    index: int,
+    camera_motion: str,
+    visual_prompt: str,
+    audio_dialogue: str,
+    fallback: str = "",
+) -> str:
+    """把拆解结果统一成视频模型可读、也方便人工检查的 SHOT 四段格式。"""
+    camera = str(camera_motion or "固定中景").strip()
+    visual = str(visual_prompt or fallback or "").strip()
+    audio = str(audio_dialogue or "无对白；保留同期环境声和必要动作音效").strip()
+    return (
+        f"[SHOT {max(1, int(index))}]\n"
+        f"Camera Motion: {camera}\n"
+        f"Visual Prompt: {visual}\n"
+        f"Audio / Dialogue: {audio}"
+    )
 
 
 def breakdown() -> str:

@@ -168,6 +168,12 @@ export interface BlankClipResult {
   timeline: Timeline
 }
 
+export interface IsolateAudioResult {
+  selected_clip_id: string
+  segments: number
+  timeline: Timeline
+}
+
 /** 裁切请求。**拖左边缘时 `in_point` 与 `start` 必须一起给**：一次请求、一格撤销。 */
 export interface TrimBody {
   in_point?: number | null
@@ -190,6 +196,15 @@ export const timelineApi = {
     api.post<Timeline>(`/projects/${pid}/clips/${clipId}/trim`, body),
   split: (pid: string, clipId: string, at: number) =>
     api.post<Timeline>(`/projects/${pid}/clips/${clipId}/split`, { at }),
+  isolateAudioSelection: (
+    pid: string,
+    clipId: string,
+    body: { in_point: number; out_point: number },
+  ) =>
+    api.post<IsolateAudioResult>(
+      `/projects/${pid}/clips/${clipId}/isolate-audio-selection`,
+      body,
+    ),
   remove: (pid: string, clipId: string, ripple = true) =>
     api.del<Timeline>(`/projects/${pid}/clips/${clipId}?ripple=${ripple}`),
   /** 只换这一个片段的版本，整条线不重排。 */

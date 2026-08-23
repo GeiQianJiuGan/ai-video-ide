@@ -36,6 +36,11 @@ class SplitBody(BaseModel):
     at: float = Field(description="时间线上的绝对秒数")
 
 
+class AudioSelectionBody(BaseModel):
+    in_point: float
+    out_point: float
+
+
 class ReplaceVersionBody(BaseModel):
     version_id: str
 
@@ -127,6 +132,15 @@ async def trim_clip(pid: str, clip_id: str, body: TrimBody) -> dict[str, Any]:
 @router.post("/projects/{pid}/clips/{clip_id}/split")
 async def split_clip(pid: str, clip_id: str, body: SplitBody) -> dict[str, Any]:
     return await timeline.split_clip(pid, clip_id, body.at)
+
+
+@router.post("/projects/{pid}/clips/{clip_id}/isolate-audio-selection")
+async def isolate_audio_selection(
+    pid: str, clip_id: str, body: AudioSelectionBody
+) -> dict[str, Any]:
+    return await timeline.isolate_audio_selection(
+        pid, clip_id, in_point=body.in_point, out_point=body.out_point
+    )
 
 
 @router.delete("/projects/{pid}/clips/{clip_id}")

@@ -105,10 +105,10 @@ export const useCastStore = defineStore('cast', () => {
     await guarded(() => loadSheets(pid))
   }
 
-  async function create(pid: string, name: string): Promise<Character> {
+  async function create(pid: string, name: string, defaultAssetId: string): Promise<Character> {
     return guarded(async () => {
       // 后端建角色时会顺手给一个「默认形象」——没有形象的角色在镜头里无法被引用
-      const row = await castApi.createCharacter(pid, { name })
+      const row = await castApi.createCharacter(pid, { name, default_asset_id: defaultAssetId })
       characters.value = await castApi.characters(pid)
       selectedId.value = row.id
       selectedAppearanceId.value = ''

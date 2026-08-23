@@ -14,6 +14,7 @@ from app.core.ids import new_id
 from app.persistence.models import utc_now
 from app.persistence.models_story import Scene, Shot, ShotProp
 from app.persistence.models_world import (
+    Asset,
     Location,
     LocationReference,
     LocationVariant,
@@ -57,7 +58,10 @@ class WorldService:
     ) -> dict[str, Any]:
         """建地点。origin_library_id 只在「从素材库采用」时传，是出处不是外键
         （见 services/adopt.py）。"""
+        default_asset_id = str(patch.get("default_asset_id") or "").strip()
         db = db_of(pid)
+        if default_asset_id:
+            await fetch(db, Asset, default_asset_id, "默认场景参考图资产")
         now = utc_now()
         row = Location(
             id=new_id("location"),
@@ -70,6 +74,11 @@ class WorldService:
         )
         async with db.write() as session:
             session.add(row)
+        if default_asset_id:
+            variant = await self.create_variant(pid, row.id, {"name": "默认场景"})
+            await self.add_variant_reference(
+                pid, variant["id"], default_asset_id, None, None
+            )
         return as_dict(row)
 
     async def update_location(self, pid: str, lid: str, patch: dict[str, Any]) -> dict[str, Any]:
@@ -214,7 +223,10 @@ class WorldService:
     ) -> dict[str, Any]:
         """建道具。origin_library_id 只在「从素材库采用」时传，是出处不是外键
         （见 services/adopt.py）。"""
+        default_asset_id = str(patch.get("default_asset_id") or "").strip()
         db = db_of(pid)
+        if default_asset_id:
+            await fetch(db, Asset, default_asset_id, "默认道具参考图资产")
         now = utc_now()
         row = Prop(
             id=new_id("prop"),
@@ -227,6 +239,8 @@ class WorldService:
         )
         async with db.write() as session:
             session.add(row)
+        if default_asset_id:
+            await self.add_prop_reference(pid, row.id, default_asset_id)
         return as_dict(row)
 
     async def update_prop(self, pid: str, prop_id: str, patch: dict[str, Any]) -> dict[str, Any]:

@@ -53,6 +53,7 @@ MARKERS: dict[str, tuple[str, ...]] = {
 #: 少了这两个就没法做 R2V；其余入口缺了只是「那一项用图里原来的值」。
 #: 参考图槽位一个都没有也照样能生成——只是人物形象只能靠首帧带，容易跑偏。
 REQUIRED = ("AIVS_FIRST_FRAME", "AIVS_PROMPT")
+FLF_REQUIRED = (*REQUIRED, "AIVS_LAST_FRAME")
 
 HOW_TO = [
     "在 ComfyUI 里右键入口节点 → Title，改成 AIVS_FIRST_FRAME / AIVS_PROMPT 等",
@@ -164,6 +165,7 @@ def inspect(graph: dict[str, Any]) -> dict[str, Any]:
     """预设的体检报告：找到哪些入口、缺哪些、缺了会怎样。"""
     points = entry_points(graph)
     missing = [m for m in REQUIRED if m not in points]
+    missing_flf = [m for m in FLF_REQUIRED if m not in points]
     slots = ref_slots(points)
     return {
         "node_count": len(graph),
@@ -171,6 +173,16 @@ def inspect(graph: dict[str, Any]) -> dict[str, Any]:
         "found": sorted(points),
         "missing_required": missing,
         "ready": not missing,
+        "r2v_ready": not missing,
+        "flf_ready": not missing_flf,
+        "capabilities": [
+            capability
+            for capability, available in (
+                ("r2v", not missing),
+                ("flf", not missing_flf),
+            )
+            if available
+        ],
         #: 能收几张参考图。0 不影响 ready——只是这份图喂不进角色表，UI 要提醒。
         "ref_slots": len(slots),
         "ref_hint": (
@@ -247,6 +259,9 @@ def listing() -> list[dict[str, Any]]:
             "name": path.stem,
             "path": path.as_posix(),
             "ready": False,
+            "r2v_ready": False,
+            "flf_ready": False,
+            "capabilities": [],
             "ref_slots": 0,
             "ref_hint": "",
         }

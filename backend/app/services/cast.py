@@ -14,6 +14,8 @@ from app.core.ids import new_id
 from app.events.bus import Channel, bus
 from app.persistence.models import utc_now
 from app.persistence.models_cast import INHERITABLE, Appearance, Character, SheetVersion
+from app.persistence.models_world import Asset
+from app.services.assets import assets
 from app.services.base import as_dict, db_of, fetch, fetch_all, require_name
 
 CHARACTER_FIELDS = (
@@ -91,7 +93,10 @@ class CastService:
         """建角色。origin_library_id 只在「从素材库采用」时传（见 services/adopt.py），
         它是出处而不是外键——采用是单向复制，之后两边各改各的。"""
         name = require_name(patch.get("name"), "角色", "林昭")
+        default_asset_id = str(patch.get("default_asset_id") or "").strip()
         db = db_of(pid)
+        if default_asset_id:
+            await fetch(db, Asset, default_asset_id, "默认定妆图资产")
         now = utc_now()
         row = Character(
             id=new_id("character"),
@@ -104,7 +109,11 @@ class CastService:
         async with db.write() as session:
             session.add(row)
         # 建角色时顺手给一个根形象：没有形象的角色在镜头里无法被引用
-        await self.create_appearance(pid, row.id, {"name": "默认形象"}, default=True)
+        appearance = await self.create_appearance(
+            pid, row.id, {"name": "默认形象"}, default=True
+        )
+        if default_asset_id:
+            await self.add_sheet(pid, appearance["id"], default_asset_id)
         bus.emit(Channel.SHOT, "character.created", {"id": row.id, "name": name}, project_id=pid)
         return as_dict(row)
 
@@ -306,6 +315,8 @@ class CastService:
             {"appearance_id": aid, "version_no": row.version_no},
             project_id=pid,
         )
+        if asset_id:
+            await assets.link(pid, asset_id, "appearance", aid, role="sheet")
         return as_dict(row)
 
     async def list_sheets(self, pid: str, aid: str) -> list[dict[str, Any]]:

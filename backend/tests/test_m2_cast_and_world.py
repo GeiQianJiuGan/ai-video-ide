@@ -64,6 +64,41 @@ def test_new_character_gets_a_usable_default_appearance(client: TestClient, pid:
     assert apps[0]["parent_id"] is None
 
 
+def test_create_with_default_images_binds_them_immediately(
+    client: TestClient, pid: str
+) -> None:
+    character_asset = upload_png(client, pid, "character_sheet", "character-default.png")
+    character = client.post(
+        f"/api/v1/projects/{pid}/characters",
+        json={"name": "带图角色", "default_asset_id": character_asset["id"]},
+    )
+    assert character.status_code == 201, character.text
+    appearance = appearances_of(client, pid, character.json()["id"])[0]
+    assert appearance["current_sheet"]["asset_id"] == character_asset["id"]
+
+    location_asset = upload_png(client, pid, "location_reference", "location-default.png")
+    location = client.post(
+        f"/api/v1/projects/{pid}/locations",
+        json={"name": "带图地点", "default_asset_id": location_asset["id"]},
+    )
+    assert location.status_code == 201, location.text
+    listed_location = client.get(f"/api/v1/projects/{pid}/locations").json()[0]
+    assert listed_location["variants"][0]["name"] == "默认场景"
+    references = client.get(
+        f"/api/v1/projects/{pid}/variants/{listed_location['variants'][0]['id']}/references"
+    ).json()
+    assert references[0]["asset_id"] == location_asset["id"]
+
+    prop_asset = upload_png(client, pid, "prop_reference", "prop-default.png")
+    prop = client.post(
+        f"/api/v1/projects/{pid}/props",
+        json={"name": "带图道具", "default_asset_id": prop_asset["id"]},
+    )
+    assert prop.status_code == 201, prop.text
+    listed_prop = client.get(f"/api/v1/projects/{pid}/props").json()[0]
+    assert listed_prop["current_reference"]["asset_id"] == prop_asset["id"]
+
+
 def test_appearance_inheritance_override_and_revert(client: TestClient, pid: str) -> None:
     char = make_character(client, pid)
     root = appearances_of(client, pid, char["id"])[0]

@@ -236,7 +236,6 @@ class AdoptService:
                     continue
                 asset = await self._adopt_file(pid, sheet["asset_id"], tally)
                 await cast.add_sheet(pid, created["id"], asset["id"], source="imported")
-                await assets.link(pid, asset["id"], "appearance", created["id"], role="sheet")
             if row.get("is_default"):
                 await cast.set_default_appearance(pid, created["id"])
         return {

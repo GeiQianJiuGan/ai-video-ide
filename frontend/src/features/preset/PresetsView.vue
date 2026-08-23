@@ -59,6 +59,8 @@ async function save(): Promise<void> {
             <AppBadge v-if="row.ready" :tone="row.ref_slots ? 'neutral' : 'warn'">
               参考图 {{ row.ref_slots }} 槽
             </AppBadge>
+            <AppBadge v-if="row.r2v_ready" tone="ok">R2V</AppBadge>
+            <AppBadge v-if="row.flf_ready" tone="accent">FL2VA</AppBadge>
             <span class="text-fg-4 min-w-0 flex-1 truncate text-2xs">
               {{ row.ready ? row.ref_hint : row.impact }}
             </span>

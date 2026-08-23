@@ -20,6 +20,7 @@ class LocationBody(BaseModel):
     name: str | None = None
     description: str | None = None
     notes: str | None = None
+    default_asset_id: str | None = Field(default=None, description="默认场景使用的参考图资产 id")
 
 
 class VariantBody(BaseModel):
@@ -40,6 +41,7 @@ class PropBody(BaseModel):
     name: str | None = None
     description: str | None = None
     notes: str | None = None
+    default_asset_id: str | None = Field(default=None, description="道具使用的默认参考图资产 id")
 
 
 class PropReferenceBody(BaseModel):
