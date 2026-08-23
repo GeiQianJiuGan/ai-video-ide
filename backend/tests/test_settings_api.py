@@ -155,6 +155,7 @@ def test_system_prompt_is_configurable_but_the_shape_is_not(client: TestClient) 
     text = prompts.breakdown()
     assert text.startswith("只拆成两幕"), "填了就是替换那一段"
     assert prompts.BREAKDOWN_TASK not in text, "不是拼在内置文案后面，是换掉它"
+    assert prompts.BREAKDOWN_AUDIO_POLICY in text, "声音边界不能被自定义 Prompt 绕过"
     assert prompts.BREAKDOWN_SHAPE in text, "JSON 形状契约永远由代码追加，用户改不掉"
 
     # 清空（哪怕只敲了空格）= 恢复内置默认，而不是存一段空提示词
@@ -162,6 +163,15 @@ def test_system_prompt_is_configurable_but_the_shape_is_not(client: TestClient) 
     assert resp.status_code == 200, resp.text
     assert fields_of(client)["prompt.breakdown"]["source"] == "default"
     assert prompts.BREAKDOWN_TASK in prompts.breakdown()
+
+    positive, negative = prompts.with_shot_audio_policy(
+        "林昭在雨夜推门。声音设计：林昭说：“有人吗？”；雨声与木门吱呀声",
+        "low quality",
+    )
+    assert "林昭说：“有人吗？”" in positive, "对白原文应保留在 Shot Prompt 中"
+    assert "无背景音乐" in positive
+    assert all(term in negative for term in prompts.SHOT_AUDIO_NEGATIVE_TERMS)
+    assert prompts.with_shot_audio_policy(positive, negative) == (positive, negative), "兜底应幂等"
 
 
 def test_director_prompt_reaches_both_paths(client: TestClient) -> None:

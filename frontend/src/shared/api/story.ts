@@ -198,6 +198,20 @@ export interface StoryboardCard {
   video_path: string | null
   video_asset_id: string | null
   video_version_id: string | null
+  /** 该 Shot 的已生成视频版本，分镜板直接展示并支持采纳。 */
+  versions: {
+    id: string
+    version_no: number
+    kind: string
+    status: string
+    asset_id: string | null
+    video_path: string | null
+    thumbnail_path: string | null
+    duration: number | null
+    source: string
+    is_current: boolean
+    created_at: string
+  }[]
   /** 有片子但还没有能当图显示的那一张：调 `extractPosters` 补抽，不是错误。 */
   poster_pending: boolean
   version_count: number
@@ -223,6 +237,9 @@ export interface ProposedShot {
   camera: string | null
   movement: string | null
   characters: string[]
+  appearance_ids?: string[]
+  prompt?: string | null
+  negative_prompt?: string | null
 }
 
 export interface ProposedScene {
@@ -231,6 +248,15 @@ export interface ProposedScene {
   title: string
   summary: string | null
   time_of_day: string | null
+  source_text?: string | null
+  location?: string | null
+  location_variant?: string | null
+  prompt?: string | null
+  negative_prompt?: string | null
+  characters?: string[]
+  appearance_ids?: string[]
+  location_variant_id?: string | null
+  location_variant_ids?: string[]
   shots: ProposedShot[]
 }
 

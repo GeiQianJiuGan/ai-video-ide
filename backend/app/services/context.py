@@ -19,8 +19,9 @@ from __future__ import annotations
 from typing import Any
 
 from app.core.errors import AppError, ErrorCode
+from app.generation.providers import presets
 from app.generation.providers.base import RefCapacity
-from app.persistence.models import utc_now
+from app.persistence.models import Project, utc_now
 from app.persistence.models_cast import Appearance, Character, SheetVersion
 from app.persistence.models_gen import GenerationVersion
 from app.persistence.models_story import Scene, SceneCast, SceneLocation, Shot, ShotCast, ShotProp
@@ -44,7 +45,7 @@ PRIORITY = {
 }
 
 
-def ref_capacity() -> RefCapacity:
+def ref_capacity(capacity: RefCapacity | None = None) -> RefCapacity:
     """模型端这一次能收几张参考图。**不是设置项**——问的是适配层。
 
     以前这里有个应用级上限 `video.ref_limit`，账单算到第 N 张就把剩下的划掉。那个数字
@@ -54,9 +55,23 @@ def ref_capacity() -> RefCapacity:
     真正的截断只发生在提交那一刻，并如实写进 `params.ref_notes`。
     没有一份可数的图（通用 REST 合同 / 没选预设）就是不限张数。
     """
+    if capacity is not None:
+        return capacity
     from app.generation.providers import registry  # 延迟导入：context 不在模块级依赖生成层
 
     return registry.ref_capacity()
+
+
+async def project_ref_capacity(pid: str) -> RefCapacity | None:
+    """The selected preset Workflow is the project's only reference-image capacity source."""
+    project = (await fetch_all(db_of(pid), Project))[0]
+    name = project.preset_name
+    if not name:
+        return None
+    count = presets.slot_count(name)
+    if count is None:
+        return None
+    return RefCapacity(count, name, f"项目预设 {name} 标了 {count} 个 AIVS_REF_* 槽位。")
 
 
 def _assign_roles(items: list[dict[str, Any]], has_prev: bool) -> None:
@@ -125,7 +140,9 @@ def _extracted_frame(assets: Any, from_asset_id: str | None) -> str | None:
 
 
 class ContextService:
-    async def resolve(self, pid: str, shot_id: str) -> dict[str, Any]:
+    async def resolve(
+        self, pid: str, shot_id: str, *, capacity_override: RefCapacity | None = None
+    ) -> dict[str, Any]:
         db = db_of(pid)
         shot = await fetch(db, Shot, shot_id, "镜头")
         scene = await fetch(db, Scene, shot.scene_id, "场景")
@@ -345,7 +362,8 @@ class ContextService:
             item["missing_file"] = bool(item["asset_id"]) and asset is None
             item.pop("eligible", None)
         _assign_roles(items, bool(shot.prev_shot_id))
-        capacity = _capacity_of(items, ref_capacity())
+        selected_capacity = capacity_override or await project_ref_capacity(pid)
+        capacity = _capacity_of(items, ref_capacity(selected_capacity))
 
         problems = []
         if not scene.location_variant_id:

@@ -34,11 +34,13 @@ import FeatureHeader from '@/shared/ui/FeatureHeader.vue'
 import type { ProposedScene, ProposedShot } from '@/shared/api/story'
 import { useStoryStore } from '@/stores/story'
 import { useWorldStore } from '@/stores/world'
+import { useQueueStore } from '@/stores/queue'
 
 const route = useRoute()
 const router = useRouter()
 const story = useStoryStore()
 const world = useWorldStore()
+const queue = useQueueStore()
 
 const pid = computed(() => String(route.params.pid ?? ''))
 
@@ -162,7 +164,20 @@ function toggleShot(shot: ProposedShot): void {
 }
 
 async function propose(): Promise<void> {
-  await story.propose(pid.value, draftText.value.trim() || undefined).catch(() => {})
+  const taskId = queue.beginBreakdown()
+  try {
+    await story.propose(pid.value, draftText.value.trim() || undefined)
+    const result = story.proposal
+    queue.finishBreakdown(
+      taskId,
+      result
+        ? `拆解完成：${result.scene_count} 场 / ${result.shot_count} 镜，提案已准备好审阅。`
+        : '拆解完成，提案已准备好审阅。',
+    )
+  } catch (err) {
+    const message = err instanceof Error ? err.message : '请求失败'
+    queue.failBreakdown(taskId, message)
+  }
 }
 
 async function applyProposal(): Promise<void> {

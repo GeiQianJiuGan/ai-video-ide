@@ -42,6 +42,7 @@ from app.core.errors import (
 )
 from app.core.logging import get_logger, setup_logging
 from app.services.appsettings import app_settings
+from app.services.global_registry import global_registry
 from app.services.library import library
 from app.services.projects import projects
 
@@ -69,6 +70,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     setup_logging()
     # 设置文件里的覆盖要在任何 service 读 settings 之前生效（顺序：文件 → 环境变量 → 默认）
     app_settings.apply()
+    await global_registry.start()
     log.info(
         "backend.starting",
         version=settings.version,
@@ -79,6 +81,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     yield
     # 关闭所有工程库：SQLite WAL 需要正常 dispose 才会把 -wal 合并回主文件
     await projects.close_all()
+    await global_registry.close()
     # 素材库同理。shutdown 只 dispose，不忘记库的位置——下次启动还要打开它
     await library.shutdown()
     log.info("backend.stopped")

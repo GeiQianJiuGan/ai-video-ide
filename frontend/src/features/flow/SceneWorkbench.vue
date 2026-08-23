@@ -146,7 +146,9 @@ function refNotes(params: Record<string, unknown>): string[] {
 
 async function reload(): Promise<void> {
   if (!pid.value) return
-  await workbench.load(pid.value, sid.value).catch(() => {})
+  await Promise.all([
+    workbench.load(pid.value, sid.value).catch(() => {}),
+  ])
 }
 
 onMounted(reload)

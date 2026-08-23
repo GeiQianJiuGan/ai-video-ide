@@ -71,6 +71,8 @@ export interface Workflow {
   notes: string | null
   /** 槽位 → `"节点id.字段名"`。 */
   bindings: Record<string, string>
+  reference_image_slots?: string[]
+  reference_image_count?: number
   nodes: WorkflowNode[]
   required_nodes: string[]
   validation: ValidationResult | null
@@ -102,6 +104,16 @@ export interface ComfyStatus {
 export interface CapabilityMatrix {
   capabilities: CapabilityRow[]
   comfy: ComfyStatus
+  project_bindings?: ProjectWorkflowBindings
+}
+
+export type GenerationMode = 'comfy_preset' | 'http_api' | 'workflow_api'
+export interface ProjectWorkflowBindings {
+  generation_mode: GenerationMode
+  text2image: string | null
+  image2video: string | null
+  first_last_frame: string | null
+  upscale: string | null
 }
 
 export interface ImportWorkflowBody {
@@ -113,22 +125,36 @@ export interface ImportWorkflowBody {
 }
 
 export const workflowsApi = {
-  list: (pid: string) => api.get<Workflow[]>(`/projects/${pid}/workflows`),
-  get: (pid: string, wid: string) => api.get<Workflow>(`/projects/${pid}/workflows/${wid}`),
-  matrix: (pid: string) => api.get<CapabilityMatrix>(`/projects/${pid}/capabilities`),
-  import: (pid: string, body: ImportWorkflowBody) =>
-    api.post<Workflow>(`/projects/${pid}/workflows`, body),
-  update: (pid: string, wid: string, patch: { name?: string; notes?: string; status?: string }) =>
-    api.patch<Workflow>(`/projects/${pid}/workflows/${wid}`, patch),
-  bind: (pid: string, wid: string, bindings: Record<string, string>) =>
-    api.put<Workflow>(`/projects/${pid}/workflows/${wid}/bindings`, { bindings }),
+  globalList: () => api.get<Workflow[]>('/workflows'),
+  globalGet: (wid: string) => api.get<Workflow>(`/workflows/${wid}`),
+  globalImport: (body: ImportWorkflowBody) => api.post<Workflow>('/workflows', body),
+  globalBind: (wid: string, bindings: Record<string, string>) =>
+    api.put<Workflow>(`/workflows/${wid}/bindings`, { bindings }),
+  globalValidate: (wid: string, probe = true) =>
+    api.post<ValidationResult>(`/workflows/${wid}/validate?probe=${probe ? 'true' : 'false'}`, {}),
+  globalSetDefault: (wid: string) => api.post<Workflow>(`/workflows/${wid}/default`, {}),
+  globalRemove: (wid: string) => api.del<void>(`/workflows/${wid}`),
+  list: (_pid: string) => api.get<Workflow[]>('/workflows'),
+  get: (_pid: string, wid: string) => api.get<Workflow>(`/workflows/${wid}`),
+  matrix: (pid: string) =>
+    api.get<CapabilityMatrix>(pid ? `/projects/${pid}/capabilities` : '/capabilities'),
+  import: (_pid: string, body: ImportWorkflowBody) =>
+    api.post<Workflow>('/workflows', body),
+  update: (_pid: string, wid: string, patch: { name?: string; notes?: string; status?: string }) =>
+    api.patch<Workflow>(`/workflows/${wid}`, patch),
+  bind: (_pid: string, wid: string, bindings: Record<string, string>) =>
+    api.put<Workflow>(`/workflows/${wid}/bindings`, { bindings }),
   /** `probe=false` 时不碰 ComfyUI，只查绑定；离线也能把工作流配到「就绪」以外的所有问题查清。 */
-  validate: (pid: string, wid: string, probe = true) =>
+  validate: (_pid: string, wid: string, probe = true) =>
     api.post<ValidationResult>(
-      `/projects/${pid}/workflows/${wid}/validate?probe=${probe ? 'true' : 'false'}`,
+      `/workflows/${wid}/validate?probe=${probe ? 'true' : 'false'}`,
       {},
     ),
-  setDefault: (pid: string, wid: string) =>
-    api.post<Workflow>(`/projects/${pid}/workflows/${wid}/default`, {}),
-  remove: (pid: string, wid: string) => api.del<void>(`/projects/${pid}/workflows/${wid}`),
+  setDefault: (_pid: string, wid: string) =>
+    api.post<Workflow>(`/workflows/${wid}/default`, {}),
+  remove: (_pid: string, wid: string) => api.del<void>(`/workflows/${wid}`),
+  projectBindings: (pid: string) =>
+    api.get<ProjectWorkflowBindings>(`/projects/${pid}/workflow-bindings`),
+  setProjectBindings: (pid: string, bindings: ProjectWorkflowBindings) =>
+    api.put<ProjectWorkflowBindings>(`/projects/${pid}/workflow-bindings`, bindings),
 }

@@ -111,6 +111,13 @@ export interface EnvironmentStatus {
     detail: string
   }
   capabilities: { capabilities: CapabilityRow[]; comfy: unknown } | null
+  generation: {
+    mode: 'comfy_preset'
+    preset_name: string | null
+    preset_ready: boolean
+    ref_slots: number | null
+    detail: string
+  } | null
 }
 
 export const CAPABILITY_LABEL: Record<string, string> = {

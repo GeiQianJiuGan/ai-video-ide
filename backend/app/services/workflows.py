@@ -12,14 +12,19 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
+
+from sqlalchemy import select
 
 from app.core.errors import AppError, ErrorCode
 from app.core.ids import new_id
 from app.generation.comfy.client import comfy
-from app.persistence.models import utc_now
+from app.persistence.models import Project, utc_now
 from app.persistence.models_gen import CAPABILITIES, REQUIRED_SLOTS, Workflow
+from app.persistence.models_global import GlobalWorkflow
 from app.services.base import as_dict, db_of, dump_json, fetch, fetch_all, load_json
+from app.services.global_registry import global_registry
 
 #: 可绑定的输入槽。前四个是素材/文本，后面是采样参数。
 SLOTS = (
@@ -106,6 +111,56 @@ def node_summary(graph: dict[str, Any]) -> list[dict[str, Any]]:
     return sorted(out, key=lambda n: n["id"])
 
 
+def auto_bindings(
+    graph: dict[str, Any], capability: str, existing: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """Auto-bind fields from the documented AIVS_* node titles."""
+    bindings = dict(existing or {})
+    titled: dict[str, str] = {}
+    ref_titled: list[tuple[int, str]] = []
+    for node_id, node in graph.items():
+        title = str((node.get("_meta") or {}).get("title") or "").strip().upper()
+        if not title:
+            continue
+        for field, value in (node.get("inputs") or {}).items():
+            if isinstance(value, list):
+                continue
+            target = f"{node_id}.{field}"
+            titled.setdefault(title, target)
+            match = re.fullmatch(r"AIVS_REF_(\d+)", title)
+            if match and not any(index == int(match.group(1)) for index, _ in ref_titled):
+                ref_titled.append((int(match.group(1)), target))
+    aliases = {
+        "prompt": ("AIVS_PROMPT",),
+        "negative_prompt": ("AIVS_NEGATIVE", "AIVS_NEGATIVE_PROMPT"),
+        "first_frame": ("AIVS_FIRST_FRAME",),
+        "last_frame": ("AIVS_LAST_FRAME",),
+        "source_image": ("AIVS_SOURCE_IMAGE", "AIVS_FIRST_FRAME"),
+        "seed": ("AIVS_SEED",),
+        "steps": ("AIVS_STEPS",),
+        "width": ("AIVS_WIDTH",),
+        "height": ("AIVS_HEIGHT",),
+        "duration": ("AIVS_DURATION",),
+    }
+    for slot, names in aliases.items():
+        if slot not in bindings:
+            target = next((titled[name] for name in names if name in titled), None)
+            if target:
+                bindings[slot] = target
+    if "reference_image" not in bindings:
+        refs = sorted(ref_titled)
+        if refs:
+            bindings["reference_image"] = refs[0][1]
+            bindings["reference_image_slots"] = [target for _, target in refs]
+        elif capability == "image2video" and "AIVS_FIRST_FRAME" in titled:
+            bindings["reference_image"] = titled["AIVS_FIRST_FRAME"]
+    elif ref_titled:
+        bindings.setdefault(
+            "reference_image_slots", [target for _, target in sorted(ref_titled)]
+        )
+    return bindings
+
+
 def custom_nodes(graph: dict[str, Any]) -> list[str]:
     kinds = {str(n.get("class_type")) for n in graph.values()}
     return sorted(k for k in kinds if k not in BUILTIN_HINT)
@@ -143,10 +198,275 @@ def apply_bindings(
 
 
 class WorkflowService:
-    async def list_workflows(self, pid: str) -> list[dict[str, Any]]:
+    async def _global_db(self):
+        return await global_registry.start()
+
+    def _global_shape(self, row: GlobalWorkflow) -> dict[str, Any]:
+        data = as_dict(row)
+        raw_bindings = load_json(row.bindings_json, {})
+        data["bindings"] = {
+            key: value for key, value in raw_bindings.items() if key != "reference_image_slots"
+        }
+        data["reference_image_slots"] = raw_bindings.get("reference_image_slots", [])
+        data["reference_image_count"] = len(data["reference_image_slots"])
+        data["nodes"] = load_json(row.nodes_json, [])
+        data["required_nodes"] = load_json(row.required_nodes_json, [])
+        data["validation"] = load_json(row.validation_json, None)
+        data["missing_slots"] = sorted(
+            set(REQUIRED_SLOTS.get(row.capability, ())) - set(raw_bindings)
+        )
+        for key in (
+            "api_json",
+            "bindings_json",
+            "nodes_json",
+            "required_nodes_json",
+            "validation_json",
+        ):
+            data.pop(key, None)
+        return data
+
+    async def list_global(self) -> list[dict[str, Any]]:
+        db = await self._global_db()
+        rows = await fetch_all(db, GlobalWorkflow, order_by=GlobalWorkflow.created_at)
+        return [self._global_shape(r) for r in rows]
+
+    async def get_global(self, wid: str) -> dict[str, Any]:
+        db = await self._global_db()
+        row = await fetch(db, GlobalWorkflow, wid, "工作流")
+        data = self._global_shape(row)
+        data["api_json"] = row.api_json
+        return data
+
+    async def _global_row(self, wid: str) -> GlobalWorkflow:
+        return await fetch(await self._global_db(), GlobalWorkflow, wid, "工作流")
+
+    async def project_bindings(self, pid: str) -> dict[str, str | None]:
+        project = (await fetch_all(db_of(pid), Project))[0]
+        return {
+            "generation_mode": project.generation_mode,
+            "text2image": project.default_image_workflow_id,
+            "image2video": project.default_video_workflow_id,
+            "first_last_frame": project.default_first_last_workflow_id,
+            "upscale": project.default_upscale_workflow_id,
+        }
+
+    async def set_project_bindings(
+        self, pid: str, bindings: dict[str, str | None]
+    ) -> dict[str, str | None]:
         db = db_of(pid)
-        rows = await fetch_all(db, Workflow, order_by=Workflow.created_at)
-        return [self._shape(r) for r in rows]
+        for capability, wid in bindings.items():
+            if capability == "generation_mode":
+                continue
+            if not wid:
+                continue
+            row = await self._global_row(wid)
+            if row.capability != capability:
+                raise AppError(
+                    ErrorCode.VALIDATION_ERROR,
+                    "Workflow 能力不匹配",
+                    f"{row.name} 提供的是 {row.capability}，不能绑定到 {capability}。",
+                    ["选择同能力 Workflow"],
+                )
+            if row.status != "ready":
+                raise AppError(
+                    ErrorCode.INVALID_WORKFLOW,
+                    "Workflow 尚未就绪",
+                    f"{row.name} 当前状态为 {row.status}。",
+                    ["先校验 Workflow"],
+                )
+        async with db.write() as session:
+            project = (await session.execute(select(Project))).scalars().first()
+            assert project is not None
+            if bindings.get("generation_mode") in {"comfy_preset", "http_api", "workflow_api"}:
+                project.generation_mode = str(bindings["generation_mode"])
+            project.default_image_workflow_id = bindings.get("text2image")
+            project.default_video_workflow_id = bindings.get("image2video")
+            project.default_first_last_workflow_id = bindings.get("first_last_frame")
+            project.default_upscale_workflow_id = bindings.get("upscale")
+            project.updated_at = utc_now()
+        return await self.project_bindings(pid)
+
+    async def import_global(
+        self,
+        *,
+        name: str,
+        capability: str,
+        api_json: str,
+        bindings: dict[str, Any] | None = None,
+        notes: str | None = None,
+    ) -> dict[str, Any]:
+        if capability not in CAPABILITIES:
+            raise AppError(
+                ErrorCode.VALIDATION_ERROR,
+                "未知的能力类型",
+                f"{capability} 不在支持列表里。",
+                ["选择已支持的能力"],
+            )
+        graph = parse_graph(api_json)
+        bindings = auto_bindings(graph, capability, bindings)
+        db = await self._global_db()
+        now = utc_now()
+        row = GlobalWorkflow(
+            id=new_id("workflow"),
+            name=(name or "").strip() or "未命名工作流",
+            capability=capability,
+            api_json=api_json,
+            bindings_json=dump_json(bindings),
+            nodes_json=dump_json(node_summary(graph)),
+            required_nodes_json=dump_json(custom_nodes(graph)),
+            status="draft",
+            notes=notes,
+            created_at=now,
+            updated_at=now,
+        )
+        async with db.write() as session:
+            session.add(row)
+        return self._global_shape(row)
+
+    async def bind_global(self, wid: str, bindings: dict[str, Any]) -> dict[str, Any]:
+        unknown = sorted(set(bindings) - set(SLOTS) - {"reference_image_slots"})
+        if unknown:
+            raise AppError(
+                ErrorCode.VALIDATION_ERROR,
+                "未知的输入槽",
+                f"{'、'.join(unknown)} 不是可绑定的槽位。",
+                ["检查槽位名拼写"],
+            )
+        db = await self._global_db()
+        row = await self._global_row(wid)
+        graph = parse_graph(row.api_json)
+        bindings = auto_bindings(graph, row.capability, bindings)
+        async with db.write() as session:
+            fresh = await session.get(GlobalWorkflow, row.id)
+            assert fresh is not None
+            fresh.bindings_json = dump_json(bindings)
+            fresh.status = "draft"
+            fresh.validation_json = None
+            fresh.updated_at = utc_now()
+        return await self.get_global(wid)
+
+    async def validate_global(self, wid: str, *, probe: bool = True) -> dict[str, Any]:
+        db = await self._global_db()
+        row = await self._global_row(wid)
+        graph = parse_graph(row.api_json)
+        bindings: dict[str, Any] = load_json(row.bindings_json, {})
+        problems = [
+            f"{slot}: 该能力必须绑定此槽位"
+            for slot in sorted(set(REQUIRED_SLOTS.get(row.capability, ())) - set(bindings))
+        ]
+        for slot, target in bindings.items():
+            if slot == "reference_image_slots":
+                if isinstance(target, list):
+                    problems += [
+                        issue
+                        for index, item in enumerate(target, 1)
+                        if (issue := _check_binding(graph, f"reference_image[{index}]", str(item)))
+                    ]
+                continue
+            if slot in SLOTS and (issue := _check_binding(graph, slot, str(target))):
+                problems.append(issue)
+        required = custom_nodes(graph)
+        missing_nodes: list[str] = []
+        probe_detail = "已跳过节点探测"
+        if probe:
+            try:
+                installed = await comfy.installed_nodes()
+                missing_nodes = [n for n in required if n not in installed]
+                probe_detail = f"已探测 {len(installed)} 个节点"
+            except AppError as err:
+                probe_detail = f"未能探测（{err.title}）"
+        result = {
+            "ok": not problems and not missing_nodes,
+            "problems": problems,
+            "missing_slots": sorted(set(REQUIRED_SLOTS.get(row.capability, ())) - set(bindings)),
+            "required_nodes": required,
+            "missing_nodes": missing_nodes,
+            "probe": probe_detail,
+            "checked_at": utc_now(),
+        }
+        async with db.write() as session:
+            fresh = await session.get(GlobalWorkflow, wid)
+            assert fresh is not None
+            fresh.validation_json = dump_json(result)
+            fresh.status = "ready" if result["ok"] else "invalid"
+            fresh.updated_at = utc_now()
+        if not result["ok"]:
+            if missing_nodes and not problems:
+                raise AppError(
+                    ErrorCode.COMFY_NODE_MISSING,
+                    "缺少 ComfyUI 节点",
+                    "；".join(missing_nodes[:8]),
+                    ["安装缺少的自定义节点后重新探测", "或关闭节点探测，仅检查绑定"],
+                    {"workflow_id": wid, **result},
+                )
+            raise AppError(
+                ErrorCode.INVALID_WORKFLOW,
+                "绑定校验未通过",
+                "；".join(problems[:8]) or "缺少 ComfyUI 节点",
+                ["按规范标题自动绑定后重试"],
+                {"workflow_id": wid, **result},
+            )
+        return result
+
+    async def delete_global(self, wid: str) -> None:
+        db = await self._global_db()
+        row = await self._global_row(wid)
+        async with db.write() as session:
+            fresh = await session.get(GlobalWorkflow, row.id)
+            if fresh is not None:
+                await session.delete(fresh)
+
+    async def set_default_global(self, wid: str) -> dict[str, Any]:
+        db = await self._global_db()
+        row = await self._global_row(wid)
+        async with db.write() as session:
+            for other in await fetch_all(
+                db, GlobalWorkflow, where=GlobalWorkflow.capability == row.capability
+            ):
+                fresh = await session.get(GlobalWorkflow, other.id)
+                if fresh is not None:
+                    fresh.is_default = 1 if other.id == wid else 0
+        return await self.get_global(wid)
+
+    async def _resolve_global(self, capability: str, wid: str | None = None) -> GlobalWorkflow:
+        db = await self._global_db()
+        if wid:
+            row = await self._global_row(wid)
+            if row.capability != capability:
+                raise AppError(
+                    ErrorCode.VALIDATION_ERROR,
+                    "Workflow 能力不匹配",
+                    f"「{row.name}」提供的是 {row.capability}，当前任务需要 {capability}。",
+                    ["选择与镜头能力一致的 Workflow"],
+                    {"workflow_id": wid, "capability": capability},
+                )
+            if row.status != "ready":
+                raise AppError(
+                    ErrorCode.INVALID_WORKFLOW,
+                    "指定的工作流未就绪",
+                    f"「{row.name}」当前状态是 {row.status}。",
+                    ["先校验 Workflow"],
+                )
+            return row
+        rows = [
+            r
+            for r in await fetch_all(
+                db, GlobalWorkflow, where=GlobalWorkflow.capability == capability
+            )
+            if r.status == "ready"
+        ]
+        if not rows:
+            raise AppError(
+                ErrorCode.MISSING_CAPABILITY,
+                f"能力「{capability}」不可用",
+                _impact(capability),
+                ["在应用级 Workflow 管理中导入并校验"],
+                {"capability": capability},
+            )
+        return next((r for r in rows if r.is_default), rows[0])
+
+    async def list_workflows(self, pid: str) -> list[dict[str, Any]]:
+        return await self.list_global()
 
     def _shape(self, row: Workflow) -> dict[str, Any]:
         data = as_dict(row)
@@ -168,10 +488,7 @@ class WorkflowService:
         return data
 
     async def get(self, pid: str, wid: str) -> dict[str, Any]:
-        row = await fetch(db_of(pid), Workflow, wid, "工作流")
-        data = self._shape(row)
-        data["api_json"] = row.api_json
-        return data
+        return await self.get_global(wid)
 
     async def import_workflow(
         self,
@@ -183,59 +500,22 @@ class WorkflowService:
         bindings: dict[str, str] | None = None,
         notes: str | None = None,
     ) -> dict[str, Any]:
-        if capability not in CAPABILITIES:
-            raise AppError(
-                ErrorCode.VALIDATION_ERROR,
-                "未知的能力类型",
-                f"{capability} 不在支持列表里：{'、'.join(CAPABILITIES)}。",
-                ["选择一个已支持的能力", "若确实需要新能力，请先在能力表里登记"],
-            )
-        graph = parse_graph(api_json)
-        db = db_of(pid)
-        now = utc_now()
-        row = Workflow(
-            id=new_id("workflow"),
-            name=(name or "").strip() or "未命名工作流",
+        return await self.import_global(
+            name=name,
             capability=capability,
             api_json=api_json,
-            bindings_json=dump_json(bindings or {}),
-            nodes_json=dump_json(node_summary(graph)),
-            required_nodes_json=dump_json(custom_nodes(graph)),
-            status="draft",
+            bindings=bindings,
             notes=notes,
-            created_at=now,
-            updated_at=now,
         )
-        async with db.write() as session:
-            session.add(row)
-        return self._shape(row)
 
     async def bind(self, pid: str, wid: str, bindings: dict[str, str]) -> dict[str, Any]:
-        """整表替换绑定。未知槽位直接拒绝，避免打错字后静默失效。"""
-        unknown = sorted(set(bindings) - set(SLOTS))
-        if unknown:
-            raise AppError(
-                ErrorCode.VALIDATION_ERROR,
-                "未知的输入槽",
-                f"{'、'.join(unknown)} 不是可绑定的槽位。可用：{'、'.join(SLOTS)}。",
-                ["检查槽位名拼写", "只绑定当前能力需要的槽位"],
-            )
-        db = db_of(pid)
-        await fetch(db, Workflow, wid, "工作流")
-        async with db.write() as session:
-            row = await session.get(Workflow, wid)
-            assert row is not None
-            row.bindings_json = dump_json(bindings)
-            row.status = "draft"  # 改过绑定就要重新校验
-            row.validation_json = None
-            row.updated_at = utc_now()
-        return await self.get(pid, wid)
+        return await self.bind_global(wid, bindings)
 
     async def update(self, pid: str, wid: str, patch: dict[str, Any]) -> dict[str, Any]:
-        db = db_of(pid)
-        await fetch(db, Workflow, wid, "工作流")
+        db = await self._global_db()
+        await self._global_row(wid)
         async with db.write() as session:
-            row = await session.get(Workflow, wid)
+            row = await session.get(GlobalWorkflow, wid)
             assert row is not None
             for key in ("name", "notes"):
                 if key in patch:
@@ -243,97 +523,20 @@ class WorkflowService:
             if patch.get("status") in ("disabled", "draft"):
                 row.status = patch["status"]
             row.updated_at = utc_now()
-        return await self.get(pid, wid)
+        return await self.get_global(wid)
 
     async def delete(self, pid: str, wid: str) -> None:
-        db = db_of(pid)
-        await fetch(db, Workflow, wid, "工作流")
-        async with db.write() as session:
-            fresh = await session.get(Workflow, wid)
-            if fresh is not None:
-                await session.delete(fresh)
+        await self.delete_global(wid)
 
     async def set_default(self, pid: str, wid: str) -> dict[str, Any]:
-        db = db_of(pid)
-        row = await fetch(db, Workflow, wid, "工作流")
-        async with db.write() as session:
-            for other in await fetch_all(db, Workflow, where=Workflow.capability == row.capability):
-                fresh = await session.get(Workflow, other.id)
-                if fresh is not None:
-                    fresh.is_default = 1 if other.id == wid else 0
-        return await self.get(pid, wid)
+        return await self.set_default_global(wid)
 
     async def validate(self, pid: str, wid: str, *, probe: bool = True) -> dict[str, Any]:
-        """校验绑定 +（可选）探测自定义节点。结果写回 validation_json 并决定 status。"""
-        db = db_of(pid)
-        row = await fetch(db, Workflow, wid, "工作流")
-        graph = parse_graph(row.api_json)
-        bindings: dict[str, str] = load_json(row.bindings_json, {})
-
-        problems: list[str] = []
-        missing = sorted(set(REQUIRED_SLOTS.get(row.capability, ())) - set(bindings))
-        problems += [f"{slot}: 该能力必须绑定此槽位" for slot in missing]
-        for slot, target in bindings.items():
-            issue = _check_binding(graph, slot, str(target))
-            if issue:
-                problems.append(issue)
-
-        required = custom_nodes(graph)
-        missing_nodes: list[str] = []
-        probe_detail = "已跳过节点探测"
-        if probe:
-            try:
-                installed = await comfy.installed_nodes()
-                missing_nodes = [n for n in required if n not in installed]
-                probe_detail = f"已探测 {len(installed)} 个节点"
-            except AppError as err:
-                probe_detail = f"未能探测（{err.title}）"
-
-        ok = not problems and not missing_nodes
-        result = {
-            "ok": ok,
-            "problems": problems,
-            "missing_slots": missing,
-            "required_nodes": required,
-            "missing_nodes": missing_nodes,
-            "probe": probe_detail,
-            "checked_at": utc_now(),
-        }
-        async with db.write() as session:
-            fresh = await session.get(Workflow, wid)
-            assert fresh is not None
-            fresh.validation_json = dump_json(result)
-            if fresh.status != "disabled":
-                fresh.status = "ready" if ok else "invalid"
-            fresh.updated_at = utc_now()
-
-        if missing_nodes:
-            raise AppError(
-                ErrorCode.COMFY_NODE_MISSING,
-                f"缺少自定义节点 {missing_nodes[0]}",
-                "工作流用到的节点在 ComfyUI 里没装："
-                + "、".join(missing_nodes)
-                + f"。（{probe_detail}）",
-                [
-                    f"在 ComfyUI 里安装节点包 {missing_nodes[0]}",
-                    "换一套不依赖该节点的 Workflow",
-                    "把这条能力标为不可用，避免依赖它的镜头排队后才失败",
-                ],
-                {"workflow_id": wid, "missing_nodes": missing_nodes},
-            )
-        if problems:
-            raise AppError(
-                ErrorCode.INVALID_WORKFLOW,
-                "绑定校验未通过",
-                "；".join(problems[:8]),
-                ["把红色槽位拖到对应节点字段上", "确认导出的 API 图与绑定来自同一份工作流"],
-                {"workflow_id": wid, "problems": problems},
-            )
-        return result
+        return await self.validate_global(wid, probe=probe)
 
     async def capability_matrix(self, pid: str) -> dict[str, Any]:
         """四行能力矩阵。没有任何镜头时就能回答「以后哪种镜头做不出来」。"""
-        rows = await fetch_all(db_of(pid), Workflow)
+        rows = await fetch_all(await self._global_db(), GlobalWorkflow)
         matrix = []
         for cap in CAPABILITIES:
             mine = [r for r in rows if r.capability == cap]
@@ -353,37 +556,46 @@ class WorkflowService:
             )
         return {"capabilities": matrix, "comfy": await comfy.ping()}
 
-    async def resolve(self, pid: str, capability: str, wid: str | None = None) -> Workflow:
+    async def global_capability_matrix(self) -> dict[str, Any]:
+        return await self.capability_matrix("")
+
+    async def project_capabilities(self, pid: str) -> dict[str, Any]:
+        matrix = await self.capability_matrix(pid)
+        matrix["project_bindings"] = await self.project_bindings(pid)
+        return matrix
+
+    async def resolve(self, pid: str, capability: str, wid: str | None = None) -> GlobalWorkflow:
         """按能力挑一条可用的工作流。挑不到就报「能力缺失」而不是随便找一条。"""
-        db = db_of(pid)
+        # 新路径：Workflow 是应用级资源；项目只通过 Project.default_* 选择它。
         if wid:
-            row = await fetch(db, Workflow, wid, "工作流")
-            if row.status != "ready":
-                raise AppError(
-                    ErrorCode.INVALID_WORKFLOW,
-                    "指定的工作流未就绪",
-                    f"「{row.name}」当前状态是 {row.status}。",
-                    ["在流程页点「校验绑定」", "或换一条已就绪的工作流"],
-                    {"workflow_id": wid},
-                )
+            row = await self._resolve_global(capability, wid)
             return row
-        rows = [
-            r
-            for r in await fetch_all(db, Workflow, where=Workflow.capability == capability)
-            if r.status == "ready"
-        ]
-        if not rows:
+        project = (await fetch_all(db_of(pid), Project))[0]
+        selected = {
+            "text2image": project.default_image_workflow_id,
+            "image2video": project.default_video_workflow_id,
+            "first_last_frame": project.default_first_last_workflow_id,
+            "upscale": project.default_upscale_workflow_id,
+        }.get(capability)
+        explicit = any(
+            (
+                project.default_image_workflow_id,
+                project.default_video_workflow_id,
+                project.default_first_last_workflow_id,
+                project.default_upscale_workflow_id,
+            )
+        )
+        if explicit and not selected:
             raise AppError(
                 ErrorCode.MISSING_CAPABILITY,
-                f"能力「{capability}」不可用",
+                f"项目未绑定「{capability}」Workflow",
                 _impact(capability),
-                [
-                    "在流程页导入并校验一条对应能力的 workflow_api.json",
-                    "或把该镜头改成使用已就绪的能力",
-                ],
-                {"capability": capability},
+                ["到应用级 Workflow 管理中为项目绑定对应能力"],
+                {"capability": capability, "project_id": pid},
             )
-        return next((r for r in rows if r.is_default), rows[0])
+        if selected:
+            return await self._resolve_global(capability, selected)
+        return await self._resolve_global(capability)
 
 
 def _impact(cap: str) -> str:

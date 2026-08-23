@@ -148,8 +148,8 @@ async def test_detaching_twice_is_a_conflict_not_a_second_copy(tmp_path: Path) -
     assert err.suggestions
 
 
-async def test_overlapping_detaches_stack_onto_a_new_audio_track(tmp_path: Path) -> None:
-    """A1 在这个时间段占着 → 自动开 A2。「音频轨之间可以叠加」就是这么实现的。"""
+async def test_sequential_video_detaches_reuse_an_audio_track(tmp_path: Path) -> None:
+    """视频轨连续铺开后，非重叠的拆轨声音可以复用同一条音频轨。"""
     binary = ffmpeg_or_skip()
     pid = await make_project(tmp_path)
     first_src = await asset_service.register_path(
@@ -163,12 +163,12 @@ async def test_overlapping_detaches_stack_onto_a_new_audio_track(tmp_path: Path)
 
     await timeline_service.detach_audio(pid, early["id"])
     second = await timeline_service.detach_audio(pid, overlapping["id"])
-    assert second["created_track"] is True
-    assert second["track_name"] == "A2"
+    assert second["created_track"] is False
+    assert second["track_name"] == "A1"
 
     audio_tracks = tracks_of(second["timeline"], "audio")
-    assert [t["name"] for t in audio_tracks] == ["A1", "A2"]
-    assert [len(t["clips"]) for t in audio_tracks] == [1, 1], "两段声音各占一条轨道，才叠得起来"
+    assert [t["name"] for t in audio_tracks] == ["A1"]
+    assert [len(t["clips"]) for t in audio_tracks] == [2]
 
 
 async def test_a_silent_video_says_so_instead_of_making_a_silent_track(tmp_path: Path) -> None:
@@ -329,8 +329,8 @@ def add_music(client: TestClient, pid: str, *, duration: float | None, start: fl
     )
 
 
-def test_left_edge_trim_moves_start_and_in_point_in_one_step(client: TestClient, pid: str) -> None:
-    """拖左边缘：`in_point` 与 `start` 一起改，一次请求、一格撤销。"""
+def test_video_trim_closes_the_gap_in_one_step(client: TestClient, pid: str) -> None:
+    """视频裁切提交后后续片段立即贴紧，一次请求、一格撤销。"""
     clips = make_clips(client, pid, 4.0, 4.0)
     resp = client.post(
         f"/api/v1/projects/{pid}/clips/{clips[1]['id']}/trim",
@@ -338,8 +338,8 @@ def test_left_edge_trim_moves_start_and_in_point_in_one_step(client: TestClient,
     )
     assert resp.status_code == 200, resp.text
     edited = clip_in(resp.json(), clips[1]["id"])
-    assert (edited["in_point"], edited["duration"], edited["start"]) == (1.0, 3.0, 5.0), (
-        "往右拖左边缘：从源素材的第 1 秒开始，在时间线的第 5 秒落位，长度 3 秒"
+    assert (edited["in_point"], edited["duration"], edited["start"]) == (1.0, 3.0, 4.0), (
+        "往右裁掉 1 秒后仍要贴住前一段，视频轨不能留下空档"
     )
 
     undone = client.post(f"/api/v1/projects/{pid}/timeline/undo")
@@ -350,7 +350,7 @@ def test_left_edge_trim_moves_start_and_in_point_in_one_step(client: TestClient,
     )
 
 
-def test_trim_start_snaps_to_the_neighbour_edge(client: TestClient, pid: str) -> None:
+def test_video_trim_ignores_a_requested_gap(client: TestClient, pid: str) -> None:
     clips = make_clips(client, pid, 4.0, 4.0)
     resp = client.post(
         f"/api/v1/projects/{pid}/clips/{clips[1]['id']}/trim",
@@ -525,24 +525,63 @@ def test_a_soundless_file_is_refused_on_an_audio_track(
     assert any("拆出声音" in s for s in err["suggestions"]), "要指出视频的声音该怎么进音频轨"
 
 
-def test_export_says_the_gap_will_be_closed(client: TestClient, pid: str, fake_probe: None) -> None:
-    """轨道区和预览器把空档画出来，导出却用 concat 合掉——这个差别必须说出来。"""
+def test_video_drag_only_changes_order_and_never_creates_a_gap(
+    client: TestClient, pid: str, fake_probe: None
+) -> None:
     ffmpeg_or_skip()
     clips = make_clips(client, pid, 2.0, 2.0)
-    moved = client.post(f"/api/v1/projects/{pid}/clips/{clips[1]['id']}/move", json={"start": 5.0})
+    moved = client.post(f"/api/v1/projects/{pid}/clips/{clips[0]['id']}/move", json={"start": 5.0})
     assert moved.status_code == 200, moved.text
+    video = next(t for t in moved.json()["tracks"] if t["kind"] == "video")
+    assert [c["id"] for c in video["clips"]] == [clips[1]["id"], clips[0]["id"]]
+    assert [c["start"] for c in video["clips"]] == [0.0, 2.0]
 
     plan = client.get(f"/api/v1/projects/{pid}/export/command").json()
-    note = next((w for w in plan["warnings"] if "空档" in w), None)
-    assert note is not None, "预览里有 3 秒黑场、导出后没有，不说清就会被当成 bug"
-    assert "3.00 秒" in note
-    assert "对不上" not in note, "没有音频轨片段时不必扯到音画对不上"
+    assert not any("空档" in warning for warning in plan["warnings"])
 
-    assert add_music(client, pid, duration=2.0).status_code == 201
-    again = client.get(f"/api/v1/projects/{pid}/export/command").json()
-    assert any("对不上" in w for w in again["warnings"]), (
-        "音频按绝对位置放，画面合掉空档之后就错位了——有音频轨时要多提这一句"
+
+def test_audio_cannot_overlap_on_one_track_but_can_move_to_a_new_track(
+    client: TestClient, pid: str, fake_probe: None
+) -> None:
+    first = add_music(client, pid, duration=3.0, start=0.0)
+    assert first.status_code == 201, first.text
+    overlap = add_music(client, pid, duration=2.0, start=1.0)
+    assert overlap.status_code == 409, overlap.text
+    assert "同一条音频轨不能重叠" in error_of(overlap)["title"]
+
+    moved = client.post(
+        f"/api/v1/projects/{pid}/clips/{first.json()['clip_id']}/new-audio-track"
     )
+    assert moved.status_code == 201, moved.text
+    tracks = [t for t in moved.json()["timeline"]["tracks"] if t["kind"] == "audio"]
+    assert len(tracks) == 2
+    assert tracks[0]["clips"] == []
+    assert [c["id"] for c in tracks[1]["clips"]] == [first.json()["clip_id"]]
+
+
+def test_blank_video_segment_has_editable_duration_and_exports_as_black(
+    client: TestClient, pid: str
+) -> None:
+    ffmpeg_or_skip()
+    video = track_named(client, pid, "V1")
+    added = client.post(
+        f"/api/v1/projects/{pid}/tracks/{video['id']}/blank-clips",
+        json={"duration": 1.5},
+    )
+    assert added.status_code == 201, added.text
+    clip_id = added.json()["clip_id"]
+    clip = clip_in(added.json()["timeline"], clip_id)
+    assert (clip["asset_id"], clip["start"], clip["duration"]) == (None, 0.0, 1.5)
+
+    resized = client.post(
+        f"/api/v1/projects/{pid}/clips/{clip_id}/blank-duration", json={"duration": 2.25}
+    )
+    assert resized.status_code == 200, resized.text
+    assert clip_in(resized.json(), clip_id)["duration"] == 2.25
+
+    plan = client.get(f"/api/v1/projects/{pid}/export/command")
+    assert plan.status_code == 200, plan.text
+    assert "color=c=black" in plan.json()["command"]
 
 
 def test_export_mixes_the_audio_tracks_and_warns_about_what_it_drops(

@@ -255,6 +255,12 @@ def test_transition_needs_a_first_frame_on_the_next_scene(client: TestClient, pi
 def test_sequential_chains_the_shots_and_explains_the_wait(client: TestClient, pid: str) -> None:
     assert client.post(f"{API}/projects/{pid}/queue/pause").status_code == 200
     a, b, sa, sb = two_scenes(client, pid)
+    # 上游即使已经有旧版本，本次续接也必须等本次新任务完成，不能拿旧指针提前放行。
+    old_asset = upload_png(client, pid, "generated_video", "old-head.png")
+    assert client.post(
+        f"{API}/projects/{pid}/shots/{sa}/versions",
+        json={"asset_id": old_asset, "kind": "video"},
+    ).status_code == 201
     client.put(
         f"{API}/projects/{pid}/links",
         json={"from_scene_id": a, "to_scene_id": b, "mode": "transition"},
@@ -280,9 +286,10 @@ def test_sequential_chains_the_shots_and_explains_the_wait(client: TestClient, p
     jobs = client.get(f"{API}/projects/{pid}/jobs").json()
     tail_job = next(j for j in jobs if j["shot_id"] == sb)
     assert tail_job["status"] == "waiting"
-    assert "末帧" in (tail_job["wait_reason"] or "")
+    assert "本次生成" in (tail_job["wait_reason"] or "")
     head_job = next(j for j in jobs if j["shot_id"] == sa)
     assert head_job["status"] == "queued", "链头不该等任何人"
+    assert tail_job["params"]["wait_for_job_id"] == head_job["id"]
 
 
 def test_transition_with_a_version_is_not_regenerated(client: TestClient, pid: str) -> None:

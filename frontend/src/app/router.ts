@@ -55,7 +55,7 @@ const projectRoutes: RouteRecordRaw[] = [
   {
     path: 'workflows',
     name: 'workflows',
-    component: () => import('@/features/workflow/WorkflowsView.vue'),
+    redirect: { name: 'dashboard' },
   },
   {
     path: 'queue',
@@ -83,6 +83,16 @@ const routes: RouteRecordRaw[] = [
     path: '/library',
     name: 'library',
     component: () => import('@/features/library/LibraryView.vue'),
+  },
+  {
+    path: '/presets',
+    name: 'presets',
+    component: () => import('@/features/preset/PresetsView.vue'),
+  },
+  {
+    path: '/workflows',
+    name: 'global-workflows',
+    redirect: { name: 'presets' },
   },
   { path: '/p/:pid', children: projectRoutes },
   {

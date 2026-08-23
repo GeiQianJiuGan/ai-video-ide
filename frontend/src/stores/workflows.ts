@@ -18,11 +18,19 @@ import {
   type ImportWorkflowBody,
   type ValidationResult,
   type Workflow,
+  type ProjectWorkflowBindings,
 } from '@/shared/api/workflows'
 
 export const useWorkflowStore = defineStore('workflows', () => {
   const list = ref<Workflow[]>([])
   const matrix = ref<CapabilityMatrix | null>(null)
+  const projectBindings = ref<ProjectWorkflowBindings>({
+    generation_mode: 'comfy_preset',
+    text2image: null,
+    image2video: null,
+    first_last_frame: null,
+    upscale: null,
+  })
   const selectedId = ref('')
   /** 选中那条的完整体（带 api_json），列表里的没有原始图。 */
   const detail = ref<Workflow | null>(null)
@@ -64,9 +72,16 @@ export const useWorkflowStore = defineStore('workflows', () => {
 
   async function load(pid: string): Promise<void> {
     await guarded(async () => {
-      const [rows, mtx] = await Promise.all([workflowsApi.list(pid), workflowsApi.matrix(pid)])
+      const [rows, mtx, bindings] = await Promise.all([
+        workflowsApi.list(pid),
+        workflowsApi.matrix(pid),
+        pid ? workflowsApi.projectBindings(pid) : Promise.resolve(projectBindings.value),
+      ])
       list.value = rows
       matrix.value = mtx
+      projectBindings.value = pid
+        ? bindings
+        : { generation_mode: 'comfy_preset', text2image: null, image2video: null, first_last_frame: null, upscale: null }
       if (!rows.some((r) => r.id === selectedId.value)) selectedId.value = rows[0]?.id ?? ''
       await loadDetail(pid)
     })
@@ -164,12 +179,23 @@ export const useWorkflowStore = defineStore('workflows', () => {
     })
   }
 
+  async function setProjectBindings(
+    pid: string,
+    bindings: ProjectWorkflowBindings,
+  ): Promise<void> {
+    await guarded(async () => {
+      projectBindings.value = await workflowsApi.setProjectBindings(pid, bindings)
+      matrix.value = await workflowsApi.matrix(pid)
+    })
+  }
+
   return {
     list,
     matrix,
     capabilities,
     comfy,
     readyCount,
+    projectBindings,
     selectedId,
     detail,
     lastValidation,
@@ -183,6 +209,7 @@ export const useWorkflowStore = defineStore('workflows', () => {
     setDefault,
     update,
     remove,
+    setProjectBindings,
     clearError,
   }
 })

@@ -250,6 +250,7 @@ class ProjectService:
                         fps=fps,
                         aspect_ratio=aspect_ratio(width, height),
                         duration_unit=duration_unit,
+                        preset_name=settings.video_preset or None,
                         schema_version=settings.schema_version,
                         created_at=now,
                         updated_at=now,
@@ -365,6 +366,13 @@ class ProjectService:
                 )
 
             migrated_from = stored if stored < settings.schema_version else None
+            inherited_preset = row.preset_name or settings.video_preset or None
+            if row.preset_name is None and inherited_preset:
+                async with db.write() as session:
+                    fresh = await session.get(Project, row.id)
+                    if fresh is not None:
+                        fresh.preset_name = inherited_preset
+                        fresh.updated_at = utc_now()
             proj = OpenProject(
                 id=row.id,
                 name=row.name,

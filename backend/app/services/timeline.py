@@ -405,10 +405,23 @@ class TimelineService:
     async def move_clip(self, pid: str, clip_id: str, start: float) -> dict[str, Any]:
         db = db_of(pid)
         clip = await fetch(db, TimelineClip, clip_id, "片段")
+        track = await fetch(db, Track, clip.track_id, "轨道")
+        siblings = await self._siblings(pid, clip.track_id, clip_id)
         await self._capture(pid)
-        snapped = self._snap_to_neighbours(
-            float(start), await self._siblings(pid, clip.track_id, clip_id)
-        )
+        if track.kind == "video":
+            # 视频轨没有“任意坐标”这件事：横向拖动只决定插到哪个片段前后，
+            # 真正的 start 始终由连续顺序重新计算。
+            desired = max(0.0, float(start))
+            ordered = sorted(siblings, key=lambda row: row.start)
+            position = sum(
+                1 for row in ordered if desired >= row.start + row.duration / 2
+            )
+            ordered.insert(position, clip)
+            await self._write_contiguous_order(pid, clip.track_id, [row.id for row in ordered])
+            return await self.get(pid)
+
+        snapped = self._snap_to_neighbours(float(start), siblings)
+        self._ensure_free(snapped, clip.duration, siblings, track.name)
         async with db.write() as session:
             row = await session.get(TimelineClip, clip_id)
             assert row is not None
@@ -435,6 +448,7 @@ class TimelineService:
         """
         db = db_of(pid)
         clip = await fetch(db, TimelineClip, clip_id, "片段")
+        track = await fetch(db, Track, clip.track_id, "轨道")
         new_in = clip.in_point if in_point is None else max(0.0, float(in_point))
         source_end = clip.out_point if clip.out_point is not None else clip.in_point + clip.duration
         new_out = source_end if out_point is None else float(out_point)
@@ -471,6 +485,13 @@ class TimelineService:
             new_start = self._snap_to_neighbours(
                 float(start), await self._siblings(pid, clip.track_id, clip_id)
             )
+        if track.kind == "audio":
+            self._ensure_free(
+                new_start,
+                new_out - new_in,
+                await self._siblings(pid, clip.track_id, clip_id),
+                track.name,
+            )
         await self._capture(pid)
         async with db.write() as session:
             row = await session.get(TimelineClip, clip_id)
@@ -479,13 +500,14 @@ class TimelineService:
             row.out_point = new_out
             row.duration = new_out - new_in
             row.start = new_start
-        if ripple:
+        if track.kind == "video" or ripple:
             await self._close_gaps(pid, clip.track_id)
         return await self.get(pid)
 
     async def split_clip(self, pid: str, clip_id: str, at: float) -> dict[str, Any]:
         db = db_of(pid)
         clip = await fetch(db, TimelineClip, clip_id, "片段")
+        track = await fetch(db, Track, clip.track_id, "轨道")
         offset = float(at) - clip.start
         if not 0 < offset < clip.duration:
             raise AppError(
@@ -531,12 +553,13 @@ class TimelineService:
         """
         db = db_of(pid)
         clip = await fetch(db, TimelineClip, clip_id, "片段")
+        track = await fetch(db, Track, clip.track_id, "轨道")
         await self._capture(pid)
         async with db.write() as session:
             fresh = await session.get(TimelineClip, clip_id)
             if fresh is not None:
                 await session.delete(fresh)
-        if ripple:
+        if track.kind == "video" or ripple:
             await self._close_gaps(pid, clip.track_id)
         else:
             await self._reindex(pid, clip.track_id)
@@ -605,10 +628,153 @@ class TimelineService:
             out_point=float(length),
             label=(label or "").strip() or _asset_label(asset),
         )
+        if track.kind == "video":
+            siblings = await self._siblings(pid, track_id, None)
+            if siblings:
+                row.start = max(c.start + c.duration for c in siblings)
+        else:
+            self._ensure_free(
+                row.start,
+                row.duration,
+                await self._siblings(pid, track_id, None),
+                track.name,
+            )
         async with db.write() as session:
             session.add(row)
-        await self._reindex(pid, track_id)
+        if track.kind == "video":
+            await self._close_gaps(pid, track_id)
+        else:
+            await self._reindex(pid, track_id)
         return {"clip_id": row.id, "timeline": await self.get(pid)}
+
+    async def add_blank_clip(
+        self,
+        pid: str,
+        track_id: str,
+        *,
+        start: float = 0.0,
+        duration: float = 1.0,
+        label: str | None = None,
+    ) -> dict[str, Any]:
+        """在视频轨放一段可导出的黑场占位片段。"""
+        db = db_of(pid)
+        track = await fetch(db, Track, track_id, "轨道")
+        if track.kind != "video":
+            raise AppError(
+                ErrorCode.VALIDATION_ERROR,
+                "空白片段只能放到视频轨",
+                f"{track.name} 不是视频轨。",
+                ["选择视频轨再添加空白视频段"],
+            )
+        if duration <= 0:
+            raise AppError(ErrorCode.VALIDATION_ERROR, "空白片段时长无效", "时长必须大于 0 秒。", ["填入正数时长"])
+        siblings = await self._siblings(pid, track_id, None)
+        await self._capture(pid)
+        row = TimelineClip(
+            id=new_id("timeline_clip"),
+            track_id=track_id,
+            index_no=0,
+            start=max((c.start + c.duration for c in siblings), default=0.0),
+            duration=float(duration),
+            in_point=0.0,
+            out_point=float(duration),
+            label=(label or "空白视频段").strip(),
+        )
+        async with db.write() as session:
+            session.add(row)
+        await self._close_gaps(pid, track_id)
+        return {"clip_id": row.id, "timeline": await self.get(pid)}
+
+    async def resize_blank_clip(
+        self, pid: str, clip_id: str, *, duration: float
+    ) -> dict[str, Any]:
+        """修改黑场占位的时长；后面的画面随即重新贴紧。"""
+        db = db_of(pid)
+        clip = await fetch(db, TimelineClip, clip_id, "片段")
+        track = await fetch(db, Track, clip.track_id, "轨道")
+        if track.kind != "video" or clip.asset_id or clip.shot_id or clip.version_id:
+            raise AppError(
+                ErrorCode.VALIDATION_ERROR,
+                "只有空白视频段能直接设置时长",
+                "普通素材片段请用左右裁切线修改可见范围。",
+                ["选中空白视频段后再设置时长"],
+            )
+        if duration <= 0:
+            raise AppError(
+                ErrorCode.VALIDATION_ERROR,
+                "空白片段时长无效",
+                "时长必须大于 0 秒。",
+                ["填入正数时长"],
+            )
+        await self._capture(pid)
+        async with db.write() as session:
+            row = await session.get(TimelineClip, clip_id)
+            assert row is not None
+            row.duration = float(duration)
+            row.in_point = 0.0
+            row.out_point = float(duration)
+        await self._close_gaps(pid, clip.track_id)
+        return await self.get(pid)
+
+    async def move_clip_to_track(
+        self, pid: str, clip_id: str, target_track_id: str
+    ) -> dict[str, Any]:
+        db = db_of(pid)
+        clip = await fetch(db, TimelineClip, clip_id, "片段")
+        source = await fetch(db, Track, clip.track_id, "轨道")
+        target = await fetch(db, Track, target_track_id, "目标轨道")
+        if source.kind != "audio" or target.kind != "audio":
+            raise AppError(
+                ErrorCode.VALIDATION_ERROR,
+                "只能在音频轨之间移动片段",
+                f"{source.name} → {target.name} 不是音频轨移动。",
+                ["视频片段请通过视频轨重新排序"],
+            )
+        self._ensure_free(
+            clip.start,
+            clip.duration,
+            await self._siblings(pid, target_track_id, None),
+            target.name,
+        )
+        await self._capture(pid)
+        async with db.write() as session:
+            row = await session.get(TimelineClip, clip_id)
+            assert row is not None
+            row.track_id = target_track_id
+        await self._reindex(pid, source.id)
+        await self._reindex(pid, target.id)
+        return await self.get(pid)
+
+    async def move_clip_to_new_audio_track(self, pid: str, clip_id: str) -> dict[str, Any]:
+        db = db_of(pid)
+        clip = await fetch(db, TimelineClip, clip_id, "片段")
+        source = await fetch(db, Track, clip.track_id, "轨道")
+        if source.kind != "audio":
+            raise AppError(
+                ErrorCode.VALIDATION_ERROR,
+                "只有音频片段能移到新音频轨",
+                f"{source.name} 不是音频轨。",
+                ["先在音频轨中选中一个片段"],
+            )
+        timeline = await self.get(pid)
+        rows = await fetch_all(db, Track, where=Track.timeline_id == timeline["id"])
+        await self._capture(pid)
+        target = Track(
+            id=new_id("track"),
+            timeline_id=timeline["id"],
+            kind="audio",
+            index_no=max((t.index_no for t in rows), default=-1) + 1,
+            name=self._next_name("audio", rows),
+        )
+        async with db.write() as session:
+            session.add(target)
+            await session.flush()
+            row = await session.get(TimelineClip, clip_id)
+            assert row is not None
+            row.track_id = target.id
+        await self._reindex(pid, source.id)
+        await self._reindex(pid, target.id)
+        return {"track_id": target.id, "timeline": await self.get(pid)}
 
     async def detach_audio(self, pid: str, clip_id: str) -> dict[str, Any]:
         """把一段画面的声音拆成音频轨上的独立片段。
@@ -770,6 +936,46 @@ class TimelineService:
     ) -> list[TimelineClip]:
         rows = await fetch_all(db_of(pid), TimelineClip, where=TimelineClip.track_id == track_id)
         return [c for c in rows if c.id != exclude_id]
+
+    @staticmethod
+    def _ensure_free(
+        start: float, duration: float, siblings: list[TimelineClip], track_name: str
+    ) -> None:
+        end = float(start) + float(duration)
+        for other in siblings:
+            other_end = float(other.start) + float(other.duration)
+            if float(start) < other_end - 0.001 and end > float(other.start) + 0.001:
+                raise AppError(
+                    ErrorCode.CONFLICT,
+                    "同一条音频轨不能重叠",
+                    f"目标区间 {start:.3f}~{end:.3f} 与「{other.label or other.id}」重叠。",
+                    ["拖到当前轨道的空闲区间", "或把片段移到另一条音频轨"],
+                    {"track": track_name, "clip_id": other.id},
+                )
+
+    async def _write_contiguous_order(
+        self, pid: str, track_id: str, clip_ids: list[str]
+    ) -> None:
+        """按给定顺序重写视频轨；视频永远从 0 秒连续铺开。"""
+        db = db_of(pid)
+        rows = {
+            c.id: c
+            for c in await fetch_all(
+                db, TimelineClip, where=TimelineClip.track_id == track_id
+            )
+        }
+        cursor = 0.0
+        async with db.write() as session:
+            for index, clip_id in enumerate(clip_ids, start=1):
+                row = rows.get(clip_id)
+                if row is None:
+                    continue
+                fresh = await session.get(TimelineClip, clip_id)
+                if fresh is None:
+                    continue
+                fresh.start = cursor
+                fresh.index_no = index
+                cursor += fresh.duration
 
     def _snap_to_neighbours(self, value: float, siblings: list[TimelineClip]) -> float:
         """吸附到同轨邻居的边界。手拖的坐标永远差那么几毫秒，靠它对齐。"""
@@ -940,9 +1146,7 @@ class TimelineService:
             )
         proj = project_of(pid)
         warnings: list[str] = []
-        # 画面用 concat 一段接一段：视频轨上的空档会被合掉，不会变成黑帧。
-        # 轨道区和预览器把空档画出来（那是时间线上的真实位置），所以这件事必须说，
-        # 不然「预览里有 2 秒黑场，导出后没有」会被当成 bug。
+        # 画面用 concat 一段接一段。服务层会保持视频轨连续；旧数据若仍有空档，预检仍会提示。
         gaps, prev_end = 0.0, 0.0
         for clip in clips:
             gaps += max(0.0, clip["start"] - prev_end)
@@ -966,7 +1170,7 @@ class TimelineService:
         missing = [
             c
             for c in [*clips, *audio_clips]
-            if not c["asset_path"] or not (proj.dir / c["asset_path"]).is_file()
+            if c["asset_path"] and not (proj.dir / c["asset_path"]).is_file()
         ]
         if missing:
             raise AppError(
@@ -991,14 +1195,24 @@ class TimelineService:
 
         args: list[str] = [self._ffmpeg(), "-y"]
         for clip in [*clips, *audio_clips]:
-            args += [
-                "-ss",
-                f"{clip['in_point']:.3f}",
-                "-t",
-                f"{clip['duration']:.3f}",
-                "-i",
-                str(proj.dir / clip["asset_path"]),
-            ]
+            if clip["asset_path"]:
+                args += [
+                    "-ss",
+                    f"{clip['in_point']:.3f}",
+                    "-t",
+                    f"{clip['duration']:.3f}",
+                    "-i",
+                    str(proj.dir / clip["asset_path"]),
+                ]
+            else:
+                args += [
+                    "-f",
+                    "lavfi",
+                    "-t",
+                    f"{clip['duration']:.3f}",
+                    "-i",
+                    f"color=c=black:s={timeline['width']}x{timeline['height']}:r={timeline['fps']}",
+                ]
         graph = []
         for i, _ in enumerate(clips):
             graph.append(
@@ -1017,7 +1231,12 @@ class TimelineService:
         unknown = 0
         for i, clip in enumerate(clips):
             offset, cursor = cursor, cursor + clip["duration"]
-            if video_muted or clip["muted"] or clip["volume"] <= 0:
+            if (
+                video_muted
+                or clip["muted"]
+                or clip["volume"] <= 0
+                or not clip["asset_path"]
+            ):
                 continue
             probe = await audio_service.peek(proj.dir / clip["asset_path"])
             if probe is None:

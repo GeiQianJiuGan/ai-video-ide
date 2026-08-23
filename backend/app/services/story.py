@@ -18,7 +18,7 @@ from app.ai.llm import client as llm
 from app.core.config import settings
 from app.core.errors import AppError, ErrorCode
 from app.core.ids import new_id
-from app.persistence.models import utc_now
+from app.persistence.models import Project, utc_now
 from app.persistence.models_cast import Appearance, Character, SheetVersion
 from app.persistence.models_gen import GenerationVersion
 from app.persistence.models_story import (
@@ -153,13 +153,35 @@ def _shot_media(
             images[-1] if images else None
         )
         poster = assets.get(chosen.asset_id or "") if chosen else None
-        poster_path = poster.path if poster else None
+    poster_path = poster.path if poster else None
+    version_rows: list[dict[str, Any]] = []
+    for version in sorted(videos, key=lambda v: v.version_no, reverse=True):
+        asset = assets.get(version.asset_id or "")
+        if asset is None:
+            continue
+        version_poster = posters.get(asset.id)
+        version_rows.append(
+            {
+                "id": version.id,
+                "version_no": version.version_no,
+                "kind": version.kind,
+                "status": version.status,
+                "asset_id": version.asset_id,
+                "video_path": asset.path,
+                "thumbnail_path": version_poster.path if version_poster else None,
+                "duration": version.duration,
+                "source": version.source,
+                "is_current": version.id == shot.current_version_id,
+                "created_at": version.created_at,
+            }
+        )
     return {
         "thumbnail_asset_id": poster.id if poster else None,
         "thumbnail_path": poster_path,
         "video_version_id": picked.id if picked else None,
         "video_asset_id": video_asset.id if video_asset else None,
         "video_path": video_asset.path if video_asset else None,
+        "versions": version_rows,
         # 有片子但还没有能当图显示的那一张：可以补抽，不是错误
         "poster_pending": bool(video_asset) and poster_path is None,
     }
@@ -940,34 +962,92 @@ class StoryService:
             )
         db = db_of(pid)
         characters = await fetch_all(db, Character)
+        appearances = await fetch_all(db, Appearance, order_by=Appearance.created_at)
+        variants = await fetch_all(db, LocationVariant, order_by=LocationVariant.created_at)
+        locations = {row.id: row for row in await fetch_all(db, Location)}
+        projects = await fetch_all(db, Project)
+        project = projects[0] if projects else None
+        default_style = str(
+            (project.default_prompt_style if project else None)
+            or "cinematic, coherent character design"
+        )
+        default_negative = str(
+            (project.negative_prompt if project else None)
+            or "low quality, blurry, distorted anatomy, extra fingers, text, watermark"
+        )
         proposal = []
         for si, scene in enumerate(scenes_raw):
             if not isinstance(scene, dict):
                 continue
             shots_raw = scene.get("shots") if isinstance(scene.get("shots"), list) else []
+            scene_title = str(scene.get("title") or f"场景 {si + 1}")
+            scene_summary = str(scene.get("summary") or scene_title)
+            scene_prompt = (
+                str(scene.get("prompt") or "").strip()
+                or f"{scene_title}，{scene_summary}，{default_style}"
+            )
+            scene_char_names = [str(c) for c in (scene.get("characters") or []) if str(c).strip()]
+            shot_rows = []
+            for hi, shot in enumerate(shots_raw):
+                if not isinstance(shot, dict):
+                    continue
+                shot_title = str(shot.get("title") or f"镜头 {hi + 1}")
+                description = str(shot.get("description") or "").strip() or shot_title
+                shot_chars = [
+                    str(c) for c in (shot.get("characters") or scene_char_names) if str(c).strip()
+                ]
+                visual_and_sound_prompt = (
+                    str(shot.get("prompt") or "").strip() or f"{description}，{scene_prompt}"
+                )
+                base_negative = (
+                    str(shot.get("negative_prompt") or "").strip() or default_negative
+                )
+                shot_prompt, shot_negative = prompts.with_shot_audio_policy(
+                    visual_and_sound_prompt, base_negative
+                )
+                shot_rows.append(
+                    {
+                        "op": "add",
+                        "temp_id": f"s{si + 1}h{hi + 1}",
+                        "title": shot_title,
+                        "description": description,
+                        "duration": float(shot.get("duration") or 4.0),
+                        "camera": str(shot.get("camera") or "中景"),
+                        "movement": str(shot.get("movement") or "固定"),
+                        "characters": shot_chars,
+                        "prompt": shot_prompt,
+                        "negative_prompt": shot_negative,
+                    }
+                )
             proposal.append(
                 {
                     "op": "add",
                     "temp_id": f"s{si + 1}",
-                    "title": str(scene.get("title") or f"场景 {si + 1}"),
-                    "summary": scene.get("summary"),
+                    "title": scene_title,
+                    "summary": scene_summary,
+                    "source_text": str(scene.get("source_text") or scene_summary),
                     "time_of_day": scene.get("time_of_day"),
-                    "shots": [
-                        {
-                            "op": "add",
-                            "temp_id": f"s{si + 1}h{hi + 1}",
-                            "title": str(shot.get("title") or f"镜头 {hi + 1}"),
-                            "description": shot.get("description"),
-                            "duration": float(shot.get("duration") or 4.0),
-                            "camera": shot.get("camera"),
-                            "movement": shot.get("movement"),
-                            "characters": [str(c) for c in (shot.get("characters") or [])],
-                        }
-                        for hi, shot in enumerate(shots_raw)
-                        if isinstance(shot, dict)
-                    ],
+                    "location": str(scene.get("location") or "").strip(),
+                    "location_variant": str(scene.get("location_variant") or "").strip(),
+                    "prompt": scene_prompt,
+                    "negative_prompt": default_negative,
+                    "characters": scene_char_names,
+                    "shots": shot_rows,
                 }
             )
+        # 二次规划：把 LLM 的名字/地点线索解析成真正可写库的 id。
+        for scene in proposal:
+            names = list(scene.get("characters") or [])
+            names.extend(c for shot in scene["shots"] for c in shot.get("characters") or [])
+            mapped_apps = self._auto_appearances(names, characters, appearances)
+            scene["appearance_ids"] = mapped_apps
+            for shot in scene["shots"]:
+                shot["appearance_ids"] = self._auto_appearances(
+                    shot.get("characters") or names, characters, appearances
+                )
+            location_id = self._auto_location_variant(scene, variants, locations)
+            scene["location_variant_id"] = location_id
+            scene["location_variant_ids"] = [location_id] if location_id else []
         names = {n for scene in proposal for shot in scene["shots"] for n in shot["characters"]}
         return {
             "scenes": proposal,
@@ -976,8 +1056,64 @@ class StoryService:
             "character_mapping": [
                 self._match_character(name, characters) for name in sorted(names)
             ],
-            "note": "以上为提案，尚未写入数据库；逐条审阅后调用「落库」才会生效。",
+            "note": (
+                "AI 已自动补齐角色形象、地点变体、正向/负向 Prompt、镜头语言，"
+                "并把声音限制为人物对白、环境声与必要音效（默认无配乐）；"
+                "审阅后落库即可直接生成。"
+            ),
         }
+
+    def _auto_appearances(
+        self, names: list[str], characters: list[Character], appearances: list[Appearance]
+    ) -> list[str]:
+        out: list[str] = []
+        for name in names:
+            text = str(name or "").strip()
+            if not text:
+                continue
+            char = next((c for c in characters if c.name == text or (c.alias or "") == text), None)
+            char = char or next((c for c in characters if text in c.name or c.name in text), None)
+            if char is None:
+                continue
+            candidates = [a for a in appearances if a.character_id == char.id]
+            pick = next((a for a in candidates if a.is_default), None) or (
+                candidates[0] if candidates else None
+            )
+            if pick and pick.id not in out:
+                out.append(pick.id)
+        return out[: node_limit()]
+
+    def _auto_location_variant(
+        self, scene: dict[str, Any], variants: list[LocationVariant], locations: dict[str, Location]
+    ) -> str | None:
+        hints = " ".join(
+            str(scene.get(k) or "") for k in ("location_variant", "location", "time_of_day")
+        ).lower()
+        if not variants:
+            return None
+
+        def score(v: LocationVariant) -> int:
+            loc = locations.get(v.location_id)
+            hay = " ".join(
+                str(x or "")
+                for x in (v.name, v.time_of_day, v.weather, v.lighting, loc.name if loc else "")
+            ).lower()
+            tokens = [
+                hints,
+                *[
+                    str(x or "").lower()
+                    for x in (
+                        scene.get("time_of_day"),
+                        scene.get("location_variant"),
+                        scene.get("location"),
+                    )
+                ],
+            ]
+            return sum(2 for token in tokens if token and token in hay) + (
+                1 if v.time_of_day and v.time_of_day.lower() in hints else 0
+            )
+
+        return max(variants, key=score).id
 
     def _match_character(self, name: str, characters: list[Character]) -> dict[str, Any]:
         """把文本里的名字对到已有角色，避免凭空多出一个重复的人。"""
@@ -997,6 +1133,11 @@ class StoryService:
     async def apply_breakdown(self, pid: str, scenes: list[dict[str, Any]]) -> dict[str, Any]:
         """把审阅通过的条目落库。只接受 op != 'reject' 的条目。"""
         created_scenes, created_shots = 0, 0
+        db = db_of(pid)
+        characters = await fetch_all(db, Character)
+        appearances = await fetch_all(db, Appearance, order_by=Appearance.created_at)
+        variants = await fetch_all(db, LocationVariant, order_by=LocationVariant.created_at)
+        locations = {row.id: row for row in await fetch_all(db, Location)}
         for scene in scenes:
             if scene.get("op") == "reject":
                 continue
@@ -1005,12 +1146,28 @@ class StoryService:
                 {
                     "title": scene.get("title"),
                     "summary": scene.get("summary"),
-                    "time_of_day": scene.get("time_of_day"),
+                    "prompt": scene.get("prompt") or scene.get("summary") or scene.get("title"),
                     "source_text": scene.get("source_text"),
-                    "location_variant_id": scene.get("location_variant_id"),
+                    "time_of_day": scene.get("time_of_day"),
+                    "location_variant_id": scene.get("location_variant_id") or None,
                 },
             )
             created_scenes += 1
+            scene_locations = scene.get("location_variant_ids") or (
+                [scene.get("location_variant_id")] if scene.get("location_variant_id") else []
+            )
+            if not scene_locations:
+                inferred = self._auto_location_variant(scene, variants, locations)
+                scene_locations = [inferred] if inferred else []
+            if scene_locations:
+                await self.set_scene_locations(
+                    pid, row["id"], [str(v) for v in scene_locations if v]
+                )
+            scene_appearance_ids = scene.get("appearance_ids") or self._auto_appearances(
+                list(scene.get("characters") or []), characters, appearances
+            )
+            if scene_appearance_ids:
+                await self.set_scene_cast(pid, row["id"], list(scene_appearance_ids))
             for shot in scene.get("shots") or []:
                 if shot.get("op") == "reject":
                     continue
@@ -1023,12 +1180,27 @@ class StoryService:
                         "duration": shot.get("duration"),
                         "camera": shot.get("camera"),
                         "movement": shot.get("movement"),
-                        "prompt": shot.get("prompt"),
+                        "prompt": shot.get("prompt")
+                        or shot.get("description")
+                        or scene.get("prompt"),
+                        "negative_prompt": shot.get("negative_prompt")
+                        or scene.get("negative_prompt"),
+                        "status": "ready",
                     },
                 )
                 created_shots += 1
-                if shot.get("appearance_ids"):
-                    await self.set_shot_cast(pid, made["id"], list(shot["appearance_ids"]))
+                appearance_ids = (
+                    shot.get("appearance_ids")
+                    or self._auto_appearances(
+                        list(shot.get("characters") or scene.get("characters") or []),
+                        characters,
+                        appearances,
+                    )
+                    or scene_appearance_ids
+                    or []
+                )
+                if appearance_ids:
+                    await self.set_shot_cast(pid, made["id"], list(appearance_ids))
         await self.save_story(pid, {"mode": "ai_assisted"})
         return {"scenes_created": created_scenes, "shots_created": created_shots}
 

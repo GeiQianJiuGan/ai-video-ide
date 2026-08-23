@@ -63,7 +63,7 @@ import {
   type Track,
 } from '@/shared/api/timeline'
 import { generationApi, type GenerationVersion } from '@/shared/api/generation'
-import { assetsApi } from '@/shared/api/assets'
+import { assetsApi, type Asset } from '@/shared/api/assets'
 import { ApiError, confirmFlagOf } from '@/shared/api/client'
 import { useConsoleStore } from '@/stores/console'
 import { useTimelineStore } from '@/stores/timeline'
@@ -84,6 +84,10 @@ const versions = ref<GenerationVersion[]>([])
 const playhead = ref(0)
 /** 导入配乐用的隐藏 input。 */
 const audioInput = ref<HTMLInputElement | null>(null)
+const materialInput = ref<HTMLInputElement | null>(null)
+const materialKind = ref<'video' | 'audio'>('video')
+const materialAssets = ref<Asset[]>([])
+const blankDuration = ref(2)
 const importing = ref(false)
 /** 上一次操作的说明（拆出声音 / 导入音频落到哪条轨上）——落地位置必须说出来。 */
 const note = ref('')
@@ -162,7 +166,7 @@ function clock(n: number): string {
 
 async function reload(): Promise<void> {
   if (!pid.value) return
-  await tl.load(pid.value).catch(() => {})
+  await Promise.all([tl.load(pid.value).catch(() => {}), loadMaterials()])
 }
 
 onMounted(reload)
@@ -186,6 +190,124 @@ watch(selected, async (clip) => {
   }
   versions.value = await generationApi.versions(pid.value, clip.shot_id).catch(() => [])
 })
+
+function isVideoAsset(asset: Asset): boolean {
+  return Boolean(
+    asset.mime?.startsWith('video/') || /\.(mp4|mov|mkv|webm|avi|m4v)$/i.test(asset.path),
+  )
+}
+
+function isAudioAsset(asset: Asset): boolean {
+  return Boolean(
+    asset.mime?.startsWith('audio/') || /\.(mp3|wav|m4a|aac|flac|ogg|opus)$/i.test(asset.path),
+  )
+}
+
+const materials = computed(() =>
+  materialAssets.value.filter((asset) => isVideoAsset(asset) || isAudioAsset(asset)),
+)
+
+async function loadMaterials(): Promise<void> {
+  if (!pid.value) return
+  materialAssets.value = (await assetsApi.list(pid.value).catch(() => [])).filter(
+    (asset) => asset.kind === 'upload' || asset.kind === 'audio',
+  )
+}
+
+function materialName(asset: Asset): string {
+  return asset.path.split(/[\\/]/).pop() || asset.path
+}
+
+function pickMaterial(kind: 'video' | 'audio'): void {
+  materialKind.value = kind
+  materialInput.value?.click()
+}
+
+async function onPickMaterial(event: Event): Promise<void> {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  input.value = ''
+  if (!file) return
+  importing.value = true
+  importError.value = null
+  try {
+    const asset = await assetsApi.upload(
+      pid.value,
+      file,
+      materialKind.value === 'audio' ? 'audio' : 'upload',
+    )
+    materialAssets.value = [asset, ...materialAssets.value.filter((row) => row.id !== asset.id)]
+    note.value = `「${file.name}」已加入素材框，可拖入${materialKind.value === 'audio' ? '音频' : '视频'}轨。`
+  } catch (err) {
+    importError.value = err instanceof ApiError ? err : null
+  } finally {
+    importing.value = false
+  }
+}
+
+function dragMaterial(event: DragEvent, asset: Asset | null): void {
+  if (!event.dataTransfer) return
+  event.dataTransfer.effectAllowed = 'copy'
+  event.dataTransfer.setData(
+    'application/x-ai-video-material',
+    JSON.stringify(
+      asset
+        ? { type: isAudioAsset(asset) ? 'audio' : 'video', assetId: asset.id }
+        : { type: 'blank', duration: Math.max(MIN_LEN, blankDuration.value) },
+    ),
+  )
+}
+
+async function dropMaterial(event: DragEvent, track: Track): Promise<void> {
+  event.preventDefault()
+  const raw = event.dataTransfer?.getData('application/x-ai-video-material')
+  if (!raw || track.locked) return
+  let payload: { type: 'video' | 'audio' | 'blank'; assetId?: string; duration?: number }
+  try {
+    payload = JSON.parse(raw) as typeof payload
+  } catch {
+    return
+  }
+  if ((payload.type === 'audio') !== (track.kind === 'audio')) {
+    note.value = payload.type === 'audio' ? '音频素材只能放入音频轨。' : '视频与空白段只能放入视频轨。'
+    return
+  }
+  const rect = (event.currentTarget as HTMLElement).getBoundingClientRect()
+  const start = Math.max(0, (event.clientX - rect.left) / zoom.value)
+  const clipId =
+    payload.type === 'blank'
+      ? await tl
+          .addBlankClip(pid.value, track.id, { duration: payload.duration ?? blankDuration.value })
+          .catch(() => '')
+      : await tl
+          .addClip(pid.value, track.id, { asset_id: payload.assetId ?? '', start })
+          .catch(() => '')
+  if (!clipId) return
+  selectedId.value = clipId
+  note.value =
+    track.kind === 'video'
+      ? `素材已放入「${track.name}」并与前后画面自动贴紧。`
+      : `素材已放入「${track.name}」的 ${fmt(start)}；同轨片段不能重叠。`
+}
+
+function isBlankClip(clip: Clip | null): boolean {
+  return Boolean(clip && !clip.asset_id && !clip.shot_id && !clip.version_id)
+}
+
+async function saveBlankDuration(value: string): Promise<void> {
+  const clip = selected.value
+  const duration = Number(value)
+  if (!isBlankClip(clip) || !clip || !Number.isFinite(duration) || duration < MIN_LEN) return
+  await tl.resizeBlankClip(pid.value, clip.id, duration).catch(() => {})
+}
+
+async function moveAudioToNewTrack(): Promise<void> {
+  const clip = selected.value
+  if (!clip || clip.track_kind !== 'audio') return
+  const trackId = await tl.moveToNewAudioTrack(pid.value, clip.id).catch(() => null)
+  if (trackId) note.value = '音频片段已移到新音频轨，可与原轨同一时间叠加。'
+  closeClipMenu()
+}
 
 async function assemble(replace: boolean): Promise<void> {
   await tl.assemble(pid.value, replace).catch(() => {})
@@ -231,10 +353,17 @@ function closeClipMenu(): void {
   clipMenu.value = null
 }
 
+function selectClip(clip: Clip): void {
+  selectedId.value = clip.id
+  // 有裁切草稿时，“最左侧进度点”是左裁切线；否则就是片段起点。
+  const left = trimBounds(clip).inOffset
+  playhead.value = clampTime(clip.start + left - clip.in_point)
+}
+
 function openClipMenu(event: MouseEvent, clip: Clip): void {
   event.preventDefault()
   event.stopPropagation()
-  selectedId.value = clip.id
+  selectClip(clip)
   clipMenu.value = {
     clipId: clip.id,
     x: Math.min(event.clientX, window.innerWidth - 190),
@@ -374,8 +503,7 @@ const MIN_LEN = 0.05
 
 function beginDrag(event: PointerEvent, clip: Clip, mode: DragMode, track: Track): void {
   if (event.button !== 0) return
-  selectedId.value = clip.id
-  playhead.value = clampTime(clip.start)
+  selectClip(clip)
   if (track.locked) return // 锁了的轨道只能看
   capture(event)
   const draft = trimBounds(clip)
@@ -395,12 +523,13 @@ function onDragMove(event: PointerEvent): void {
   const clip = tl.clips.find((c) => c.id === drag.value?.id)
   if (!clip || drag.value.mode === 'move') return
   const delta = drag.value.dx / zoom.value
+  const currentEnd = clip.out_point ?? clip.in_point + clip.duration
   const next =
     drag.value.mode === 'left'
       ? {
           inOffset: Math.min(
             drag.value.originOut - MIN_LEN,
-            Math.max(0, drag.value.originIn + delta),
+            Math.max(clip.in_point, drag.value.originIn + delta),
           ),
           outOffset: drag.value.originOut,
         }
@@ -408,31 +537,34 @@ function onDragMove(event: PointerEvent): void {
           inOffset: drag.value.originIn,
           outOffset: Math.max(
             drag.value.originIn + MIN_LEN,
-            Math.min(
-              clip.source_duration,
-              drag.value.originOut + delta,
-            ),
+            Math.min(currentEnd, drag.value.originOut + delta),
           ),
         }
   trimDrafts.value = { ...trimDrafts.value, [clip.id]: next }
 }
 
-/** 拖动中的位移预览：只是画一下，位置的真相仍然是后端返回的那一条时间线。 */
+/** 外框只预览整段移动；裁切草稿绝不改变 Shot 外框的起点或长度。 */
 function clipStyle(clip: Clip): Record<string, string> {
   const d = drag.value?.id === clip.id ? drag.value : null
-  const shift = d ? d.dx : 0
-  if (hasTrimDraft(clip)) {
-    const bounds = trimBounds(clip)
-    return {
-      left: `${Math.max(0, (clip.start + bounds.inOffset - clip.in_point) * zoom.value + (d?.mode === 'move' ? shift : 0))}px`,
-      width: `${Math.max(8, (bounds.outOffset - bounds.inOffset) * zoom.value)}px`,
-    }
-  }
-  const left = clip.start * zoom.value + (d?.mode === 'move' ? shift : 0)
+  const left = clip.start * zoom.value + (d?.mode === 'move' ? d.dx : 0)
   return {
     left: `${Math.max(0, left)}px`,
     width: `${Math.max(8, clip.duration * zoom.value)}px`,
   }
+}
+
+function trimLinePercent(clip: Clip, side: 'left' | 'right'): number {
+  const bounds = trimBounds(clip)
+  const value = side === 'left' ? bounds.inOffset : bounds.outOffset
+  return Math.max(0, Math.min(100, ((value - clip.in_point) / clip.duration) * 100))
+}
+
+function trimShadeStyle(clip: Clip, side: 'left' | 'right'): Record<string, string> {
+  const left = trimLinePercent(clip, 'left')
+  const right = trimLinePercent(clip, 'right')
+  return side === 'left'
+    ? { left: '0', width: `${left}%` }
+    : { left: `${right}%`, right: '0' }
 }
 
 async function endDrag(event: PointerEvent): Promise<void> {
@@ -451,6 +583,17 @@ async function endDrag(event: PointerEvent): Promise<void> {
 
 async function doRemove(clipId: string, ripple: boolean): Promise<void> {
   await tl.remove(pid.value, clipId, ripple).catch(() => {})
+  const next = { ...trimDrafts.value }
+  delete next[clipId]
+  trimDrafts.value = next
+  closeClipMenu()
+}
+
+function cancelTrimDraft(clipId: string): void {
+  const next = { ...trimDrafts.value }
+  delete next[clipId]
+  trimDrafts.value = next
+  closeClipMenu()
 }
 
 // --- 声音：视频片段自带的那一路，与音频轨上的独立片段 ---
@@ -733,7 +876,74 @@ function goShot(shotId: string | null): void {
     <div class="min-h-0 flex-1 p-2">
       <SplitPane id="timeline-main" direction="horizontal" :sizes="[78, 22]" :min-sizes="[55, 18]">
         <template #pane-0>
-          <div class="flex min-h-0 min-w-0 flex-1 flex-col gap-1.5 pr-1.5">
+          <div class="flex min-h-0 min-w-0 flex-1 gap-1.5 pr-1.5">
+            <AppPanel title="素材" class="w-52 shrink-0">
+              <template #actions>
+                <button
+                  class="text-fg-3 hover:text-fg-1"
+                  :disabled="importing"
+                  title="上传视频素材"
+                  @click="pickMaterial('video')"
+                >
+                  <Plus :size="11" />
+                </button>
+              </template>
+              <div class="flex min-h-0 flex-1 flex-col gap-1.5 overflow-y-auto p-1.5">
+                <input
+                  ref="materialInput"
+                  type="file"
+                  class="hidden"
+                  accept="video/*,audio/*"
+                  @change="onPickMaterial"
+                />
+                <div class="grid grid-cols-2 gap-1">
+                  <AppButton size="sm" variant="ghost" :disabled="importing" @click="pickMaterial('video')">
+                    <Clapperboard :size="10" />视频
+                  </AppButton>
+                  <AppButton size="sm" variant="ghost" :disabled="importing" @click="pickMaterial('audio')">
+                    <Music :size="10" />音频
+                  </AppButton>
+                </div>
+                <label class="border-line-1 bg-base-2 flex items-center justify-between border px-1.5 py-1 text-2xs">
+                  <span class="text-fg-3">空白视频段</span>
+                  <input
+                    v-model.number="blankDuration"
+                    type="number"
+                    min="0.05"
+                    step="0.1"
+                    class="border-line-1 bg-base-1 text-fg-1 tnum h-5 w-14 border px-1 text-right text-2xs outline-none"
+                    title="拖入视频轨时使用的黑场时长"
+                  />
+                </label>
+                <button
+                  draggable="true"
+                  class="border-line-1 bg-base-2 text-fg-2 hover:border-accent/60 flex items-center gap-1 border p-1.5 text-left text-2xs"
+                  title="拖入视频轨添加黑场"
+                  @dragstart="dragMaterial($event, null)"
+                >
+                  <span class="bg-black inline-block h-7 w-10 border border-white/20" />
+                  <span class="min-w-0 truncate">黑场 · {{ fmt(blankDuration) }}</span>
+                </button>
+                <div
+                  v-for="asset in materials"
+                  :key="asset.id"
+                  draggable="true"
+                  class="border-line-1 bg-base-2 text-fg-2 hover:border-accent/60 flex items-center gap-1 border p-1.5 text-left text-2xs"
+                  :title="`${materialName(asset)} · 拖入${isAudioAsset(asset) ? '音频' : '视频'}轨`"
+                  @dragstart="dragMaterial($event, asset)"
+                >
+                  <span class="bg-base-3 flex h-7 w-10 shrink-0 items-center justify-center">
+                    <Music v-if="isAudioAsset(asset)" :size="12" />
+                    <Clapperboard v-else :size="12" />
+                  </span>
+                  <span class="min-w-0 truncate">{{ materialName(asset) }}</span>
+                </div>
+                <p v-if="materials.length === 0" class="text-fg-4 px-1 text-2xs">
+                  上传视频或音频后，从这里拖到对应轨道。
+                </p>
+              </div>
+            </AppPanel>
+            <div class="flex min-h-0 min-w-0 flex-1 flex-col gap-1.5">
             <div class="border-line-1 bg-base-1 flex h-row shrink-0 items-center gap-1 border px-1.5">
               <span class="text-fg-3 text-2xs">成片预览</span>
               <span class="text-fg-4 text-2xs">{{ clock(playhead) }} / {{ clock(total) }}</span>
@@ -771,7 +981,7 @@ function goShot(shotId: string | null): void {
             title="轨道上还没有片段"
             body="点「自动装配」把每个镜头的当前版本按 Scene / Shot 顺序铺上来。没有当前版本的镜头会被跳过并写明理由——这一步不需要 ComfyUI。"
           />
-          <div v-else class="overflow-x-auto p-2">
+          <div class="overflow-x-auto p-2">
             <div class="relative" :style="{ width: `${laneWidth}px` }">
               <!-- 标尺：拖它移播放头。竖条底下那一段会被选中 -->
               <div
@@ -833,6 +1043,8 @@ function goShot(shotId: string | null): void {
                 <div
                   class="border-line-1 bg-base-2 relative h-14 border"
                   :style="{ width: `${laneWidth}px` }"
+                  @dragover.prevent
+                  @drop="dropMaterial($event, track)"
                 >
                   <p
                     v-if="track.clips.length === 0"
@@ -856,24 +1068,38 @@ function goShot(shotId: string | null): void {
                           : 'border-line-1',
                     ]"
                     :style="clipStyle(clip)"
-                    :title="`${clip.label ?? clip.id} · 起点 ${fmt(clip.start)} · 时长 ${fmt(clip.duration)}${clip.muted ? ' · 已静音' : ''}${clip.missing_file ? ' · 文件已丢失' : ''}${track.locked ? ' · 轨道已锁，拖不动' : ' · 拖块身移动；拖边界线生成裁切草稿'}`"
-                    @click="selectedId = clip.id"
+                    :title="`${clip.label ?? clip.id} · 起点 ${fmt(clip.start)} · 时长 ${fmt(clip.duration)}${clip.muted ? ' · 已静音' : ''}${clip.missing_file ? ' · 文件已丢失' : ''}${track.locked ? ' · 轨道已锁，拖不动' : ' · 拖块身移动；拖内部边界线生成裁切草稿'}`"
+                    @click="selectClip(clip)"
                     @contextmenu="openClipMenu($event, clip)"
                     @pointerdown="beginDrag($event, clip, 'move', track)"
                     @pointermove="onDragMove($event)"
                     @pointerup="endDrag($event)"
                     @pointercancel="endDrag($event)"
                   >
-                    <span
-                      v-if="hasTrimDraft(clip)"
-                      class="bg-accent/10 pointer-events-none absolute inset-0 z-[1]"
-                    />
-                    <!-- 裁切把手。左边缘同时改入点与起点（一次请求、一格撤销） -->
+                    <!-- 草稿只移动两条内部裁切线；Shot 外框与时长在确认前保持不变。 -->
+                    <template v-if="hasTrimDraft(clip)">
+                      <span
+                        class="pointer-events-none absolute top-0 bottom-0 z-[1] bg-black/45"
+                        :style="trimShadeStyle(clip, 'left')"
+                      />
+                      <span
+                        class="pointer-events-none absolute top-0 bottom-0 z-[1] bg-black/45"
+                        :style="trimShadeStyle(clip, 'right')"
+                      />
+                      <span
+                        class="border-accent/60 pointer-events-none absolute top-0 bottom-0 z-[2] border-y bg-accent/10"
+                        :style="{
+                          left: `${trimLinePercent(clip, 'left')}%`,
+                          right: `${100 - trimLinePercent(clip, 'right')}%`,
+                        }"
+                      />
+                    </template>
+                    <!-- 左线确认后才同时改变入点与时间线起点。 -->
                     <span
                       v-if="!track.locked"
-                      class="hover:bg-accent/70 absolute top-0 bottom-0 z-10 w-1 cursor-ew-resize bg-white/70"
-                      :style="{ left: '0px' }"
-                      title="拖动前边界线，松手后右键选择裁切"
+                      class="hover:bg-accent/80 absolute top-0 bottom-0 z-10 w-1 cursor-ew-resize bg-white/80"
+                      :style="{ left: `calc(${trimLinePercent(clip, 'left')}% - 2px)` }"
+                      title="拖动左裁切线；Shot 长度在确认前不会变化"
                       @pointerdown.stop="beginDrag($event, clip, 'left', track)"
                       @pointermove.stop="onDragMove($event)"
                       @pointerup.stop="endDrag($event)"
@@ -881,9 +1107,9 @@ function goShot(shotId: string | null): void {
                     />
                     <span
                       v-if="!track.locked"
-                      class="hover:bg-accent/70 absolute top-0 bottom-0 z-10 w-1 cursor-ew-resize bg-white/70"
-                      :style="{ right: '0px' }"
-                      title="拖动后边界线，松手后右键选择裁切"
+                      class="hover:bg-accent/80 absolute top-0 bottom-0 z-10 w-1 cursor-ew-resize bg-white/80"
+                      :style="{ left: `calc(${trimLinePercent(clip, 'right')}% - 2px)` }"
+                      title="拖动右裁切线；Shot 长度在确认前不会变化"
                       @pointerdown.stop="beginDrag($event, clip, 'right', track)"
                       @pointermove.stop="onDragMove($event)"
                       @pointerup.stop="endDrag($event)"
@@ -895,6 +1121,9 @@ function goShot(shotId: string | null): void {
                       </span>
                       <span class="text-fg-4 tnum block truncate">
                         {{ fmt(clip.duration) }}
+                        <template v-if="hasTrimDraft(clip)">
+                          → {{ fmt(trimBounds(clip).outOffset - trimBounds(clip).inOffset) }} 待确认
+                        </template>
                         <template v-if="clip.version_no">· v{{ clip.version_no }}</template>
                         <template v-if="clip.volume !== 1">· ×{{ clip.volume }}</template>
                       </span>
@@ -937,12 +1166,47 @@ function goShot(shotId: string | null): void {
                 <Crop :size="11" />确认裁切边界
               </button>
               <button
+                v-if="hasTrimDraft(menuClip)"
+                class="text-fg-1 hover:bg-base-2 flex w-full items-center gap-1.5 px-2 py-1 text-left text-2xs"
+                :disabled="tl.busy"
+                @click="cancelTrimDraft(menuClip.id)"
+              >
+                <Undo2 :size="11" />取消裁切草稿
+              </button>
+              <button
                 v-if="menuClip.track_kind === 'video'"
                 class="text-fg-1 hover:bg-base-2 flex w-full items-center gap-1.5 px-2 py-1 text-left text-2xs"
                 :disabled="tl.busy || !menuClip.asset_path || menuClip.missing_file"
                 @click="detachAudio(); closeClipMenu()"
               >
                 <AudioLines :size="11" />分割音频到独立轨
+              </button>
+              <button
+                v-if="menuClip.track_kind === 'audio'"
+                class="text-fg-1 hover:bg-base-2 flex w-full items-center gap-1.5 px-2 py-1 text-left text-2xs"
+                :disabled="tl.busy"
+                title="把裁切后的整段音频移到一条新轨道，可与旧轨道重叠"
+                @click="moveAudioToNewTrack()"
+              >
+                <Plus :size="11" />移到新音频轨
+              </button>
+              <div class="bg-line-1 my-1 h-px" />
+              <button
+                class="text-st-failed hover:bg-base-2 flex w-full items-center gap-1.5 px-2 py-1 text-left text-2xs"
+                :disabled="tl.busy"
+                title="删除片段并让后续片段自动贴紧"
+                @click="doRemove(menuClip.id, true)"
+              >
+                <Trash2 :size="11" />删除并贴紧
+              </button>
+              <button
+                v-if="menuClip.track_kind === 'audio'"
+                class="text-fg-1 hover:bg-base-2 flex w-full items-center gap-1.5 px-2 py-1 text-left text-2xs"
+                :disabled="tl.busy"
+                title="删除片段但保留原位置的空档"
+                @click="doRemove(menuClip.id, false)"
+              >
+                <Trash2 :size="11" />删除并留空档
               </button>
             </div>
             <p v-if="tl.missing.length" class="text-st-review mt-2 text-2xs">
@@ -953,6 +1217,7 @@ function goShot(shotId: string | null): void {
         </AppPanel>
               </template>
             </SplitPane>
+          </div>
           </div>
         </template>
         <template #pane-1>
@@ -997,8 +1262,21 @@ function goShot(shotId: string | null): void {
                   type="number"
                   min="0"
                   step="0.1"
+                  :disabled="selectedTrack?.kind === 'video'"
                   class="border-line-1 bg-base-2 text-fg-1 focus:border-accent/60 tnum mt-px h-5 w-full border px-1.5 text-2xs outline-none"
+                  :title="selectedTrack?.kind === 'video' ? '视频轨不允许空档；左右拖动片段只调整顺序' : '音频可放在本轨空闲位置'"
                   @change="saveStart(($event.target as HTMLInputElement).value)"
+                />
+              </label>
+              <label v-if="isBlankClip(selected)" class="block">
+                <span class="text-fg-4 text-2xs">空白时长（秒）</span>
+                <input
+                  :value="selected.duration"
+                  type="number"
+                  min="0.05"
+                  step="0.1"
+                  class="border-line-1 bg-base-2 text-fg-1 focus:border-accent/60 tnum mt-px h-5 w-full border px-1.5 text-2xs outline-none"
+                  @change="saveBlankDuration(($event.target as HTMLInputElement).value)"
                 />
               </label>
               <div class="text-fg-4 text-2xs">
@@ -1183,6 +1461,7 @@ function goShot(shotId: string | null): void {
                 <Trash2 :size="10" />删除并贴紧
               </AppButton>
               <AppButton
+                v-if="selectedTrack?.kind === 'audio'"
                 size="sm"
                 variant="ghost"
                 :disabled="tl.busy"
@@ -1197,8 +1476,8 @@ function goShot(shotId: string | null): void {
             </p>
           </section>
         </div>
-      </AppPanel>
-        </template>
+        </AppPanel>
+              </template>
       </SplitPane>
     </div>
     <AppDialog

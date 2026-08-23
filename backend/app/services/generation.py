@@ -23,14 +23,16 @@ from app.events.bus import Channel, bus
 from app.generation.comfy.client import comfy, outputs_of
 from app.generation.providers import registry
 from app.generation.providers.base import RefImage, TaskState, VideoRequest
-from app.persistence.models import utc_now
-from app.persistence.models_gen import GenerationVersion, Job, Workflow
+from app.persistence.models import Project, utc_now
+from app.persistence.models_gen import GenerationVersion, Job
+from app.persistence.models_global import GlobalWorkflow
 from app.persistence.models_story import Scene, Shot
 from app.persistence.models_world import Asset
 from app.services.assets import assets, kind_of_suffix
 from app.services.base import as_dict, db_of, dump_json, fetch, fetch_all, load_json, project_of
 from app.services.context import context
 from app.services.frames import start_frame_index
+from app.services.global_registry import global_registry
 from app.services.workflows import apply_bindings, parse_graph, workflows
 
 log = get_logger("queue")
@@ -118,6 +120,7 @@ class GenerationService:
         allow_ref_drop: bool = False,
         first_frame_asset_id: str | None = None,
         last_frame_asset_id: str | None = None,
+        wait_for_job_id: str | None = None,
         extra: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         db = db_of(pid)
@@ -130,9 +133,12 @@ class GenerationService:
         capability = kind or ("first_last_frame" if shot.prev_shot_id else "image2video")
         # 走适配层时不需要工作流：模型端那份图由模型端维护（预设 / 通用 REST 合同）。
         # 只有旧的 comfy_workflow 兼容路径才必须先解析出一份已校验的工作流。
-        workflow = None
-        if registry.is_legacy() or workflow_id or shot.workflow_id:
-            workflow = await workflows.resolve(pid, capability, workflow_id or shot.workflow_id)
+        project = (await fetch_all(db, Project))[0]
+        generation_mode = "comfy_preset"
+        preset_name = project.preset_name or settings.video_preset
+        # 保留旧设置的明确错误提示；正常项目生成始终走项目选择的预设。
+        if registry.is_legacy():
+            await workflows.resolve(pid, capability, workflow_id or shot.workflow_id)
         if check_context:
             await context.require_complete(pid, shot_id)
         snapshot = await context.snapshot(pid, shot_id)
@@ -146,7 +152,12 @@ class GenerationService:
         depends_on, wait_reason = None, None
         if shot.prev_shot_id:
             prev = await fetch(db, Shot, shot.prev_shot_id, "上游镜头")
-            if not prev.current_version_id:
+            if wait_for_job_id:
+                # 单线程续接等待的是本次编排中的上一条任务，而不是旧的当前版本。
+                # 否则上游已有旧版本时，下游会提前并发启动，拿不到本次生成的真末帧。
+                depends_on = prev.id
+                wait_reason = f"等待上游 Shot {prev.index_no} 完成本次生成（需要末帧）"
+            elif not prev.current_version_id:
                 depends_on = prev.id
                 wait_reason = f"等待上游 Shot {prev.index_no} 完成（需要末帧）"
 
@@ -158,7 +169,7 @@ class GenerationService:
             priority=priority,
             depends_on=depends_on,
             wait_reason=wait_reason,
-            workflow_id=workflow.id if workflow else None,
+            workflow_id=None,
             params_json=dump_json(
                 {
                     "prompt": prompt,
@@ -169,7 +180,10 @@ class GenerationService:
                     "context": snapshot,
                     "first_frame_asset_id": first_frame_asset_id,
                     "last_frame_asset_id": last_frame_asset_id,
+                    "wait_for_job_id": wait_for_job_id,
                     "extra": extra or {},
+                    "generation_mode": generation_mode,
+                    "preset": preset_name,
                 }
             ),
             created_at=utc_now(),
@@ -392,7 +406,32 @@ class GenerationService:
         running = [j for j in jobs if j.status == "running"]
         slots = max(0, settings.worker_limit - len(running))
 
+        by_id = {j.id: j for j in jobs}
         for job in [j for j in jobs if j.status == "waiting"]:
+            params = load_json(job.params_json, {})
+            wait_for_job_id = params.get("wait_for_job_id")
+            if wait_for_job_id:
+                upstream_job = by_id.get(str(wait_for_job_id))
+                if upstream_job is not None and upstream_job.status == "done" and upstream_job.version_id:
+                    await self._set(pid, job.id, status="queued", wait_reason=None)
+                elif upstream_job is not None and upstream_job.status in ("failed", "canceled"):
+                    await self._set(
+                        pid,
+                        job.id,
+                        status="failed",
+                        error_json=dump_json(
+                            {
+                                "code": ErrorCode.UPSTREAM_NOT_READY,
+                                "title": "上游 Shot 生成失败",
+                                "detail": "本次续接不会跳过失败的上游任务，因此没有启动当前 Shot。",
+                                "suggestions": ["先重试上游 Shot", "上游完成后重新执行单线程续接"],
+                                "related_ids": {"job_id": str(wait_for_job_id)},
+                            }
+                        ),
+                        finished_at=utc_now(),
+                        wait_reason=None,
+                    )
+                continue
             upstream = shots.get(job.depends_on or "")
             if upstream is None or upstream.current_version_id:
                 await self._set(pid, job.id, status="queued", wait_reason=None)
@@ -466,7 +505,7 @@ class GenerationService:
         旧的节点绑定路径只在「设置里选了 comfy_workflow 且这个任务确实绑了工作流」时才走
         ——它是兼容选项，不是主路。产物登记与 `add_version` 两条路完全共用。
         """
-        if registry.is_legacy() and job.workflow_id:
+        if job.workflow_id:
             filename, data, workflow_id = await self._run_legacy(pid, job, params)
         else:
             filename, data, workflow_id = await self._run_provider(pid, job, params)
@@ -491,7 +530,7 @@ class GenerationService:
         self, pid: str, job: Job, params: dict[str, Any]
     ) -> tuple[str, bytes, str | None]:
         """默认路径：把请求交给适配器，轮询到出片。service 层不认识任何具体模型。"""
-        provider = registry.provider()
+        provider = registry.provider("comfy_preset")
         first, last, refs = await self._images_of(pid, job, params)
         mode = "flf" if last is not None else "i2v"
         if mode == "i2v" and first is None:
@@ -514,7 +553,7 @@ class GenerationService:
             refs=refs,
             duration=float(params.get("duration") or 4.0),
             seed=params.get("seed"),
-            extra=params.get("extra") or {},
+            extra={**(params.get("extra") or {}), "preset": params.get("preset")},
         )
         task_id = await provider.submit(req, client_id=f"aivs-{pid}")
         # 冻结「实际喂了哪几张参考图」与适配器的降级说明。`_execute` 在这之后才收集
@@ -632,18 +671,51 @@ class GenerationService:
     async def _run_legacy(
         self, pid: str, job: Job, params: dict[str, Any]
     ) -> tuple[str, bytes, str | None]:
-        """兼容路径：旧的 Workflow 节点绑定。保留是为了老工程还能跑，不再演进。"""
-        db = db_of(pid)
-        workflow = await fetch(db, Workflow, job.workflow_id or "", "工作流")
+        """Workflow API 路径：上传输入图片，再按 AIVS_* 标题写入图。"""
+        workflow = await fetch(
+            await global_registry.start(), GlobalWorkflow, job.workflow_id or "", "工作流"
+        )
         graph = parse_graph(workflow.api_json)
-        bindings: dict[str, str] = load_json(workflow.bindings_json, {})
+        raw_bindings: dict[str, Any] = load_json(workflow.bindings_json, {})
+        bindings = {
+            key: str(value)
+            for key, value in raw_bindings.items()
+            if key != "reference_image_slots" and isinstance(value, str) and "." in value
+        }
+        first, last, refs = await self._images_of(pid, job, params)
+
+        async def upload(path: Path | None) -> str | None:
+            if path is None:
+                return None
+            data = await asyncio.to_thread(path.read_bytes)
+            return await comfy.upload_image(path.name, data)
+
+        first_name = await upload(first)
+        last_name = await upload(last)
+        ref_names = [name for name in [await upload(ref.path) for ref in refs] if name]
         values = {
             "prompt": params.get("prompt"),
             "negative_prompt": params.get("negative_prompt"),
             "seed": params.get("seed"),
             "steps": params.get("steps"),
             "duration": params.get("duration"),
+            "first_frame": first_name,
+            "last_frame": last_name,
+            "source_image": first_name or (ref_names[0] if ref_names else None),
+            "reference_image": ref_names[0] if ref_names else first_name,
         }
+        ref_slots = raw_bindings.get("reference_image_slots")
+        if isinstance(ref_slots, list):
+            for index, target in enumerate(ref_slots):
+                if index >= len(ref_names) or not isinstance(target, str) or "." not in target:
+                    continue
+                values[f"__ref_{index}"] = ref_names[index]
+                bindings[f"__ref_{index}"] = target
+            if len(ref_names) > len(ref_slots):
+                params["ref_notes"] = [
+                    f"Workflow 只有 {len(ref_slots)} 个 AIVS_REF_* 槽位，"
+                    f"已省略 {len(ref_names) - len(ref_slots)} 张参考图。"
+                ]
         graph = apply_bindings(graph, bindings, values)
         prompt_id = await comfy.submit(graph, client_id=f"aivs-{pid}")
 

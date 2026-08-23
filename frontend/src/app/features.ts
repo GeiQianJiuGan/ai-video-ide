@@ -135,6 +135,23 @@ const APP_DEFS: FeatureDef[] = [
     ],
     outcome: ['换一部片子不用从零重建角色与素材', '工程里拿到的是可再改的副本'],
   },
+  {
+    id: 'presets',
+    route: 'presets',
+    title: '预设 Workflow',
+    purpose: '管理可复用的 ComfyUI API 图；项目只从这里选择一份作为唯一生成能力',
+    group: 'app',
+    icon: Workflow,
+    milestone: 'M2',
+    ready: true,
+    requires: ['backend', 'comfyui'],
+    panels: {
+      main: { title: '预设列表', body: '导入、检查、删除 ComfyUI API 格式图' },
+      right: { title: '参考图槽位', body: '显示 AIVS_REF_* 可接收的图片数量' },
+    },
+    actions: [{ label: '导入预设 Workflow', hint: '上传 ComfyUI 的 API 格式 json', primary: true }],
+    outcome: ['项目可绑定一份明确的生成图', '同一份预设可复用于多个项目'],
+  },
 ]
 
 /** 必须先打开一个工程才有意义的功能。 */
@@ -262,7 +279,7 @@ const PROJECT_DEFS: FeatureDef[] = [
     id: 'storyboard',
     route: 'storyboard',
     title: '分镜板',
-    purpose: '整片的鸟瞰视图：每个镜头一张卡片，缺什么、生成到哪一步都写在脸上',
+    purpose: 'Shot 主工作区：版本列表、视频预览、采纳与进入单 Shot 工作台都在这里完成',
     group: 'story',
     icon: LayoutGrid,
     milestone: 'M3',
@@ -270,14 +287,14 @@ const PROJECT_DEFS: FeatureDef[] = [
     requires: ['backend'],
     panels: {
       main: {
-        title: 'Scene 泳道',
-        body: '按 Scene 分行，Shot 卡片显示缩略图、时长、出场角色、状态点与上下文完备度',
+        title: 'Shot 卡片',
+        body: '按时间顺序展示 Shot；每张卡片直接列出已生成版本和采纳状态',
       },
-      right: { title: '批量操作', body: '选中多个镜头后统一生成、改时长、改 Workflow' },
+      right: { title: '预览与工作台', body: '单击预览视频，双击进入单 Shot 工作台配置角色、场景与上下文' },
     },
     actions: [
-      { label: '生成整个 Scene', hint: '把这一场的所有镜头一次性入队', primary: true },
-      { label: '移动镜头', hint: '本场内换位或跨场搬，顺序即时间顺序' },
+      { label: '采纳版本', hint: '为每个 Shot 选择进入时间线和下游续接的版本', primary: true },
+      { label: '单击预览 / 双击编辑', hint: '预览当前版本，双击打开完整 Shot 工作台' },
       { label: '按状态筛选', hint: '只看失败的、只看缺上下文的' },
     ],
     outcome: ['一眼看出整片进度与缺口', '批量推进而不用一个个点'],
@@ -321,29 +338,29 @@ const PROJECT_DEFS: FeatureDef[] = [
   {
     id: 'flow',
     route: 'flow',
-    title: '幕流程图',
-    purpose: '整片就这一张图：有哪几幕、每一幕做到哪了、两幕之间怎么接',
+    title: '单线程续接',
+    purpose: '按 Shot 顺序串行生成：上一条完成并产出末帧后，才执行下一条',
     group: 'generate',
     icon: Network,
     milestone: 'M4',
+    advanced: true,
     ready: true,
     requires: ['backend'],
     panels: {
       main: {
-        title: '幕与衔接',
-        body: '一个节点是一幕（缩略图、出场角色、进度徽标），节点之间那一条是衔接：硬切 / 转场 / 续接末帧',
+        title: '串行生成链',
+        body: '把所有 Shot 排成一条生成链，后一个 Shot 等前一个任务真正完成',
       },
       right: {
-        title: '编排账单',
-        body: '这次会入队几个任务、要补几段转场、哪一条缺什么；执行完把「做了的」和「说好的」摆在一起',
+        title: '依赖状态',
+        body: '每个等待中的 Shot 都显示上游任务和等待原因，确保首尾帧素材可用',
       },
     },
     actions: [
-      { label: '先看账单', hint: '只算不做：把要生成的、要补的、缺的全列出来', primary: true },
-      { label: '执行编排', hint: '各幕并发（补转场）或单线程续接（上一段末帧当下一段首帧）' },
-      { label: '加一幕', hint: '不依赖 LLM，手动编排能走完全程' },
+      { label: '先看账单', hint: '只算不做：列出将按顺序执行的 Shot 与缺口', primary: true },
+      { label: '执行续接', hint: '上一条完成后才释放下一条任务' },
     ],
-    outcome: ['整片结构一眼看全', '两幕之间怎么接是显式选择，不是默认行为'],
+    outcome: ['不会因缺少上游末帧而提前失败', '每条 Shot 的执行顺序和依赖都可追踪'],
   },
   {
     id: 'scene',
@@ -353,6 +370,7 @@ const PROJECT_DEFS: FeatureDef[] = [
     group: 'generate',
     icon: Video,
     milestone: 'M4',
+    advanced: true,
     ready: true,
     requires: ['backend'],
     panels: {
@@ -502,12 +520,12 @@ export interface ChainNode {
 export const CHAIN: ChainNode[] = [
   { label: 'Character', route: 'characters', desc: '角色本体' },
   { label: 'Appearance', route: 'characters', desc: '同一角色的不同形象' },
-  { label: 'Scene', route: 'flow', desc: '一场戏：地点 + 时间 + 出场角色' },
+  { label: 'Scene', route: 'storyboard', desc: 'Shot 的地点、时间与上下文来源' },
   { label: 'Shot', route: 'storyboard', desc: '一个镜头' },
   // Context / Generation 现在的主路是幕工作台，但它必须带着 sid 才有意义，
   // 所以链路上指向流程图——从那儿点一个节点进去。
-  { label: 'Context', route: 'flow', desc: '真正喂给模型的参考集合' },
-  { label: 'Generation', route: 'flow', desc: '一次生成请求' },
+  { label: 'Context', route: 'shot', desc: '真正喂给模型的参考集合' },
+  { label: 'Generation', route: 'shot', desc: '一次生成请求' },
   { label: 'Version', route: 'shot', desc: '生成结果，永不覆盖' },
   { label: 'Clip', route: 'timeline', desc: '被选中进入成片的片段' },
   { label: 'Timeline', route: 'timeline', desc: '确定性的编辑系统' },
@@ -538,7 +556,7 @@ export function featuresOf(group: GroupId): Feature[] {
  * 左栏顶上的「← 项目列表」。工程内要取库里的东西走各页的「从素材库采用」
  * （角色 / 地点 / 道具在各自的页面，素材文件在资产库页），不必掉出工程再回来。
  */
-export const APP_NAV = ['projects', 'library'] as const
+export const APP_NAV = ['projects', 'library', 'presets'] as const
 
 /**
  * 项目内导航顺序：按创作流程走，而不是按字母。
@@ -557,7 +575,6 @@ export const PROJECT_NAV = [
   'props',
   'story',
   'storyboard',
-  'flow',
   'timeline',
   'assets',
 ] as const
@@ -582,6 +599,7 @@ export const PROJECT_ADVANCED_FEATURES: Feature[] = FEATURES.filter(
 export const NAV_LABEL: Record<string, string> = {
   projects: '项目',
   library: '素材库',
+  presets: '预设 Workflow',
   dashboard: '概览',
   characters: '角色',
   locations: '场景',

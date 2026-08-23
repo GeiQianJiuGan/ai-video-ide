@@ -39,6 +39,12 @@ class Project(Base):
 
     default_video_workflow_id: Mapped[str | None] = mapped_column(String(40))
     default_image_workflow_id: Mapped[str | None] = mapped_column(String(40))
+    default_first_last_workflow_id: Mapped[str | None] = mapped_column(String(40))
+    default_upscale_workflow_id: Mapped[str | None] = mapped_column(String(40))
+    #: 项目级生成方式：工作流资源在应用层维护，项目只选择采用哪条调用路径。
+    generation_mode: Mapped[str] = mapped_column(String(20), nullable=False, default="comfy_preset")
+    #: 项目唯一生成预设；预设由应用级管理，项目只选择其中一份。
+    preset_name: Mapped[str | None] = mapped_column(String(100))
     default_prompt_style: Mapped[str | None] = mapped_column(Text)
     negative_prompt: Mapped[str | None] = mapped_column(Text)
 

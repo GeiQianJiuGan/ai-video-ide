@@ -35,6 +35,9 @@ REVISION_SCHEMA: dict[str, int] = {
     "0005_scene_nodes": 5,
     "0006_shot_adopted_video": 6,
     "0007_timeline_audio": 7,
+    "0008_global_workflow_bindings": 8,
+    "0009_project_generation_mode": 9,
+    "0010_project_preset": 10,
 }
 
 

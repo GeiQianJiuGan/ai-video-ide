@@ -212,6 +212,34 @@ export const useTimelineStore = defineStore('timeline', () => {
     return out.clip_id
   }
 
+  async function addBlankClip(
+    pid: string,
+    trackId: string,
+    body: { duration: number; label?: string | null },
+  ): Promise<string> {
+    const out = await guarded(() => timelineApi.addBlankClip(pid, trackId, body))
+    timeline.value = out.timeline
+    return out.clip_id
+  }
+
+  async function resizeBlankClip(pid: string, clipId: string, duration: number): Promise<void> {
+    await guarded(async () => {
+      timeline.value = await timelineApi.resizeBlankClip(pid, clipId, duration)
+    })
+  }
+
+  async function moveToAudioTrack(pid: string, clipId: string, trackId: string): Promise<void> {
+    await guarded(async () => {
+      timeline.value = await timelineApi.moveToAudioTrack(pid, clipId, trackId)
+    })
+  }
+
+  async function moveToNewAudioTrack(pid: string, clipId: string): Promise<string | null> {
+    const out = await guarded(() => timelineApi.moveToNewAudioTrack(pid, clipId))
+    timeline.value = out.timeline
+    return out.track_id
+  }
+
   async function addTransition(
     pid: string,
     body: { from_clip_id: string; to_clip_id: string; kind?: string; duration?: number },
@@ -287,6 +315,10 @@ export const useTimelineStore = defineStore('timeline', () => {
     patchTrack,
     removeTrack,
     addClip,
+    addBlankClip,
+    resizeBlankClip,
+    moveToAudioTrack,
+    moveToNewAudioTrack,
     addTransition,
     removeTransition,
     loadPlan,

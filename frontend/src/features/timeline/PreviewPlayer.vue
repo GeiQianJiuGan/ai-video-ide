@@ -10,8 +10,8 @@
  *      写在界面上（说「实时预览」却和成片不一样，比没有预览更糟）。
  *   2. **画面只认第一条视频轨**，和导出（`timeline.build_command`）同一条规矩。预览器
  *      自己另挑一条的话，看到的就不是将要导出的东西。
- *   3. **空档是黑屏而不是跳过**：轨道区把空档画出来了，预览器也照着走时间——但导出会用
- *      concat 把它们合掉，所以下面那行注释要说清这个差别（预检里也有同一条警告）。
+ *   3. **空白视频段是真黑场**：这是时间线上的显式片段，预览与导出都会保留；历史数据中
+ *      若仍有真正的空档，服务层会在下一次编辑时自动贴紧视频轨。
  *   4. **音量在预览里最高只能到 1.0**（HTMLMediaElement 的硬限制），而后端允许到 4。
  *      放大过的片段在这里听起来偏轻，这件事要说出来而不是让人以为设置没生效。
  *
@@ -67,6 +67,7 @@ const activeSrc = computed(() => {
   const clip = active.value
   return clip && clip.asset_path && playable(clip) ? fileUrl(props.pid, clip.asset_path) : ''
 })
+const activeIsBlank = computed(() => Boolean(active.value && !active.value.asset_path))
 
 interface Part {
   clip: Clip
@@ -93,7 +94,7 @@ const parts = computed<Part[]>(() => {
   return out
 })
 
-/** 视频轨上的空档合计。预览里是黑屏，导出会被合掉——差别要说出来。 */
+/** 兼容历史数据：显式空白片段不是空档；只统计真正没有片段的时间。 */
 const gapSeconds = computed(() => {
   let gaps = 0
   let prev = 0
@@ -349,11 +350,14 @@ function stamp(n: number): string {
       <p v-else-if="program.length === 0" class="text-fg-4 px-3 text-center text-2xs">
         视频轨上还没有片段。先「自动装配」把镜头铺上来，这里就能看整体效果了。
       </p>
+      <p v-else-if="activeIsBlank" class="text-fg-3 px-3 text-center text-2xs">
+        空白视频段 · {{ active?.duration.toFixed(2) }} 秒
+      </p>
       <p v-else-if="active && !playable(active)" class="text-st-review px-3 text-center text-2xs">
         这一段登记的文件已经不在磁盘上，预览跳过它。
       </p>
       <p v-else class="text-fg-4 px-3 text-center text-2xs">
-        空档（这里没有画面）。导出会把空档合掉，成片里不会有这段黑屏。
+        当前播放头不在视频片段内。
       </p>
       <span
         v-if="active"
@@ -402,7 +406,7 @@ function stamp(n: number): string {
         逐段近似预览：换段时会有一小段接缝，转场 / 特效在这里不渲染——最终效果看导出。
       </p>
       <p v-if="gapSeconds > 0.05" class="text-fg-4 text-2xs">
-        视频轨上有 {{ gapSeconds.toFixed(2) }} 秒空档，这里是黑屏；导出会把它们合掉。
+        历史数据中仍有 {{ gapSeconds.toFixed(2) }} 秒视频空档；编辑视频轨时会自动贴紧。
       </p>
       <p v-if="boosted" class="text-fg-4 text-2xs">
         有片段音量大于 1：预览最高只能到 1.0（浏览器限制），导出会按设定值放大。

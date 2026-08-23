@@ -58,6 +58,19 @@ class AddClipBody(BaseModel):
     label: str | None = None
 
 
+class BlankClipBody(BaseModel):
+    duration: float = Field(default=1.0, gt=0, description="黑场时长，单位秒")
+    label: str | None = None
+
+
+class BlankDurationBody(BaseModel):
+    duration: float = Field(gt=0, description="黑场时长，单位秒")
+
+
+class MoveTrackBody(BaseModel):
+    track_id: str
+
+
 class MixBody(BaseModel):
     muted: bool | None = None
     volume: float | None = Field(default=None, description="0 ~ 4，1 是原样")
@@ -139,6 +152,25 @@ async def detach_audio(pid: str, clip_id: str) -> dict[str, Any]:
     return await timeline.detach_audio(pid, clip_id)
 
 
+@router.post("/projects/{pid}/clips/{clip_id}/blank-duration")
+async def resize_blank_clip(
+    pid: str, clip_id: str, body: BlankDurationBody
+) -> dict[str, Any]:
+    return await timeline.resize_blank_clip(pid, clip_id, duration=body.duration)
+
+
+@router.post("/projects/{pid}/clips/{clip_id}/audio-track")
+async def move_clip_to_audio_track(
+    pid: str, clip_id: str, body: MoveTrackBody
+) -> dict[str, Any]:
+    return await timeline.move_clip_to_track(pid, clip_id, body.track_id)
+
+
+@router.post("/projects/{pid}/clips/{clip_id}/new-audio-track", status_code=201)
+async def move_clip_to_new_audio_track(pid: str, clip_id: str) -> dict[str, Any]:
+    return await timeline.move_clip_to_new_audio_track(pid, clip_id)
+
+
 @router.post("/projects/{pid}/tracks", status_code=201)
 async def add_track(pid: str, body: TrackBody) -> dict[str, Any]:
     return await timeline.add_track(pid, kind=body.kind, name=body.name)
@@ -167,6 +199,15 @@ async def add_clip(pid: str, track_id: str, body: AddClipBody) -> dict[str, Any]
         start=body.start,
         duration=body.duration,
         label=body.label,
+    )
+
+
+@router.post("/projects/{pid}/tracks/{track_id}/blank-clips", status_code=201)
+async def add_blank_clip(
+    pid: str, track_id: str, body: BlankClipBody
+) -> dict[str, Any]:
+    return await timeline.add_blank_clip(
+        pid, track_id, duration=body.duration, label=body.label
     )
 
 

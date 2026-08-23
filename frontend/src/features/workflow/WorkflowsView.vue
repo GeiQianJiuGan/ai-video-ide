@@ -36,6 +36,7 @@ import {
   CAPABILITY_LABEL,
   SLOTS,
   type Capability,
+  type GenerationMode,
   type Workflow,
 } from '@/shared/api/workflows'
 import { useWorkflowStore } from '@/stores/workflows'
@@ -63,6 +64,7 @@ const capabilityRow = computed(() =>
   wf.capabilities.find((c) => c.capability === detail.value?.capability),
 )
 const requiredSlots = computed(() => capabilityRow.value?.required_slots ?? [])
+const projectBindings = computed(() => wf.projectBindings)
 
 /** 图里所有可绑定的「节点.字段」，下拉只从这里取。 */
 const fieldOptions = computed(() =>
@@ -108,7 +110,6 @@ function byCapability(cap: string): Workflow[] {
 }
 
 async function reload(): Promise<void> {
-  if (!pid.value) return
   await wf.load(pid.value).catch(() => {})
 }
 
@@ -139,6 +140,7 @@ async function onPickFile(event: Event): Promise<void> {
 }
 
 async function confirmImport(): Promise<void> {
+  if (pid.value) return
   const name = importName.value.trim()
   if (!name || !importJson.value) return
   try {
@@ -156,6 +158,7 @@ async function confirmImport(): Promise<void> {
 }
 
 async function saveBindings(): Promise<void> {
+  if (pid.value) return
   const wid = detail.value?.id
   if (!wid) return
   // 空字符串表示「不绑」，不要把它当成一个绑定发过去
@@ -165,15 +168,33 @@ async function saveBindings(): Promise<void> {
 }
 
 async function runValidate(probe: boolean): Promise<void> {
+  if (pid.value) return
   const wid = detail.value?.id
   if (!wid) return
   await wf.validate(pid.value, wid, probe)
 }
 
 async function saveField(key: 'name' | 'notes' | 'status', value: string): Promise<void> {
+  if (pid.value) return
   const wid = detail.value?.id
   if (!wid) return
   await wf.update(pid.value, wid, { [key]: value }).catch(() => {})
+}
+
+async function saveProjectBinding(capability: Capability, value: string): Promise<void> {
+  if (!pid.value) return
+  await wf.setProjectBindings(pid.value, {
+    ...projectBindings.value,
+    [capability]: value || null,
+  }).catch(() => {})
+}
+
+async function saveGenerationMode(value: GenerationMode): Promise<void> {
+  if (!pid.value) return
+  await wf.setProjectBindings(pid.value, {
+    ...projectBindings.value,
+    generation_mode: value,
+  }).catch(() => {})
 }
 </script>
 
@@ -182,7 +203,7 @@ async function saveField(key: 'name' | 'notes' | 'status', value: string): Promi
     <FeatureHeader />
 
     <div class="border-line-1 bg-base-1 flex h-row shrink-0 items-center gap-1 border-b px-2">
-      <AppButton size="sm" variant="primary" :disabled="wf.busy" @click="fileInput?.click()">
+      <AppButton v-if="!pid" size="sm" variant="primary" :disabled="wf.busy" @click="fileInput?.click()">
         <Plus :size="10" />导入 Workflow
       </AppButton>
       <input
@@ -192,10 +213,11 @@ async function saveField(key: 'name' | 'notes' | 'status', value: string): Promi
         class="hidden"
         @change="onPickFile"
       />
-      <AppButton size="sm" :disabled="!detail || wf.busy" @click="runValidate(false)">
+      <AppButton v-if="!pid" size="sm" :disabled="!detail || wf.busy" @click="runValidate(false)">
         <ShieldCheck :size="10" />校验绑定
       </AppButton>
       <AppButton
+        v-if="!pid"
         size="sm"
         :disabled="!detail || wf.busy"
         title="连 ComfyUI 检查自定义节点是否都装了；离线时会明说探测失败，绑定检查照常"
@@ -204,6 +226,7 @@ async function saveField(key: 'name' | 'notes' | 'status', value: string): Promi
         <Plug :size="10" />校验 + 探测节点
       </AppButton>
       <AppButton
+        v-if="!pid"
         size="sm"
         :disabled="!detail || wf.busy || detail.is_default === 1"
         title="新镜头默认用这套 Workflow"
@@ -273,10 +296,11 @@ async function saveField(key: 'name' | 'notes' | 'status', value: string): Promi
       <AppPanel title="节点绑定" class="min-h-0 flex-1">
         <template #actions>
           <span v-if="detail" class="text-fg-4 text-2xs"> 带 * 的是这项能力的必填槽位 </span>
-          <AppButton size="sm" variant="ghost" :disabled="!dirty" @click="resetDraft()">
+          <AppButton v-if="!pid" size="sm" variant="ghost" :disabled="!dirty" @click="resetDraft()">
             还原
           </AppButton>
           <AppButton
+            v-if="!pid"
             size="sm"
             variant="primary"
             :disabled="!detail || !dirty || wf.busy"
@@ -315,6 +339,7 @@ async function saveField(key: 'name' | 'notes' | 'status', value: string): Promi
                   <div class="flex items-center gap-1">
                     <select
                       v-model="draft[slot]"
+                      :disabled="!!pid"
                       class="border-line-1 bg-base-2 text-fg-1 focus:border-accent/60 h-5 min-w-0 flex-1 border px-1 text-2xs outline-none"
                     >
                       <option value="">未绑定</option>
@@ -369,6 +394,49 @@ async function saveField(key: 'name' | 'notes' | 'status', value: string): Promi
           </section>
 
           <section class="border-line-1 border-t pt-2">
+            <p class="text-fg-3 text-2xs tracking-wide uppercase">
+              当前项目绑定
+            </p>
+            <p v-if="!pid" class="text-fg-4 mt-1 text-2xs">
+              这是应用级 Workflow 资源。打开项目后可在这里绑定项目能力。
+            </p>
+            <div v-else class="mt-1 space-y-1">
+              <label class="block">
+                <span class="text-fg-4 text-2xs">项目生成方式</span>
+                <select
+                  :value="projectBindings.generation_mode"
+                  class="border-line-1 bg-base-2 text-fg-1 focus:border-accent/60 mt-px h-5 w-full border px-1 text-2xs outline-none"
+                  :disabled="wf.busy"
+                  @change="saveGenerationMode(($event.target as HTMLSelectElement).value as GenerationMode)"
+                >
+                  <option value="comfy_preset">ComfyUI 预设</option>
+                  <option value="http_api">通用 REST API</option>
+                  <option value="workflow_api">Workflow API 图</option>
+                </select>
+                <span class="text-fg-4 mt-0.5 block text-2xs">选择 Workflow API 后，生成会使用下面绑定的应用级 Workflow。</span>
+              </label>
+              <label v-for="cap in CAPABILITIES" :key="cap" class="block">
+                <span class="text-fg-4 text-2xs">{{ CAPABILITY_LABEL[cap] }}</span>
+                <select
+                  :value="projectBindings[cap] ?? ''"
+                  class="border-line-1 bg-base-2 text-fg-1 focus:border-accent/60 mt-px h-5 w-full border px-1 text-2xs outline-none"
+                  :disabled="wf.busy || projectBindings.generation_mode !== 'workflow_api'"
+                  @change="saveProjectBinding(cap, ($event.target as HTMLSelectElement).value)"
+                >
+                  <option value="">未绑定</option>
+                  <option
+                    v-for="w in byCapability(cap).filter((row) => row.status === 'ready')"
+                    :key="w.id"
+                    :value="w.id"
+                  >
+                    {{ w.name }}
+                  </option>
+                </select>
+              </label>
+            </div>
+          </section>
+
+          <section class="border-line-1 border-t pt-2">
             <p class="text-fg-3 text-2xs tracking-wide uppercase">ComfyUI</p>
             <p class="mt-1 flex items-center gap-1 text-2xs">
               <AppBadge :tone="wf.comfy?.online ? 'ok' : 'warn'">
@@ -410,6 +478,7 @@ async function saveField(key: 'name' | 'notes' | 'status', value: string): Promi
                 <input
                   :value="detail.name"
                   class="border-line-1 bg-base-2 text-fg-1 focus:border-accent/60 mt-px h-5 w-full border px-1.5 text-2xs outline-none"
+                  :disabled="!!pid"
                   @change="saveField('name', ($event.target as HTMLInputElement).value)"
                 />
               </label>
@@ -418,6 +487,7 @@ async function saveField(key: 'name' | 'notes' | 'status', value: string): Promi
                 <input
                   :value="detail.notes ?? ''"
                   class="border-line-1 bg-base-2 text-fg-1 focus:border-accent/60 mt-px h-5 w-full border px-1.5 text-2xs outline-none"
+                  :disabled="!!pid"
                   @change="saveField('notes', ($event.target as HTMLInputElement).value)"
                 />
               </label>
@@ -426,6 +496,7 @@ async function saveField(key: 'name' | 'notes' | 'status', value: string): Promi
                 <select
                   :value="detail.status"
                   class="border-line-1 bg-base-2 text-fg-1 focus:border-accent/60 mt-px h-5 w-full border px-1 text-2xs outline-none"
+                  :disabled="!!pid"
                   @change="saveField('status', ($event.target as HTMLSelectElement).value)"
                 >
                   <option
@@ -442,6 +513,7 @@ async function saveField(key: 'name' | 'notes' | 'status', value: string): Promi
               手工改成「就绪」不会跳过校验：镜头解析时仍按绑定取值，缺了就在入队前报错。
             </p>
             <AppButton
+              v-if="!pid"
               size="sm"
               variant="danger"
               class="mt-1.5"

@@ -25,6 +25,11 @@ export interface Project {
   updated_at: string
 }
 
+export interface ProjectPreset {
+  name: string | null
+  preset: import('./settings').PresetRow | null
+}
+
 export interface RecentProject {
   id: string
   name: string
@@ -52,4 +57,7 @@ export const projectsApi = {
   forget: (dir: string) => api.post<void>('/projects/recent/forget', { dir }),
   get: (pid: string) => api.get<Project>(`/projects/${pid}`),
   close: (pid: string) => api.post<void>(`/projects/${pid}/close`),
+  preset: (pid: string) => api.get<ProjectPreset>(`/projects/${pid}/preset`),
+  setPreset: (pid: string, name: string | null) =>
+    api.put<ProjectPreset>(`/projects/${pid}/preset`, { name }),
 }

@@ -33,17 +33,14 @@ import {
   type GenerationVersion,
 } from '@/shared/api/generation'
 import { SHOT_STATUS, SHOT_STATUS_LABEL } from '@/shared/api/story'
-import { CAPABILITY_LABEL, type Capability } from '@/shared/api/workflows'
 import { useConsoleStore } from '@/stores/console'
 import { useShotStore } from '@/stores/shot'
 import { useStoryStore } from '@/stores/story'
-import { useWorkflowStore } from '@/stores/workflows'
 
 const route = useRoute()
 const router = useRouter()
 const editor = useShotStore()
 const story = useStoryStore()
-const wf = useWorkflowStore()
 const consolePanel = useConsoleStore()
 
 const pid = computed(() => String(route.params.pid ?? ''))
@@ -92,7 +89,6 @@ const allShots = computed(() =>
   ),
 )
 
-const readyWorkflows = computed(() => wf.list.filter((w) => w.status === 'ready'))
 
 function thumb(assetId: string | null): string {
   if (!assetId) return ''
@@ -139,7 +135,6 @@ async function reload(): Promise<void> {
   await Promise.all([
     editor.load(pid.value, sid.value).catch(() => {}),
     story.loadBoard(pid.value).catch(() => {}),
-    wf.load(pid.value).catch(() => {}),
     loadSide(),
   ])
 }
@@ -726,17 +721,6 @@ async function confirmDrop(): Promise<void> {
           </label>
           <div class="w-64 shrink-0 space-y-1">
             <label class="block">
-              <span class="text-fg-4 text-2xs">Workflow（决定用哪套图与参数）</span>
-              <select
-                :value="shot.workflow_id ?? ''"
-                class="border-line-1 bg-base-2 text-fg-1 focus:border-accent/60 mt-px h-5 w-full border px-1 text-2xs outline-none"
-                @change="saveField('workflow_id', ($event.target as HTMLSelectElement).value)"
-              >
-                <option value="">用该能力的默认 Workflow</option>
-                <option v-for="w in readyWorkflows" :key="w.id" :value="w.id">
-                  {{ w.name }} · {{ CAPABILITY_LABEL[w.capability as Capability] ?? w.capability }}
-                </option>
-              </select>
             </label>
             <div class="grid grid-cols-2 gap-1">
               <label class="block">
@@ -759,11 +743,8 @@ async function confirmDrop(): Promise<void> {
                 />
               </label>
             </div>
-            <p v-if="readyWorkflows.length === 0" class="text-fg-4 text-2xs">
-              还没有校验通过的 Workflow。去 Workflow 页导入并绑定一个——不然入队会说不出该用哪套图。
-            </p>
-            <p v-else class="text-fg-4 text-2xs">
-              入队那一刻这些值会被冻结进版本里，之后再改不影响已经出过的结果。
+            <p class="text-fg-4 text-2xs">
+              项目概览里绑定的预设 Workflow 决定本镜头实际使用的模型图；入队那一刻参数会被冻结进版本。
             </p>
           </div>
           <label class="w-56 shrink-0">

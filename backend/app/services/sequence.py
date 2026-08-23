@@ -615,6 +615,7 @@ class SequenceService:
 
         queued: list[str] = []
         skipped: list[dict[str, Any]] = []
+        previous_job_id: str | None = None
         for i, shot in enumerate(chain):
             try:
                 # 链头必须自己有首帧，所以照常过门槛；后面的首帧要等上游出片，
@@ -625,8 +626,10 @@ class SequenceService:
                     priority=priority,
                     check_context=i == 0,
                     allow_ref_drop=allow_ref_drop,
+                    wait_for_job_id=previous_job_id,
                 )
                 queued.append(job["id"])
+                previous_job_id = job["id"]
             except AppError as err:
                 skipped.append(
                     {"shot_id": shot.id, "index_no": shot.index_no, "error": err.to_dict()}

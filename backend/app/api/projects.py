@@ -6,12 +6,16 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from fastapi import APIRouter
 from pydantic import BaseModel, Field
+from sqlalchemy import select
 
 from app.core.logging import get_logger
+from app.generation.providers import presets
+from app.persistence.models import Project, utc_now
+from app.services.base import db_of, fetch_all
 from app.services.projects import projects
 
 router = APIRouter(tags=["projects"])
@@ -91,6 +95,38 @@ async def forget_recent(body: ProjectOpen) -> None:
 @router.get("/projects/{pid}", response_model=ProjectOut)
 async def get_project(pid: str) -> ProjectOut:
     return ProjectOut(**projects.get(pid).to_dict())
+
+
+@router.get("/projects/{pid}/preset")
+async def get_project_preset(pid: str) -> dict[str, Any]:
+    row = (await fetch_all(db_of(pid), Project))[0]
+    name = row.preset_name
+    item = next((x for x in presets.listing() if x["name"] == name), None) if name else None
+    return {"name": name, "preset": item}
+
+
+@router.put("/projects/{pid}/preset")
+async def set_project_preset(pid: str, payload: dict[str, str | None]) -> dict[str, Any]:
+    name = (payload.get("name") or "").strip() or None
+    if name and not any(x["name"] == name and x.get("ready") for x in presets.listing()):
+        from app.core.errors import AppError, ErrorCode
+
+        raise AppError(
+            ErrorCode.INVALID_WORKFLOW,
+            "预设不可用",
+            f"预设 {name} 不存在或未通过入口检查。",
+            ["到左侧「预设 Workflow」导入并修复这份图", "再回项目选择它"],
+            {"preset": name},
+        )
+    db = db_of(pid)
+    async with db.write() as session:
+        row = (await session.execute(select(Project))).scalars().first()
+        assert row is not None
+        row.preset_name = name
+        row.generation_mode = "comfy_preset"
+        row.updated_at = utc_now()
+    item = next((x for x in presets.listing() if x["name"] == name), None) if name else None
+    return {"name": name, "preset": item}
 
 
 @router.post("/projects/{pid}/close", status_code=204)

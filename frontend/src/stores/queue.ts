@@ -20,11 +20,29 @@ import { ApiError } from '@/shared/api/client'
 import { generationApi, type Job, type QueueState } from '@/shared/api/generation'
 import { EventClient, type ConnState } from '@/shared/api/ws'
 
+export interface BreakdownTask {
+  id: string
+  kind: 'breakdown'
+  status: 'running' | 'done' | 'failed'
+  title: string
+  detail: string
+  created_at: string
+  finished_at: string | null
+  error: string | null
+}
+
 export const useQueueStore = defineStore('queue', () => {
   const state = ref<QueueState | null>(null)
   const conn = ref<ConnState>('closed')
   const busy = ref(false)
   const lastError = ref<ApiError | null>(null)
+
+  /**
+   * 非生成类任务消息。剧本拆解目前是同步 API（没有后端 Job），但它仍然是
+   * 一件用户发起、需要等待并且可能失败的工作；把它放在任务框里，用户不会
+   * 误以为点击后没有执行。按工程切换时由 reset() 清空。
+   */
+  const breakdownTasks = ref<BreakdownTask[]>([])
 
   const jobs = computed(() => state.value?.jobs ?? [])
   const paused = computed(() => state.value?.paused ?? false)
@@ -52,6 +70,41 @@ export const useQueueStore = defineStore('queue', () => {
       lastError.value = err instanceof ApiError ? err : null
       throw err
     }
+  }
+
+  function beginBreakdown(): string {
+    const id = `breakdown-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
+    breakdownTasks.value = [
+      ...breakdownTasks.value,
+      {
+        id,
+        kind: 'breakdown' as const,
+        status: 'running' as const,
+        title: 'AI 剧本拆解',
+        detail: '正在根据剧本生成 Scene / Shot 提案…',
+        created_at: new Date().toISOString(),
+        finished_at: null,
+        error: null,
+      },
+    ].slice(-20)
+    return id
+  }
+
+  function finishBreakdown(id: string, detail = '拆解完成，提案已准备好审阅。'): void {
+    const row = breakdownTasks.value.find((task) => task.id === id)
+    if (!row) return
+    row.status = 'done'
+    row.detail = detail
+    row.finished_at = new Date().toISOString()
+  }
+
+  function failBreakdown(id: string, error: string): void {
+    const row = breakdownTasks.value.find((task) => task.id === id)
+    if (!row) return
+    row.status = 'failed'
+    row.detail = '拆解失败'
+    row.error = error
+    row.finished_at = new Date().toISOString()
   }
 
   /** 合并高频事件：400ms 内的多条只重拉一次。 */
@@ -107,6 +160,7 @@ export const useQueueStore = defineStore('queue', () => {
   function reset(): void {
     disconnect()
     state.value = null
+    breakdownTasks.value = []
     lastError.value = null
   }
 
@@ -129,6 +183,10 @@ export const useQueueStore = defineStore('queue', () => {
     counts,
     active,
     failed,
+    breakdownTasks,
+    beginBreakdown,
+    finishBreakdown,
+    failBreakdown,
     idle,
     load,
     connect,

@@ -10,12 +10,16 @@ from typing import Any
 
 from app.core import ffmpeg as ffmpeg_tool
 from app.generation.comfy.client import comfy
+from app.generation.providers import presets
+from app.persistence.models import Project
 from app.persistence.models_cast import Appearance, Character, SheetVersion
 from app.persistence.models_edit import ExportRecord, TimelineClip
-from app.persistence.models_gen import GenerationVersion, Job, Workflow
+from app.persistence.models_gen import GenerationVersion, Job
+from app.persistence.models_global import GlobalWorkflow
 from app.persistence.models_story import Scene, Shot, ShotCast, ShotProp
 from app.persistence.models_world import Location, LocationVariant, Prop, PropReference
 from app.services.base import db_of, fetch_all, load_json, project_of
+from app.services.global_registry import global_registry
 from app.services.workflows import workflows
 
 #: 状态中文名，前后端共用一套口径。
@@ -359,6 +363,26 @@ class OverviewService:
                     "detail": f"{device.get('name')} · 空闲 {round((free or 0) / 1024**3, 1)}G",
                 }
         capabilities = await workflows.capability_matrix(pid) if pid else None
+        generation: dict[str, Any] | None = None
+        if pid:
+            project = (await fetch_all(db_of(pid), Project))[0]
+            selected = project.preset_name or ""
+            item = (
+                next((x for x in presets.listing() if x["name"] == selected), None)
+                if selected
+                else None
+            )
+            generation = {
+                "mode": "comfy_preset",
+                "preset_name": selected or None,
+                "preset_ready": bool(item and item.get("ready")),
+                "ref_slots": item.get("ref_slots") if item else None,
+                "detail": (
+                    f"项目使用预设 Workflow：{selected}"
+                    if selected
+                    else "项目尚未绑定预设 Workflow"
+                ),
+            }
         return {
             "comfy": ping,
             "ffmpeg": {
@@ -381,11 +405,12 @@ class OverviewService:
             },
             "gpu": gpu,
             "capabilities": capabilities,
+            "generation": generation,
         }
 
     async def workflow_health(self, pid: str) -> list[dict[str, Any]]:
-        db = db_of(pid)
-        rows = await fetch_all(db, Workflow, order_by=Workflow.created_at)
+        db = await global_registry.start()
+        rows = await fetch_all(db, GlobalWorkflow, order_by=GlobalWorkflow.created_at)
         return [
             {
                 "id": r.id,

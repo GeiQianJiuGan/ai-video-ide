@@ -38,15 +38,23 @@ const taskLabel = computed(() => {
   const pending = (c.queued ?? 0) + (c.waiting ?? 0)
   if (pending) parts.push(`排 ${pending}`)
   if (queue.failed.length) parts.push(`失败 ${queue.failed.length}`)
+  const breakdownRunning = queue.breakdownTasks.filter((task) => task.status === 'running').length
+  const breakdownFailed = queue.breakdownTasks.filter((task) => task.status === 'failed').length
+  if (breakdownRunning) parts.push(`拆解 ${breakdownRunning}`)
+  if (breakdownFailed) parts.push(`拆解失败 ${breakdownFailed}`)
   if (queue.paused) parts.push('已暂停')
   return parts.length ? parts.join(' · ') : '空闲'
 })
 
 /** 有失败标红、有在跑用「运行中」的颜色、暂停用复核色，其余静默。 */
 const taskColor = computed(() => {
-  if (queue.failed.length) return 'text-st-failed'
+  if (queue.failed.length || queue.breakdownTasks.some((task) => task.status === 'failed')) {
+    return 'text-st-failed'
+  }
   if (queue.paused) return 'text-st-review'
-  if (!queue.idle) return 'text-st-running'
+  if (!queue.idle || queue.breakdownTasks.some((task) => task.status === 'running')) {
+    return 'text-st-running'
+  }
   return 'text-fg-3'
 })
 

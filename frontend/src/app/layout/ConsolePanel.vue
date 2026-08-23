@@ -34,6 +34,7 @@ import {
   Play,
   RefreshCw,
   RotateCcw,
+  Wand2,
 } from '@lucide/vue'
 import AppBadge from '@/shared/ui/AppBadge.vue'
 import AppButton from '@/shared/ui/AppButton.vue'
@@ -86,6 +87,13 @@ const RANK: Record<string, number> = { running: 0, waiting: 1, queued: 1, failed
 
 const rows = computed(() =>
   [...queue.jobs].sort((a, b) => (RANK[a.status] ?? 3) - (RANK[b.status] ?? 3)),
+)
+
+const breakdownRows = computed(() =>
+  [...queue.breakdownTasks].sort((a, b) => {
+    const rank = (status: string) => (status === 'running' ? 0 : status === 'failed' ? 1 : 2)
+    return rank(a.status) - rank(b.status)
+  }),
 )
 
 const CHANNELS: Channel[] = ['job', 'queue', 'shot', 'version', 'asset', 'system', 'error']
@@ -179,7 +187,9 @@ function startResize(e: PointerEvent): void {
         @click="panel.tab = 'jobs'"
       >
         任务框
-        <span v-if="queue.jobs.length" class="tnum text-fg-4">{{ queue.jobs.length }}</span>
+        <span v-if="queue.jobs.length + queue.breakdownTasks.length" class="tnum text-fg-4">
+          {{ queue.jobs.length + queue.breakdownTasks.length }}
+        </span>
       </button>
       <button
         type="button"
@@ -299,11 +309,11 @@ function startResize(e: PointerEvent): void {
           @dismiss="queue.clearError()"
         />
         <EmptyState
-          v-if="rows.length === 0"
+          v-if="rows.length === 0 && breakdownRows.length === 0"
           title="队列里什么都没有"
           body="去幕流程图、幕工作台或镜头页入队一个镜头。任务会带着它的上下文一起排进来，跑完落成一个新版本。"
         />
-        <table v-else class="w-full border-collapse text-2xs">
+        <table v-if="rows.length" class="w-full border-collapse text-2xs">
           <tbody>
             <tr v-for="job in rows" :key="job.id" class="hover:bg-base-2">
               <td class="border-line-1 w-20 border-b px-1.5 py-1 align-top">
@@ -367,6 +377,29 @@ function startResize(e: PointerEvent): void {
             </tr>
           </tbody>
         </table>
+        <ul v-if="breakdownRows.length" class="divide-line-1 divide-y">
+          <li
+            v-for="task in breakdownRows"
+            :key="task.id"
+            class="hover:bg-base-2 flex items-start gap-1.5 px-1.5 py-1 text-2xs"
+          >
+            <AppBadge
+              :tone="
+                task.status === 'running' ? 'accent' : task.status === 'failed' ? 'fail' : 'ok'
+              "
+            >
+              {{
+                task.status === 'running' ? '正在跑' : task.status === 'failed' ? '失败' : '完成'
+              }}
+            </AppBadge>
+            <span class="text-fg-2 min-w-0 flex-1">
+              <span class="text-fg-1">{{ task.title }}</span>
+              <span class="text-fg-4 ml-1">{{ task.detail }}</span>
+              <span v-if="task.error" class="text-st-failed ml-1">{{ task.error }}</span>
+            </span>
+            <Wand2 v-if="task.status === 'running'" :size="10" class="text-accent shrink-0" />
+          </li>
+        </ul>
       </template>
     </div>
 

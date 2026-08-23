@@ -14,11 +14,10 @@
  *
  * 空工程刻意不画空图表（0% 的进度条 + 全 0 的分布条只是噪音），改画下一步引导。
  */
-import { computed, onMounted, watch } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { RouterLink, useRoute } from 'vue-router'
 import {
   Activity,
-  ArrowRight,
   CheckCircle2,
   Library,
   PlayCircle,
@@ -33,13 +32,17 @@ import EmptyState from '@/shared/ui/EmptyState.vue'
 import ErrorPanel from '@/shared/ui/ErrorPanel.vue'
 import FeatureHeader from '@/shared/ui/FeatureHeader.vue'
 import ChainStrip from '@/shared/ui/ChainStrip.vue'
-import { CAPABILITY_LABEL, COUNT_CARDS } from '@/shared/api/overview'
+import { COUNT_CARDS } from '@/shared/api/overview'
+import { projectsApi } from '@/shared/api/projects'
+import { settingsApi, type PresetRow } from '@/shared/api/settings'
 import { useOverviewStore } from '@/stores/overview'
 
 const route = useRoute()
 const ov = useOverviewStore()
 
 const pid = computed(() => String(route.params.pid ?? ''))
+const presets = ref<PresetRow[]>([])
+const presetBusy = ref(false)
 
 /** 分布条按 count 过滤：0 的状态不占宽度，也不占图例。 */
 const buckets = computed(() => (ov.summary?.shot_status ?? []).filter((b) => b.count > 0))
@@ -63,8 +66,20 @@ const FFMPEG_SOURCE: Record<string, string> = {
   configured: '配置指定',
 }
 
-function reload(): void {
-  if (pid.value) void ov.load(pid.value)
+async function reload(): Promise<void> {
+  if (!pid.value) return
+  await ov.load(pid.value)
+  presets.value = (await settingsApi.presets().catch(() => ({ items: [] } as { items: PresetRow[] }))).items
+}
+
+async function selectPreset(name: string): Promise<void> {
+  presetBusy.value = true
+  try {
+    await projectsApi.setPreset(pid.value, name || null)
+    await ov.load(pid.value)
+  } finally {
+    presetBusy.value = false
+  }
 }
 
 onMounted(reload)
@@ -341,28 +356,28 @@ function duration(sec: number): string {
                 </div>
                 <p class="text-fg-4 mt-px text-2xs break-words">{{ ov.environment.gpu.detail }}</p>
               </div>
-              <div v-if="ov.environment.capabilities" class="border-line-1 border-t pt-1.5">
-                <p class="text-fg-3 text-2xs tracking-wide uppercase">生成能力</p>
-                <ul class="mt-1 space-y-1">
-                  <li v-for="c in ov.environment.capabilities.capabilities" :key="c.capability">
-                    <div class="flex items-center gap-1.5">
-                      <span class="text-fg-2 text-2xs">
-                        {{ CAPABILITY_LABEL[c.capability] ?? c.capability }}
-                      </span>
-                      <AppBadge :tone="c.ready ? 'ok' : 'warn'">
-                        {{ c.ready ? '就绪' : '未就绪' }}
-                      </AppBadge>
-                      <RouterLink
-                        :to="{ name: 'workflows', params: { pid } }"
-                        class="text-fg-4 hover:text-accent ml-auto"
-                        title="去 Workflow 页配置绑定"
-                      >
-                        <ArrowRight :size="10" />
-                      </RouterLink>
-                    </div>
-                    <p v-if="c.impact" class="text-fg-4 mt-px text-2xs">{{ c.impact }}</p>
-                  </li>
-                </ul>
+              <div v-if="ov.environment.generation" class="border-line-1 border-t pt-1.5">
+                <div class="flex items-center gap-1.5">
+                  <p class="text-fg-3 text-2xs tracking-wide uppercase">项目生成 Workflow</p>
+                  <AppBadge :tone="ov.environment.generation.preset_ready ? 'ok' : 'warn'">
+                    {{ ov.environment.generation.preset_ready ? '已绑定' : '未绑定' }}
+                  </AppBadge>
+                </div>
+                <select
+                  :value="ov.environment.generation.preset_name ?? ''"
+                  class="border-line-1 bg-base-2 text-fg-1 mt-1 h-6 w-full border px-1.5 text-2xs outline-none"
+                  :disabled="presetBusy"
+                  @change="selectPreset(($event.target as HTMLSelectElement).value)"
+                >
+                  <option value="">未选择预设 Workflow</option>
+                  <option v-for="preset in presets.filter((row) => row.ready)" :key="preset.name" :value="preset.name">
+                    {{ preset.name }} · 参考图 {{ preset.ref_slots }} 槽
+                  </option>
+                </select>
+                <p class="text-fg-4 mt-1 text-2xs">{{ ov.environment.generation.detail }}</p>
+                <RouterLink :to="{ name: 'presets' }" class="text-accent mt-1 inline-block text-2xs">
+                  管理预设 Workflow
+                </RouterLink>
               </div>
             </div>
             <EmptyState

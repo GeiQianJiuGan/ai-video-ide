@@ -163,6 +163,11 @@ export interface AddClipResult {
   timeline: Timeline
 }
 
+export interface BlankClipResult {
+  clip_id: string
+  timeline: Timeline
+}
+
 /** 裁切请求。**拖左边缘时 `in_point` 与 `start` 必须一起给**：一次请求、一格撤销。 */
 export interface TrimBody {
   in_point?: number | null
@@ -213,6 +218,19 @@ export const timelineApi = {
     trackId: string,
     body: { asset_id: string; start?: number; duration?: number | null; label?: string | null },
   ) => api.post<AddClipResult>(`/projects/${pid}/tracks/${trackId}/clips`, body),
+  addBlankClip: (
+    pid: string,
+    trackId: string,
+    body: { duration: number; label?: string | null },
+  ) => api.post<BlankClipResult>(`/projects/${pid}/tracks/${trackId}/blank-clips`, body),
+  resizeBlankClip: (pid: string, clipId: string, duration: number) =>
+    api.post<Timeline>(`/projects/${pid}/clips/${clipId}/blank-duration`, { duration }),
+  moveToAudioTrack: (pid: string, clipId: string, trackId: string) =>
+    api.post<Timeline>(`/projects/${pid}/clips/${clipId}/audio-track`, { track_id: trackId }),
+  moveToNewAudioTrack: (pid: string, clipId: string) =>
+    api.post<{ track_id: string; timeline: Timeline }>(
+      `/projects/${pid}/clips/${clipId}/new-audio-track`,
+    ),
 
   transitions: (pid: string) => api.get<Transition[]>(`/projects/${pid}/transitions`),
   addTransition: (

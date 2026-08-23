@@ -95,7 +95,7 @@ FIELDS: tuple[FieldSpec, ...] = (
         "text",
         impact=(
             "决定 AI 把剧本拆成什么样的幕与镜头。留空用内置默认；"
-            "JSON 输出形状由系统始终追加，改不坏。"
+            "JSON 输出形状与‘只处理对白/环境声、不生成配乐’的规则由系统始终追加，改不坏。"
         ),
         builtin=prompts.BREAKDOWN_TASK,
     ),
