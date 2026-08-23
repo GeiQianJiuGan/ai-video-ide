@@ -20,6 +20,10 @@
  *   6. **声音有两条路**：视频片段自带的音轨（可静音 / 调音量），与音频轨上的独立片段
  *      （从画面「拆出声音」或导入配乐）。音频轨之间可以随意重叠——叠加是它存在的意义，
  *      不是错误；后端导出时用 `amix` 把它们混在一起。
+ *   7. **片段属性里没有转场**。两段之间怎么接是**分镜那一页**的事：每两个 Shot（以及每两幕）
+ *      之间那条线选「转场」就会生成一段真的过渡视频，装配到这里就是一个正常片段。
+ *      在这里再摆一份 ffmpeg 层的叠化只会变成第二处配置，和分镜上那条线互相打架。
+ *      后端的 `Transition` 接口原样留着（兼容路径），只是不再有界面入口。
  *
  * 拖拽只做三件事：拖块身 = 移动、拖左右边界线 = 生成裁切草稿、拖标尺 = 移播放头。
  * 裁切草稿只在片段内预览，右键确认后才发请求，返回的整条时间线整体覆盖。
@@ -55,13 +59,7 @@ import ErrorPanel from '@/shared/ui/ErrorPanel.vue'
 import FeatureHeader from '@/shared/ui/FeatureHeader.vue'
 import SplitPane from '@/shared/ui/SplitPane.vue'
 import PreviewPlayer from './PreviewPlayer.vue'
-import {
-  TRACK_KIND_LABEL,
-  TRANSITION_KINDS,
-  TRANSITION_LABEL,
-  type Clip,
-  type Track,
-} from '@/shared/api/timeline'
+import { TRACK_KIND_LABEL, type Clip, type Track } from '@/shared/api/timeline'
 import { generationApi, type GenerationVersion } from '@/shared/api/generation'
 import { assetsApi, type Asset } from '@/shared/api/assets'
 import { ApiError, confirmFlagOf } from '@/shared/api/client'
@@ -134,25 +132,6 @@ const menuClip = computed<Clip | null>(
   () => tl.clips.find((c) => c.id === clipMenu.value?.clipId) ?? null,
 )
 const latestExport = computed(() => tl.exports[0] ?? null)
-/** 挂在选中片段上的转场（进或出）。 */
-const clipTransitions = computed(() =>
-  tl.transitions.filter(
-    (t) => t.from_clip_id === selectedId.value || t.to_clip_id === selectedId.value,
-  ),
-)
-
-/** 同一条轨道上排在选中片段后面的那一个——转场只能加在相邻两段之间。 */
-const nextClip = computed<Clip | null>(() => {
-  const cur = selected.value
-  if (!cur) return null
-  const lane = tl.timeline?.tracks.find((t) => t.id === cur.track_id)
-  if (!lane) return null
-  const at = lane.clips.findIndex((c) => c.id === cur.id)
-  return lane.clips[at + 1] ?? null
-})
-
-const transitionKind = ref<string>('dissolve')
-const transitionDuration = ref(0.5)
 
 function fmt(n: number): string {
   return `${Math.round(n * 100) / 100}s`
@@ -708,20 +687,6 @@ async function doReplaceVersion(versionId: string): Promise<void> {
   const clip = selected.value
   if (!clip || !versionId) return
   await tl.replaceVersion(pid.value, clip.id, versionId).catch(() => {})
-}
-
-async function addTransition(): Promise<void> {
-  const from = selected.value
-  const to = nextClip.value
-  if (!from || !to) return
-  await tl
-    .addTransition(pid.value, {
-      from_clip_id: from.id,
-      to_clip_id: to.id,
-      kind: transitionKind.value,
-      duration: transitionDuration.value,
-    })
-    .catch(() => {})
 }
 
 async function runExport(): Promise<void> {
@@ -1444,48 +1409,10 @@ function goShot(shotId: string | null): void {
             <p class="text-fg-4 mt-1 text-2xs">
               换版本只改这一段，整条时间线不重排——所以别的片段的位置不会动。
             </p>
-          </section>
-
-          <section class="border-line-1 border-t pt-2">
-            <p class="text-fg-3 text-2xs tracking-wide uppercase">转场</p>
-            <div v-if="nextClip" class="mt-1 flex items-end gap-1">
-              <select
-                v-model="transitionKind"
-                class="border-line-1 bg-base-2 text-fg-1 focus:border-accent/60 h-5 min-w-0 flex-1 border px-1 text-2xs outline-none"
-              >
-                <option v-for="k in TRANSITION_KINDS" :key="k" :value="k">
-                  {{ TRANSITION_LABEL[k] }}
-                </option>
-              </select>
-              <input
-                v-model.number="transitionDuration"
-                type="number"
-                min="0"
-                step="0.1"
-                class="border-line-1 bg-base-2 text-fg-1 focus:border-accent/60 tnum h-5 w-14 border px-1 text-2xs outline-none"
-              />
-              <AppButton size="sm" :disabled="tl.busy" @click="addTransition()">加转场</AppButton>
-            </div>
-            <p v-else class="text-fg-4 mt-1 text-2xs">
-              它后面没有片段了：转场加在相邻两段之间，所以最后一段加不了。
+            <p class="text-fg-4 mt-1 text-2xs">
+              两段之间怎么接在分镜那一页配：每两个 Shot（以及每两幕）之间那条线选「转场」，
+              生成出来的过渡视频装配到这里就是一个正常片段。
             </p>
-            <ul v-if="clipTransitions.length" class="mt-1 space-y-0.5">
-              <li v-for="t in clipTransitions" :key="t.id" class="flex items-center gap-1 text-2xs">
-                <span class="text-fg-2">
-                  {{ TRANSITION_LABEL[t.kind] ?? t.kind }} · {{ fmt(t.duration) }}
-                </span>
-                <span class="text-fg-4">{{
-                  t.from_clip_id === selected.id ? '（出）' : '（进）'
-                }}</span>
-                <button
-                  class="text-fg-4 hover:text-st-failed ml-auto"
-                  title="删掉这个转场"
-                  @click="tl.removeTransition(pid, t.id).catch(() => {})"
-                >
-                  <Trash2 :size="10" />
-                </button>
-              </li>
-            </ul>
           </section>
 
           <section class="border-line-1 border-t pt-2">

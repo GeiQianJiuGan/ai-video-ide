@@ -18,8 +18,10 @@ from app.persistence.models_edit import (
 from app.persistence.models_flow import (
     LINK_MODES,
     SHOT_KINDS,
+    SHOT_LINK_MODES,
     DirectorTurn,
     SceneLink,
+    ShotLink,
 )
 from app.persistence.models_gen import (
     CAPABILITIES,
@@ -56,6 +58,7 @@ __all__ = [
     "LINK_MODES",
     "REQUIRED_SLOTS",
     "SHOT_KINDS",
+    "SHOT_LINK_MODES",
     "SHOT_STATUS",
     "Appearance",
     "Asset",
@@ -78,6 +81,7 @@ __all__ = [
     "SheetVersion",
     "Shot",
     "ShotCast",
+    "ShotLink",
     "ShotProp",
     "Story",
     "Timeline",

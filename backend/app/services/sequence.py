@@ -40,13 +40,14 @@ from typing import Any
 from app.core.errors import AppError, ErrorCode
 from app.core.ids import new_id
 from app.persistence.models import utc_now
-from app.persistence.models_flow import LINK_MODES, SceneLink
+from app.persistence.models_flow import LINK_MODES, SHOT_LINK_MODES, SceneLink, ShotLink
 from app.persistence.models_gen import GenerationVersion
 from app.persistence.models_story import Scene, Shot, ShotCast
 from app.persistence.models_world import Asset
 from app.services.assets import kind_of_suffix
 from app.services.base import as_dict, db_of, fetch, fetch_all
 from app.services.context import context
+from app.services.frames import frames, start_frame_index
 from app.services.generation import drop_entry, generation, over_capacity_error
 from app.services.story import node_limit, story
 
@@ -57,6 +58,12 @@ LINK_HINT = {
     "cut": "硬切：不生成任何东西，两幕直接相接。",
     "transition": "转场：生成一段 1~2 秒的过渡视频，接在上一幕末尾。",
     "tail_frame": "续接末帧：上一幕的真末帧当下一幕的首帧，不需要转场。",
+}
+
+#: 镜头之间那条线的解释。镜头级只有两种：要么直接硬切，要么补一段转场。
+SHOT_LINK_HINT = {
+    "cut": "无转场：两个镜头直接硬切相接，不生成任何东西。",
+    "transition": "转场：在这两个镜头之间补一段过渡视频（上一镜真末帧 → 下一镜真首帧）。",
 }
 
 #: 转场时长的合理区间。超出就直接拒绝——十秒的「转场」是配错了，不是需求。
@@ -165,6 +172,139 @@ class SequenceService:
         await fetch(db, SceneLink, link_id, "衔接")
         async with db.write() as session:
             fresh = await session.get(SceneLink, link_id)
+            if fresh is not None:
+                await session.delete(fresh)
+
+    # --- 镜头之间的衔接（ShotLink） ---
+
+    async def list_shot_links(self, pid: str) -> list[dict[str, Any]]:
+        db = db_of(pid)
+        shots = {s.id: s for s in await fetch_all(db, Shot)}
+        rows = await fetch_all(db, ShotLink, order_by=ShotLink.created_at)
+        return [self._shot_link_out(row, shots) for row in rows]
+
+    def _shot_link_out(self, row: ShotLink, shots: dict[str, Shot]) -> dict[str, Any]:
+        head, tail = shots.get(row.from_shot_id), shots.get(row.to_shot_id)
+        return {
+            **as_dict(row),
+            "from_index_no": head.index_no if head else None,
+            "from_title": head.title if head else None,
+            "to_index_no": tail.index_no if tail else None,
+            "to_title": tail.title if tail else None,
+            "hint": SHOT_LINK_HINT.get(row.mode, ""),
+        }
+
+    async def set_shot_link(
+        self,
+        pid: str,
+        from_shot_id: str,
+        to_shot_id: str,
+        *,
+        mode: str,
+        duration: float | None = None,
+        prompt: str | None = None,
+    ) -> dict[str, Any]:
+        """新建或改一条镜头衔接。同一对镜头之间只有一条，所以这是 upsert。
+
+        只接受**同一幕内相邻的两个正片镜头**：跨幕那条线是 `SceneLink` 的事
+        （分镜板上幕与幕之间那条线走 `set_link`），不相邻的两镜之间插一段转场没有意义。
+        """
+        db = db_of(pid)
+        if mode not in SHOT_LINK_MODES:
+            raise AppError(
+                ErrorCode.VALIDATION_ERROR,
+                "未知的镜头衔接方式",
+                f"{mode} 不在 {'、'.join(SHOT_LINK_MODES)} 里。",
+                [f"{name}——{text}" for name, text in SHOT_LINK_HINT.items()],
+            )
+        if from_shot_id == to_shot_id:
+            raise AppError(
+                ErrorCode.VALIDATION_ERROR,
+                "一个镜头不能接到自己",
+                "衔接的两端是同一个镜头。",
+                ["选下一个镜头作为衔接的另一端"],
+                {"shot_id": from_shot_id},
+            )
+        head = await fetch(db, Shot, from_shot_id, "镜头")
+        tail = await fetch(db, Shot, to_shot_id, "镜头")
+        if head.scene_id != tail.scene_id:
+            raise AppError(
+                ErrorCode.VALIDATION_ERROR,
+                "这两个镜头不在同一幕里",
+                "镜头衔接只管一幕之内相邻的两镜。",
+                ["幕与幕之间的转场配在幕的衔接上（分镜板上两条泳道之间那一行）"],
+                {"from_shot_id": from_shot_id, "to_shot_id": to_shot_id},
+            )
+        if head.kind == "transition" or tail.kind == "transition":
+            raise AppError(
+                ErrorCode.VALIDATION_ERROR,
+                "转场镜头两侧不能再挂转场",
+                "衔接的一端本身就是一段转场。",
+                ["转场是补在两个正片镜头之间的，不要再往它两侧接转场"],
+                {"from_shot_id": from_shot_id, "to_shot_id": to_shot_id},
+            )
+        shots = await fetch_all(db, Shot, order_by=Shot.index_no)
+        real = [s for s in shots if s.scene_id == head.scene_id and s.kind != "transition"]
+        ids = [s.id for s in real]
+        at = ids.index(from_shot_id)
+        if at + 1 >= len(ids) or ids[at + 1] != to_shot_id:
+            raise AppError(
+                ErrorCode.VALIDATION_ERROR,
+                "这两个镜头不相邻",
+                f"Shot {head.index_no} 的下一个镜头不是 Shot {tail.index_no}。",
+                ["转场只能补在相邻的两镜之间", "刷新分镜板后重试——顺序可能刚被改过"],
+                {"from_shot_id": from_shot_id, "to_shot_id": to_shot_id},
+            )
+        seconds = float(duration if duration is not None else 1.5)
+        low, high = TRANSITION_RANGE
+        if mode == "transition" and not (low <= seconds <= high):
+            raise AppError(
+                ErrorCode.VALIDATION_ERROR,
+                "转场时长超出合理范围",
+                f"给的是 {seconds} 秒，允许 {low}~{high} 秒。",
+                ["镜头之间的转场是过渡，不是一段戏——1~2 秒足够", "真要更长的话，排成一个独立镜头"],
+            )
+        existing = next(
+            (
+                r
+                for r in await fetch_all(db, ShotLink)
+                if r.from_shot_id == from_shot_id and r.to_shot_id == to_shot_id
+            ),
+            None,
+        )
+        now = utc_now()
+        async with db.write() as session:
+            if existing is None:
+                row = ShotLink(
+                    id=new_id("shot_link"),
+                    from_shot_id=from_shot_id,
+                    to_shot_id=to_shot_id,
+                    mode=mode,
+                    duration=seconds,
+                    prompt=prompt or (_default_prompt(head.title, tail.title) or None),
+                    created_at=now,
+                    updated_at=now,
+                )
+                session.add(row)
+            else:
+                row = await session.get(ShotLink, existing.id)  # type: ignore[assignment]
+                assert row is not None
+                row.mode = mode
+                row.duration = seconds
+                if prompt is not None:
+                    row.prompt = prompt
+                row.updated_at = now
+            made = as_dict(row)
+        return self._shot_link_out(
+            await fetch(db, ShotLink, made["id"], "镜头衔接"), {head.id: head, tail.id: tail}
+        )
+
+    async def delete_shot_link(self, pid: str, link_id: str) -> None:
+        """删掉一条镜头衔接。已经生成出来的转场镜头**不跟着删**——那是用户的成片。"""
+        db = db_of(pid)
+        await fetch(db, ShotLink, link_id, "镜头衔接")
+        async with db.write() as session:
+            fresh = await session.get(ShotLink, link_id)
             if fresh is not None:
                 await session.delete(fresh)
 
@@ -649,6 +789,229 @@ class SequenceService:
 
     # --- 转场 ---
 
+    async def transition_plan(self, pid: str) -> dict[str, Any]:
+        """只管转场的账单：配了转场却还没生成的，一条一条列出来。
+
+        「一键生成转场」按下去之前必须先看见这张账单——它同时覆盖两级：
+        镜头之间的 `ShotLink` 与幕之间的 `SceneLink`，界面上是同一种线，
+        账单里也就是同一种条目（`level` 区分）。
+
+        和 `plan()` 一样是只读的：**不抽帧、不入队**，还没抽过的首帧只标一句
+        「生成前会抽」。
+        """
+        db = db_of(pid)
+        scenes = await fetch_all(db, Scene, order_by=Scene.index_no)
+        shots = await fetch_all(db, Shot, order_by=Shot.index_no)
+        by_id = {s.id: s for s in shots}
+        items: list[dict[str, Any]] = []
+        blocked: list[dict[str, Any]] = []
+
+        async def entry(
+            level: str,
+            link_id: str,
+            head: Shot,
+            tail: Shot,
+            duration: float,
+            prompt: str | None,
+            made_shot_id: str | None,
+            where: str,
+        ) -> dict[str, Any]:
+            made = by_id.get(made_shot_id or "")
+            generated = bool(made is not None and made.current_version_id)
+            last_asset, last_source = await self._last_frame_asset(pid, tail, extract=False)
+            row: dict[str, Any] = {
+                "level": level,
+                "link_id": link_id,
+                "where": where,
+                "from_shot_id": head.id,
+                "to_shot_id": tail.id,
+                "from_index_no": head.index_no,
+                "to_index_no": tail.index_no,
+                "from_title": head.title,
+                "to_title": tail.title,
+                "duration": duration,
+                "prompt": prompt,
+                "shot_id": made.id if made is not None else None,
+                "generated": generated,
+                "first_frame": "real_frame" if head.current_version_id else "waiting",
+                "last_frame": last_source,
+                "will_generate": False,
+            }
+            if generated:
+                row["note"] = "这段转场已经有成片了，一键生成不会重做它。"
+                return row
+            if last_source == "none":
+                row["blocked"] = f"{where}：下一个镜头既没有成片也没有可用的首帧图，取不到末帧"
+                blocked.append(
+                    {
+                        "link_id": link_id,
+                        "why": row["blocked"],
+                        "how": "先把下一个镜头生成出来，或给它挑一张首帧图；也可以把这条改成无转场",
+                    }
+                )
+                return row
+            row["will_generate"] = True
+            if last_source == "reference_image":
+                row["note"] = (
+                    "下一个镜头还没有成片，末帧只能用它的首帧图——"
+                    "等它出片后重跑这段转场，接缝会更准。"
+                )
+            if row["first_frame"] == "waiting":
+                row["note"] = (
+                    (row.get("note") or "") + "上一个镜头还没有成片，这条任务会排队等它的末帧。"
+                ).strip()
+            return row
+
+        for scene in scenes:
+            real = [s for s in shots if s.scene_id == scene.id and s.kind != "transition"]
+            links = {
+                (r.from_shot_id, r.to_shot_id): r
+                for r in await fetch_all(db, ShotLink)
+                if r.mode == "transition"
+            }
+            for head, tail in zip(real, real[1:], strict=False):
+                link = links.get((head.id, tail.id))
+                if link is None:
+                    continue
+                items.append(
+                    await entry(
+                        "shot",
+                        link.id,
+                        head,
+                        tail,
+                        float(link.duration or 1.5),
+                        link.prompt,
+                        link.shot_id,
+                        f"第 {scene.index_no} 幕 Shot {head.index_no} → Shot {tail.index_no}",
+                    )
+                )
+
+        scene_links = {
+            (r.from_scene_id, r.to_scene_id): r
+            for r in await fetch_all(db, SceneLink)
+            if r.mode == "transition"
+        }
+        for head_scene, tail_scene in zip(scenes, scenes[1:], strict=False):
+            link = scene_links.get((head_scene.id, tail_scene.id))
+            if link is None:
+                continue
+            upstream = self._last_real(shots, head_scene.id)
+            downstream = self._first_real(shots, tail_scene.id)
+            where = f"第 {head_scene.index_no} 幕 → 第 {tail_scene.index_no} 幕"
+            if upstream is None or downstream is None:
+                why = f"{where}：{'上一' if upstream is None else '下一'}幕还没有镜头"
+                items.append(
+                    {
+                        "level": "scene",
+                        "link_id": link.id,
+                        "where": where,
+                        "from_scene_id": head_scene.id,
+                        "to_scene_id": tail_scene.id,
+                        "duration": link.duration,
+                        "prompt": link.prompt,
+                        "shot_id": link.shot_id,
+                        "generated": False,
+                        "will_generate": False,
+                        "blocked": why,
+                    }
+                )
+                blocked.append({"link_id": link.id, "why": why, "how": "给那一幕加至少一个镜头"})
+                continue
+            row = await entry(
+                "scene",
+                link.id,
+                upstream,
+                downstream,
+                float(link.duration or 1.5),
+                link.prompt,
+                link.shot_id,
+                where,
+            )
+            row["from_scene_id"] = head_scene.id
+            row["to_scene_id"] = tail_scene.id
+            items.append(row)
+
+        total = len([i for i in items if i["will_generate"]])
+        reused = len([i for i in items if i["generated"]])
+        notes = ["以下是账单，还没有入队任何任务。"]
+        if not items:
+            notes.append(
+                "现在没有任何一条衔接配成了转场——把要补转场的那条线改成「转场」就会出现在这里。"
+            )
+        else:
+            notes.append(
+                f"配成转场的一共 {len(items)} 条：这次会生成 {total} 条，跳过已出片的 {reused} 条。"
+            )
+        return {
+            "items": items,
+            "total": total,
+            "reused": reused,
+            "blocked": blocked,
+            "notes": notes,
+        }
+
+    async def transition_run(
+        self,
+        pid: str,
+        priority: int = 100,
+        *,
+        allow_ref_drop: bool = False,
+        only: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """一键生成转场：把账单里「配了但还没生成」的那些真的入队。
+
+        `only` 给的是衔接的 id（`ShotLink` / `SceneLink` 都用 id 认），
+        不传就是全部——分镜板上单条转场的「生成」按钮走的就是它。
+        已经出片的转场一条都不会重做（硬约束 3：版本永不覆盖）。
+        """
+        db = db_of(pid)
+        bill = await self.transition_plan(pid)
+        wanted = set(only or [])
+        made: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+        shot_links = {r.id: r for r in await fetch_all(db, ShotLink)}
+        for item in bill["items"]:
+            if wanted and item["link_id"] not in wanted:
+                continue
+            if not item["will_generate"]:
+                skipped.append(
+                    {
+                        "link_id": item["link_id"],
+                        "where": item["where"],
+                        "reason": item.get("blocked") or item.get("note") or "这条不需要生成",
+                    }
+                )
+                continue
+            try:
+                if item["level"] == "shot":
+                    made.append(
+                        await self._make_shot_transition(
+                            pid, shot_links[item["link_id"]], priority, allow_ref_drop
+                        )
+                    )
+                else:
+                    edge = {
+                        "from_scene_id": item["from_scene_id"],
+                        "to_scene_id": item["to_scene_id"],
+                        "duration": item["duration"],
+                    }
+                    out = await self._make_transition(pid, edge, priority, allow_ref_drop)
+                    made.append({**out, "level": "scene", "link_id": item["link_id"]})
+            except AppError as err:
+                skipped.append(
+                    {
+                        "link_id": item["link_id"],
+                        "where": item["where"],
+                        "error": err.to_dict(),
+                    }
+                )
+        return {
+            "transitions": made,
+            "queued": [m["job_id"] for m in made if m.get("job_id")],
+            "skipped": skipped,
+            "plan": bill,
+        }
+
     async def _transition_ready(
         self, pid: str, head: Scene, tail: Scene, shots: list[Shot]
     ) -> tuple[bool, str]:
@@ -658,8 +1021,9 @@ class SequenceService:
         downstream = self._first_real(shots, tail.id)
         if downstream is None:
             return False, f"第 {tail.index_no} 幕没有镜头，取不到首帧图"
-        if await self._first_frame_asset(pid, downstream.id) is None:
-            return False, f"第 {tail.index_no} 幕的首镜头还没有任何可用的首帧图"
+        _, source = await self._last_frame_asset(pid, downstream, extract=False)
+        if source == "none":
+            return False, f"第 {tail.index_no} 幕的首镜头既没有成片也没有可用的首帧图"
         return True, ""
 
     async def _make_transition(
@@ -685,7 +1049,7 @@ class SequenceService:
         upstream = self._last_real(shots, head.id)
         downstream = self._first_real(shots, tail.id)
         assert upstream is not None and downstream is not None  # plan 已经拦过
-        last_frame = await self._first_frame_asset(pid, downstream.id)
+        last_frame, _ = await self._last_frame_asset(pid, downstream, extract=True)
         if last_frame is None:  # pragma: no cover - plan 已经拦过
             raise AppError(
                 ErrorCode.MISSING_INPUT,
@@ -749,6 +1113,140 @@ class SequenceService:
             extra={"transition": True},
         )
         return {"link": edge, "shot_id": shot_id, "job_id": job["id"], "reused": False}
+
+    async def _make_shot_transition(
+        self, pid: str, link: ShotLink, priority: int, allow_ref_drop: bool = False
+    ) -> dict[str, Any]:
+        """造一段**镜头之间**的转场并入队。它属于 from_shot 所在的那一幕、紧跟在 from_shot 之后。
+
+        和幕级转场是同一条规矩（`_make_transition`），只是落点从「排在整幕最后」
+        变成「插在这两镜之间」——`timeline.auto_assemble` 认的还是
+        「scene.index_no + shot.index_no」，导出侧照旧一行不用改。
+        """
+        db = db_of(pid)
+        head = await fetch(db, Shot, link.from_shot_id, "镜头")
+        tail = await fetch(db, Shot, link.to_shot_id, "镜头")
+        last_frame, _ = await self._last_frame_asset(pid, tail, extract=True)
+        if last_frame is None:  # pragma: no cover - plan 已经拦过
+            raise AppError(
+                ErrorCode.MISSING_INPUT,
+                "转场缺末帧",
+                f"Shot {tail.index_no} 既没有成片也没有可用的首帧图。",
+                ["先把下一个镜头生成出来", "或把这条衔接改成无转场"],
+            )
+
+        existing: Shot | None = None
+        if link.shot_id:
+            existing = next((s for s in await fetch_all(db, Shot) if s.id == link.shot_id), None)
+        if existing is not None and existing.current_version_id is None:
+            shot_id = existing.id
+        elif existing is not None:
+            # 已经出片的转场不重做：版本永不覆盖，要重做请在工作台里重新生成。
+            return {
+                "level": "shot",
+                "link_id": link.id,
+                "shot_id": existing.id,
+                "job_id": None,
+                "reused": True,
+                "note": "这段转场已经有成片了，没有重新生成。",
+            }
+        else:
+            made = await story.create_shot(
+                pid,
+                head.scene_id,
+                {
+                    "title": f"转场 → {tail.title}",
+                    "description": link.prompt or None,
+                    "prompt": link.prompt or _default_prompt(head.title, tail.title),
+                    "duration": float(link.duration or 1.5),
+                    "prev_shot_id": head.id,
+                },
+            )
+            shot_id = made["id"]
+            async with db.write() as session:
+                row = await session.get(Shot, shot_id)
+                if row is not None:
+                    row.kind = "transition"
+            await self._place_after(pid, head, shot_id)
+            async with db.write() as session:
+                fresh = await session.get(ShotLink, link.id)
+                if fresh is not None:
+                    fresh.shot_id = shot_id
+                    fresh.updated_at = utc_now()
+
+        # 和幕级转场同理：转场镜头没有出场角色、没有地点变体，显式跳过上下文门槛，
+        # 由「两侧那两张图」来把关。
+        job = await generation.enqueue_shot(
+            pid,
+            shot_id,
+            kind="first_last_frame",
+            priority=priority,
+            check_context=False,
+            allow_ref_drop=allow_ref_drop,
+            last_frame_asset_id=last_frame,
+            extra={"transition": True},
+        )
+        return {
+            "level": "shot",
+            "link_id": link.id,
+            "shot_id": shot_id,
+            "job_id": job["id"],
+            "reused": False,
+        }
+
+    async def _place_after(self, pid: str, anchor: Shot, shot_id: str) -> None:
+        """把刚造出来的转场镜头挪到 anchor 的后面（同一幕内）。"""
+        db = db_of(pid)
+        siblings = [
+            s
+            for s in await fetch_all(db, Shot, order_by=Shot.index_no)
+            if s.scene_id == anchor.scene_id and s.id != shot_id
+        ]
+        order = [s.id for s in siblings]
+        at = order.index(anchor.id) + 1 if anchor.id in order else len(order)
+        order.insert(at, shot_id)
+        await story.reorder_shots(pid, anchor.scene_id, order)
+
+    async def _last_frame_asset(
+        self, pid: str, shot: Shot, *, extract: bool
+    ) -> tuple[str | None, str]:
+        """转场的**末帧**是哪张——「下一个镜头真正的第一格」。
+
+        顺序 **采用那一版的真首帧 → 上下文账单里的首帧图**：
+        本工具的转场是用来把两段真实成片接上的，所以只要下一镜已经出片，
+        就该用它的第一格，而不是当初喂给它的设定图（R2V 生成出来的画面和设定图并不一样，
+        拿设定图收尾会在接缝处跳一下）。下一镜还没出片时才退回设定图。
+
+        `extract=False` 是只读路径：还没抽过的帧只回一个 `"extract"` 标记，
+        **绝不在读路径上起 FFmpeg**（同 `context.py` 那条规矩）。
+        返回 `(asset_id, source)`，`source ∈ real_frame / extract / reference_image / none`。
+        """
+        db = db_of(pid)
+        version = None
+        if shot.current_version_id:
+            version = next(
+                (
+                    v
+                    for v in await fetch_all(db, GenerationVersion)
+                    if v.id == shot.current_version_id
+                ),
+                None,
+            )
+        assets = {a.id: a for a in await fetch_all(db, Asset)}
+        asset = assets.get(version.asset_id or "") if version else None
+        if asset is not None:
+            if kind_of_suffix(Path(asset.path).suffix) == "image":
+                # 采用的那一版本身就是一张图：它就是第一格，没什么可抽的。
+                return str(asset.id), "real_frame"
+            done = start_frame_index(list(assets.values())).get(str(asset.id))
+            if done is not None:
+                return str(done.id), "real_frame"
+            if extract:
+                made = await frames.extract(pid, str(asset.id), "start")
+                return str(made["id"]), "real_frame"
+            return None, "extract"
+        fallback = await self._first_frame_asset(pid, shot.id)
+        return fallback, ("reference_image" if fallback else "none")
 
     def _last_real(self, shots: list[Shot], scene_id: str) -> Shot | None:
         mine = [s for s in shots if s.scene_id == scene_id and s.kind != "transition"]

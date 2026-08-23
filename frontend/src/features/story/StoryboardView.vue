@@ -1,5 +1,19 @@
 <script setup lang="ts">
-/** Shot-first storyboard: Scene remains data context, not an interaction layer. */
+/**
+ * Shot-first storyboard: Scene remains data context, not an interaction layer.
+ *
+ * 卡片之间那条线（`lane.links`）与幕与幕之间那条（`lane.next_link`）是这一页的第二种主体：
+ *
+ *   - **没配过就是无转场**——两个镜头直接硬切，什么都不生成；
+ *   - 配成「转场」就会在这两镜之间补一段过渡视频（上一镜真末帧 → 下一镜真首帧），
+ *     这是为「能引用设定图的模型做不了严格首尾帧」准备的那条路；
+ *   - 配了却还没出片时线上写一行**转场暂未生成**——判断只认后端的 `pending`，
+ *     界面不自己拿 `transition_shot_id` 再算一遍（镜头造出来了但任务还在排队，
+ *     那仍然是「暂未生成」）。
+ *
+ * 补出来的转场镜头**不在卡片行里**：它照旧在 `lane.shots` 里（导出顺序与时间线装配靠它），
+ * 这里只是把它画到那条线上，免得它混在导演排的戏中间。
+ */
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ChevronLeft, ChevronRight, Image, ListVideo, RefreshCw, Sparkles, Trash2 } from '@lucide/vue'
@@ -10,11 +24,11 @@ import ErrorPanel from '@/shared/ui/ErrorPanel.vue'
 import FeatureHeader from '@/shared/ui/FeatureHeader.vue'
 import { fileUrl } from '@/shared/api/files'
 import { ApiError, confirmFlagOf } from '@/shared/api/client'
-import { SHOT_STATUS, SHOT_STATUS_LABEL, storyApi, type PosterResult, type ShotStatus, type StoryboardCard } from '@/shared/api/story'
+import { SHOT_STATUS, SHOT_STATUS_LABEL, storyApi, type PosterResult, type ShotStatus, type StoryboardCard, type StoryboardConnector, type StoryboardLane } from '@/shared/api/story'
 import { useConsoleStore } from '@/stores/console'
 import { useStoryStore } from '@/stores/story'
 import { generationApi } from '@/shared/api/generation'
-import { sequenceApi } from '@/shared/api/sequence'
+import { LINK_MODES, LINK_MODE_LABEL, SHOT_LINK_MODES, SHOT_LINK_MODE_LABEL, sequenceApi, type TransitionRun } from '@/shared/api/sequence'
 
 const route = useRoute()
 const router = useRouter()
@@ -24,13 +38,33 @@ const pid = computed(() => String(route.params.pid ?? ''))
 const filter = ref<'all' | 'issues' | ShotStatus>('all')
 const preview = ref<{ shotId: string; title: string; path: string } | null>(null)
 const allCards = computed(() => story.lanes.flatMap((lane) => lane.shots))
-const total = computed(() => ({ shots: allCards.value.length, duration: allCards.value.reduce((n, s) => n + s.duration, 0), issues: allCards.value.filter((s) => !s.context_ok).length }))
+/** 导演排的戏。转场是系统按衔接补出来的，不算「一个镜头」，也不进卡片行。 */
+const realCards = computed(() => allCards.value.filter((s) => s.kind !== 'transition'))
+const total = computed(() => ({ shots: realCards.value.length, transitions: allCards.value.length - realCards.value.length, duration: allCards.value.reduce((n, s) => n + s.duration, 0), issues: allCards.value.filter((s) => !s.context_ok).length }))
 const pendingPosters = computed(() => allCards.value.filter((s) => s.poster_pending))
+/** 两级衔接里「配了转场却还没出片」的条数，就是一键生成转场要补的那些。 */
+const pendingLinks = computed(() => story.lanes.flatMap((lane) => [...lane.links, ...(lane.next_link ? [lane.next_link] : [])]).filter((l) => l.pending))
 
+function realShots(lane: StoryboardLane): StoryboardCard[] { return lane.shots.filter((s) => s.kind !== 'transition') }
 function visible(shots: StoryboardCard[]): StoryboardCard[] {
   if (filter.value === 'all') return shots
   if (filter.value === 'issues') return shots.filter((s) => !s.context_ok)
   return shots.filter((s) => s.status === filter.value)
+}
+/**
+ * 卡片 + 卡片右边那条线。筛选把中间某张卡片藏起来时那条线**不画**——
+ * 此时屏幕上相邻的两张并不是真的相邻，画出来就是在骗人。
+ */
+function rows(lane: StoryboardLane): { card: StoryboardCard; link: StoryboardConnector | null }[] {
+  const cards = visible(realShots(lane))
+  return cards.map((card, at) => {
+    const next = cards[at + 1]
+    const link = next ? (lane.links.find((l) => l.from_shot_id === card.id && l.to_shot_id === next.id) ?? null) : null
+    return { card, link }
+  })
+}
+function transitionOf(lane: StoryboardLane, link: StoryboardConnector): StoryboardCard | null {
+  return link.transition_shot_id ? (lane.shots.find((s) => s.id === link.transition_shot_id) ?? null) : null
 }
 function statusTone(status: string): 'neutral' | 'accent' | 'ok' | 'warn' {
   if (status === 'locked') return 'ok'
@@ -85,8 +119,11 @@ const enqueuing = ref(false)
 const enqueueError = ref<ApiError | null>(null)
 const enqueueNote = ref('')
 const skipped = ref<Array<{ shot_id?: string; index_no?: number; error?: { title?: string; detail?: string } | null }>>([])
-const pendingDrop = ref<'shot' | 'scene' | null>(null)
-function resetEnqueue(): void { enqueueError.value = null; enqueueNote.value = ''; skipped.value = []; pendingDrop.value = null }
+const pendingDrop = ref<'shot' | 'scene' | 'transition' | null>(null)
+/** 转场那次的结果。跳过的每条形状和 Shot 不一样（认的是衔接 id），所以单独存一份。 */
+const transitionRun = ref<TransitionRun | null>(null)
+const transitionOnly = ref<string[] | undefined>(undefined)
+function resetEnqueue(): void { enqueueError.value = null; enqueueNote.value = ''; skipped.value = []; pendingDrop.value = null; transitionRun.value = null }
 async function generateShot(allowRefDrop = false): Promise<void> {
   const shot = story.shot; if (!shot) return
   resetEnqueue(); enqueuing.value = true
@@ -113,7 +150,46 @@ async function runSequential(): Promise<void> {
     enqueueError.value = err instanceof ApiError ? err : null
   } finally { enqueuing.value = false }
 }
-async function confirmDrop(): Promise<void> { if (pendingDrop.value === 'scene') await generateScene(true); else if (pendingDrop.value === 'shot') await generateShot(true) }
+
+// --- 卡片之间那条线 ---
+
+const linkBusy = ref('')
+function linkKey(link: StoryboardConnector): string { return link.id ?? `${link.from_shot_id ?? link.from_scene_id}` }
+/** 改这条线的模式或时长。镜头级走 `shot-links`，幕级走 `links`，两边都是 upsert。 */
+async function saveLink(link: StoryboardConnector, patch: { mode?: string; duration?: number }): Promise<void> {
+  resetEnqueue(); linkBusy.value = linkKey(link)
+  const mode = patch.mode ?? link.mode
+  const duration = patch.duration ?? link.duration ?? 1.5
+  try {
+    if (link.level === 'shot' && link.from_shot_id && link.to_shot_id) await sequenceApi.setShotLink(pid.value, { from_shot_id: link.from_shot_id, to_shot_id: link.to_shot_id, mode, duration })
+    else if (link.level === 'scene' && link.from_scene_id && link.to_scene_id) await sequenceApi.setLink(pid.value, { from_scene_id: link.from_scene_id, to_scene_id: link.to_scene_id, mode, duration })
+    await reload()
+  } catch (err) { enqueueError.value = err instanceof ApiError ? err : null } finally { linkBusy.value = '' }
+}
+function onDuration(link: StoryboardConnector, value: string): void {
+  const duration = Number(value)
+  if (Number.isFinite(duration)) void saveLink(link, { duration })
+}
+/**
+ * 一键生成转场（或线上那个单条「生成」）。`only` 就是那一条衔接的 id。
+ *
+ * 已经出片的转场一条都不会重做（版本永不覆盖），跳过的每条都带原因，绝不静默少做。
+ */
+async function runTransitions(only?: string[], allowRefDrop = false): Promise<void> {
+  resetEnqueue(); enqueuing.value = true; transitionOnly.value = only
+  try {
+    const out = await sequenceApi.transitionRun(pid.value, { only, allowRefDrop })
+    transitionRun.value = out
+    enqueueNote.value = out.transitions.length ? `转场已入队：${out.queued.length} 段（账单里一共 ${out.plan.total} 段要生成）` : (out.plan.notes.join('') || '没有需要生成的转场。')
+    await reload()
+  } catch (err) { enqueueError.value = err instanceof ApiError ? err : null; pendingDrop.value = confirmFlagOf(err) ? 'transition' : null }
+  finally { enqueuing.value = false }
+}
+async function confirmDrop(): Promise<void> {
+  if (pendingDrop.value === 'scene') await generateScene(true)
+  else if (pendingDrop.value === 'shot') await generateShot(true)
+  else if (pendingDrop.value === 'transition') await runTransitions(transitionOnly.value, true)
+}
 </script>
 
 <template>
@@ -122,9 +198,10 @@ async function confirmDrop(): Promise<void> { if (pendingDrop.value === 'scene')
     <div class="border-line-1 bg-base-1 flex h-row shrink-0 items-center gap-1.5 border-b px-2">
       <span class="text-fg-4 text-2xs">筛选</span>
       <select v-model="filter" class="border-line-1 bg-base-2 text-fg-1 h-5 border px-1 text-2xs outline-none"><option value="all">全部 Shot</option><option value="issues">只看上下文不完整</option><option v-for="s in SHOT_STATUS" :key="s" :value="s">{{ SHOT_STATUS_LABEL[s] }}</option></select>
-      <span class="text-fg-3 text-2xs">{{ total.shots }} Shot · {{ fmtDuration(total.duration) }}<span v-if="total.issues" class="text-st-review"> · {{ total.issues }} 个缺上下文</span></span>
+      <span class="text-fg-3 text-2xs">{{ total.shots }} Shot<span v-if="total.transitions"> · {{ total.transitions }} 段转场</span> · {{ fmtDuration(total.duration) }}<span v-if="total.issues" class="text-st-review"> · {{ total.issues }} 个缺上下文</span></span>
       <AppButton size="sm" :disabled="!story.shot || enqueuing || story.busy" title="生成当前 Shot 所在场景的全部镜头" @click="generateScene()"><Sparkles :size="10" />生成本场 Shot</AppButton>
-      <AppButton size="sm" variant="primary" :disabled="enqueuing || story.busy || !allCards.length" title="按 Shot 顺序串行生成；上一条完成并产出末帧后才执行下一条" @click="runSequential()"><Sparkles :size="10" />单线程续接</AppButton>
+      <AppButton size="sm" variant="primary" :disabled="enqueuing || story.busy || !realCards.length" title="按 Shot 顺序串行生成；上一条完成并产出末帧后才执行下一条" @click="runSequential()"><Sparkles :size="10" />单线程续接</AppButton>
+      <AppButton size="sm" :disabled="enqueuing || story.busy || !pendingLinks.length" :title="pendingLinks.length ? `补齐 ${pendingLinks.length} 条配了转场却还没出片的衔接（镜头之间与幕之间一起）；已经有成片的一条都不重做` : '没有配成转场却还没出片的衔接'" @click="runTransitions()"><Sparkles :size="10" />一键生成转场<span v-if="pendingLinks.length" class="tnum"> {{ pendingLinks.length }}</span></AppButton>
       <AppButton v-if="pendingPosters.length" size="sm" variant="ghost" :disabled="posterBusy" @click="extractPosters()"><Image :size="10" />补首帧 {{ pendingPosters.length }}</AppButton>
       <AppButton size="sm" variant="ghost" @click="consolePanel.openWith('jobs')"><ListVideo :size="10" />任务</AppButton>
       <AppButton size="sm" variant="ghost" class="ml-auto" :disabled="story.busy" @click="reload()"><RefreshCw :size="10" />刷新</AppButton>
@@ -132,12 +209,13 @@ async function confirmDrop(): Promise<void> { if (pendingDrop.value === 'scene')
     <ErrorPanel v-if="story.lastError" class="mx-2 mt-2" :error="story.lastError" @dismiss="story.clearError()" />
     <ErrorPanel v-if="posterError" class="mx-2 mt-2" :error="posterError" @dismiss="posterError = null" />
     <ErrorPanel v-if="enqueueError" class="mx-2 mt-2" :error="enqueueError" @dismiss="enqueueError = null"><template #actions><AppButton v-if="pendingDrop" size="sm" variant="primary" :disabled="enqueuing" @click="confirmDrop()"><Sparkles :size="10" />确认并继续</AppButton></template></ErrorPanel>
-    <div v-if="enqueueNote" class="border-line-1 bg-base-2 mx-2 mt-2 border p-1.5 text-2xs"><p class="text-fg-2">{{ enqueueNote }}</p><p v-for="s in skipped" :key="s.shot_id" class="text-st-review">跳过 {{ s.index_no }}：{{ s.error?.title }} — {{ s.error?.detail }}</p></div>
+    <div v-if="enqueueNote" class="border-line-1 bg-base-2 mx-2 mt-2 border p-1.5 text-2xs"><p class="text-fg-2">{{ enqueueNote }}</p><p v-for="s in skipped" :key="s.shot_id" class="text-st-review">跳过 {{ s.index_no }}：{{ s.error?.title }} — {{ s.error?.detail }}</p><template v-if="transitionRun"><p v-for="made in transitionRun.transitions" :key="made.shot_id" class="text-fg-3">{{ made.reused ? '已有成片，跳过' : '已入队' }}：{{ made.note ?? made.shot_id }}</p><p v-for="s in transitionRun.skipped" :key="s.link_id" class="text-st-review">跳过 {{ s.where }}：{{ s.error ? `${s.error.title} — ${s.error.detail}` : s.reason }}</p><p v-for="b in transitionRun.plan.blocked" :key="b.link_id" class="text-st-review">{{ b.why }} — {{ b.how }}</p></template></div>
     <div class="flex min-h-0 flex-1 gap-2 p-2">
       <section class="border-line-1 bg-base-1 min-h-0 min-w-0 flex-1 border">
         <header class="border-line-1 flex items-center gap-2 border-b px-2 py-1.5">
           <span class="text-fg-1 text-xs">Scene 泳道</span>
-          <span class="text-fg-4 text-2xs">点击图片预览 · 双击卡片进入 Shot 工作台</span>
+          <span class="text-fg-4 text-2xs">点击图片预览 · 双击卡片进入 Shot 工作台 · 卡片之间那条线是转场，没配过就是无转场（直接硬切）</span>
+          <span v-if="filter !== 'all'" class="text-st-review text-2xs">筛选中：屏幕上相邻的两张卡片不一定真的相邻，所以只在「全部 Shot」下画那条线</span>
         </header>
         <EmptyState v-if="!story.lanes.length" title="还没有 Shot" body="去剧本页创建镜头，或让 AI 先拆解剧本。" />
         <div v-else class="min-h-0 space-y-2 overflow-auto p-2">
@@ -145,21 +223,47 @@ async function confirmDrop(): Promise<void> { if (pendingDrop.value === 'scene')
             <header class="border-line-1 flex items-center gap-1.5 border-b px-2 py-1">
               <span class="text-fg-4 tnum text-2xs">{{ lane.index_no }}</span>
               <span class="text-fg-1 min-w-0 flex-1 truncate text-xs">{{ lane.title }}</span>
-              <AppBadge>{{ lane.shots.length }} 镜</AppBadge>
+              <AppBadge>{{ realShots(lane).length }} 镜</AppBadge>
+              <AppBadge v-if="lane.shots.length > realShots(lane).length">{{ lane.shots.length - realShots(lane).length }} 段转场</AppBadge>
               <AppBadge v-if="!lane.location_variant_id" tone="warn">未挂地点</AppBadge>
             </header>
-            <p v-if="visible(lane.shots).length === 0" class="text-fg-4 px-2 py-2 text-2xs">{{ lane.shots.length ? '没有符合筛选条件的 Shot。' : '这一场还没有 Shot。' }}</p>
-            <div v-else class="flex gap-2 overflow-x-auto p-2">
-              <article v-for="card in visible(lane.shots)" :key="card.id" class="w-40 shrink-0 border bg-base-1" :class="card.id === story.selectedShotId ? 'border-accent/60' : 'border-line-1'" @click="story.selectShot(pid, card.id).catch(() => {})" @dblclick="openShot(card.id)">
-                <button class="bg-base-3 flex h-24 w-full items-center justify-center overflow-hidden" title="预览当前采纳的视频版本" @click.stop="previewShot(card)"><img v-if="thumb(card)" :src="thumb(card)" alt="" class="h-full w-full object-cover" /><span v-else class="text-fg-4 px-1 text-center text-2xs">{{ card.versions.length ? '点击预览视频' : '尚无画面' }}</span></button>
-                <div class="text-left">
-                  <span class="flex items-center gap-1 px-1.5 pt-1"><span class="text-fg-4 tnum text-2xs">{{ card.index_no }}</span><span class="text-fg-1 min-w-0 flex-1 truncate text-2xs">{{ card.title }}</span><span class="text-fg-3 tnum text-2xs">{{ fmtDuration(card.duration) }}</span></span>
-                  <span class="flex flex-wrap items-center gap-1 px-1.5 pt-1"><AppBadge :tone="statusTone(card.status)">{{ SHOT_STATUS_LABEL[card.status as ShotStatus] ?? card.status }}</AppBadge><AppBadge>{{ card.versions.length }} 版</AppBadge><AppBadge v-if="!card.context_ok" tone="warn">缺 {{ card.context_issues.length }} 项</AppBadge></span>
-                  <span class="text-fg-4 block truncate px-1.5 pt-0.5 pb-1 text-2xs">{{ card.cast_names.length ? card.cast_names.join(' / ') : '没有出场角色' }}</span>
+            <p v-if="visible(realShots(lane)).length === 0" class="text-fg-4 px-2 py-2 text-2xs">{{ realShots(lane).length ? '没有符合筛选条件的 Shot。' : '这一场还没有 Shot。' }}</p>
+            <div v-else class="flex items-stretch gap-1 overflow-x-auto p-2">
+              <template v-for="row in rows(lane)" :key="row.card.id">
+                <article class="w-40 shrink-0 border bg-base-1" :class="row.card.id === story.selectedShotId ? 'border-accent/60' : 'border-line-1'" @click="story.selectShot(pid, row.card.id).catch(() => {})" @dblclick="openShot(row.card.id)">
+                  <button class="bg-base-3 flex h-24 w-full items-center justify-center overflow-hidden" title="预览当前采纳的视频版本" @click.stop="previewShot(row.card)"><img v-if="thumb(row.card)" :src="thumb(row.card)" alt="" class="h-full w-full object-cover" /><span v-else class="text-fg-4 px-1 text-center text-2xs">{{ row.card.versions.length ? '点击预览视频' : '尚无画面' }}</span></button>
+                  <div class="text-left">
+                    <span class="flex items-center gap-1 px-1.5 pt-1"><span class="text-fg-4 tnum text-2xs">{{ row.card.index_no }}</span><span class="text-fg-1 min-w-0 flex-1 truncate text-2xs">{{ row.card.title }}</span><span class="text-fg-3 tnum text-2xs">{{ fmtDuration(row.card.duration) }}</span></span>
+                    <span class="flex flex-wrap items-center gap-1 px-1.5 pt-1"><AppBadge :tone="statusTone(row.card.status)">{{ SHOT_STATUS_LABEL[row.card.status as ShotStatus] ?? row.card.status }}</AppBadge><AppBadge>{{ row.card.versions.length }} 版</AppBadge><AppBadge v-if="!row.card.context_ok" tone="warn">缺 {{ row.card.context_issues.length }} 项</AppBadge></span>
+                    <span class="text-fg-4 block truncate px-1.5 pt-0.5 pb-1 text-2xs">{{ row.card.cast_names.length ? row.card.cast_names.join(' / ') : '没有出场角色' }}</span>
+                  </div>
+                  <footer class="border-line-1 flex items-center gap-px border-t px-1 py-0.5"><AppButton size="sm" variant="ghost" title="本场内前移" @click.stop="moveWithin(lane.id, row.card.id, -1)"><ChevronLeft :size="10" /></AppButton><AppButton size="sm" variant="ghost" title="本场内后移" @click.stop="moveWithin(lane.id, row.card.id, 1)"><ChevronRight :size="10" /></AppButton><AppButton size="sm" variant="ghost" class="ml-auto" title="删除这个 Shot" @click.stop="removeShot(row.card.id)"><Trash2 :size="10" /></AppButton></footer>
+                </article>
+                <div v-if="row.link" class="flex w-28 shrink-0 flex-col items-center justify-center gap-1 px-1">
+                  <span class="border-line-1 h-0 w-full border-t" />
+                  <select :value="row.link.mode" :disabled="linkBusy === linkKey(row.link) || story.busy" class="border-line-1 bg-base-2 text-fg-1 h-5 w-full border px-1 text-2xs outline-none" :title="row.link.mode === 'cut' ? '无转场：两镜直接硬切，不生成任何东西' : '转场：在这两镜之间补一段过渡视频（上一镜真末帧 → 下一镜真首帧）'" @change="saveLink(row.link!, { mode: ($event.target as HTMLSelectElement).value })"><option v-for="m in SHOT_LINK_MODES" :key="m" :value="m">{{ SHOT_LINK_MODE_LABEL[m] }}</option></select>
+                  <template v-if="row.link.mode !== 'cut'">
+                    <label class="flex w-full items-center gap-1"><span class="text-fg-4 text-2xs">时长</span><input :value="row.link.duration ?? 1.5" type="number" min="0.5" max="4" step="0.1" :disabled="linkBusy === linkKey(row.link) || story.busy" class="border-line-1 bg-base-2 text-fg-1 tnum h-5 min-w-0 flex-1 border px-1 text-2xs outline-none" title="这段转场几秒（0.5 ~ 4）" @change="onDuration(row.link!, ($event.target as HTMLInputElement).value)" /></label>
+                    <p v-if="row.link.pending" class="text-st-review w-full text-center text-2xs">转场暂未生成</p>
+                    <AppButton v-if="row.link.pending" size="sm" variant="primary" :disabled="enqueuing || story.busy" title="只生成这一条转场" @click="runTransitions([row.link!.id!])"><Sparkles :size="10" />生成</AppButton>
+                    <button v-else-if="transitionOf(lane, row.link)" class="bg-base-3 border-line-1 h-10 w-full overflow-hidden border" title="预览这段转场" @click="previewShot(transitionOf(lane, row.link!)!)"><img v-if="thumb(transitionOf(lane, row.link)!)" :src="thumb(transitionOf(lane, row.link)!)" alt="" class="h-full w-full object-cover" /><span v-else class="text-fg-4 text-2xs">转场已生成</span></button>
+                  </template>
+                  <template v-else-if="row.link.transition_shot_id">
+                    <p class="text-st-review w-full text-center text-2xs">改成无转场了，但之前补出来的那段还在，导出照旧带上它</p>
+                    <AppButton size="sm" variant="ghost" :disabled="story.busy" title="删掉那个转场镜头（成片版本一起没了，不可撤销）" @click="removeShot(row.link!.transition_shot_id!)"><Trash2 :size="10" />删掉那段转场</AppButton>
+                  </template>
                 </div>
-                <footer class="border-line-1 flex items-center gap-px border-t px-1 py-0.5"><AppButton size="sm" variant="ghost" title="本场内前移" @click.stop="moveWithin(lane.id, card.id, -1)"><ChevronLeft :size="10" /></AppButton><AppButton size="sm" variant="ghost" title="本场内后移" @click.stop="moveWithin(lane.id, card.id, 1)"><ChevronRight :size="10" /></AppButton><AppButton size="sm" variant="ghost" class="ml-auto" title="删除这个 Shot" @click.stop="removeShot(card.id)"><Trash2 :size="10" /></AppButton></footer>
-              </article>
+              </template>
             </div>
+            <footer v-if="lane.next_link" class="border-line-1 flex flex-wrap items-center gap-1.5 border-t px-2 py-1">
+              <span class="text-fg-4 text-2xs">接第 {{ lane.next_link.to_index_no }} 幕{{ lane.next_link.to_title ? ` · ${lane.next_link.to_title}` : '' }}</span>
+              <select :value="lane.next_link.mode" :disabled="linkBusy === linkKey(lane.next_link) || story.busy" class="border-line-1 bg-base-2 text-fg-1 h-5 border px-1 text-2xs outline-none" title="幕与幕之间怎么接：无转场硬切 / 补一段转场 / 让下一幕首镜续接这一幕末帧" @change="saveLink(lane.next_link!, { mode: ($event.target as HTMLSelectElement).value })"><option v-for="m in LINK_MODES" :key="m" :value="m">{{ LINK_MODE_LABEL[m] }}</option></select>
+              <label v-if="lane.next_link.mode === 'transition'" class="flex items-center gap-1"><span class="text-fg-4 text-2xs">时长</span><input :value="lane.next_link.duration ?? 1.5" type="number" min="0.5" max="4" step="0.1" :disabled="linkBusy === linkKey(lane.next_link) || story.busy" class="border-line-1 bg-base-2 text-fg-1 tnum h-5 w-16 border px-1 text-2xs outline-none" @change="onDuration(lane.next_link!, ($event.target as HTMLInputElement).value)" /></label>
+              <span v-if="lane.next_link.pending" class="text-st-review text-2xs">转场暂未生成</span>
+              <AppButton v-if="lane.next_link.pending" size="sm" variant="primary" :disabled="enqueuing || story.busy" title="只生成这一条转场" @click="runTransitions([lane.next_link!.id!])"><Sparkles :size="10" />生成转场</AppButton>
+              <span v-else-if="lane.next_link.generated" class="text-fg-3 text-2xs">{{ lane.next_link.mode === 'cut' ? '改成无转场了，但之前补出来的那段还在，导出照旧带上它' : '转场已生成，排在这一幕最后' }}</span>
+              <AppButton v-if="lane.next_link.mode === 'cut' && lane.next_link.transition_shot_id" size="sm" variant="ghost" :disabled="story.busy" title="删掉那个转场镜头（成片版本一起没了，不可撤销）" @click="removeShot(lane.next_link!.transition_shot_id!)"><Trash2 :size="10" />删掉那段转场</AppButton>
+            </footer>
           </section>
         </div>
       </section>

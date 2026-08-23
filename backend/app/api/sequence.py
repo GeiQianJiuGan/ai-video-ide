@@ -36,6 +36,26 @@ class RunBody(BaseModel):
     )
 
 
+class ShotLinkBody(BaseModel):
+    from_shot_id: str
+    to_shot_id: str
+    mode: str = Field(description="cut 无转场 / transition 补一段转场")
+    duration: float | None = Field(default=None, description="转场时长（秒），只有 transition 用")
+    prompt: str | None = None
+
+
+class TransitionRunBody(BaseModel):
+    priority: int = 100
+    allow_ref_drop: bool = Field(
+        default=False,
+        description="转场镜头的参考图装不下时先回 REF_OVER_CAPACITY；true 就是「确认丢弃并继续」。",
+    )
+    only: list[str] | None = Field(
+        default=None,
+        description="只生成这几条衔接（ShotLink / SceneLink 的 id）。不传就是全部。",
+    )
+
+
 @router.get("/projects/{pid}/flow")
 async def flow_graph(pid: str) -> dict[str, Any]:
     """流程图：场景节点 + 衔接边。第一级页面的唯一数据源。"""
@@ -75,6 +95,44 @@ async def set_link(pid: str, body: LinkBody) -> dict[str, Any]:
 @router.delete("/projects/{pid}/links/{link_id}", status_code=204)
 async def delete_link(pid: str, link_id: str) -> None:
     await sequence.delete_link(pid, link_id)
+
+
+@router.get("/projects/{pid}/shot-links")
+async def list_shot_links(pid: str) -> list[dict[str, Any]]:
+    """镜头之间的衔接。分镜板上两张卡片之间那条线，没有行就是「无转场」。"""
+    return await sequence.list_shot_links(pid)
+
+
+@router.put("/projects/{pid}/shot-links")
+async def set_shot_link(pid: str, body: ShotLinkBody) -> dict[str, Any]:
+    """新建或改一条镜头衔接。同一对镜头之间只有一条，所以是 PUT 而不是 POST。"""
+    return await sequence.set_shot_link(
+        pid,
+        body.from_shot_id,
+        body.to_shot_id,
+        mode=body.mode,
+        duration=body.duration,
+        prompt=body.prompt,
+    )
+
+
+@router.delete("/projects/{pid}/shot-links/{link_id}", status_code=204)
+async def delete_shot_link(pid: str, link_id: str) -> None:
+    await sequence.delete_shot_link(pid, link_id)
+
+
+@router.post("/projects/{pid}/sequence/transitions/plan")
+async def transition_plan(pid: str) -> dict[str, Any]:
+    """一键生成转场的账单：配了转场却还没生成的，两级一起列出来，不入队任何任务。"""
+    return await sequence.transition_plan(pid)
+
+
+@router.post("/projects/{pid}/sequence/transitions/run", status_code=201)
+async def transition_run(pid: str, body: TransitionRunBody) -> dict[str, Any]:
+    """按账单补转场。已经出片的转场一条都不重做（版本永不覆盖）。"""
+    return await sequence.transition_run(
+        pid, body.priority, allow_ref_drop=body.allow_ref_drop, only=body.only
+    )
 
 
 @router.post("/projects/{pid}/sequence/plan")

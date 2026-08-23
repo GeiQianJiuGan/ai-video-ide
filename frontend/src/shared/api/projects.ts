@@ -6,6 +6,7 @@
  */
 
 import { api } from './client'
+import type { PresetRow } from './settings'
 
 export type DurationUnit = 'frames' | 'seconds'
 
@@ -27,11 +28,11 @@ export interface Project {
 
 export interface ProjectPreset {
   name: string | null
-  preset: import('./settings').PresetRow | null
+  preset: PresetRow | null
   r2v_name: string | null
-  r2v_preset: import('./settings').PresetRow | null
+  r2v_preset: PresetRow | null
   flf_name: string | null
-  flf_preset: import('./settings').PresetRow | null
+  flf_preset: PresetRow | null
 }
 
 export interface RecentProject {

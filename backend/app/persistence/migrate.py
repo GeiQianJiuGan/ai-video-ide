@@ -39,6 +39,7 @@ REVISION_SCHEMA: dict[str, int] = {
     "0009_project_generation_mode": 9,
     "0010_project_preset": 10,
     "0011_project_video_presets": 11,
+    "0012_shot_link": 12,
 }
 
 

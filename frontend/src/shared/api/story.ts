@@ -219,12 +219,50 @@ export interface StoryboardCard {
   context_issues: string[]
 }
 
+/**
+ * 分镜板上两张卡片之间那条线。镜头之间（`level: 'shot'`）与幕之间（`level: 'scene'`）
+ * 是同一种形状，界面上也是同一条线。
+ *
+ * 三件事只有这一个来源：
+ *   - **没配过就是无转场**——`id === null` / `mode === 'cut'`，后端连行都没有；
+ *   - `pending` 就是「配了转场但还没出片」，分镜板上那行「转场暂未生成」照它显示，
+ *     **不要**在界面里用 `transition_shot_id` 再算一遍（镜头造出来了但任务还在排队时，
+ *     它仍然是「暂未生成」）；
+ *   - `transition_shot_id` 指的那个镜头**照旧在 `shots` 里**（导出顺序、补首帧、
+ *     时间线装配都靠它在那儿），前端把它从卡片行里拿出来画在线上而已。
+ */
+export interface StoryboardConnector {
+  /** 后端还没有这条记录时是 null（= 无转场）。 */
+  id: string | null
+  level: 'shot' | 'scene'
+  /** cut 无转场 / transition 补一段转场。 */
+  mode: string
+  duration: number | null
+  prompt: string | null
+  transition_shot_id: string | null
+  /** 那段转场已经有成片了。 */
+  generated: boolean
+  /** 配了转场却还没出片——「转场暂未生成」那行字的唯一依据。 */
+  pending: boolean
+  from_shot_id?: string
+  to_shot_id?: string
+  from_scene_id?: string
+  to_scene_id?: string
+  from_index_no?: number
+  to_index_no?: number
+  to_title?: string
+}
+
 export interface StoryboardLane {
   id: string
   index_no: number
   title: string
   location_variant_id: string | null
   shots: StoryboardCard[]
+  /** 本幕内相邻两个正片镜头之间那条线，按顺序，比卡片数少一条。 */
+  links: StoryboardConnector[]
+  /** 本幕到下一幕那条线；最后一幕是 null。 */
+  next_link: StoryboardConnector | null
 }
 
 /** AI 提案里的镜头。`op` 由前端改：`reject` 表示不要它。 */

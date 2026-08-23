@@ -15,7 +15,7 @@ class Settings(BaseSettings):
 
     app_name: str = "AI Video Studio"
     version: str = "0.1.0"
-    schema_version: int = 11
+    schema_version: int = 12
 
     # --- 网络：只监听回环，绝不对外暴露工程数据 ---
     host: str = "127.0.0.1"

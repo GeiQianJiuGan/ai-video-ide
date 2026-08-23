@@ -231,6 +231,19 @@ kind / priority / included / reason；人工覆写记在 `shot.context_overrides
   编排两种模式（`parallel` / `sequential`）**一律先账单再动手**：`POST /sequence/plan` 只读地
   列出「入队几个任务、补几段转场、哪一条缺什么」，`POST /sequence/run` 才真入队；被跳过的每条
   都带四要素错误，跳过不是失败。
+- **镜头之间也有那条线**（`ShotLink`，迁移 `0012_shot_link`；前端画在
+  `features/story/StoryboardView.vue` 的卡片之间）：能引用设定图的模型往往做不了严格首尾帧，
+  反过来能严格首尾帧的又引用不了设定图，所以「两镜之间补一段短转场」是这类模型下唯一能把画面
+  接上的路。与 `SceneLink` 同一套形状，但**刻意没有 `tail_frame`**——镜头级的「续接末帧」早就有
+  表达方式了（`Shot.prev_shot_id`），再给它一个同义词只会让两处配置打架。四条规矩：
+  **没有行就是无转场**（老工程一行不用建，画线也不需要先落库）；两头必须**同幕且相邻**，
+  跨幕请用幕级那条；补出来的转场镜头**排在这两镜之间**，所以导出与时间线装配一行不用改；
+  **「转场暂未生成」只认 `GET /storyboard` 连接器上的 `pending`**
+  （`mode == 'transition' and not generated`，`generated` 说的是那个转场镜头有了成片）——
+  界面绝不拿 `transition_shot_id` 再算一遍，否则一入队就会谎报「已生成」。
+  一键生成转场是 `POST /sequence/transitions/plan` → `.../run`（`only` 收衔接 id，两级共用，
+  已有成片的一条都不重做）。**转场只在分镜那一页配**：时间线的片段属性里没有转场，
+  后端的 `Transition` 接口原样留着当兼容路径，但不再有界面入口——两处都能配的话必然打架。
 - **节点里的小节点**（`services/story.py` + `persistence` 里 `SceneCast` / `SceneLocation`，前端
   `features/flow/SceneNodeCard.vue` + `SceneNodeInspector.vue`）：一幕是一张小图表，挂着三种小
   节点——**prompt 必填**（`Scene.prompt`，缺了 `graph()` 会把它写进 `issues`），**人物 / 地点可以
@@ -341,9 +354,9 @@ kind / priority / included / reason；人工覆写记在 `shot.context_overrides
 - **新增表**：工程表必须在 `persistence/all_models.py` 里 import，否则 `Base.metadata` 漏表；
   素材库表相反——挂 `LibraryBase`，**不要**进 `all_models.py`（理由见上面的素材库段）。
 - **新增迁移**：`alembic/versions/` 加脚本 → 在 `persistence/migrate.py::REVISION_SCHEMA` 登记
-  它对应的 schema 版本 → 同步 `settings.schema_version`（当前 6，最新一条是
-  `0006_shot_adopted_video`：把 `Scene.main_version_id` 回填进 `shot.current_version_id`
-  后删掉那一列，「用哪一段」从此只有镜头级一个指针）。漏登记会导致
+  它对应的 schema 版本 → 同步 `settings.schema_version`（当前 12，最新一条是
+  `0012_shot_link`：镜头之间那条衔接，与 `scene_link` 同一套形状但**没有 `tail_frame`**，
+  没有行就是无转场）。漏登记会导致
   打开旧工程时无法告诉用户「schema X → Y」。
 - **落盘**：资产 `path` 相对工程目录存（整个目录拷走仍然有效）；类型→子目录映射在
   `services/assets.py::KIND_DIR`，`generations/` 只放生成物，手动素材一律进 `assets/`，

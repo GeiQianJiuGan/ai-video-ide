@@ -24,6 +24,18 @@ export const LINK_MODE_LABEL: Record<LinkMode, string> = {
   tail_frame: '续接末帧',
 }
 
+/**
+ * **镜头之间**那条线只有两种。刻意没有 `tail_frame`：镜头级的「续接末帧」早就有
+ * 表达方式了（`Shot.prev_shot_id`），再给它一个同义词只会让两处配置打架。
+ */
+export const SHOT_LINK_MODES = ['cut', 'transition'] as const
+export type ShotLinkMode = (typeof SHOT_LINK_MODES)[number]
+
+export const SHOT_LINK_MODE_LABEL: Record<ShotLinkMode, string> = {
+  cut: '无转场',
+  transition: '转场',
+}
+
 export const SEQUENCE_MODES = ['parallel', 'sequential'] as const
 export type SequenceMode = (typeof SEQUENCE_MODES)[number]
 
@@ -242,12 +254,134 @@ export interface SceneVideos {
   note: string
 }
 
+/**
+ * 两个镜头之间那条线。**没有行就是「无转场」**，所以分镜板上画线不需要先建记录。
+ *
+ * `shot_id` 是这条线补出来的那个转场镜头；它还没出片时分镜板上要写「转场暂未生成」，
+ * 判断依据在 `StoryboardConnector.pending`，不要在界面里各算一遍。
+ */
+export interface ShotLink {
+  id: string
+  from_shot_id: string
+  to_shot_id: string
+  mode: string
+  /** transition 生成出来的那个镜头；还没生成时是 null。 */
+  shot_id: string | null
+  duration: number
+  prompt: string | null
+  from_index_no: number | null
+  from_title: string | null
+  to_index_no: number | null
+  to_title: string | null
+  /** 这种衔接方式的一句话解释，文案在后端写一遍，前端不复制。 */
+  hint: string
+  created_at: string
+  updated_at: string
+}
+
+export interface ShotLinkBody {
+  from_shot_id: string
+  to_shot_id: string
+  mode: string
+  duration?: number | null
+  prompt?: string | null
+}
+
+/**
+ * 「一键生成转场」账单里的一条。两级共用一种形状，`level` 区分：
+ * `shot` 是镜头之间那条线，`scene` 是幕与幕之间那条。
+ *
+ * `first_frame` / `last_frame` 说的是这段转场两头的图从哪来
+ * （`real_frame` 真帧 / `extract` 生成前会抽 / `reference_image` 只能退回设定图 /
+ * `waiting` 上游还没出片 / `none` 取不到），界面照它解释「接缝准不准」。
+ */
+export interface TransitionPlanItem {
+  level: 'shot' | 'scene'
+  link_id: string
+  where: string
+  from_shot_id?: string
+  to_shot_id?: string
+  from_scene_id?: string
+  to_scene_id?: string
+  from_index_no?: number
+  to_index_no?: number
+  from_title?: string
+  to_title?: string
+  duration: number | null
+  prompt: string | null
+  /** 已经补出来的那个转场镜头。 */
+  shot_id: string | null
+  generated: boolean
+  first_frame?: string
+  last_frame?: string
+  will_generate: boolean
+  note?: string
+  blocked?: string
+}
+
+export interface TransitionPlan {
+  items: TransitionPlanItem[]
+  /** 这次真会生成的条数（已出片的不算）。 */
+  total: number
+  /** 已经有成片、这次跳过的条数。 */
+  reused: number
+  blocked: { link_id: string; why: string; how: string }[]
+  notes: string[]
+}
+
+/** 一键生成转场里被补出来的一段。`reused: true` = 已经有成片，这次没重做。 */
+export interface TransitionMade {
+  level?: string
+  link_id?: string
+  shot_id: string
+  job_id: string | null
+  reused: boolean
+  note?: string
+}
+
+export interface TransitionRun {
+  transitions: TransitionMade[]
+  queued: string[]
+  /** 跳过的每一条都带原因——绝不静默少做一件事。 */
+  skipped: {
+    link_id: string
+    where: string
+    reason?: string
+    error?: { code: string; title: string; detail: string; suggestions: string[] }
+  }[]
+  plan: TransitionPlan
+}
+
 export const sequenceApi = {
   graph: (pid: string) => api.get<FlowGraph>(`/projects/${pid}/flow`),
   links: (pid: string) => api.get<SceneLink[]>(`/projects/${pid}/links`),
   /** 同一对场景之间只有一条衔接，所以这是 upsert。 */
   setLink: (pid: string, body: LinkBody) => api.put<SceneLink>(`/projects/${pid}/links`, body),
   deleteLink: (pid: string, linkId: string) => api.del<void>(`/projects/${pid}/links/${linkId}`),
+
+  shotLinks: (pid: string) => api.get<ShotLink[]>(`/projects/${pid}/shot-links`),
+  /** 同一对镜头之间只有一条衔接，所以这也是 upsert。 */
+  setShotLink: (pid: string, body: ShotLinkBody) =>
+    api.put<ShotLink>(`/projects/${pid}/shot-links`, body),
+  deleteShotLink: (pid: string, linkId: string) =>
+    api.del<void>(`/projects/${pid}/shot-links/${linkId}`),
+
+  /** 一键生成转场的账单：两级一起列，只读，不抽帧也不入队。 */
+  transitionPlan: (pid: string) =>
+    api.post<TransitionPlan>(`/projects/${pid}/sequence/transitions/plan`, {}),
+  /**
+   * 按账单补转场。`only` 给的是衔接 id（镜头级 / 幕级都认 id），
+   * 分镜板上单条转场的「生成」按钮走的就是它；不传就是全部。
+   */
+  transitionRun: (
+    pid: string,
+    opts: { only?: string[]; priority?: number; allowRefDrop?: boolean } = {},
+  ) =>
+    api.post<TransitionRun>(`/projects/${pid}/sequence/transitions/run`, {
+      priority: opts.priority ?? 100,
+      allow_ref_drop: opts.allowRefDrop ?? false,
+      ...(opts.only ? { only: opts.only } : {}),
+    }),
 
   /**
    * 这一幕**按镜头分组**的视频候选；不能当候选的在 `omitted` 里带原因。

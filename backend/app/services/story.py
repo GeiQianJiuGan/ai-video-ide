@@ -20,6 +20,7 @@ from app.core.errors import AppError, ErrorCode
 from app.core.ids import new_id
 from app.persistence.models import Project, utc_now
 from app.persistence.models_cast import Appearance, Character, SheetVersion
+from app.persistence.models_flow import SceneLink, ShotLink
 from app.persistence.models_gen import GenerationVersion
 from app.persistence.models_story import (
     SHOT_STATUS,
@@ -184,6 +185,33 @@ def _shot_media(
         "versions": version_rows,
         # 有片子但还没有能当图显示的那一张：可以补抽，不是错误
         "poster_pending": bool(video_asset) and poster_path is None,
+    }
+
+
+def _connector(
+    row: ShotLink | SceneLink | None, made: Shot | None, extra: dict[str, Any]
+) -> dict[str, Any]:
+    """分镜板上两张卡片之间那一行：这里配的是什么，转场生成了没有。
+
+    **没有行就等于「无转场」**（`cut`）——这正是这两张表出现之前的行为，
+    所以老工程打开来一条线都不会凭空多出东西。
+
+    `pending=True` 是界面上那句「转场暂未生成」的唯一来源：配成了转场、
+    但那个 `Shot.kind="transition"` 的镜头还没有当前版本。判断只看
+    `current_version_id`，和 `sequence._make_*transition` 的「要不要重做」
+    是同一个口径（版本永不覆盖，已出片的转场不会被一键生成重做）。
+    """
+    mode = row.mode if row is not None else "cut"
+    generated = bool(made is not None and made.current_version_id)
+    return {
+        "id": row.id if row is not None else None,
+        "mode": mode,
+        "duration": row.duration if row is not None else None,
+        "prompt": row.prompt if row is not None else None,
+        "transition_shot_id": made.id if made is not None else None,
+        "generated": generated,
+        "pending": mode == "transition" and not generated,
+        **extra,
     }
 
 
@@ -818,7 +846,17 @@ class StoryService:
     # --- 分镜板 ---
 
     async def storyboard(self, pid: str) -> list[dict[str, Any]]:
-        """泳道 + 卡片。卡片自带 Context 完备度，黄色感叹号的数据来源就是这里。"""
+        """泳道 + 卡片 + **卡片之间那条线**。卡片自带 Context 完备度，黄色感叹号来源就是这里。
+
+        每条泳道带两样衔接数据，界面上是同一种线：
+
+          - `links` —— 本幕内相邻两个正片镜头之间的 `ShotLink`（没有行就是「无转场」）；
+          - `next_link` —— 本幕到下一幕的 `SceneLink`（最后一幕是 null）。
+
+        转场镜头**照旧留在 `shots` 里**（导出顺序、补首帧、时间线装配都靠它在那儿），
+        连接器只额外指出「这条线的转场是哪个镜头、生成了没有」，前端据此把它从卡片行里
+        拿出来画在线上。两处读的是同一条记录，不会各说一套。
+        """
         db = db_of(pid)
         scenes = await fetch_all(db, Scene, order_by=Scene.index_no)
         shots = await fetch_all(db, Shot, order_by=Shot.index_no)
@@ -830,6 +868,9 @@ class StoryService:
         chars = {c.id: c for c in await fetch_all(db, Character)}
         assets = {a.id: a for a in await fetch_all(db, Asset)}
         posters = start_frame_index(list(assets.values()))
+        shot_links = await fetch_all(db, ShotLink)
+        scene_links = await fetch_all(db, SceneLink)
+        by_id = {s.id: s for s in shots}
 
         lanes = []
         for scene in scenes:
@@ -884,6 +925,53 @@ class StoryService:
                         "context_issues": issues,
                     }
                 )
+            real = [s for s in shots if s.scene_id == scene.id and s.kind != "transition"]
+            links = []
+            for head, tail in zip(real, real[1:], strict=False):
+                row = next(
+                    (
+                        r
+                        for r in shot_links
+                        if r.from_shot_id == head.id and r.to_shot_id == tail.id
+                    ),
+                    None,
+                )
+                links.append(
+                    _connector(
+                        row,
+                        by_id.get(row.shot_id or "") if row is not None else None,
+                        {
+                            "level": "shot",
+                            "from_shot_id": head.id,
+                            "to_shot_id": tail.id,
+                            "from_index_no": head.index_no,
+                            "to_index_no": tail.index_no,
+                        },
+                    )
+                )
+            nxt = next((s for s in scenes if s.index_no > scene.index_no), None)
+            next_link = None
+            if nxt is not None:
+                row = next(
+                    (
+                        r
+                        for r in scene_links
+                        if r.from_scene_id == scene.id and r.to_scene_id == nxt.id
+                    ),
+                    None,
+                )
+                next_link = _connector(
+                    row,
+                    by_id.get(row.shot_id or "") if row is not None else None,
+                    {
+                        "level": "scene",
+                        "from_scene_id": scene.id,
+                        "to_scene_id": nxt.id,
+                        "from_index_no": scene.index_no,
+                        "to_index_no": nxt.index_no,
+                        "to_title": nxt.title,
+                    },
+                )
             lanes.append(
                 {
                     "id": scene.id,
@@ -891,6 +979,8 @@ class StoryService:
                     "title": scene.title,
                     "location_variant_id": scene.location_variant_id,
                     "shots": cards,
+                    "links": links,
+                    "next_link": next_link,
                 }
             )
         return lanes
@@ -1009,9 +1099,7 @@ class StoryService:
                 visual_and_sound_prompt = prompts.format_shot_prompt(
                     hi + 1, camera_motion, visual_prompt, audio_dialogue, description
                 )
-                base_negative = (
-                    str(shot.get("negative_prompt") or "").strip() or default_negative
-                )
+                base_negative = str(shot.get("negative_prompt") or "").strip() or default_negative
                 shot_prompt, shot_negative = prompts.with_shot_audio_policy(
                     visual_and_sound_prompt, base_negative
                 )
