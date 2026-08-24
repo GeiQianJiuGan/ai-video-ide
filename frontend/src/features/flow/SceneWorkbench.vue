@@ -3,21 +3,24 @@
  * 幕工作台（两级场景系统的第二级）。
  *
  * 这一页只回答一个问题：**这一幕怎么做出来**。所以它把「一幕」当作工作单位——
- * 左边是这一幕本身（地点变体、时间、镜头清单），中间是当前镜头的**首帧来源**与上下文账单，
+ * 左边是这一幕本身（地点变体、时间、镜头清单），中间是当前镜头的**首尾帧槽位**与上下文账单，
  * 右边是版本轨，底部是 prompt 与参数。想看「某一条片段是怎么来的」全部真相，去镜头编辑器。
  *
  * 三个刻意的设计：
- *   1. **首帧来源写成四张卡，而不是一个下拉**。角色表 / 地点参考 / 上传 三条都是
- *      「往上下文里加一张图」，上游末帧那条是「把 prev_shot_id 指过去、生成前抽真末帧」——
- *      这两件事的后果完全不同，界面上不能长得一样。
+ *   1. **首尾帧和参考素材分成两块写**。上面那两个槽位决定「画面从哪一格开始 / 结束」
+ *      （只收图片，模型端接的是 LoadImage），下面的账单决定「谁出场、在哪儿、什么动作、
+ *      什么声音」（图 / 视频 / 音频都收）。挂角色、选地点变体只往账单里加参考素材，
+ *      **一张都不会被提拔成画面第一格**；上游末帧那条又是另一回事——它把
+ *      `prev_shot_id` 指过去，由后端在生成前抽真末帧。这三件事后果不同，界面上不能长得一样。
  *   2. **账单里没被采用的照样列出来**。和镜头编辑器同一个理由：用户问的是「为什么没进去」。
  *   3. **整幕入队会返回一张账单式结果**（入队了几条、跳过了哪几条与原因），
  *      跳过不当成失败弹红叉——它是设计里的门槛。
  *
- * 采用的每一张都标出**它当首帧还是当参考图**（`item.role`，规则只在后端的
- * `services/context.py::_assign_roles`）；版本卡上则显示当次**真正喂进去几张**
- * 与适配器的降级说明（冻结在 `params.refs` / `params.ref_notes` 里）——
- * 账单说 5 张、只喂了 3 张，这件事必须在界面上看得见。
+ * 采用的每一个都标出**它当首帧 / 末帧还是当参考素材**（`item.role`，规则只在后端的
+ * `services/context.py::_assign_roles`）与**它是图还是视频 / 音频**（`item.media`，
+ * 三族各进各自的槽位）；版本卡上则显示当次**真正喂进去几个**与适配器的降级说明
+ * （冻结在 `params.refs` / `params.ref_notes` 里）——账单说 5 个、只喂了 3 个，
+ * 这件事必须在界面上看得见。
  */
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
@@ -47,12 +50,15 @@ import { ApiError, confirmFlagOf } from '@/shared/api/client'
 import { fileUrl } from '@/shared/api/files'
 import {
   CONTEXT_KIND_LABEL,
+  CONTEXT_MEDIA_LABEL,
   CONTEXT_ROLE_LABEL,
+  type ContextCapacityMedia,
+  type ContextItem,
   type GenerationVersion,
 } from '@/shared/api/generation'
 import { SHOT_STATUS, SHOT_STATUS_LABEL, type ShotStatus } from '@/shared/api/story'
 import { useConsoleStore } from '@/stores/console'
-import { useSceneStore } from '@/stores/scene'
+import { useSceneStore, type FrameSlotKey } from '@/stores/scene'
 
 const route = useRoute()
 const router = useRouter()
@@ -65,27 +71,84 @@ const sid = computed(() => String(route.params.sid ?? ''))
 const sideError = ref<ApiError | null>(null)
 const busyFile = ref(false)
 const frameInput = ref<HTMLInputElement | null>(null)
+const refInput = ref<HTMLInputElement | null>(null)
 const versionInput = ref<HTMLInputElement | null>(null)
+/** 首帧 / 末帧共用一个 file input，记住正在填哪一个槽位。 */
+const pickingSlot = ref<FrameSlotKey>('first_frame_asset_id')
 const newShotTitle = ref('')
 /** 整幕入队的结果：入队了几条、跳过了哪几条。null = 这次会话还没整幕入过。 */
 const sceneRun = ref<{ queued: string[]; skipped: unknown[] } | null>(null)
+
+/** 某一族的槽位账 + 它是哪一族——界面上每族一行，所以把 key 带进值里。 */
+type CapBlock = ContextCapacityMedia & { media: 'image' | 'video' | 'audio' }
 
 const scene = computed(() => workbench.scene)
 const shot = computed(() => workbench.shot)
 const bill = computed(() => workbench.bill)
 /**
- * 这一次模型端能收几张参考图。**不是应用级设置**：ComfyUI 预设里标了几个 `AIVS_REF_*`
- * 就是几张，通用 REST 合同与「还没选预设」都是不限张数（`limit === null`）。
- * 所以界面上连「这个数字哪来的」（`source` / `detail`）一起显示——上限变了要能看懂为什么。
+ * 这一次模型端能收几个参考素材。**不是应用级设置**：ComfyUI 预设里标了几个
+ * `AIVS_REF_*` / `AIVS_REF_VIDEO_*` / `AIVS_REF_AUDIO_*` 就是几个，通用 REST 合同与
+ * 「还没选预设」都是不限数量（`limit === null`）。所以界面上连「这个数字哪来的」
+ * （`source` / `detail`）一起显示——上限变了要能看懂为什么。
  */
 const cap = computed(() => bill.value?.capacity ?? null)
+/**
+ * 三族分开报。混在一起数的话「图多音频少」会显示成装得下，然后那段音频被安静丢掉。
+ * 只列有素材的那几族，一个都没有的族不占位置。
+ */
+const capBlocks = computed<CapBlock[]>(() => {
+  const per = cap.value?.media
+  if (!per) return []
+  const out: CapBlock[] = []
+  for (const media of ['image', 'video', 'audio'] as const) {
+    const block = per[media]
+    if (block && (block.ref_count > 0 || block.over)) out.push({ ...block, media })
+  }
+  return out
+})
 const capText = computed(() => {
   const c = cap.value
   if (!c) return ''
-  return c.limit === null ? `参考图 ${c.ref_count} 张 · 不限` : `参考图 ${c.ref_count} / ${c.limit}`
+  const blocks = capBlocks.value
+  if (!blocks.length) {
+    return c.limit === null ? '参考素材 0 个 · 不限' : `参考图 0 / ${c.limit}`
+  }
+  return blocks
+    .map((b) => `${b.label} ${b.ref_count}${b.limit === null ? '' : ` / ${b.limit}`}`)
+    .join(' · ')
 })
+/** 会被挤掉的那几个，按族说清——「装不下」的原因每族不一样。 */
+const dropText = computed(() =>
+  capBlocks.value
+    .filter((b) => b.over)
+    .map(
+      (b) =>
+        `${b.label}采用了 ${b.ref_count} 个、只能喂 ${b.limit} 个（会丢：${b.dropped_labels.join('、')}）`,
+    )
+    .join('；'),
+)
 /**
- * 参考图装不下时的那一次确认：记住刚才想干什么，用户点确认就带 `allow_ref_drop` 重来一次。
+ * 两个显式槽位。**「哪一张是首帧」就是这里按下去的那一下**——没填就是没有首帧，
+ * 账单里的角色表 / 地点图一张都不会被提拔（以前三视图当画面第一格就是这么来的）。
+ */
+const frameSlots = computed(() => [
+  {
+    key: 'first_frame_asset_id' as FrameSlotKey,
+    label: '首帧',
+    hint: '画面的第一格。留空就是不指定首帧，模型自己起画。',
+    assetId: shot.value?.first_frame_asset_id ?? null,
+    path: shot.value?.first_frame_path ?? null,
+  },
+  {
+    key: 'last_frame_asset_id' as FrameSlotKey,
+    label: '末帧',
+    hint: '画面的最后一格，只有首尾帧能力的模型用得上。',
+    assetId: shot.value?.last_frame_asset_id ?? null,
+    path: shot.value?.last_frame_path ?? null,
+  },
+])
+/**
+ * 参考素材装不下时的那一次确认：记住刚才想干什么，用户点确认就带 `allow_ref_drop` 重来一次。
  * 后端此时**一个任务都没入队**（批量路径是先扫完再动手），所以重来一次不会重复生成。
  */
 const pendingDrop = ref<{ scope: 'shot'; skipContext: boolean } | { scope: 'scene' } | null>(null)
@@ -102,13 +165,37 @@ const prevShot = computed(
   () => workbench.shots.find((s) => s.id === shot.value?.prev_shot_id) ?? null,
 )
 const prevReady = computed(() => Boolean(prevShot.value?.current_version_id))
+/** 转场的两侧由流程图连接固定；这里仅展示负责的正片镜头。 */
+const transitionPeers = computed(() => {
+  const current = shot.value
+  if (!current || current.kind !== 'transition') return null
+  const before = workbench.shots.find((s) => s.id === current.prev_shot_id)
+  const after = current.title.replace(/^转场\s*→\s*/, '').trim()
+  return {
+    before: before?.title ?? '上游镜头',
+    after: after || '下游镜头',
+  }
+})
 /** 这一幕选的地点变体那张参考图——`<select>` 里塞不进图，所以在它下面单独给一眼。 */
 const sceneVariant = computed(
   () => workbench.variants.find((v) => v.id === scene.value?.location_variant_id) ?? null,
 )
 
-/** 账单条目自带相对路径，不用再查资产表。 */
-function itemThumb(path: string | null): string {
+/**
+ * 账单条目那一格的 URL。**用条目自己带的 `asset_path`**，不去资产总账里查——
+ * 上游末帧是抽出来的临时帧（`cache/frames/`），它压根不在总账里（`TRANSIENT_KINDS`）。
+ */
+function itemUrl(item: ContextItem): string {
+  return item.asset_path && !item.missing_file ? fileUrl(pid.value, item.asset_path) : ''
+}
+
+/** 图片走 `<img>`、视频走 `<video>`、音频走 `<audio>`：把 `.mp4` 塞进 `<img>` 只会得到坏图标。 */
+function mediaOf(item: ContextItem): string {
+  return item.media ?? 'image'
+}
+
+/** 槽位缩略图。资产被删掉时后端给 null，此时要显示「指定的图已不在」而不是空白。 */
+function slotUrl(path: string | null): string {
   return path ? fileUrl(pid.value, path) : ''
 }
 
@@ -130,15 +217,15 @@ function fmt(n: number | null | undefined): string {
 }
 
 /**
- * 这个版本实际喂进去了几张参考图 —— 冻结在 `params.refs` 里，不是现在重算的。
- * 账单上标了 5 张而这里只有 3 张，就是模型端那份图槽位不够（说明在 `ref_notes` 里）。
+ * 这个版本实际喂进去了几个参考素材 —— 冻结在 `params.refs` 里，不是现在重算的。
+ * 账单上标了 5 个而这里只有 3 个，就是模型端那份图槽位不够（说明在 `ref_notes` 里）。
  */
 function refCount(params: Record<string, unknown>): number {
   const refs = params.refs
   return Array.isArray(refs) ? refs.length : 0
 }
 
-/** 适配器的降级说明，原样显示：喂少了几张必须看得见，不能悄悄过去。 */
+/** 适配器的降级说明，原样显示：喂少了几个必须看得见，不能悄悄过去。 */
 function refNotes(params: Record<string, unknown>): string[] {
   const notes = params.ref_notes
   return Array.isArray(notes) ? notes.map(String) : []
@@ -146,9 +233,7 @@ function refNotes(params: Record<string, unknown>): string[] {
 
 async function reload(): Promise<void> {
   if (!pid.value) return
-  await Promise.all([
-    workbench.load(pid.value, sid.value).catch(() => {}),
-  ])
+  await Promise.all([workbench.load(pid.value, sid.value).catch(() => {})])
 }
 
 onMounted(reload)
@@ -180,7 +265,7 @@ async function saveStatus(value: string): Promise<void> {
   await workbench.saveShot(pid.value, { status: value }).catch(() => {})
 }
 
-/** 挂 / 摘一个形象。挂上之后它的角色表会自动出现在账单里——这就是「从角色表取首帧」。 */
+/** 挂 / 摘一个形象。挂上之后它的角色表会自动进账单当**参考素材**（不是首帧）。 */
 async function toggleCast(appearanceId: string): Promise<void> {
   const next = new Set(castIds.value)
   if (next.has(appearanceId)) next.delete(appearanceId)
@@ -190,7 +275,7 @@ async function toggleCast(appearanceId: string): Promise<void> {
 
 /** 指上游镜头：后端在生成前抽它的**真末帧**，不是把整段视频喂进去。 */
 async function setPrev(value: string): Promise<void> {
-  await workbench.saveShot(pid.value, { prev_shot_id: value || null }).catch(() => {})
+  await workbench.saveShot(pid.value, { prev_shot_id: value || '' }).catch(() => {})
 }
 
 async function addShot(): Promise<void> {
@@ -199,6 +284,20 @@ async function addShot(): Promise<void> {
   await workbench.addShot(pid.value, title).catch(() => {})
 }
 
+/**
+ * 写一个首 / 末帧槽位。**清空传 `''`**——`null` 会被后端 `exclude_none` 吃掉，等于没改。
+ * 挑了视频 / 音频后端会用 422「首帧只能是图片」拦下来，错误面板照常显示建议。
+ */
+async function setSlot(key: FrameSlotKey, assetId: string): Promise<void> {
+  await workbench.setFrameSlot(pid.value, key, assetId).catch(() => {})
+}
+
+function pickSlotFile(key: FrameSlotKey): void {
+  pickingSlot.value = key
+  frameInput.value?.click()
+}
+
+/** 上传一张图并直接填进刚才那个槽位（不是往账单里加一条人工项）。 */
 async function onPickFrame(event: Event): Promise<void> {
   const input = event.target as HTMLInputElement
   const file = input.files?.[0]
@@ -206,7 +305,26 @@ async function onPickFrame(event: Event): Promise<void> {
   if (!file) return
   busyFile.value = true
   try {
-    await workbench.uploadFirstFrame(pid.value, file)
+    await workbench.uploadFrame(pid.value, pickingSlot.value, file)
+  } catch (err) {
+    sideError.value = err instanceof ApiError ? err : null
+  } finally {
+    busyFile.value = false
+  }
+}
+
+/**
+ * 上传一个**参考素材**并挂进上下文。图 / 视频 / 音频都收——参考素材回答的是
+ * 「谁出场、在哪儿、什么动作、什么声音」，不只是「长什么样」。
+ */
+async function onPickRef(event: Event): Promise<void> {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  input.value = ''
+  if (!file) return
+  busyFile.value = true
+  try {
+    await workbench.uploadRef(pid.value, file)
   } catch (err) {
     sideError.value = err instanceof ApiError ? err : null
   } finally {
@@ -241,8 +359,8 @@ async function generateScene(allowRefDrop = false): Promise<void> {
 }
 
 /**
- * 「知道会丢图，继续」——把刚才那一次原样重来，只多带一个 `allow_ref_drop`。
- * 绝不自动重试：丢掉哪几张角色图 / 场景图这件事必须是用户点下去的。
+ * 「知道会丢素材，继续」——把刚才那一次原样重来，只多带一个 `allow_ref_drop`。
+ * 绝不自动重试：丢掉哪几个参考素材这件事必须是用户点下去的。
  */
 async function confirmDrop(): Promise<void> {
   const pending = pendingDrop.value
@@ -271,15 +389,15 @@ async function confirmDrop(): Promise<void> {
         @change="workbench.select(pid, ($event.target as HTMLSelectElement).value)"
       >
         <option value="">未选择</option>
-        <option v-for="s in workbench.shots" :key="s.id" :value="s.id">
-          {{ s.index_no }}. {{ s.title }}{{ s.kind === 'transition' ? '（转场）' : '' }}
+        <option v-for="s in workbench.realShots" :key="s.id" :value="s.id">
+          {{ s.index_no }}. {{ s.title }}
         </option>
       </select>
       <AppButton
         size="sm"
         variant="primary"
         :disabled="!shot || workbench.busy"
-        title="按当前首帧与上下文入队生成一个新版本；旧版本一条都不会被覆盖"
+        title="按当前首尾帧槽位与上下文账单入队生成一个新版本；旧版本一条都不会被覆盖"
         @click="generate(false)"
       >
         <Sparkles :size="10" />生成本镜头
@@ -327,17 +445,17 @@ async function confirmDrop(): Promise<void> {
       :error="workbench.lastError"
       @dismiss="workbench.clearError()"
     >
-      <!-- 参考图装不下不是失败，是一次确认：这颗按钮把刚才那一次原样重来 -->
+      <!-- 参考素材装不下不是失败，是一次确认：这颗按钮把刚才那一次原样重来 -->
       <template #actions>
         <AppButton
           v-if="askDrop"
           size="sm"
           variant="primary"
           :disabled="workbench.busy"
-          title="按模型端那份图的槽位顺序喂前几张；少喂了哪几张会记进版本参数，事后查得到"
+          title="按模型端那份图的槽位顺序喂前几个；少喂了哪几个会记进版本参数，事后查得到"
           @click="confirmDrop()"
         >
-          <Sparkles :size="10" />知道会丢图，继续生成
+          <Sparkles :size="10" />知道会丢素材，继续生成
         </AppButton>
       </template>
     </ErrorPanel>
@@ -486,6 +604,7 @@ async function confirmDrop(): Promise<void> {
                           : 'text-fg-2 hover:bg-base-2'
                       "
                       @click="workbench.select(pid, s.id)"
+                      @dblclick.stop="router.push({ name: 'shot', params: { pid: pid, sid: s.id } })"
                     >
                       <Film :size="10" class="text-fg-4" />
                       <span class="min-w-0 flex-1 truncate text-2xs">{{ s.title }}</span>
@@ -538,15 +657,31 @@ async function confirmDrop(): Promise<void> {
           </div>
         </AppPanel>
 
-        <!-- 中：首帧来源 + 上下文账单 -->
-        <AppPanel title="首帧与上下文" class="min-w-0 flex-1">
+        <!-- 中：首尾帧槽位 + 上下文账单（两件事，分两块写） -->
+        <AppPanel title="首尾帧与上下文" class="min-w-0 flex-1">
           <template #actions>
             <span v-if="cap" class="text-fg-4 tnum text-2xs" :title="cap.detail">
               {{ capText }}
             </span>
-            <AppBadge v-if="cap?.over" tone="warn" :title="cap.detail">
-              会丢 {{ cap.dropped }} 张
+            <AppBadge v-if="cap?.over" tone="warn" :title="dropText">
+              会丢 {{ capBlocks.reduce((n, b) => n + b.dropped, 0) }} 个
             </AppBadge>
+            <AppButton
+              size="sm"
+              variant="ghost"
+              :disabled="!shot || busyFile || workbench.busy"
+              title="上传一个参考素材并挂进上下文（图 / 视频 / 音频都收，人工项优先级最高）"
+              @click="refInput?.click()"
+            >
+              <Upload :size="10" />加素材
+            </AppButton>
+            <input
+              ref="refInput"
+              type="file"
+              accept="image/*,video/*,audio/*"
+              class="hidden"
+              @change="onPickRef"
+            />
             <AppButton
               size="sm"
               variant="ghost"
@@ -564,12 +699,83 @@ async function confirmDrop(): Promise<void> {
               body="左边加一个镜头。一幕由若干镜头组成，每个镜头出一段视频。"
             />
             <template v-else>
-              <p class="text-fg-3 text-2xs tracking-wide uppercase">首帧从哪来（四条路）</p>
+              <!--
+                首尾帧和参考素材是两件事：这两个槽位决定「画面从哪一格开始 / 结束」，
+                下面账单里的角色表 / 地点图决定「谁出场、在哪儿」。以前这一页的「上传一张」
+                是往账单里加一条人工项，于是首帧由优先级决定——角色三视图成了画面第一格。
+              -->
+              <p class="text-fg-3 text-2xs tracking-wide uppercase">首帧 / 末帧（只能是图片）</p>
+              <div class="mt-1 grid grid-cols-2 gap-1.5">
+                <div v-for="slot in frameSlots" :key="slot.key" class="min-w-0">
+                  <div class="flex items-center gap-1">
+                    <AppBadge :tone="slot.assetId ? 'ok' : 'neutral'">{{ slot.label }}</AppBadge>
+                    <span class="text-fg-4 min-w-0 flex-1 truncate text-2xs">{{ slot.hint }}</span>
+                    <button
+                      v-if="slot.assetId"
+                      class="text-fg-4 hover:text-st-failed"
+                      title="清空这个槽位（不指定这一帧）"
+                      @click="setSlot(slot.key, '')"
+                    >
+                      <X :size="10" />
+                    </button>
+                  </div>
+                  <div
+                    class="bg-base-3 border-line-1 mt-1 flex h-20 items-center justify-center overflow-hidden border"
+                  >
+                    <img
+                      v-if="slotUrl(slot.path)"
+                      :src="slotUrl(slot.path)"
+                      class="max-h-full max-w-full object-contain"
+                      :alt="slot.label"
+                    />
+                    <span v-else-if="slot.assetId" class="text-st-failed px-1 text-center text-2xs">
+                      指定的图已不在
+                    </span>
+                    <span v-else class="text-fg-4 text-2xs">未指定</span>
+                  </div>
+                  <div class="mt-1 flex gap-1">
+                    <select
+                      :value="slot.assetId ?? ''"
+                      class="border-line-1 bg-base-2 text-fg-1 focus:border-accent/60 h-5 min-w-0 flex-1 border px-1 text-2xs outline-none"
+                      :title="slot.hint"
+                      @change="setSlot(slot.key, ($event.target as HTMLSelectElement).value)"
+                    >
+                      <option value="">不指定</option>
+                      <option v-for="a in workbench.imageAssets" :key="a.id" :value="a.id">
+                        {{ a.path.split('/').pop() }}
+                      </option>
+                    </select>
+                    <AppButton
+                      size="sm"
+                      variant="ghost"
+                      :disabled="busyFile || workbench.busy"
+                      title="上传一张图直接填进这个槽位"
+                      @click="pickSlotFile(slot.key)"
+                    >
+                      <Upload :size="10" />上传
+                    </AppButton>
+                  </div>
+                </div>
+              </div>
+              <input
+                ref="frameInput"
+                type="file"
+                accept="image/*"
+                class="hidden"
+                @change="onPickFrame"
+              />
+              <p class="text-fg-4 mt-1 text-2xs">
+                留空就是不指定：账单里的角色表 / 地点图一律是参考素材，不会有一张被当成画面第一格。
+                视频 / 音频请用右上角「加素材」当参考素材加——这两个槽位只收图片。
+              </p>
+              <p class="text-fg-3 mt-3 text-2xs tracking-wide uppercase">
+                参考素材从哪来（谁出场、在哪儿）
+              </p>
               <div class="mt-1 grid grid-cols-2 gap-1.5">
                 <div class="border-line-1 bg-base-2 border p-1.5">
                   <p class="text-fg-1 text-2xs">1 · 从角色表</p>
                   <p class="text-fg-4 mt-0.5 text-2xs">
-                    左栏挂上形象，它的角色表自动进账单。挂了 {{ castIds.size }} 个。
+                    左栏挂上形象，它的角色表自动进账单当参考图。挂了 {{ castIds.size }} 个。
                   </p>
                 </div>
                 <div class="border-line-1 bg-base-2 border p-1.5">
@@ -583,28 +789,21 @@ async function confirmDrop(): Promise<void> {
                   </p>
                 </div>
                 <div class="border-line-1 bg-base-2 border p-1.5">
-                  <p class="text-fg-1 text-2xs">3 · 上传一张</p>
+                  <p class="text-fg-1 text-2xs">3 · 上传一个</p>
                   <p class="text-fg-4 mt-0.5 text-2xs">
-                    直接给一张首帧，记成人工添加，优先级最高。
+                    图 / 视频 / 音频都收，记成人工添加，优先级最高。
                   </p>
                   <AppButton
                     size="sm"
                     variant="ghost"
                     class="mt-1"
                     :disabled="busyFile || workbench.busy"
-                    @click="frameInput?.click()"
+                    @click="refInput?.click()"
                   >
-                    <Upload :size="10" />选图
+                    <Upload :size="10" />选素材
                   </AppButton>
-                  <input
-                    ref="frameInput"
-                    type="file"
-                    accept="image/*"
-                    class="hidden"
-                    @change="onPickFrame"
-                  />
                 </div>
-                <div class="border-line-1 bg-base-2 border p-1.5">
+                <div v-if="shot.kind !== 'transition'" class="border-line-1 bg-base-2 border p-1.5">
                   <p class="text-fg-1 text-2xs">4 · 接上游末帧</p>
                   <select
                     :value="shot.prev_shot_id ?? ''"
@@ -617,7 +816,7 @@ async function confirmDrop(): Promise<void> {
                     </option>
                   </select>
                   <p v-if="!shot.prev_shot_id" class="text-fg-4 mt-0.5 text-2xs">
-                    这一条不是「加一张图」：它让后端在生成前抽上游的真末帧，接不上的话队列里会写明在等谁。
+                    这一条不是「加一张图」：它让后端在生成前抽上游的真末帧当首帧，接不上的话队列里会写明在等谁。
                   </p>
                   <p v-else-if="prevReady" class="text-st-done mt-0.5 text-2xs">
                     上游「{{ prevShot?.title }}」已出片，生成前会抽它的真末帧当首帧。
@@ -626,6 +825,12 @@ async function confirmDrop(): Promise<void> {
                     上游「{{
                       prevShot?.title
                     }}」还没有当前版本，本镜头会排成可解释的等待，不是卡住。
+                  </p>
+                </div>
+                <div v-else class="border-line-1 bg-base-2 border p-1.5">
+                  <p class="text-fg-1 text-2xs">4 · 转场上下游已固定</p>
+                  <p class="text-fg-4 mt-0.5 text-2xs">
+                    负责「{{ transitionPeers?.before ?? '上游镜头' }} → {{ transitionPeers?.after ?? '下游镜头' }}」的转场；请回到这两个镜头修改衔接。
                   </p>
                 </div>
               </div>
@@ -641,14 +846,20 @@ async function confirmDrop(): Promise<void> {
                 </ul>
               </div>
               <p v-else-if="bill" class="text-st-done mt-3 text-2xs">上下文完整。</p>
-              <!-- 装不下不是 blocker：生成前会问一次，确认了照样能生成 -->
+              <!-- 装不下不是 blocker：生成前会问一次，确认了照样能生成。三族分开说 -->
               <div v-if="cap?.over" class="border-st-review/40 bg-base-2 mt-1.5 border p-1.5">
-                <p class="text-st-review text-2xs">
-                  采用了 {{ cap.ref_count }} 张参考图，这里只能喂 {{ cap.limit }} 张，会丢
-                  {{ cap.dropped }} 张（{{ cap.dropped_labels.join('、') }}）。
+                <p
+                  v-for="b in capBlocks.filter((x) => x.over)"
+                  :key="b.media"
+                  class="text-st-review text-2xs"
+                >
+                  采用了 {{ b.ref_count }} 个{{ b.label }}，这里只能喂 {{ b.limit }} 个，会丢
+                  {{ b.dropped }} 个（{{ b.dropped_labels.join('、') }}）。
                 </p>
                 <p class="text-fg-4 mt-0.5 text-2xs">
-                  {{ cap.detail }}生成时会先问一次；不想丢就在下面把不重要的那几张移除，自己决定丢哪张。
+                  {{
+                    cap.detail
+                  }}生成时会先问一次；不想丢就在下面把不重要的那几个移除，自己决定丢哪个。
                 </p>
               </div>
 
@@ -657,8 +868,8 @@ async function confirmDrop(): Promise<void> {
               </p>
               <EmptyState
                 v-if="workbench.included.length === 0"
-                title="一条参考都没有"
-                body="用上面四条路里的任意一条给它首帧——账单会立刻重算。"
+                title="一条参考素材都没有"
+                body="挂个形象、选个地点变体，或者用「加素材」上传一个——账单会立刻重算。首帧是上面那个槽位，和这里是两件事。"
               />
               <ul v-else class="mt-1 grid grid-cols-4 gap-1.5">
                 <li
@@ -667,21 +878,49 @@ async function confirmDrop(): Promise<void> {
                   class="border-line-1 bg-base-2 border"
                 >
                   <div class="bg-base-3 flex h-20 items-center justify-center overflow-hidden">
+                    <!-- 图片走 <img>、视频走 <video>、音频走 <audio>：三族绝不混用一个标签 -->
                     <img
-                      v-if="itemThumb(item.asset_path)"
-                      :src="itemThumb(item.asset_path)"
+                      v-if="mediaOf(item) === 'image' && itemUrl(item)"
+                      :src="itemUrl(item)"
                       class="max-h-full max-w-full object-contain"
                       :alt="item.label"
                     />
-                    <span v-else class="text-fg-4 text-2xs">
-                      {{ item.missing_file ? '文件不在磁盘上' : '无图' }}
+                    <video
+                      v-else-if="mediaOf(item) === 'video' && itemUrl(item)"
+                      :src="itemUrl(item)"
+                      controls
+                      preload="metadata"
+                      class="max-h-full max-w-full"
+                    />
+                    <audio
+                      v-else-if="mediaOf(item) === 'audio' && itemUrl(item)"
+                      :src="itemUrl(item)"
+                      controls
+                      class="w-full px-1"
+                    />
+                    <span v-else class="text-fg-4 px-1 text-center text-2xs">
+                      {{ item.missing_file ? '文件不在磁盘上' : '无预览' }}
                     </span>
                   </div>
                   <div class="p-1">
                     <div class="flex items-center gap-1">
-                      <!-- 这一张是当首帧还是当参考图：规则在后端，这里只把它标出来 -->
-                      <AppBadge :tone="item.role === 'first_frame' ? 'ok' : 'accent'">
-                        {{ CONTEXT_ROLE_LABEL[item.role ?? ''] ?? '参考图' }}
+                      <!-- 当首 / 末帧还是当参考素材：规则只在后端，这里只把它标出来 -->
+                      <AppBadge
+                        :tone="item.role === 'reference' ? 'accent' : 'ok'"
+                        :title="
+                          item.role === 'reference'
+                            ? '参考素材：告诉模型谁出场、在哪儿、什么动作、什么声音'
+                            : '首尾帧：决定画面从哪一格开始 / 结束'
+                        "
+                      >
+                        {{ CONTEXT_ROLE_LABEL[item.role ?? ''] ?? '参考素材' }}
+                      </AppBadge>
+                      <AppBadge
+                        v-if="item.role === 'reference'"
+                        tone="neutral"
+                        title="进哪一族槽位：图 / 视频 / 音频各填各的，槽位也各算各的"
+                      >
+                        {{ CONTEXT_MEDIA_LABEL[mediaOf(item)] ?? mediaOf(item) }}
                       </AppBadge>
                       <AppBadge tone="neutral">
                         {{ CONTEXT_KIND_LABEL[item.kind] ?? item.kind }}
@@ -691,7 +930,7 @@ async function confirmDrop(): Promise<void> {
                       <AppBadge
                         v-if="item.over_capacity"
                         tone="fail"
-                        title="槽位不够，提交时这一张会被挤掉——生成前会先问一次"
+                        title="槽位不够，提交时这一个会被挤掉——生成前会先问一次"
                       >
                         装不下
                       </AppBadge>
@@ -727,6 +966,9 @@ async function confirmDrop(): Promise<void> {
                 >
                   <AppBadge tone="neutral">
                     {{ CONTEXT_KIND_LABEL[item.kind] ?? item.kind }}
+                  </AppBadge>
+                  <AppBadge v-if="item.media && item.media !== 'image'" tone="neutral">
+                    {{ CONTEXT_MEDIA_LABEL[item.media] ?? item.media }}
                   </AppBadge>
                   <span class="text-fg-2 min-w-0 shrink-0 truncate text-2xs">{{ item.label }}</span>
                   <span class="text-fg-4 min-w-0 flex-1 truncate text-2xs" :title="item.reason">
@@ -819,7 +1061,7 @@ async function confirmDrop(): Promise<void> {
                 <p class="text-fg-4 mt-0.5 text-2xs">
                   {{ v.kind }} · {{ fmt(v.duration) }} · {{ v.created_at.slice(0, 16) }}
                   <template v-if="refCount(v.params)">
-                    · 参考图 {{ refCount(v.params) }} 张
+                    · 参考素材 {{ refCount(v.params) }} 个
                   </template>
                 </p>
                 <!-- 适配器说「少喂了几张」时原样显示：这就是形象跑偏的现场证据 -->
@@ -844,7 +1086,7 @@ async function confirmDrop(): Promise<void> {
             <textarea
               :value="shot.prompt ?? ''"
               rows="3"
-              placeholder="账单里「参考图」那几张会连标签一起喂给模型（要求预设图里有 AIVS_REF_* 槽位）。本轮只做 R2V：必须有首帧。"
+              placeholder="账单里「参考素材」那几个会连标签一起喂给模型（图进 AIVS_REF_*、视频进 AIVS_REF_VIDEO_*、音频进 AIVS_REF_AUDIO_*）。本轮只做 R2V。"
               class="border-line-1 bg-base-2 text-fg-1 placeholder:text-fg-4 focus:border-accent/60 mt-px w-full resize-none border px-1.5 py-1 text-2xs outline-none"
               @change="saveShotText('prompt', ($event.target as HTMLTextAreaElement).value)"
             />

@@ -6,10 +6,13 @@
  * 这一页盯的是**一幕怎么做出来**——所以镜头是列表里的一项，切换要快。
  *
  * 三个刻意的取舍：
- *   1. **首帧来源是四条路，不是一个字段**——角色表 / 地点参考 / 上传 / 上游末帧。
- *      前三条都是「往上下文里加一张图」（override add），最后一条是
- *      「把 prev_shot_id 指过去」，由后端在生成前抽真末帧。页面上要写清区别。
- *   2. **改完必须重拉账单**——挂角色、换首帧、改上游，账单立刻不一样了。
+ *   1. **首帧是镜头上一个显式槽位，不是「账单里优先级最高的那条」**——
+ *      `Shot.first_frame_asset_id` / `last_frame_asset_id` 就是用户按下去的那一下
+ *      （`setFrameSlot` / `uploadFrame`，清空传 `''`）。挂角色 / 选地点变体只是
+ *      **往账单里加参考素材**（谁出场、在哪儿），一张都不会被提拔成画面第一格；
+ *      上游末帧那条仍然是「把 `prev_shot_id` 指过去」，由后端在生成前抽真末帧。
+ *      页面上这三件事必须分开写。
+ *   2. **改完必须重拉账单**——挂角色、填槽位、改上游，账单立刻不一样了。
  *   3. **入队被拒不是异常**——`CONTEXT_INCOMPLETE` 是设计里的门槛，
  *      错误照常显示（含 suggestions），账单一起刷新，让用户看见缺哪条。
  */
@@ -17,7 +20,7 @@
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import { ApiError } from '@/shared/api/client'
-import { assetsApi } from '@/shared/api/assets'
+import { assetsApi, type Asset } from '@/shared/api/assets'
 import { loadNodeOptions, type CastOption, type VariantOption } from '@/shared/api/pickers'
 import {
   contextApi,
@@ -36,6 +39,16 @@ import {
 
 export type { CastOption, VariantOption }
 
+/**
+ * 镜头上那两个显式槽位的字段名。**清空传 `''`**——`null` 会被后端 `exclude_none`
+ * 吃掉，等于没改；两个槽位都**只收图片**（模型端接的是 LoadImage），
+ * 挑了视频 / 音频后端用 422「首帧只能是图片」拦下来。
+ */
+export type FrameSlotKey = 'first_frame_asset_id' | 'last_frame_asset_id'
+
+/** 后缀判图。和后端 `assets.kind_of_suffix` 同一口径，用来筛槽位能挑哪几个资产。 */
+const IMAGE_SUFFIX = /\.(png|jpe?g|webp|bmp|gif|tiff?)$/i
+
 export const useSceneStore = defineStore('scene', () => {
   const scene = ref<Scene | null>(null)
   const shots = ref<Shot[]>([])
@@ -44,6 +57,8 @@ export const useSceneStore = defineStore('scene', () => {
   const versions = ref<GenerationVersion[]>([])
   const castOptions = ref<CastOption[]>([])
   const variants = ref<VariantOption[]>([])
+  /** 工程里的资产，只为两个槽位的下拉与「已有素材」挑选用（缺图的临时帧不在里面）。 */
+  const assets = ref<Asset[]>([])
   /** 最近一次入队产生的任务；页面用它给一句「已入队，去队列页看」。 */
   const lastJob = ref<Job | null>(null)
 
@@ -54,13 +69,31 @@ export const useSceneStore = defineStore('scene', () => {
   const included = computed(() => bill.value?.items.filter((i) => i.included) ?? [])
   const omitted = computed(() => bill.value?.items.filter((i) => !i.included) ?? [])
   const currentVersion = computed(() => versions.value.find((v) => v.is_current) ?? null)
+  /**
+   * 能填进首 / 末帧槽位的资产：**只有图片**，且文件还在磁盘上。
+   * 视频 / 音频不是「不能用」，是该当参考素材加进上下文（`uploadRef`）。
+   */
+  const imageAssets = computed(() =>
+    assets.value.filter((a) => !a.missing && IMAGE_SUFFIX.test(a.path)),
+  )
   /** 这一幕里导演排的戏；转场是系统补的，列表里要分开看。 */
   const realShots = computed(() => shots.value.filter((s) => s.kind !== 'transition'))
   const transitionShots = computed(() => shots.value.filter((s) => s.kind === 'transition'))
   /** 上游可选项：本幕里排在它前面的镜头。跨幕的续接由流程图上的衔接负责。 */
   const prevCandidates = computed(() =>
     realShots.value.filter(
-      (s) => s.id !== selectedShotId.value && s.index_no < (shot.value?.index_no ?? 0),
+      (s) => {
+        if (s.id === selectedShotId.value || s.index_no >= (shot.value?.index_no ?? 0)) return false
+        const byId = new Map(shots.value.map((row) => [row.id, row]))
+        const seen = new Set<string>()
+        let node: string | null = s.id
+        while (node) {
+          if (node === selectedShotId.value || seen.has(node)) return false
+          seen.add(node)
+          node = byId.get(node)?.prev_shot_id ?? null
+        }
+        return true
+      },
     ),
   )
 
@@ -111,11 +144,18 @@ export const useSceneStore = defineStore('scene', () => {
     }
   }
 
-  /** 挑首帧要用的两张清单：形象、地点变体（各自带缩略图，一个接口给全）。 */
+  /**
+   * 挑参考素材要用的清单：形象、地点变体（各自带缩略图，一个接口给全），
+   * 外加工程资产总账——首 / 末帧槽位那两个下拉从它里面挑。
+   */
   async function loadPickers(pid: string): Promise<void> {
-    const options = await loadNodeOptions(pid)
+    const [options, rows] = await Promise.all([
+      loadNodeOptions(pid),
+      assetsApi.list(pid).catch(() => [] as Asset[]),
+    ])
     castOptions.value = options.cast
     variants.value = options.locations
+    assets.value = rows
   }
 
   async function load(pid: string, sid: string): Promise<void> {
@@ -210,17 +250,47 @@ export const useSceneStore = defineStore('scene', () => {
     })
   }
 
-  /** 上传一张图直接当首帧：先登记成资产，再往账单里加一条人工项。 */
-  async function uploadFirstFrame(pid: string, file: File): Promise<void> {
+  /**
+   * 填 / 清一个首末帧槽位。`assetId` 传 `''` 就是清空。
+   *
+   * 这里写的是**镜头上那个字段**，不是往账单里加一条人工项——账单里 `kind=first_frame`
+   * 的那条是这个字段的投影。以前上传首帧走的是 override add，于是「哪一张是首帧」
+   * 由优先级决定，角色三视图会被当成画面第一格喂进 `AIVS_FIRST_FRAME`。
+   */
+  async function setFrameSlot(pid: string, key: FrameSlotKey, assetId: string): Promise<void> {
+    await saveShot(pid, { [key]: assetId })
+  }
+
+  /** 上传一张图并直接填进那个槽位（先登记成资产，再写字段）。 */
+  async function uploadFrame(pid: string, key: FrameSlotKey, file: File): Promise<void> {
     const id = selectedShotId.value
-    if (!id) return
+    const sid = scene.value?.id
+    if (!id || !sid) return
+    await guarded(async () => {
+      const asset = await assetsApi.upload(pid, file, 'upload')
+      await storyApi.updateShot(pid, id, { [key]: asset.id })
+      await loadShots(pid, sid)
+      await refresh(pid)
+    })
+  }
+
+  /**
+   * 上传一个**参考素材**并挂进上下文（人工项，优先级最高）。
+   * 图 / 视频 / 音频都收：参考素材回答的是「谁出场、在哪儿、什么动作、什么声音」，
+   * 不只是「长什么样」。认不出后缀的后端会列出来但不采用，并写清理由。
+   */
+  async function uploadRef(pid: string, file: File): Promise<void> {
+    const id = selectedShotId.value
+    const sid = scene.value?.id
+    if (!id || !sid) return
     await guarded(async () => {
       const asset = await assetsApi.upload(pid, file, 'upload')
       bill.value = await contextApi.override(pid, id, {
         action: 'add',
         asset_id: asset.id,
-        label: '首帧（上传）',
+        label: file.name,
       })
+      await loadShots(pid, sid)
     })
   }
 
@@ -310,6 +380,8 @@ export const useSceneStore = defineStore('scene', () => {
     currentVersion,
     castOptions,
     variants,
+    assets,
+    imageAssets,
     prevCandidates,
     lastJob,
     busy,
@@ -322,7 +394,9 @@ export const useSceneStore = defineStore('scene', () => {
     removeShot,
     setCast,
     override,
-    uploadFirstFrame,
+    setFrameSlot,
+    uploadFrame,
+    uploadRef,
     addVersion,
     setCurrent,
     enqueue,

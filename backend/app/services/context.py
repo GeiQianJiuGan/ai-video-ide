@@ -5,10 +5,23 @@
 人可以手动移除 / 添加 / 替换，覆写记录写在 shot.context_overrides_json，
 随时可以「恢复自动」。
 
-被采用的条目还带一个 `role`：**哪一张当首帧、剩下的当参考图**。这条规则只写在这里，
+被采用的条目还带一个 `role`：**哪一张当首帧 / 末帧，剩下的当参考素材**。这条规则只写在这里，
 `services/generation.py` 照账单读它，不再自己挑一遍——否则界面上标的和真正喂进去的会分叉。
 
-**账单不截断。** 「能收几张参考图」不是我们的设置，而是模型端那份图的事实
+**首尾帧只认显式指定，绝不提拔参考素材。** 以前这里把优先级最高的那一条（通常是角色表）
+自动标成 `first_frame`：界面上给一张三视图标了「首帧」，模型端也真把它当画面第一格用，
+于是画面从一张三视图开始。首尾帧决定「画面从哪一格开始 / 结束」，参考素材决定
+「谁出场、在哪儿、什么动作、什么声音」——两件事，两处表达。现在首尾帧来自
+`Shot.first_frame_asset_id` / `last_frame_asset_id`（用户按下去的那一下，迁移
+`0013_shot_frames`），`use_prev_frame` 的镜头才用上游末帧顶首帧（那是 tail_frame 衔接的
+全部意义）；两个都没有就是**这个镜头没有首帧**，账单照实说。
+
+**参考素材不只有图。** 每条都带 `media`（`image` / `video` / `audio`，只看后缀，
+`assets.kind_of_suffix`），槽位也按媒体分开数（`AIVS_REF_*` / `AIVS_REF_VIDEO_*` /
+`AIVS_REF_AUDIO_*`）——三种混在一起数的话，一段 `.mp4` 会被填进 LoadImage，既不报错
+也出不了片。认不出来的后缀不采用，理由写在条目上。
+
+**账单不截断。** 「能收几个」不是我们的设置，而是模型端那份图的事实
 （`ref_capacity()` 问适配层）。采用的照样全采用，超出槽位的部分变成 `capacity` 块里的
 一句警告，生成前要用户确认（`REF_OVER_CAPACITY`）——悄悄少喂两张图，事后没人查得出
 人物形象为什么跑偏。
@@ -16,11 +29,12 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from app.core.errors import AppError, ErrorCode
 from app.generation.providers import presets
-from app.generation.providers.base import RefCapacity
+from app.generation.providers.base import MEDIA, MEDIA_LABEL, RefCapacity
 from app.persistence.models import Project, utc_now
 from app.persistence.models_cast import Appearance, Character, SheetVersion
 from app.persistence.models_gen import GenerationVersion
@@ -33,16 +47,36 @@ from app.persistence.models_world import (
     Prop,
     PropReference,
 )
+from app.services.assets import kind_of_suffix
 from app.services.base import as_dict, db_of, dump_json, fetch, fetch_all, load_json
 
 #: 优先级：同一角色只留最高的那个形象；上游末帧比道具重要，因为它决定连续性。
+#: 显式指定的首 / 末帧排在最前——它们不占参考槽位，但账单上就该在第一行。
 PRIORITY = {
+    "first_frame": 130,
+    "last_frame": 129,
+    "manual": 110,
     "character_sheet": 100,
     "location_reference": 90,
     "prev_frame": 80,
     "prop_reference": 60,
-    "manual": 110,
 }
+
+#: 首帧 / 末帧只能是图片：模型端那两个槽位接的是 LoadImage，喂一段视频进去不出片。
+FRAME_KINDS = ("first_frame", "last_frame")
+
+#: 这条素材**是什么**（`MEDIA_LABEL` 说的是它**当什么用**：参考图 / 参考视频 / 参考音频）。
+#: 「首帧只能是图片」「不认识这种文件」两句话都用它，别在两处各写一遍。
+MEDIA_NOUN = {"image": "图片", "video": "视频", "audio": "音频", "other": "不认识的文件"}
+
+
+def _asset_label(row: Asset | None, asset_id: str) -> str:
+    """账单上显示的文件名。资产行取不到时退回 id——照实说「找不到」比留空好排查。"""
+    if row is None:
+        return f"资产 {asset_id}（找不到）"
+    meta = load_json(row.meta_json, {})
+    name = meta.get("filename") if isinstance(meta, dict) else None
+    return str(name or Path(row.path).name)
 
 
 def ref_capacity(capacity: RefCapacity | None = None) -> RefCapacity:
@@ -63,62 +97,104 @@ def ref_capacity(capacity: RefCapacity | None = None) -> RefCapacity:
 
 
 async def project_ref_capacity(pid: str) -> RefCapacity | None:
-    """The selected preset Workflow is the project's only reference-image capacity source."""
+    """工程选的那份预设是这个工程唯一的参考素材容量来源。
+
+    三种媒体各数一遍（`presets.slot_counts`）：图片槽位是 `AIVS_REF_*`，视频是
+    `AIVS_REF_VIDEO_*`，音频是 `AIVS_REF_AUDIO_*`。视频 / 音频 0 槽是常态
+    （大多数图只收图），所以只在 detail 里附一句，不当成异常。
+    """
     project = (await fetch_all(db_of(pid), Project))[0]
     name = project.r2v_preset_name or project.preset_name
     if not name:
         return None
-    count = presets.slot_count(name)
-    if count is None:
+    counts = presets.slot_counts(name)
+    if counts is None:
         return None
-    return RefCapacity(count, name, f"项目预设 {name} 标了 {count} 个 AIVS_REF_* 槽位。")
+    # 列出所有媒体类型的槽位情况
+    parts = [f"参考图 {counts['image']} 个"]
+    for media in ("video", "audio"):
+        parts.append(f"{presets.MEDIA_LABEL[media]} {counts[media]} 个")
+    detail = f"当前预设 {name} 支持：{' / '.join(parts)}。"
+    return RefCapacity(counts["image"], name, detail, video=counts["video"], audio=counts["audio"])
 
 
 def _assign_roles(items: list[dict[str, Any]], has_prev: bool) -> None:
-    """给采用的条目标上 `role`：一张 `first_frame`，其余 `reference`。
+    """给采用的条目标上 `role`：`first_frame` / `last_frame`，其余 `reference`。
 
     规则只有这一份，`services/generation.py` 照它读——以前那边自己又挑了一遍首帧，
     于是检查器上标的和真正喂进去的可能不是同一张。
 
-    挑首帧的顺序：**有上游就用上游末帧**（连续性优先，这是 tail_frame 衔接的全部意义），
-    否则用优先级最高的那张（通常是角色表）。没有采用任何条目时谁都不标，
-    生成层会去 `params.first_frame_asset_id` 里找显式指定的那张。
+    **顺序只有两级**：先看镜头上显式指定的那两个槽位（`Shot.first_frame_asset_id` /
+    `last_frame_asset_id`，就是用户按下去的那一下），首帧没指定而这个镜头要续接上游时
+    才用上游末帧顶上（tail_frame 衔接的全部意义）。**到此为止**——两个都没有就是这个
+    镜头没有首帧，绝不把优先级最高的参考素材提拔上来。以前那么做的结果是：界面上给一张
+    三视图标了「首帧」，模型端也真把它当画面第一格用，画面从一张三视图开始。
     """
-    used = [i for i in items if i.get("included")]
     for item in items:
         item["role"] = "reference" if item.get("included") else ""
-    if not used:
-        return
-    first = next((i for i in used if i["kind"] == "prev_frame"), None) if has_prev else None
-    (first or used[0])["role"] = "first_frame"
+    used = [i for i in items if i.get("included")]
+    explicit = set()
+    for slot in FRAME_KINDS:
+        hit = next((i for i in used if i["kind"] == slot), None)
+        if hit is not None:
+            hit["role"] = slot
+            explicit.add(slot)
+    if "first_frame" not in explicit and has_prev:
+        prev = next((i for i in used if i["kind"] == "prev_frame"), None)
+        if prev is not None:
+            prev["role"] = "first_frame"
 
 
 def _capacity_of(items: list[dict[str, Any]], cap: RefCapacity) -> dict[str, Any]:
-    """账单这一次会不会有图喂不进去——**只报，不删**。
+    """账单这一次会不会有素材喂不进去——**只报，不删**。
 
-    数的是 `role == "reference"` 那几条：当首帧的那张走 `AIVS_FIRST_FRAME`，不占参考图槽位。
-    喂不进去的一定是**末尾**几条，因为适配器按账单顺序填槽位（`comfy_preset._refs` 取前 N 张），
-    优先级最低的先被挤掉。它们照旧 `included=True`，只是多一个 `over_capacity` 标记——
-    「这张我采用了、但这份图收不下」和「这张我没采用」是两件事，界面上得分得开。
+    数的是 `role == "reference"` 那几条，而且**按媒体各数一遍**：首 / 末帧走
+    `AIVS_FIRST_FRAME` / `AIVS_LAST_FRAME`，不占参考槽位；参考图数 `AIVS_REF_*`、
+    参考视频数 `AIVS_REF_VIDEO_*`、参考音频数 `AIVS_REF_AUDIO_*`——三种混在一起数的话，
+    图多音频少也会报成「装得下」，然后那段音频被安静地丢掉。
+    喂不进去的一定是每一族里**末尾**几条，因为适配器按账单顺序填槽位
+    （`comfy_preset._refs` 取前 N 个），优先级最低的先被挤掉。它们照旧 `included=True`，
+    只是多一个 `over_capacity` 标记——「这条我采用了、但这份图收不下」和「这条我没采用」
+    是两件事，界面上得分得开。
 
-    这是一份估算：真正喂了哪几张由提交那一刻的 `params.refs` / `params.ref_notes` 记录
-    （显式指定首帧、同一张图重复出现都会让数量差一张），出入只会更少不会更多。
+    顶层那几个字段（`limit` / `ref_count` / `dropped` / `dropped_labels`）说的是**参考图**，
+    这是历史口径，`generation.drop_entry` 与旧版本里冻结的账单都照它读；三种媒体的完整
+    账在 `media` 子块里，`over` 是「任意一种装不下」。
+
+    这是一份估算：真正喂了哪几个由提交那一刻的 `params.refs` / `params.ref_notes` 记录
+    （同一份素材重复出现会让数量差一个），出入只会更少不会更多。
     """
-    refs = [i for i in items if i.get("role") == "reference"]
-    dropped = cap.dropped(len(refs))
-    tail = refs[len(refs) - dropped :] if dropped else []
-    over = {id(i) for i in tail}
     for item in items:
-        item["over_capacity"] = id(item) in over
+        item["over_capacity"] = False
+    refs = [i for i in items if i.get("role") == "reference"]
+    per_media: dict[str, dict[str, Any]] = {}
+    for media in MEDIA:
+        group = [i for i in refs if (i.get("media") or "image") == media]
+        dropped = cap.dropped_of(media, len(group))
+        tail = group[len(group) - dropped :] if dropped else []
+        for item in tail:
+            item["over_capacity"] = True
+        per_media[media] = {
+            "label": MEDIA_LABEL[media],
+            #: None = 不限制。0 是有意义的答案（那份图这一族槽位一个都没标）。
+            "limit": cap.limit_of(media),
+            "ref_count": len(group),
+            "dropped": dropped,
+            "dropped_labels": [str(i["label"]) for i in tail],
+            "over": dropped > 0,
+        }
+    image = per_media["image"]
     return {
         #: None = 不限制。0 是有意义的答案（那份图一个参考图槽位都没标）。
         "limit": cap.limit,
         "source": cap.source,
         "detail": cap.detail,
-        "ref_count": len(refs),
-        "dropped": dropped,
-        "dropped_labels": [str(i["label"]) for i in tail],
-        "over": dropped > 0,
+        "ref_count": image["ref_count"],
+        "dropped": image["dropped"],
+        "dropped_labels": image["dropped_labels"],
+        "over": any(block["over"] for block in per_media.values()),
+        #: 三种媒体各自的账。顶层那几个字段是它的 `image` 那一份（历史口径）。
+        "media": per_media,
     }
 
 
@@ -157,47 +233,88 @@ class ContextService:
 
         assets = {a.id: a for a in await fetch_all(db, Asset)}
         items: list[dict[str, Any]] = []
+        # 转场跳过角色参考素材，但后面的完整性检查仍需一个稳定的空列表。
+        picks: list[str] = []
 
-        # 1. 出场形象的角色表：同一角色保留优先级最高的一个形象。
-        #    镜头没单独挂出场表时**继承这一幕的人物**——流程图上那些「人物」小节点
-        #    必须真的影响生成，否则只是装饰（幕级清单见 services/story.py::set_scene_cast）。
-        cast_rows = await fetch_all(db, ShotCast, where=ShotCast.shot_id == shot_id)
-        picks = [r.appearance_id for r in sorted(cast_rows, key=lambda r: r.id)]
-        inherited = False
-        if not picks:
-            scene_cast = await fetch_all(
-                db, SceneCast, where=SceneCast.scene_id == scene.id, order_by=SceneCast.index_no
-            )
-            picks = [r.appearance_id for r in scene_cast]
-            inherited = bool(picks)
-        apps = {a.id: a for a in await fetch_all(db, Appearance)}
-        chars = {c.id: c for c in await fetch_all(db, Character)}
-        sheets = await fetch_all(db, SheetVersion, order_by=SheetVersion.version_no)
-        seen_char: set[str] = set()
-        for appearance_id in picks:
-            app = apps.get(appearance_id)
-            if app is None:
+        # **转场镜头只要首尾帧，不要参考素材。** 两帧之间的过渡只靠首尾帧驱动，
+        # 加角色表 / 地点图只会让画面跑偏。
+        is_transition = shot.kind == "transition"
+
+        # 0. 镜头上显式指定的首帧 / 末帧：**「哪一张是首帧」是用户按下去的那一下。**
+        #    它们不占参考槽位（走 AIVS_FIRST_FRAME / AIVS_LAST_FRAME），但必须上账单——
+        #    首尾帧决定画面从哪一格开始 / 结束，是这一次生成里影响最大的两条。
+        #    没指定就是没有这一条（老工程两列都是空的，行为与以前一致）。
+        for slot, slot_asset_id, slot_label in (
+            ("first_frame", shot.first_frame_asset_id, "首帧"),
+            ("last_frame", shot.last_frame_asset_id, "末帧"),
+        ):
+            if not slot_asset_id:
                 continue
-            char = chars.get(app.character_id)
-            mine = [s for s in sheets if s.appearance_id == app.id]
-            current = next((s for s in mine if s.is_current), mine[-1] if mine else None)
-            label = (
-                f"{char.name if char else '未知角色'}（{app.name}）"
-                f" · Character Sheet v{current.version_no}"
-                if current
-                else f"{char.name if char else '未知角色'}（{app.name}） · 无角色表"
-            )
-            duplicate = app.character_id in seen_char
-            seen_char.add(app.character_id)
+            row = assets.get(slot_asset_id)
+            picked_media = kind_of_suffix(Path(row.path).suffix) if row is not None else "image"
+            usable = row is None or picked_media == "image"
             items.append(
                 {
-                    "key": f"character_sheet:{app.id}",
-                    "kind": "character_sheet",
-                    "label": label + ("（本幕人物）" if inherited else ""),
-                    "priority": PRIORITY["character_sheet"] if not duplicate else 30,
-                    "asset_id": current.asset_id if current else None,
-                    "source_id": app.id,
-                    "eligible": bool(current and current.asset_id) and not duplicate,
+                    "key": f"{slot}:{slot_asset_id}",
+                    "kind": slot,
+                    "label": f"{slot_label} · {_asset_label(row, slot_asset_id)}",
+                    "priority": PRIORITY[slot],
+                    "asset_id": slot_asset_id,
+                    "source_id": None,
+                    "eligible": usable,
+                    "reason": (
+                        f"镜头上指定的{slot_label}"
+                        if usable
+                        else f"{slot_label}只能是图片，这一个是{MEDIA_NOUN[picked_media]}"
+                    ),
+                }
+            )
+
+        # 转场镜头只要首尾帧，跳过所有参考素材收集（角色表、地点图、道具）。
+        if is_transition:
+            # 直接跳到最后的采纳与排序环节
+            pass
+        else:
+            # 1. 出场形象的角色表：同一角色保留优先级最高的一个形象。
+            #    镜头没单独挂出场表时**继承这一幕的人物**——流程图上那些「人物」小节点
+            #    必须真的影响生成，否则只是装饰（幕级清单见 services/story.py::set_scene_cast）。
+            cast_rows = await fetch_all(db, ShotCast, where=ShotCast.shot_id == shot_id)
+            picks = [r.appearance_id for r in sorted(cast_rows, key=lambda r: r.id)]
+            inherited = False
+            if not picks:
+                scene_cast = await fetch_all(
+                    db, SceneCast, where=SceneCast.scene_id == scene.id, order_by=SceneCast.index_no
+                )
+                picks = [r.appearance_id for r in scene_cast]
+                inherited = bool(picks)
+            apps = {a.id: a for a in await fetch_all(db, Appearance)}
+            chars = {c.id: c for c in await fetch_all(db, Character)}
+            sheets = await fetch_all(db, SheetVersion, order_by=SheetVersion.version_no)
+            seen_char: set[str] = set()
+            for appearance_id in picks:
+                app = apps.get(appearance_id)
+                if app is None:
+                    continue
+                char = chars.get(app.character_id)
+                mine = [s for s in sheets if s.appearance_id == app.id]
+                current = next((s for s in mine if s.is_current), mine[-1] if mine else None)
+                label = (
+                    f"{char.name if char else '未知角色'}（{app.name}）"
+                    f" · Character Sheet v{current.version_no}"
+                    if current
+                    else f"{char.name if char else '未知角色'}（{app.name}） · 无角色表"
+                )
+                duplicate = app.character_id in seen_char
+                seen_char.add(app.character_id)
+                items.append(
+                    {
+                        "key": f"character_sheet:{app.id}",
+                        "kind": "character_sheet",
+                        "label": label + ("（本幕人物）" if inherited else ""),
+                        "priority": PRIORITY["character_sheet"] if not duplicate else 30,
+                        "asset_id": current.asset_id if current else None,
+                        "source_id": app.id,
+                        "eligible": bool(current and current.asset_id) and not duplicate,
                     "reason": (
                         "同一角色已有更高优先级形象"
                         if duplicate
@@ -214,142 +331,149 @@ class ContextService:
                 }
             )
 
-        # 2. 地点参考：本 Scene 的主地点优先；幕里另外选的地点也能用，只是低一档；
-        #    同地点的其他变体列出但省略，理由写清。
-        variants = {v.id: v for v in await fetch_all(db, LocationVariant)}
-        locations = {loc.id: loc for loc in await fetch_all(db, Location)}
-        loc_refs = await fetch_all(db, LocationReference, order_by=LocationReference.created_at)
-        chosen = variants.get(scene.location_variant_id or "")
-        picked_rows = await fetch_all(
-            db,
-            SceneLocation,
-            where=SceneLocation.scene_id == scene.id,
-            order_by=SceneLocation.index_no,
-        )
-        picked = {r.location_variant_id for r in picked_rows}
-        for ref in loc_refs:
-            variant = variants.get(ref.variant_id)
-            if variant is None:
-                continue
-            location = locations.get(variant.location_id)
-            same = chosen is not None and variant.id == chosen.id
-            extra = not same and variant.id in picked
-            sibling = (
-                not same
-                and not extra
-                and chosen is not None
-                and variant.location_id == chosen.location_id
+            # 2. 地点参考：本 Scene 的主地点优先；幕里另外选的地点也能用，只是低一档；
+            #    同地点的其他变体列出但省略，理由写清。
+            variants = {v.id: v for v in await fetch_all(db, LocationVariant)}
+            locations = {loc.id: loc for loc in await fetch_all(db, Location)}
+            loc_refs = await fetch_all(db, LocationReference, order_by=LocationReference.created_at)
+            chosen = variants.get(scene.location_variant_id or "")
+            picked_rows = await fetch_all(
+                db,
+                SceneLocation,
+                where=SceneLocation.scene_id == scene.id,
+                order_by=SceneLocation.index_no,
             )
-            if not same and not extra and not sibling:
-                continue
-            items.append(
-                {
-                    "key": f"location_reference:{ref.id}",
-                    "kind": "location_reference",
-                    "label": f"{location.name if location else '未知地点'} · {variant.name}"
-                    + (f" · 机位 {ref.camera}" if ref.camera else ""),
-                    "priority": (
-                        PRIORITY["location_reference"]
-                        if same
-                        else (PRIORITY["location_reference"] - 5 if extra else 20)
-                    ),
-                    "asset_id": ref.asset_id,
-                    "source_id": ref.id,
-                    "eligible": same or extra,
-                    "reason": (
-                        "本 Scene 选定的地点变体"
-                        if same
-                        else ("本幕另外选中的地点变体" if extra else "与本 Scene 的时间设定冲突")
-                    ),
-                }
-            )
-
-        # 3. 上游镜头末帧：连续性的来源。
-        #    注意这里指的是**抽出来的那张图**，不是上游那整段视频——模型端拿一段视频当
-        #    首帧是用不了的。抽帧要起 FFmpeg 进程，所以不在这条只读路径上做：还没抽的时候
-        #    先标 pending_extract，真正抽取发生在入队前（services/generation.py）。
-        if include_prev and shot.prev_shot_id:
-            prev = next((s for s in await fetch_all(db, Shot) if s.id == shot.prev_shot_id), None)
-            version = None
-            if prev is not None and prev.current_version_id:
-                version = next(
-                    (
-                        v
-                        for v in await fetch_all(db, GenerationVersion)
-                        if v.id == prev.current_version_id
-                    ),
-                    None,
+            picked = {r.location_variant_id for r in picked_rows}
+            for ref in loc_refs:
+                variant = variants.get(ref.variant_id)
+                if variant is None:
+                    continue
+                location = locations.get(variant.location_id)
+                same = chosen is not None and variant.id == chosen.id
+                extra = not same and variant.id in picked
+                sibling = (
+                    not same
+                    and not extra
+                    and chosen is not None
+                    and variant.location_id == chosen.location_id
                 )
-            source_asset = version.asset_id if version else None
-            ready = source_asset is not None
-            frame = _extracted_frame(assets.values(), source_asset) if ready else None
-            items.append(
-                {
-                    "key": f"prev_frame:{shot.prev_shot_id}",
-                    "kind": "prev_frame",
-                    "label": f"Shot {prev.index_no if prev else '?'} 末帧",
-                    "priority": PRIORITY["prev_frame"],
-                    "asset_id": frame or source_asset,
-                    "source_id": shot.prev_shot_id,
-                    "eligible": ready,
-                    "pending_extract": bool(ready and frame is None),
-                    "from_asset_id": source_asset,
-                    "reason": (
-                        "已抽取的上游末帧，用于保持连续性"
-                        if frame
-                        else (
-                            "上游已出片，生成前会从它抽取末帧"
-                            if ready
-                            else "上游镜头还没有当前版本，末帧不存在"
-                        )
-                    ),
-                }
-            )
+                if not same and not extra and not sibling:
+                    continue
+                items.append(
+                    {
+                        "key": f"location_reference:{ref.id}",
+                        "kind": "location_reference",
+                        "label": f"{location.name if location else '未知地点'} · {variant.name}"
+                        + (f" · 机位 {ref.camera}" if ref.camera else ""),
+                        "priority": (
+                            PRIORITY["location_reference"]
+                            if same
+                            else (PRIORITY["location_reference"] - 5 if extra else 20)
+                        ),
+                        "asset_id": ref.asset_id,
+                        "source_id": ref.id,
+                        "eligible": same or extra,
+                        "reason": (
+                            "本 Scene 选定的地点变体"
+                            if same
+                            else ("本幕另外选中的地点变体" if extra else "与本 Scene 的时间设定冲突")
+                        ),
+                    }
+                )
 
-        # 4. 出场道具参考图
-        props = {p.id: p for p in await fetch_all(db, Prop)}
-        prop_refs = await fetch_all(db, PropReference)
-        for row in await fetch_all(db, ShotProp, where=ShotProp.shot_id == shot_id):
-            prop = props.get(row.prop_id)
-            mine = [r for r in prop_refs if r.prop_id == row.prop_id]
-            current = next((r for r in mine if r.is_current), None)
-            present = row.state == "present"
-            items.append(
-                {
-                    "key": f"prop_reference:{row.prop_id}",
-                    "kind": "prop_reference",
-                    "label": f"{prop.name if prop else '未知道具'} · 参考图 v{current.version_no}"
-                    if current
-                    else f"{prop.name if prop else '未知道具'} · 无参考图",
-                    "priority": PRIORITY["prop_reference"] if present else 10,
-                    "asset_id": current.asset_id if current else None,
-                    "source_id": row.prop_id,
-                    "eligible": bool(current) and present,
-                    "reason": ("本镜头出场道具" if present else "该道具在本镜头标为已丢弃")
-                    if current
-                    else "该道具还没有参考图",
-                }
-            )
+            # 3. 上游镜头末帧：连续性的来源。
+            #    注意这里指的是**抽出来的那张图**，不是上游那整段视频——模型端拿一段视频当
+            #    首帧是用不了的。抽帧要起 FFmpeg 进程，所以不在这条只读路径上做：还没抽的时候
+            #    先标 pending_extract，真正抽取发生在入队前（services/generation.py）。
+            if include_prev and shot.prev_shot_id:
+                prev = next((s for s in await fetch_all(db, Shot) if s.id == shot.prev_shot_id), None)
+                version = None
+                if prev is not None and prev.current_version_id:
+                    version = next(
+                        (
+                            v
+                            for v in await fetch_all(db, GenerationVersion)
+                            if v.id == prev.current_version_id
+                        ),
+                        None,
+                    )
+                source_asset = version.asset_id if version else None
+                ready = source_asset is not None
+                frame = _extracted_frame(assets.values(), source_asset) if ready else None
+                items.append(
+                    {
+                        "key": f"prev_frame:{shot.prev_shot_id}",
+                        "kind": "prev_frame",
+                        "label": f"Shot {prev.index_no if prev else '?'} 末帧",
+                        "priority": PRIORITY["prev_frame"],
+                        "asset_id": frame or source_asset,
+                        "source_id": shot.prev_shot_id,
+                        "eligible": ready,
+                        "pending_extract": bool(ready and frame is None),
+                        "from_asset_id": source_asset,
+                        "reason": (
+                            "已抽取的上游末帧，用于保持连续性"
+                            if frame
+                            else (
+                                "上游已出片，生成前会从它抽取末帧"
+                                if ready
+                                else "上游镜头还没有当前版本，末帧不存在"
+                            )
+                        ),
+                    }
+                )
 
-        # 5. 人工添加的条目：优先级最高，永不被自动逻辑挤掉
-        for extra in added:
-            items.append(
-                {
-                    "key": extra.get("key") or f"manual:{extra.get('asset_id')}",
-                    "kind": "manual",
-                    "label": extra.get("label") or "手动添加的参考图",
-                    "priority": PRIORITY["manual"],
-                    "asset_id": extra.get("asset_id"),
-                    "source_id": None,
-                    "eligible": True,
-                    "reason": "手动添加",
-                }
-            )
+            # 4. 出场道具参考图
+            props = {p.id: p for p in await fetch_all(db, Prop)}
+            prop_refs = await fetch_all(db, PropReference)
+            for row in await fetch_all(db, ShotProp, where=ShotProp.shot_id == shot_id):
+                prop = props.get(row.prop_id)
+                mine = [r for r in prop_refs if r.prop_id == row.prop_id]
+                current = next((r for r in mine if r.is_current), None)
+                present = row.state == "present"
+                items.append(
+                    {
+                        "key": f"prop_reference:{row.prop_id}",
+                        "kind": "prop_reference",
+                        "label": f"{prop.name if prop else '未知道具'} · 参考图 v{current.version_no}"
+                        if current
+                        else f"{prop.name if prop else '未知道具'} · 无参考图",
+                        "priority": PRIORITY["prop_reference"] if present else 10,
+                        "asset_id": current.asset_id if current else None,
+                        "source_id": row.prop_id,
+                        "eligible": bool(current) and present,
+                        "reason": ("本镜头出场道具" if present else "该道具在本镜头标为已丢弃")
+                        if current
+                        else "该道具还没有参考图",
+                    }
+                )
 
-        # 排序 → 应用覆写（**不再卡上限**：能收几张是模型端的事，超了在生成前问用户）
+            # 5. 人工添加的条目：优先级最高，永不被自动逻辑挤掉
+            for extra in added:
+                items.append(
+                    {
+                        "key": extra.get("key") or f"manual:{extra.get('asset_id')}",
+                        "kind": "manual",
+                        "label": extra.get("label") or "手动添加的参考素材",
+                        "priority": PRIORITY["manual"],
+                        "asset_id": extra.get("asset_id"),
+                        "source_id": None,
+                        "eligible": True,
+                        "reason": "手动添加",
+                    }
+                )
+
+        # 排序 → 应用覆写（**不再卡上限**：能收几个是模型端的事，超了在生成前问用户）
         items.sort(key=lambda i: (-int(i["priority"]), str(i["key"])))
         included = 0
         for item in items:
+            asset = assets.get(item["asset_id"] or "")
+            #: 这一条是什么媒体：**只看后缀**（`assets.kind_of_suffix`）。槽位按媒体分开数，
+            #: 所以这个字段决定它去数哪一族（`AIVS_REF_*` / `AIVS_REF_VIDEO_*` /
+            #: `AIVS_REF_AUDIO_*`）。资产行取不到时按图片算——那是 `missing_file`，
+            #: 「媒体未知」不等于「这种媒体喂不进去」。
+            media = kind_of_suffix(Path(asset.path).suffix) if asset is not None else "image"
+            item["media"] = media
             item["manual"] = item["kind"] == "manual" or item["key"] in removed
             if item["key"] in removed:
                 item["included"] = False
@@ -358,11 +482,18 @@ class ContextService:
                 item["included"] = False
             elif item["asset_id"] is None:
                 item["included"] = False
-                item["reason"] = "没有可用的图片资产"
+                item["reason"] = "没有可用的资产"
+            elif media == "other":
+                # 认不出后缀的一律不采用：当图填进 LoadImage 既不报错也出不了片，
+                # 悄悄喂进去比明说更糟。
+                item["included"] = False
+                item["reason"] = (
+                    f"不认识这种文件（{Path(asset.path).suffix or '没有后缀'}），"
+                    "参考素材只能是图片 / 视频 / 音频"
+                )
             else:
                 item["included"] = True
                 included += 1
-            asset = assets.get(item["asset_id"] or "")
             item["asset_path"] = asset.path if asset else None
             item["missing_file"] = bool(item["asset_id"]) and asset is None
             item.pop("eligible", None)
@@ -378,8 +509,10 @@ class ContextService:
         # 幕级 prompt 是镜头没写 prompt 时的兜底，取值口径与 generation.enqueue_shot 一致
         if not (shot.prompt or shot.description or scene.prompt):
             problems.append("既没有 prompt 也没有画面描述")
-        if include_prev and shot.prev_shot_id and not any(
-            i["kind"] == "prev_frame" and i["included"] for i in items
+        if (
+            include_prev
+            and shot.prev_shot_id
+            and not any(i["kind"] == "prev_frame" and i["included"] for i in items)
         ):
             problems.append("需要上游末帧，但上游镜头还没有当前版本")
 
@@ -508,8 +641,11 @@ class ContextService:
                     "label": i["label"],
                     "asset_id": i["asset_id"],
                     "priority": i["priority"],
-                    #: 这一张是当首帧还是当参考图。冻结它，事后才说得清「喂了什么」。
+                    #: 这一条是当首帧 / 末帧还是当参考素材。冻结它，事后才说得清「喂了什么」。
                     "role": i.get("role") or "reference",
+                    #: 是图 / 是视频 / 是音频。槽位按媒体分开算，所以这个也得冻结——
+                    #: 不然事后看不出「那段音频到底有没有送出去」。
+                    "media": i.get("media") or "image",
                     #: 采用了、但这份图收不下（会在提交时按顺序被挤掉）。
                     "over_capacity": bool(i.get("over_capacity")),
                 }

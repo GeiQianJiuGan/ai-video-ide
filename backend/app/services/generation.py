@@ -22,7 +22,7 @@ from app.core.logging import get_logger
 from app.events.bus import Channel, bus
 from app.generation.comfy.client import comfy, outputs_of
 from app.generation.providers import registry
-from app.generation.providers.base import RefImage, TaskState, VideoRequest
+from app.generation.providers.base import RefAsset, TaskState, VideoRequest
 from app.persistence.models import Project, utc_now
 from app.persistence.models_gen import GenerationVersion, Job
 from app.persistence.models_global import GlobalWorkflow
@@ -44,51 +44,92 @@ POLL_INTERVAL = 1.0
 #: 前端按「哪个非空」决定画 `<video>` 还是 `<img>`，键时有时无就得到处写可选判断。
 _NO_MEDIA: dict[str, Any] = {"video_path": None, "thumbnail_path": None}
 
+#: 参考素材的量词：图片是「张」，视频 / 音频是「段」。只用在四要素错误的文案里。
+_UNIT = {"image": "张", "video": "段", "audio": "段"}
+
+
+def _unit_of(block: dict[str, Any]) -> str:
+    return _UNIT.get(str(block.get("media") or "image"), "个")
+
 
 def drop_entry(shot: Shot, capacity: dict[str, Any]) -> dict[str, Any] | None:
-    """这个镜头会不会有参考图喂不进去。装得下时回 None。
+    """这个镜头会不会有参考素材喂不进去。装得下时回 None。
 
-    `capacity` 就是账单里的那一块（`context._capacity_of`）——**能收几张由适配层回答**，
-    这里不再有任何应用级上限可看。
+    `capacity` 就是账单里的那一块（`context._capacity_of`）——**能收几个由适配层回答**，
+    这里不再有任何应用级上限可看。**按媒体分开报**：图片槽位与视频 / 音频槽位是三族
+    不同的标题（`AIVS_REF_*` / `AIVS_REF_VIDEO_*` / `AIVS_REF_AUDIO_*`），
+    混成一个数字的话「图装得下、那段音频没槽位」会被算成装得下，然后音频被安静地丢掉。
+    顶层字段仍是参考图那一份（历史口径，旧版本冻结的账单没有 `media` 子块）。
     """
     if not capacity.get("over"):
         return None
+    per_media = capacity.get("media") or {}
+    blocks = [
+        {
+            "media": media,
+            "label": str(block.get("label") or media),
+            "ref_count": int(block.get("ref_count") or 0),
+            "limit": block.get("limit"),
+            "dropped": int(block.get("dropped") or 0),
+            "labels": [str(x) for x in (block.get("dropped_labels") or [])],
+        }
+        for media, block in per_media.items()
+        if isinstance(block, dict) and block.get("over")
+    ]
+    if not blocks:  # 旧账单：只有顶层那一份（参考图）
+        blocks = [
+            {
+                "media": "image",
+                "label": "参考图",
+                "ref_count": int(capacity.get("ref_count") or 0),
+                "limit": capacity.get("limit"),
+                "dropped": int(capacity.get("dropped") or 0),
+                "labels": [str(x) for x in (capacity.get("dropped_labels") or [])],
+            }
+        ]
     return {
         "shot_id": shot.id,
         "index_no": shot.index_no,
         "title": shot.title,
         "ref_count": int(capacity.get("ref_count") or 0),
         "limit": capacity.get("limit"),
-        "dropped": int(capacity.get("dropped") or 0),
-        "labels": [str(x) for x in (capacity.get("dropped_labels") or [])],
+        "dropped": sum(b["dropped"] for b in blocks),
+        "labels": [label for b in blocks for label in b["labels"]],
         "source": str(capacity.get("source") or ""),
+        #: 三种媒体里哪几族装不下，各丢几个。界面与错误文案照它逐族说清。
+        "media": blocks,
     }
 
 
 def over_capacity_error(drops: list[dict[str, Any]]) -> AppError:
-    """「会丢几张图，还继续吗」——**这不是失败，是一次确认**。
+    """「会丢几个素材，还继续吗」——**这不是失败，是一次确认**。
 
     所以它必须在入队**任何一个任务之前**抛出来（批量路径先整体扫一遍再动手）：
     一半已经入队、另一半等确认的话，用户点了确认就会把前一半再入队一遍。
     确认的样子是重新调一次同一个入口并带上 `allow_ref_drop=true`，
-    之后按槽位顺序喂前 N 张，少喂了哪几张照旧记进 `params.ref_notes`。
+    之后按槽位顺序喂前 N 个，少喂了哪几个照旧记进 `params.ref_notes`。
     """
     total = sum(int(d["dropped"]) for d in drops)
     lines = "；".join(
-        f"Shot {d['index_no']} 采用了 {d['ref_count']} 张参考图，这里只能喂 {d['limit']} 张，"
-        f"会丢 {d['dropped']} 张" + (f"（{'、'.join(d['labels'])}）" if d["labels"] else "")
+        "，".join(
+            f"Shot {d['index_no']} 采用了 {b['ref_count']}{_unit_of(b)}{b['label']}，"
+            f"这里只能喂 {b['limit']}{_unit_of(b)}，会丢 {b['dropped']}{_unit_of(b)}"
+            + (f"（{'、'.join(b['labels'])}）" if b["labels"] else "")
+            for b in d.get("media") or []
+        )
         for d in drops
     )
     source = next((str(d["source"]) for d in drops if d.get("source")), "")
-    where = f"（能收几张由{source}决定）" if source else ""
+    where = f"（能收几个由{source}决定）" if source else ""
     return AppError(
         ErrorCode.REF_OVER_CAPACITY,
-        f"有 {len(drops)} 个镜头的参考图装不下，会丢 {total} 张",
-        f"{lines}{where}。丢的是账单里优先级最低的那几张——角色图最先保住，道具图最先被挤掉。",
+        f"有 {len(drops)} 个镜头的参考素材装不下，会丢 {total} 个",
+        f"{lines}{where}。丢的是账单里优先级最低的那几条——角色图最先保住，道具图最先被挤掉。",
         [
-            "确认后继续：按槽位顺序喂前几张，丢掉哪几张会记进版本参数，事后查得到",
-            "不想丢：在 ComfyUI 里给这份图多标几个 AIVS_REF_n 标题，重新上传预设",
-            "或在上下文检查器里手动移除不重要的参考图，自己决定丢哪几张",
+            "确认后继续：按槽位顺序喂前几个，丢掉哪几个会记进版本参数，事后查得到",
+            "不想丢：在 ComfyUI 里给这份图多标几个 AIVS_REF_n 标题（视频 / 音频是"
+            " AIVS_REF_VIDEO_n / AIVS_REF_AUDIO_n），重新上传预设",
+            "或在上下文检查器里手动移除不重要的参考素材，自己决定丢哪几个",
         ],
         {
             "shot_ids": [str(d["shot_id"]) for d in drops],
@@ -419,7 +460,11 @@ class GenerationService:
             wait_for_job_id = params.get("wait_for_job_id")
             if wait_for_job_id:
                 upstream_job = by_id.get(str(wait_for_job_id))
-                if upstream_job is not None and upstream_job.status == "done" and upstream_job.version_id:
+                if (
+                    upstream_job is not None
+                    and upstream_job.status == "done"
+                    and upstream_job.version_id
+                ):
                     await self._set(pid, job.id, status="queued", wait_reason=None)
                 elif upstream_job is not None and upstream_job.status in ("failed", "canceled"):
                     await self._set(
@@ -544,13 +589,15 @@ class GenerationService:
             if job.kind in {"first_last_frame", "transition", "fl2va"} or last is not None
             else "i2v"
         )
-        if mode == "i2v" and first is None:
+        if mode == "i2v" and first is None and not refs:
             raise AppError(
                 ErrorCode.MISSING_INPUT,
-                "这个镜头还没有首帧",
-                "本轮只做图生视频（R2V），必须有一张首帧图才能生成。",
+                "这个镜头既没有首帧也没有参考素材",
+                "本轮只做图生视频（R2V）：要么给它一张首帧，要么至少给一条参考素材"
+                "（角色图 / 场景图 / 参考视频 / 对白音频），否则只有提示词，出来的画面与本片无关。",
                 [
-                    "在场景工作台里给它挑一张首帧（角色表 / 地点参考 / 上传的图都行）",
+                    "在镜头编辑器的「首帧」槽位里挑一张图（画面的第一格就是它）",
+                    "或给这一幕 / 这个镜头挂上人物与地点，账单会把它们当参考素材喂进去",
                     "或把上一幕的衔接改成「续接末帧」，让上一幕的末帧当它的首帧",
                 ],
                 {"shot_id": job.shot_id},
@@ -567,10 +614,12 @@ class GenerationService:
             extra={**(params.get("extra") or {}), "preset": params.get("preset")},
         )
         task_id = await provider.submit(req, client_id=f"aivs-{pid}")
-        # 冻结「实际喂了哪几张参考图」与适配器的降级说明。`_execute` 在这之后才收集
-        # params，所以这里改它就会跟着版本一起存下来——账单说要喂 5 张、图只收了 3 张，
+        # 冻结「实际喂了哪几个参考素材」与适配器的降级说明。`_execute` 在这之后才收集
+        # params，所以这里改它就会跟着版本一起存下来——账单说要喂 5 个、图只收了 3 个，
         # 事后必须在版本里看得见这件事（绝不静默失败）。
-        params["refs"] = [{"label": r.label, "kind": r.kind, "file": r.path.name} for r in refs]
+        params["refs"] = [
+            {"label": r.label, "kind": r.kind, "media": r.media, "file": r.path.name} for r in refs
+        ]
         if req.notes:
             params["ref_notes"] = list(req.notes)
         state = TaskState("queued")
@@ -610,16 +659,23 @@ class GenerationService:
 
     async def _images_of(
         self, pid: str, job: Job, params: dict[str, Any]
-    ) -> tuple[Path | None, Path | None, list[RefImage]]:
-        """定首帧、末帧，以及**首尾帧之外的那些参考图**。
+    ) -> tuple[Path | None, Path | None, list[RefAsset]]:
+        """定首帧、末帧，以及**首尾帧之外的那些参考素材**（图 / 视频 / 音频）。
 
-        这里只挑「哪几张图、谁是谁」，不管模型怎么用它们——差异在适配器里。
+        这里只挑「哪几个、谁是谁」，不管模型怎么用它们——差异在适配器里。
         「哪一张当首帧」这条规则不在这里，在 `services/context.py::_assign_roles`
         （账单上标的 `role`）：两边各挑一次的话，检查器里标的和真正喂进去的会分叉。
 
-        剩下的采用条目全部当参考图带走，**这就是「角色/场景真正被引入」的那一步**——
+        首尾帧的来源只有三处，按这个顺序：入队时显式传的（编排路径）→ 账单上标了
+        `first_frame` / `last_frame` 的那一条（镜头上指定的槽位，或要续接时的上游末帧）→
+        镜头上那两列（账单冻结之后才指定的情况）。**到此为止**——都没有就是这个镜头
+        没有首帧，绝不像以前那样把优先级最高的参考图顶上来当第一格画面。
+
+        剩下的采用条目全部当参考素材带走，**这就是「角色/场景真正被引入」的那一步**——
         以前它们算进了账单却在这里被丢掉，于是只剩一张首帧，人物形象自然跑偏。
-        显式指定的首/末帧如果本身就在账单里，不会再重复当一次参考图。
+        显式指定的首/末帧如果本身就在账单里，不会再重复当一次参考素材。
+        每一条带上 `media`（只看后缀），适配器照它分流到 `AIVS_REF_*` /
+        `AIVS_REF_VIDEO_*` / `AIVS_REF_AUDIO_*`——一段 `.mp4` 填进 LoadImage 不出片。
 
         有一处不能用入队时冻结的那份账单：**要接上游末帧的镜头**。那张图在入队的时刻
         还不存在（上游还没出片），所以对这种镜头在真正要跑的时候重新结一次账并按需抽帧
@@ -627,22 +683,29 @@ class GenerationService:
         """
         db = db_of(pid)
         proj = project_of(pid)
+        shot = await fetch(db, Shot, job.shot_id, "镜头")
         explicit_first = params.get("first_frame_asset_id")
         explicit_last = params.get("last_frame_asset_id")
         included = [i for i in (params.get("context") or {}).get("included") or []]
-        shot = await fetch(db, Shot, job.shot_id, "镜头")
         use_prev_frame = job.kind in {"first_last_frame", "transition", "fl2va"}
         if use_prev_frame and shot.prev_shot_id and not explicit_first:
             fresh = await context.ensure_frames(pid, job.shot_id, include_prev=True)
             included = [i for i in fresh["items"] if i.get("included")]
         usable = [i for i in included if i.get("asset_id")]
-        if not explicit_first:
-            chosen = next((i for i in usable if i.get("role") == "first_frame"), None)
-            if chosen is None:  # 旧版本冻结的账单里没有 role，退回原来的挑法
-                chosen = next((i for i in usable if i.get("kind") == "prev_frame"), None) or next(
-                    iter(usable), None
-                )
-            explicit_first = (chosen or {}).get("asset_id")
+
+        def by_role(role: str, kinds: tuple[str, ...]) -> str | None:
+            hit = next((i for i in usable if i.get("role") == role), None)
+            if hit is None:  # 旧版本冻结的账单里没有 role，只认得出上游末帧那一条
+                hit = next((i for i in usable if i.get("kind") in kinds), None)
+            return (hit or {}).get("asset_id")
+
+        explicit_first = (
+            explicit_first
+            or by_role("first_frame", ("first_frame", "prev_frame"))
+            or shot.first_frame_asset_id
+        )
+        explicit_last = explicit_last or by_role("last_frame", ("last_frame",))
+        explicit_last = explicit_last or shot.last_frame_asset_id
         spent = {explicit_first, explicit_last} - {None, ""}
 
         async def resolve(asset_id: str | None) -> Path | None:
@@ -651,17 +714,25 @@ class GenerationService:
             asset = await fetch(db, Asset, asset_id, "资产")
             return proj.dir / asset.path
 
-        refs: list[RefImage] = []
+        refs: list[RefAsset] = []
         for item in usable:
             asset_id = str(item["asset_id"])
             if asset_id in spent:
                 continue
-            spent.add(asset_id)  # 同一张图在账单里出现两次时只喂一次
+            spent.add(asset_id)  # 同一份素材在账单里出现两次时只喂一次
             path = await resolve(asset_id)
             if path is None:
                 continue
+            media = kind_of_suffix(path.suffix)
+            if media == "other":
+                continue  # 认不出后缀的不喂：填进哪个槽位都是错的（账单也没采用它）
             refs.append(
-                RefImage(path=path, label=str(item.get("label") or ""), kind=str(item["kind"]))
+                RefAsset(
+                    path=path,
+                    label=str(item.get("label") or ""),
+                    kind=str(item["kind"]),
+                    media=media,
+                )
             )
         return await resolve(explicit_first), await resolve(explicit_last), refs
 
@@ -677,7 +748,13 @@ class GenerationService:
     async def _run_legacy(
         self, pid: str, job: Job, params: dict[str, Any]
     ) -> tuple[str, bytes, str | None]:
-        """Workflow API 路径：上传输入图片，再按 AIVS_* 标题写入图。"""
+        """Workflow API 路径：上传输入图片，再按 AIVS_* 标题写入图。
+
+        **这条兼容路径只认图片**：旧的绑定表里只有 `reference_image_slots`，
+        没有任何地方能接一段参考视频 / 音频。所以非图片的参考素材在这里被跳过，
+        并把跳过了哪几条记进 `params.ref_notes`——静默丢掉的话，事后没人查得出
+        「我挂的那段对白音频到底送没送出去」。要喂视频 / 音频请走预设适配层。
+        """
         workflow = await fetch(
             await global_registry.start(), GlobalWorkflow, job.workflow_id or "", "工作流"
         )
@@ -688,13 +765,20 @@ class GenerationService:
             for key, value in raw_bindings.items()
             if key != "reference_image_slots" and isinstance(value, str) and "." in value
         }
-        first, last, refs = await self._images_of(pid, job, params)
+        first, last, all_refs = await self._images_of(pid, job, params)
+        refs = [r for r in all_refs if r.media == "image"]
+        notes = [
+            f"旧的 Workflow 绑定路径只能喂图片，{r.media_label}「{r.label or r.path.name}」"
+            "没有送出去（要喂它请改用预设适配层）。"
+            for r in all_refs
+            if r.media != "image"
+        ]
 
         async def upload(path: Path | None) -> str | None:
             if path is None:
                 return None
             data = await asyncio.to_thread(path.read_bytes)
-            return await comfy.upload_image(path.name, data)
+            return await comfy.upload_input(path.name, data)
 
         first_name = await upload(first)
         last_name = await upload(last)
@@ -718,10 +802,12 @@ class GenerationService:
                 values[f"__ref_{index}"] = ref_names[index]
                 bindings[f"__ref_{index}"] = target
             if len(ref_names) > len(ref_slots):
-                params["ref_notes"] = [
+                notes.append(
                     f"Workflow 只有 {len(ref_slots)} 个 AIVS_REF_* 槽位，"
                     f"已省略 {len(ref_names) - len(ref_slots)} 张参考图。"
-                ]
+                )
+        if notes:
+            params["ref_notes"] = notes
         graph = apply_bindings(graph, bindings, values)
         prompt_id = await comfy.submit(graph, client_id=f"aivs-{pid}")
 

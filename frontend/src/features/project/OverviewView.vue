@@ -69,7 +69,9 @@ const FFMPEG_SOURCE: Record<string, string> = {
 async function reload(): Promise<void> {
   if (!pid.value) return
   await ov.load(pid.value)
-  presets.value = (await settingsApi.presets().catch(() => ({ items: [] } as { items: PresetRow[] }))).items
+  presets.value = (
+    await settingsApi.presets().catch(() => ({ items: [] }) as { items: PresetRow[] })
+  ).items
 }
 
 async function selectPreset(role: 'r2v' | 'flf', name: string): Promise<void> {
@@ -78,8 +80,8 @@ async function selectPreset(role: 'r2v' | 'flf', name: string): Promise<void> {
     const generation = ov.environment?.generation
     await projectsApi.setVideoPresets(
       pid.value,
-      role === 'r2v' ? name || null : generation?.r2v_name ?? null,
-      role === 'flf' ? name || null : generation?.flf_name ?? null,
+      role === 'r2v' ? name || null : (generation?.r2v_name ?? null),
+      role === 'flf' ? name || null : (generation?.flf_name ?? null),
     )
     await ov.load(pid.value)
   } finally {
@@ -89,6 +91,19 @@ async function selectPreset(role: 'r2v' | 'flf', name: string): Promise<void> {
 
 onMounted(reload)
 watch(pid, reload)
+
+/**
+ * 下拉里那一段槽位说明。`<option>` 里塞不进徽标，所以拼成一行文字。
+ *
+ * **三族分开写**：参考图 0 槽要提醒（角色表喂不进去），参考视频 / 参考音频 0 槽是常态
+ * （绝大多数图只收图片），所以后两项只在真标了槽位时才出现。
+ */
+function slotText(preset: PresetRow): string {
+  const parts = [`参考图 ${preset.ref_slots} 槽`]
+  if (preset.ref_video_slots) parts.push(`视频 ${preset.ref_video_slots} 槽`)
+  if (preset.ref_audio_slots) parts.push(`音频 ${preset.ref_audio_slots} 槽`)
+  return parts.join(' · ')
+}
 
 /** 秒 → `MM:SS`，与时间线页同口径。 */
 function duration(sec: number): string {
@@ -392,7 +407,7 @@ function duration(sec: number): string {
                       :key="preset.name"
                       :value="preset.name"
                     >
-                      {{ preset.name }} · 参考图 {{ preset.ref_slots }} 槽
+                      {{ preset.name }} · {{ slotText(preset) }}
                     </option>
                   </select>
                 </label>
@@ -418,7 +433,10 @@ function duration(sec: number): string {
                 <p class="text-fg-4 mt-1 text-2xs">
                   两项可以选择同一份预设；普通 Shot 只用 R2V，明确生成衔接时才用 FL2VA。
                 </p>
-                <RouterLink :to="{ name: 'presets' }" class="text-accent mt-1 inline-block text-2xs">
+                <RouterLink
+                  :to="{ name: 'presets' }"
+                  class="text-accent mt-1 inline-block text-2xs"
+                >
                   管理预设 Workflow
                 </RouterLink>
               </div>

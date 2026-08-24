@@ -9,13 +9,21 @@ service 层永远不出现 `if provider == "xxx"`。
   · `flf` 给首尾帧（两幕之间那段 1~2s 转场就是它）。
 T2V 暂不做——没有首帧的镜头在编排时就会被账单挡下来，而不是生成出一段跑偏的画面。
 
-**首尾帧和参考图不是一回事**，所以是两个字段：首尾帧决定「画面从哪一格开始 / 结束」，
-参考图决定「谁出场、长什么样、在哪儿」。只喂一张首帧时最容易丢的就是人物形象——
-账单里算出来的角色表 / 地点参考图必须能一起送到模型端，这就是 `refs` 存在的理由。
+**首尾帧和参考素材不是一回事**，所以是两个字段：首尾帧决定「画面从哪一格开始 / 结束」，
+参考素材决定「谁出场、长什么样、在哪儿、动作什么样、跟着哪段声音」。只喂一张首帧时最容易
+丢的就是人物形象——账单里算出来的角色表 / 地点参考图必须能一起送到模型端，
+这就是 `refs` 存在的理由。
 
-**能收几张参考图由适配器回答**（`RefCapacity` + `ref_capacity()`），不是应用级设置：
-真实上限写在模型端那份图里（`comfy_preset` 数 `AIVS_REF_*` 槽位），我们这边配一个数字
-只会和它打架。没有一份可数的图时就是「不限制」，不凭空造上限。
+**参考素材分三种媒体**（`RefAsset.media` = `image` / `video` / `audio`），因为模型端接它们
+的节点根本不是一类：图片进 LoadImage 那类、视频进 VHS / LoadVideo 那类、音频进 LoadAudio
+那类。混着数会把一段 `.mp4` 填进 LoadImage——既不报错也出不了片。所以**上限也按媒体分开**
+（`RefCapacity.limit_of(media)`）：一份图标了 3 张图片槽 + 1 段音频槽是很常见的事，
+折成一个「4 个参考素材」的数字，用户照着塞 4 张图必然白跑一趟。
+
+**能收几个参考素材由适配器回答**（`RefCapacity` + `ref_capacity()`），不是应用级设置：
+真实上限写在模型端那份图里（`comfy_preset` 数 `AIVS_REF_*` / `AIVS_REF_VIDEO_*` /
+`AIVS_REF_AUDIO_*` 槽位），我们这边配一个数字只会和它打架。没有一份可数的图时就是
+「不限制」，不凭空造上限。
 """
 
 from __future__ import annotations
@@ -30,31 +38,56 @@ MODES = ("i2v", "flf")
 #: 任务状态的统一口径，与 Job.status 对齐，适配器负责把各家的说法翻译成这四个。
 STATUSES = ("queued", "running", "done", "failed")
 
+#: 参考素材的三种媒体。**这一串的顺序就是对外展示的顺序**（账单、降级说明、提示词里那句
+#: 「参考图1=…」都按它排），别在别处再定一次。
+MEDIA = ("image", "video", "audio")
+
+#: 媒体的中文说法。与 `presets.MEDIA_LABEL` 是同一份口径，这里再列一遍是因为
+#: `base` 不该反向依赖某一个适配器的模块。
+MEDIA_LABEL = {"image": "参考图", "video": "参考视频", "audio": "参考音频"}
+
 
 @dataclass(frozen=True, slots=True)
-class RefImage:
-    """一张参考图：图在哪 + 它是谁。
+class RefAsset:
+    """一个参考素材：文件在哪 + 它是谁 + 它是什么媒体。
 
-    `label` / `kind` 直接来自上下文账单（角色表 / 地点参考 / 道具参考）。模型端接不接收
-    这句说明由适配器决定——但**不许因为带不了标签就把图丢掉**。
+    `label` / `kind` 直接来自上下文账单（角色表 / 地点参考 / 道具参考 / 手动添加）。模型端
+    接不接收这句说明由适配器决定——但**不许因为带不了标签就把它丢掉**。
+
+    `media` 决定它进哪一组槽位，来源是文件后缀（`assets.kind_of_suffix`），不是用户手填：
+    真正决定「这个文件能不能填进 LoadImage」的是它到底是什么文件。
     """
 
     path: Path
     label: str = ""
     kind: str = ""
+    media: str = "image"
+
+    @property
+    def media_label(self) -> str:
+        return MEDIA_LABEL.get(self.media, "参考素材")
+
+
+#: 旧名字。参考素材支持视频 / 音频之前它只可能是图，改名后留一个别名给外部引用
+#: （`tests/test_providers.py` 那类只关心「有个参考素材形状」的地方）。
+RefImage = RefAsset
 
 
 @dataclass(frozen=True, slots=True)
 class RefCapacity:
-    """这条生成路径一次能收几张参考图（**首尾帧不算在内**）。
+    """这条生成路径一次能收几个参考素材（**首尾帧不算在内**）。
 
-    「最多喂几张」不是本工具的偏好，而是模型端那份图的事实，所以它由适配器回答，
+    「最多喂几个」不是本工具的偏好，而是模型端那份图的事实，所以它由适配器回答，
     不再是应用级设置——设置里那个数字只会和真实槽位数打架，还得用户自己去对。
 
-    `limit is None` = **不限制**：这条路上没有一份可数的图（通用 REST 合同天生收多张，
-    旧的绑定路径压根不注入图片），此时凭空造一个上限只会白丢用户的图。
+    `limit is None` = **不限制**：这条路上没有一份可数的图（通用 REST 合同天生收多个，
+    旧的绑定路径压根不注入素材），此时凭空造一个上限只会白丢用户的素材。
     `limit == 0` 是一个有意义的答案，不是「没查到」：那份图一个 `AIVS_REF_*` 都没标，
     角色表 / 地点图全都进不去——这正是人物形象跑偏的现场，必须说出来。
+
+    `limit` / `dropped()` 说的**只是图片**（问得最多的那一种，也是历史上唯一一种）；
+    视频 / 音频各有自己的数字，走 `video` / `audio` 或 `limit_of(media)` 取——
+    三种媒体折成一个数字的话，「还能再喂 1 个」到底指图还是音频就说不清了。
 
     `source` 是这个数字从哪来的（预设名 / 合同），`detail` 是给人看的一句话，
     两个都会一路传到界面上：「预设只有 3 槽」和「这条路不限张数」的处置方式完全不同。
@@ -63,12 +96,30 @@ class RefCapacity:
     limit: int | None = None
     source: str = ""
     detail: str = ""
+    #: 参考视频 / 参考音频的上限，含义与 `limit` 完全一致（`None` = 不限制）。
+    video: int | None = None
+    audio: int | None = None
+
+    def limit_of(self, media: str) -> int | None:
+        """某一媒体的上限。不认识的媒体回 0——那种素材这条路根本收不了。"""
+        if media == "image":
+            return self.limit
+        if media == "video":
+            return self.video
+        if media == "audio":
+            return self.audio
+        return 0
 
     def dropped(self, count: int) -> int:
-        """账单给了 `count` 张时，会有几张喂不进去。"""
-        if self.limit is None:
+        """账单给了 `count` 张**图片**时，会有几张喂不进去。"""
+        return self.dropped_of("image", count)
+
+    def dropped_of(self, media: str, count: int) -> int:
+        """账单给了 `count` 个某一媒体的素材时，会有几个喂不进去。"""
+        limit = self.limit_of(media)
+        if limit is None:
             return 0
-        return max(0, count - self.limit)
+        return max(0, count - limit)
 
 
 @dataclass(slots=True)
@@ -80,8 +131,10 @@ class VideoRequest:
     negative: str = ""
     first_frame: Path | None = None
     last_frame: Path | None = None
-    #: 首尾帧之外的参考图，按账单顺序（优先级高的在前）。
-    refs: list[RefImage] = field(default_factory=list)
+    #: 首尾帧之外的参考素材（图片 / 视频 / 音频混在一个列表里，按账单顺序、优先级高的在前）。
+    #: 刻意**不按媒体分成三个字段**：账单里的优先级是跨媒体排的，拆开就得在适配器里
+    #: 重新合并一次顺序；分组是填槽位那一步的事（`comfy_preset._refs`）。
+    refs: list[RefAsset] = field(default_factory=list)
     duration: float = 4.0
     seed: int | None = None
     extra: dict[str, Any] = field(default_factory=dict)
@@ -91,16 +144,34 @@ class VideoRequest:
     notes: list[str] = field(default_factory=list)
 
 
-def ref_hint(refs: Sequence[RefImage]) -> str:
-    """把「第几张参考图是谁」写成一句话。
+def refs_by_media(refs: Sequence[RefAsset]) -> dict[str, list[RefAsset]]:
+    """把参考素材按媒体分组，组内保持账单顺序。三个键一定齐全（空组给空列表）。
 
-    给**只按顺序收图、不接收标签**的模型端用（ComfyUI 那类图就是这样）：不说清楚的话，
-    模型只知道多了几张图，不知道哪张是主角。空列表回空串，调用方照此决定要不要拼。
+    分组这件事**只在这里做一次**：适配器填槽位、账单算上限、降级说明分媒体说，
+    各写一份 `if media == ...` 迟早在「第几个是谁」上分叉。
     """
-    if not refs:
+    groups: dict[str, list[RefAsset]] = {media: [] for media in MEDIA}
+    for ref in refs:
+        groups.setdefault(ref.media, []).append(ref)
+    return groups
+
+
+def ref_hint(refs: Sequence[RefAsset]) -> str:
+    """把「第几个参考素材是谁」写成一句话。
+
+    给**只按顺序收素材、不接收标签**的模型端用（ComfyUI 那类图就是这样）：不说清楚的话，
+    模型只知道多了几个输入，不知道哪个是主角。空列表回空串，调用方照此决定要不要拼。
+
+    序号**按媒体各自从 1 数**，因为槽位就是按媒体分开的：图片进 `AIVS_REF_1`、
+    视频进 `AIVS_REF_VIDEO_1`，混在一起连续编号的话这句说明会和真正填进去的槽位错位。
+    """
+    parts: list[str] = []
+    for media, group in refs_by_media(refs).items():
+        label = MEDIA_LABEL.get(media, "参考素材")
+        parts += [f"{label}{i}={r.label or r.path.name}" for i, r in enumerate(group, 1)]
+    if not parts:
         return ""
-    body = "；".join(f"参考图{i}={r.label or r.path.name}" for i, r in enumerate(refs, 1))
-    return f"参考图说明：{body}。"
+    return f"参考素材说明：{'；'.join(parts)}。"
 
 
 @dataclass(slots=True)
@@ -119,7 +190,7 @@ class VideoProvider(Protocol):
     name: str
 
     def ref_capacity(self) -> RefCapacity:
-        """一次能收几张参考图。**同步**，因为它只读本地那份图，不出网——
+        """一次能收几个参考素材（按媒体各一个数）。**同步**，因为它只读本地那份图，不出网——
         上下文账单、编排账单、界面上每一处都要问它，出网的话这些只读路径全得变慢。
         查不出来（没选预设、文件坏了）一律回「不限制」，绝不在只读路径上抛错。
         """

@@ -37,7 +37,12 @@ async function save(): Promise<void> {
 <template>
   <div class="min-h-0 flex-1 overflow-auto p-2">
     <FeatureHeader />
-    <ErrorPanel v-if="cfg.lastError" :error="cfg.lastError" class="mb-2" @dismiss="cfg.clearError()" />
+    <ErrorPanel
+      v-if="cfg.lastError"
+      :error="cfg.lastError"
+      class="mb-2"
+      @dismiss="cfg.clearError()"
+    />
     <AppPanel title="预设 Workflow（ComfyUI API 图）">
       <template #actions>
         <AppButton size="sm" variant="ghost" :disabled="cfg.busy" @click="cfg.loadPresets()">
@@ -46,10 +51,18 @@ async function save(): Promise<void> {
         <AppButton size="sm" variant="primary" :disabled="cfg.busy" @click="fileInput?.click()">
           <Upload :size="10" />上传 API json
         </AppButton>
-        <input ref="fileInput" type="file" accept=".json,application/json" class="hidden" @change="pick" />
+        <input
+          ref="fileInput"
+          type="file"
+          accept=".json,application/json"
+          class="hidden"
+          @change="pick"
+        />
       </template>
       <p v-if="cfg.presets" class="text-fg-4 border-line-1 border-b px-3 py-1.5 text-2xs">
-        预设目录：{{ cfg.presets.dir }}。节点标题按 AIVS_PROMPT、AIVS_NEGATIVE、AIVS_FIRST_FRAME、AIVS_LAST_FRAME、AIVS_REF_* 规范设置后会自动识别。
+        预设目录：{{ cfg.presets.dir }}。节点标题按
+        AIVS_PROMPT、AIVS_NEGATIVE、AIVS_FIRST_FRAME、AIVS_LAST_FRAME、AIVS_REF_*（参考图）、AIVS_REF_VIDEO_*（参考视频）、AIVS_REF_AUDIO_*（参考音频）规范设置后会自动识别。三族各进各自的槽位：把一段
+        .mp4 接到 AIVS_REF_1 上只会喂给 LoadImage。
       </p>
       <ul class="divide-line-1 divide-y">
         <li v-for="row in cfg.presets?.items ?? []" :key="row.name" class="px-3 py-2">
@@ -59,12 +72,27 @@ async function save(): Promise<void> {
             <AppBadge v-if="row.ready" :tone="row.ref_slots ? 'neutral' : 'warn'">
               参考图 {{ row.ref_slots }} 槽
             </AppBadge>
+            <!--
+              参考视频 / 参考音频只在真标了槽位时才画：**0 是常态**（绝大多数图只收图片），
+              给每一份预设都挂一个「参考音频 0 槽」只会把「参考图 0 槽」那个真问题埋掉。
+            -->
+            <AppBadge v-if="row.ready && row.ref_video_slots" tone="neutral">
+              参考视频 {{ row.ref_video_slots }} 槽
+            </AppBadge>
+            <AppBadge v-if="row.ready && row.ref_audio_slots" tone="neutral">
+              参考音频 {{ row.ref_audio_slots }} 槽
+            </AppBadge>
             <AppBadge v-if="row.r2v_ready" tone="ok">R2V</AppBadge>
             <AppBadge v-if="row.flf_ready" tone="accent">FL2VA</AppBadge>
             <span class="text-fg-4 min-w-0 flex-1 truncate text-2xs">
               {{ row.ready ? row.ref_hint : row.impact }}
             </span>
-            <AppButton size="sm" variant="danger" :disabled="cfg.busy" @click="cfg.removePreset(row.name)">
+            <AppButton
+              size="sm"
+              variant="danger"
+              :disabled="cfg.busy"
+              @click="cfg.removePreset(row.name)"
+            >
               <Trash2 :size="10" />
             </AppButton>
           </div>
@@ -74,9 +102,24 @@ async function save(): Promise<void> {
         </li>
       </ul>
       <div class="border-line-1 space-y-1 border-t p-2">
-        <input v-model="name" placeholder="预设名，例如 minimax-h3-fast" class="border-line-1 bg-base-2 text-fg-1 h-6 w-full border px-1.5 text-2xs outline-none" />
-        <textarea v-model="text" rows="5" placeholder="也可以直接粘贴 API 格式 json" class="border-line-1 bg-base-2 text-fg-1 w-full border px-1.5 py-1 font-mono text-2xs outline-none" />
-        <AppButton size="sm" variant="primary" :disabled="cfg.busy || !name.trim() || !text.trim()" @click="save()">保存预设 Workflow</AppButton>
+        <input
+          v-model="name"
+          placeholder="预设名，例如 minimax-h3-fast"
+          class="border-line-1 bg-base-2 text-fg-1 h-6 w-full border px-1.5 text-2xs outline-none"
+        />
+        <textarea
+          v-model="text"
+          rows="5"
+          placeholder="也可以直接粘贴 API 格式 json"
+          class="border-line-1 bg-base-2 text-fg-1 w-full border px-1.5 py-1 font-mono text-2xs outline-none"
+        />
+        <AppButton
+          size="sm"
+          variant="primary"
+          :disabled="cfg.busy || !name.trim() || !text.trim()"
+          @click="save()"
+          >保存预设 Workflow</AppButton
+        >
       </div>
     </AppPanel>
   </div>

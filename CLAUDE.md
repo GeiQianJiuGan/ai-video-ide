@@ -210,12 +210,20 @@ Ctrl + \` 开合，高度记在 localStorage）。控制台常驻，所以 **WS 
 不进 `PROJECT_NAV`，只从命令面板或控制台的「队列页」按钮进，看失败现场与冻结参数。
 
 **Context Resolver**（`services/context.py`）：把「到底喂了什么给模型」变成一张账单——每条带
-kind / priority / included / reason；人工覆写记在 `shot.context_overrides_json`（可 reset 回
-自动），`snapshot()` 的结果冻结进 `GenerationVersion.context_json`。入队前
-`require_complete()` 是硬门槛，`check_context=false` 才能显式跳过。采用的条目还带一个
-`role`（`first_frame` / `reference`）——**「哪一张当首帧」这条规则只在 `_assign_roles` 这一处**，
-`services/generation.py::_images_of` 照账单读它，绝不在生成层再挑一遍（两边各挑一次的话，
-检查器上标的和真正喂进去的会分叉）。上限是应用级设置 `video.ref_limit`（默认 8，`ref_limit()`）。
+kind / priority / included / reason / **media**（`image` / `video` / `audio`，只看后缀）；
+人工覆写记在 `shot.context_overrides_json`（可 reset 回自动），`snapshot()` 的结果冻结进
+`GenerationVersion.context_json`。入队前 `require_complete()` 是硬门槛，`check_context=false`
+才能显式跳过。采用的条目还带一个 `role`（`first_frame` / `last_frame` / `reference`）——
+**「哪一张是首帧」只认显式槽位**（`Shot.first_frame_asset_id` / `last_frame_asset_id`，
+用户按下去的那一下），首帧没指定而这个镜头要续接上游时才用 `prev_frame` 那张真末帧，
+**到此为止，绝不提拔参考素材**。以前这里把优先级最高的那一条（通常是角色三视图）自动标成
+首帧，于是画面从一张三视图开始——那是「默认首张就是首帧」那个 bug 的根源。判定规则只有一份
+（`_assign_roles`），`services/generation.py::_images_of` 照账单读它，绝不在生成层再挑一遍
+（两边各挑一次的话，检查器上标的和真正喂进去的会分叉）。**账单不截断**：采用的照样全采用，
+超出槽位的部分变成生成前的一次确认（`REF_OVER_CAPACITY` + `allow_ref_drop`），
+真正的截断只发生在提交那一刻并如实写进 `params.ref_notes` / `params.refs`。上限来自**预设里
+数出来的槽位**（`presets.slot_counts` → `RefCapacity`），不是应用级设置——`video.ref_limit`
+已经不再是上限来源。
 
 **时间线与导出**（`services/timeline.py`）：完全不依赖 AI。撤销栈是整轨快照（`UNDO_DEPTH=50`）；
 `GET /export/command` 只产出 ffmpeg 参数计划，`POST /export` 才真的起进程。
@@ -267,6 +275,16 @@ kind / priority / included / reason；人工覆写记在 `shot.context_overrides
   「主视频」。历史上幕上另存过一个 `Scene.main_version_id`：镜头一搬到别的幕那个指针就发霉，
   只能靠 `issues` 报「已失效」——`0006_shot_adopted_video` 把它回填进
   `shot.current_version_id` 后删掉了这一列。
+- **镜头上的首帧 / 末帧槽位**（`Shot.first_frame_asset_id` / `last_frame_asset_id`，迁移
+  `0013_shot_frames`）：**「哪一张是首帧」是用户按下去的那一下**，不再由上下文账单自动提拔
+  优先级最高的那一条（那条老规矩会把角色三视图当成画面第一格）。两列都可空，空 = 没有指定；
+  `tail_frame` 衔接的镜头照旧用上游那张抽出来的真末帧（`prev_shot_id` +
+  `services/frames.py`）。**必须是图片**：视频 / 音频报 422「首帧只能是图片」；
+  **清空要传 `''`**（`ShotPatch` 走 `exclude_none`，`null` 会被当成「这次不改」）；
+  **刻意不加外键**：资产被删掉时按「这个镜头没有首帧」处理，`GET /shots/{id}` 除两个 id 外
+  还回 `first_frame_path` / `last_frame_path`，资产行已经不在了时是 `null`，界面显示
+  「指定的图已不在」而不是画碎图标。老工程升上来只是多了两个空列，行为不变——真正的行为变化在
+  `services/context.py::_assign_roles`（不再提拔参考素材），不需要迁移。
 - **节点上播的那一段**：`graph()` 的节点带 `video_path`（能播的 `<video>`）与 `thumbnail_path`
   （只会是图片），**两个字段绝不混用**。挑用哪一段的顺序是「按镜头顺序 → 同一镜头内采用的
   那一版优先 → 否则最新的那一版」，并带上 `video_shot_id`（播的这段属于哪个镜头）与
@@ -292,23 +310,28 @@ kind / priority / included / reason；人工覆写记在 `shot.context_overrides
   退化成一次性 `complete_json()`，提案形状完全一样。会话与提案存 `DirectorTurn`（只增不改），
   审阅到一半刷新页面不丢。
 - **provider 适配层**（`app/generation/providers/`）：`base.py` 定义与模型无关的 `VideoRequest`
-  （`mode` = `i2v` / `flf`、prompt、首尾帧、**参考图 `refs`**、时长、seed、透传 `extra`、
-  降级说明 `notes`）与 `VideoProvider` 协议（`probe` / `submit` / `poll` / `fetch`）；
-  `comfy_preset.py` 是默认核心，`http_api.py` 是通用 REST 合同，`registry.py::provider()`
-  按应用级设置选。
+  （`mode` = `i2v` / `flf`、prompt、首尾帧、**参考素材 `refs`**（`RefAsset`，带 `media` =
+  `image` / `video` / `audio`）、时长、seed、透传 `extra`、降级说明 `notes`）与 `VideoProvider`
+  协议（`probe` / `submit` / `poll` / `fetch`）；`comfy_preset.py` 是默认核心，`http_api.py`
+  是通用 REST 合同，`registry.py::provider()` 按应用级设置选。
   **本工具不维护模型端的图**：ComfyUI 适配器只按**节点 title 约定**注入入口参数——
   `AIVS_FIRST_FRAME` / `AIVS_LAST_FRAME` / `AIVS_PROMPT` / `AIVS_NEGATIVE` / `AIVS_DURATION` /
-  `AIVS_SEED` / `AIVS_REF_1`…`AIVS_REF_9`——不解析、不校验、不改写图里的 lora 与加速节点。
-  缺必需 title 时报 `INVALID_WORKFLOW`，建议里写「在 ComfyUI 里把该节点标题改成 X」。
-  lora、加速节点、采样器怎么摆是模型端自己的事，本工具跟着改迟早两边打架。
-- **首尾帧 ≠ 参考图**（`AIVS_REF_*` 那一组就是为这件事加的）：首尾帧决定「画面从哪一格开始 /
-  结束」，参考图决定「谁出场、在哪儿」。只喂一张首帧最容易丢的就是人物形象，所以账单里采用的
-  条目**除首帧那一张之外全部当参考图送到模型端**（`generation._images_of`）。
-  **槽位不够只降级、不失败**：图里标了 3 个而账单给了 5 张就填前 3 张，把少喂了哪几张写进
-  `req.notes` → 冻结成版本参数 `ref_notes`（`refs` 记实际喂了哪几张），界面上看得见。
-  一个 `AIVS_REF_*` 都没有的预设照样 `ready`，只是设置页的预设列表会把「参考图 0 槽」
-  标成警告。默认会在 prompt 末尾附一句 `参考图说明：参考图1=…`（`base.ref_hint`，
-  ComfyUI 那类图收不到标签，只能靠这句对号），设置里 `video.ref_labels` 可关。
+  `AIVS_SEED` / `AIVS_REF_1`…`AIVS_REF_9`（参考图，最多 9 个）/
+  `AIVS_REF_VIDEO_1`…`AIVS_REF_VIDEO_4`（参考视频，最多 4 个）/
+  `AIVS_REF_AUDIO_1`…`AIVS_REF_AUDIO_4`（参考音频，最多 4 个）——不解析、不校验、不改写图里的
+  lora 与加速节点。缺必需 title 时报 `INVALID_WORKFLOW`，建议里写「在 ComfyUI 里把该节点标题改成
+  X」。lora、加速节点、采样器怎么摆是模型端自己的事，本工具跟着改迟早两边打架。
+- **首尾帧 ≠ 参考素材**（`AIVS_REF_*` 三族就是为这件事加的）：首尾帧决定「画面从哪一格开始 /
+  结束」，参考素材决定「谁出场、在哪儿、什么动作、什么声音」。只喂一张首帧最容易丢的就是
+  人物形象，所以账单里采用的条目**除首帧那一张之外全部当参考素材送到模型端**
+  （`generation._images_of`）。**槽位不够只降级、不失败**：图里标了 3 个而账单给了 5 张就填
+  前 3 张，把少喂了哪几张写进 `req.notes` → 冻结成版本参数 `ref_notes`（`refs` 记实际喂了
+  哪几张），界面上看得见。一个 `AIVS_REF_*` 都没有的预设照样 `ready`，只是设置页的预设列表会把
+  「参考图 0 槽」标成警告；**参考视频 / 参考音频 0 槽是常态**（绝大多数图只收图片），只在真标了
+  槽位时画徽标，否则会把前面那个真问题埋掉。默认会在 prompt 末尾附一句
+  `参考图说明：参考图1=…`（`base.ref_hint`，ComfyUI 那类图收不到标签，只能靠这句对号），
+  设置里 `video.ref_labels` 可关。**三族分开算槽位**：把 `.mp4` 接到 `AIVS_REF_1` 上会喂给
+  LoadImage 一个视频文件名，既不报错也出不了片。
 - **真末帧抽取**（`services/frames.py`）：`tail_frame` 衔接靠它。FFmpeg `-sseof` 抽一张 PNG →
   登记 `Asset(kind="frame")` → 同 (asset, at) 幂等复用；`services/context.py` 的 `prev_frame`
   指的就是这张抽出来的帧，不是上游那整段视频。抽取失败报 `FFMPEG_ERROR`，建议里给出
@@ -354,9 +377,9 @@ kind / priority / included / reason；人工覆写记在 `shot.context_overrides
 - **新增表**：工程表必须在 `persistence/all_models.py` 里 import，否则 `Base.metadata` 漏表；
   素材库表相反——挂 `LibraryBase`，**不要**进 `all_models.py`（理由见上面的素材库段）。
 - **新增迁移**：`alembic/versions/` 加脚本 → 在 `persistence/migrate.py::REVISION_SCHEMA` 登记
-  它对应的 schema 版本 → 同步 `settings.schema_version`（当前 12，最新一条是
-  `0012_shot_link`：镜头之间那条衔接，与 `scene_link` 同一套形状但**没有 `tail_frame`**，
-  没有行就是无转场）。漏登记会导致
+  它对应的 schema 版本 → 同步 `settings.schema_version`（当前 13，最新一条是
+  `0013_shot_frames`：镜头上显式的首帧 / 末帧槽位，`Shot.first_frame_asset_id` /
+  `last_frame_asset_id`，只能是图片、可空、不加外键，清空传 `''` 不传 `null`）。漏登记会导致
   打开旧工程时无法告诉用户「schema X → Y」。
 - **落盘**：资产 `path` 相对工程目录存（整个目录拷走仍然有效）；类型→子目录映射在
   `services/assets.py::KIND_DIR`，`generations/` 只放生成物，手动素材一律进 `assets/`，

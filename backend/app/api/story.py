@@ -47,6 +47,15 @@ class ShotBody(BaseModel):
     steps: int | None = None
     workflow_id: str | None = None
     prev_shot_id: str | None = Field(default=None, description="上游镜头；用于首尾帧连续性")
+    #: 首 / 末帧槽位。**「哪一张是首帧」是用户按下去的那一下**，不再由账单里优先级最高
+    #: 的那张顶替（那条老规矩会把角色三视图当成画面第一格）。必须是图片资产。
+    #: PATCH 里的 `null` 会被 `exclude_none` 吃掉，所以**清空槽位传空串 `""`**。
+    first_frame_asset_id: str | None = Field(
+        default=None, description="首帧图片资产 id；传空串表示清空这个槽位"
+    )
+    last_frame_asset_id: str | None = Field(
+        default=None, description="末帧图片资产 id；传空串表示清空这个槽位"
+    )
 
 
 class OrderBody(BaseModel):
@@ -165,6 +174,51 @@ async def get_shot(pid: str, shot_id: str) -> dict[str, Any]:
 
 @router.patch("/projects/{pid}/shots/{shot_id}")
 async def update_shot(pid: str, shot_id: str, body: ShotBody) -> dict[str, Any]:
+    """更新镜头。首帧槽位有 `prev_shot_id` 时的规则：
+
+    **有上游镜头时首帧强制从上游末帧来，不允许显式指定。** 用户想用自己的首帧就得先
+    断开上游（清空 `prev_shot_id`），否则报 `VALIDATION_ERROR`。这是为了防止两处配置
+    打架：上游末帧是 tail_frame 衔接的全部意义，显式首帧会把它顶掉。
+
+    **转场镜头首尾帧都不能手动设置**——首帧来自上游镜头末帧，末帧来自下游镜头首帧，
+    都是自动确定的，手动改只会让衔接断开。
+    """
+    from app.services.base import db_of, fetch
+    from app.persistence.models_story import Shot
+    from app.core.errors import AppError, ErrorCode
+
+    shot = await fetch(db_of(pid), Shot, shot_id, "镜头")
+
+    if shot.kind == "transition" and body.prev_shot_id is not None:
+        raise AppError(
+            ErrorCode.VALIDATION_ERROR,
+            "转场镜头的上下游已固定",
+            "转场镜头自动连接负责转场的前后两个镜头，不能手动修改上游依赖。",
+            ["回到负责这段转场的前后两个镜头修改衔接", "双击转场镜头只编辑转场本身"],
+        )
+
+    # 校验：转场镜头不许改首尾帧
+    if shot.kind == "transition":
+        if body.first_frame_asset_id is not None or body.last_frame_asset_id is not None:
+            raise AppError(
+                ErrorCode.VALIDATION_ERROR,
+                "转场镜头首尾帧不能手动设置",
+                "转场镜头的首帧来自上游镜头末帧，末帧来自下游镜头首帧，都是自动确定的。"
+                "手动改会让衔接断开——转场就是为了把两个镜头无缝连起来。",
+                ["保持转场镜头的自动首尾帧", "如果要自定义首尾帧，请用普通镜头而非转场"],
+            )
+
+    # 校验：有上游时不许改首帧
+    if body.first_frame_asset_id is not None:
+        if shot.prev_shot_id and body.first_frame_asset_id != "":
+            raise AppError(
+                ErrorCode.VALIDATION_ERROR,
+                "有上游镜头时不能指定首帧",
+                f"这个镜头的首帧来自上游镜头（tail_frame 衔接）。"
+                "要用自己的首帧就先断开上游：清空「上游镜头」那一栏。",
+                ["在镜头编辑器里清空「上游镜头」", "保持当前的上游衔接，不指定首帧"],
+            )
+
     return await story.update_shot(pid, shot_id, body.model_dump(exclude_none=True))
 
 

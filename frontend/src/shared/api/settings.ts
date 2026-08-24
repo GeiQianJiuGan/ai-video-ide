@@ -129,17 +129,29 @@ export interface PresetRow {
   ready: boolean
   r2v_ready?: boolean
   flf_ready?: boolean
-  capabilities?: Array<'r2v' | 'flf'>
+  capabilities?: Array<'r2v' | 'flf' | 'ref_video' | 'ref_audio'>
   impact: string | null
   found?: string[]
   missing_required?: string[]
   node_count?: number
+  /** 有没有首帧入口。没有不影响 `ready`，但首帧只能当参考图 1 送进去。 */
+  first_frame_ok?: boolean
   /**
    * 这份图能收几张参考图（`AIVS_REF_1…` 标了几个）。
    * **0 不影响 `ready`**——只是角色表 / 地点参考图喂不进去，人物形象只能靠首帧带，
    * 所以页面要把 `ref_hint` 那句话显示出来，而不是只画一个绿点。
    */
   ref_slots: number
+  /**
+   * 参考视频 / 参考音频的槽位数（`AIVS_REF_VIDEO_*` / `AIVS_REF_AUDIO_*`）。
+   * **和 `ref_slots` 分开数**：混成一个总数会显示「能收 5 个参考素材」而其中 2 个
+   * 只吃音频，用户照着塞图只会得到一个空跑的任务。**0 是常态**，绝大多数图只收图片，
+   * 所以这两个数只在大于 0 时值得画出来。
+   */
+  ref_video_slots?: number
+  ref_audio_slots?: number
+  /** 三族各自的槽位数，键是 `image` / `video` / `audio`。 */
+  ref_slots_by_media?: Record<string, number>
   ref_hint: string
 }
 

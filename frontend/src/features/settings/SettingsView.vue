@@ -211,9 +211,7 @@ async function pastePreset(): Promise<void> {
                   type="checkbox"
                   :checked="Boolean(cfg.draft[field.key])"
                   class="accent-accent"
-                  @change="
-                    cfg.setOne(field.key, ($event.target as HTMLInputElement).checked)
-                  "
+                  @change="cfg.setOne(field.key, ($event.target as HTMLInputElement).checked)"
                 />
                 {{ Boolean(cfg.draft[field.key]) ? '开启' : '关闭' }}
               </label>
@@ -360,11 +358,7 @@ async function pastePreset(): Promise<void> {
       </ul>
 
       <ul class="divide-line-1 divide-y">
-        <li
-          v-for="row in cfg.presets?.items ?? []"
-          :key="row.name"
-          class="px-3 py-1.5"
-        >
+        <li v-for="row in cfg.presets?.items ?? []" :key="row.name" class="px-3 py-1.5">
           <div class="flex items-center gap-2">
             <StatusDot :status="row.ready ? 'completed' : 'failed'" />
             <span class="text-fg-1 text-xs">{{ row.name }}</span>
@@ -374,6 +368,16 @@ async function pastePreset(): Promise<void> {
             <!-- 参考图槽位数：0 个也能生成，但角色表喂不进去，所以标出来而不是藏起来 -->
             <AppBadge v-if="row.ready" :tone="row.ref_slots ? 'neutral' : 'warn'">
               参考图 {{ row.ref_slots }} 槽
+            </AppBadge>
+            <!--
+              参考视频 / 参考音频反过来：**0 是常态**，只在真标了槽位时画。
+              给每份预设都挂一个「参考音频 0 槽」会把「参考图 0 槽」那个真问题埋掉。
+            -->
+            <AppBadge v-if="row.ready && row.ref_video_slots" tone="neutral">
+              参考视频 {{ row.ref_video_slots }} 槽
+            </AppBadge>
+            <AppBadge v-if="row.ready && row.ref_audio_slots" tone="neutral">
+              参考音频 {{ row.ref_audio_slots }} 槽
             </AppBadge>
             <span class="text-fg-4 min-w-0 flex-1 truncate text-2xs">
               {{ row.ready ? (row.found ?? []).join(' · ') : row.impact }}

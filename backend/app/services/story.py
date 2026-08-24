@@ -65,7 +65,15 @@ SHOT_FIELDS = (
     "steps",
     "workflow_id",
     "prev_shot_id",
+    #: 显式的首帧 / 末帧槽位（`Asset.id`，必须是图片）。**「哪一张是首帧」就是用户按下去
+    #: 的那一下**，不是账单里优先级最高那张（那条老规矩会把角色三视图当成画面第一格）。
+    #: 清空 = 传 null，表示这个镜头没有指定首帧。
+    "first_frame_asset_id",
+    "last_frame_asset_id",
 )
+
+#: 首 / 末帧槽位对应的中文说法，校验错误与账单文案共用一份。
+FRAME_SLOT_LABEL = {"first_frame_asset_id": "首帧", "last_frame_asset_id": "末帧"}
 
 
 def _renumber(rows: list[Shot]) -> list[tuple[str, int]]:
@@ -85,6 +93,34 @@ def _unique(ids: list[str]) -> list[str]:
     """去重但保留顺序——第一条是主地点，顺序有意义，不能用 set。"""
     seen: set[str] = set()
     return [i for i in ids if not (i in seen or seen.add(i))]
+
+
+async def _check_frame_slots(pid: str, patch: dict[str, Any]) -> None:
+    """首 / 末帧槽位只收**存在的图片资产**，不合规就当场拒绝。
+
+    在这里挡而不是等到生成时：那两张图直接决定画面的第一格 / 最后一格，
+    存进去一段 `.mp4` 的话要等排队跑到它才报错，中间界面上还一直标着「首帧」。
+    传 `null` 是合法的（= 清空这个槽位，这个镜头没有指定首帧）。
+    """
+    db = db_of(pid)
+    for key, label in FRAME_SLOT_LABEL.items():
+        asset_id = patch.get(key)
+        if not asset_id:
+            continue
+        asset = await fetch(db, Asset, str(asset_id), f"{label}资产")
+        media = kind_of_suffix(Path(asset.path).suffix)
+        if media != "image":
+            raise AppError(
+                ErrorCode.VALIDATION_ERROR,
+                f"{label}只能是图片",
+                f"{asset.path} 不是图片（认出来是 {media}）。"
+                f"{label}决定画面的第一格 / 最后一格，模型端那个槽位接的是 LoadImage。",
+                [
+                    f"选一张图片当{label}",
+                    "视频 / 音频请当参考素材用（在上下文检查器里添加）",
+                ],
+                {"asset_id": str(asset_id)},
+            )
 
 
 def _guard_node_limit(what: str, ids: list[str]) -> None:
@@ -586,6 +622,7 @@ class StoryService:
             )
         existing = await fetch_all(db, Shot)
         now = utc_now()
+        await _check_frame_slots(pid, patch)
         fields = {k: patch.get(k) for k in SHOT_FIELDS if k not in ("status", "duration")}
         row = Shot(
             id=new_id("shot"),
@@ -604,7 +641,20 @@ class StoryService:
 
     async def update_shot(self, pid: str, shot_id: str, patch: dict[str, Any]) -> dict[str, Any]:
         db = db_of(pid)
-        await fetch(db, Shot, shot_id, "镜头")
+        row = await fetch(db, Shot, shot_id, "镜头")
+        if row.kind == "transition" and "prev_shot_id" in patch:
+            raise AppError(
+                ErrorCode.VALIDATION_ERROR,
+                "转场镜头的上下游已固定",
+                "转场镜头自动连接负责转场的前后两个镜头，不能手动修改上游依赖。",
+                ["回到负责这段转场的前后两个镜头修改衔接"],
+            )
+        # 空串 = 清空首 / 末帧槽位。PATCH body 是 `exclude_none` 出来的（null 会被吃掉），
+        # 而「取消首帧」必须表达得出来——否则挑错一张图就再也改不回「没有指定」。
+        patch = {
+            k: (None if k in FRAME_SLOT_LABEL and v == "" else None if k == "prev_shot_id" and v == "" else v)
+            for k, v in patch.items()
+        }
         if patch.get("status") and patch["status"] not in SHOT_STATUS:
             raise AppError(
                 ErrorCode.VALIDATION_ERROR,
@@ -621,8 +671,16 @@ class StoryService:
                     ["选择另一个镜头作为上游", "或清空上游依赖"],
                     {"shot_id": shot_id},
                 )
-            await fetch(db, Shot, patch["prev_shot_id"], "上游镜头")
+            upstream = await fetch(db, Shot, patch["prev_shot_id"], "上游镜头")
+            if upstream.kind == "transition":
+                raise AppError(
+                    ErrorCode.VALIDATION_ERROR,
+                    "不能选择转场镜头作为上游",
+                    "转场镜头的上下游由它负责的前后两个普通镜头固定，不能再被其他镜头依赖。",
+                    ["选择负责转场的普通镜头", "回到转场连接器修改前后镜头"],
+                )
             await self._guard_cycle(pid, shot_id, patch["prev_shot_id"])
+        await _check_frame_slots(pid, patch)
         async with db.write() as session:
             row = await session.get(Shot, shot_id)
             assert row is not None
@@ -667,8 +725,20 @@ class StoryService:
             where=GenerationVersion.shot_id == shot_id,
             order_by=GenerationVersion.version_no.desc(),
         )
+        #: 首 / 末帧槽位的图路径（相对工程目录）。前端要画那两个槽位，只有 asset_id 的话
+        #: 又得一张一张回头拉资产（N+1）；资产被删掉时给 `null`，界面按「没有指定」画。
+        frame_assets = {a.id: a for a in await fetch_all(db, Asset)}
+        slots = {
+            f"{name}_path": (
+                frame_assets[getattr(row, f"{name}_asset_id")].path
+                if getattr(row, f"{name}_asset_id") in frame_assets
+                else None
+            )
+            for name in ("first_frame", "last_frame")
+        }
         return {
             **as_dict(row),
+            **slots,
             "scene_title": scene.title,
             "scene_index_no": scene.index_no,
             "context_overrides": load_json(row.context_overrides_json, []),
@@ -969,6 +1039,7 @@ class StoryService:
                         "title": shot.title,
                         # 转场是系统按衔接补出来的，界面上要能和导演排的戏区分开
                         "kind": shot.kind,
+                        "prev_shot_id": shot.prev_shot_id,
                         "duration": shot.duration,
                         "status": shot.status,
                         "camera": shot.camera,

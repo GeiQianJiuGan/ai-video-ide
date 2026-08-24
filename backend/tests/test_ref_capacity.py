@@ -79,10 +79,11 @@ async def png(pid: str, kind: str, name: str) -> str:
 
 
 async def three_ref_shot(tmp_path: Path) -> dict[str, Any]:
-    """一个采用了 3 张图的完整镜头：角色表（首帧）+ 地点参考 + 道具参考（各 1 张）。
+    """一个采用了 3 张图的完整镜头：角色表 + 地点参考 + 道具参考（各 1 张）。
 
-    于是「参考图」是 2 张（首帧那一张不占 `AIVS_REF_*` 槽位），配一个 1 槽位的预设
-    刚好差 1 张——优先级最低的道具图最先被挤掉。
+    **这 3 张全都是参考图**：首帧只认镜头上显式指定的那一张（`shot.first_frame_asset_id`）
+    或上游末帧，这个镜头两样都没有，所以没有任何一条会被提拔成首帧去占掉一个槽位。
+    配一个 1 槽位的预设就差 2 张——优先级最低的先被挤掉（道具图、然后是地点图）。
     """
     proj = await projects.create(str(tmp_path / "film"), "参考图上限", 1920, 1080, 25.0, "cap")
     pid = proj.id
@@ -172,15 +173,20 @@ async def test_the_bill_keeps_everything_and_marks_what_will_not_fit(
 
     assert ctx["included_count"] == 3, "账单绝不截断：采用了几条就是几条"
     cap = ctx["capacity"]
-    assert (cap["limit"], cap["ref_count"], cap["dropped"], cap["over"]) == (1, 2, 1, True)
+    assert (cap["limit"], cap["ref_count"], cap["dropped"], cap["over"]) == (1, 3, 2, True)
     assert cap["source"] == "只有一个槽位"
-    # 挤掉的是优先级最低的那一条（道具图），角色表最先保住
-    assert cap["dropped_labels"] == [
-        next(i["label"] for i in ctx["items"] if i["kind"] == "prop_reference")
-    ]
+    # 挤掉的是优先级最低的那几条（地点图、道具图），角色表最先保住
+    labels = {i["kind"]: i["label"] for i in ctx["items"]}
+    assert cap["dropped_labels"] == [labels["location_reference"], labels["prop_reference"]]
     over = [i["kind"] for i in ctx["items"] if i.get("over_capacity")]
-    assert over == ["prop_reference"]
+    assert over == ["location_reference", "prop_reference"]
     assert all(i["included"] for i in ctx["items"]), "「装不下」和「没采用」是两件事"
+    assert [i["role"] for i in ctx["items"]] == ["reference"] * 3, "没指定首帧就一张都不许提拔"
+    assert {i["media"] for i in ctx["items"]} == {"image"}
+    # 按媒体分开报：图片这一族装不下，视频 / 音频这两族一个都没采用，谈不上装不下
+    per_media = cap["media"]
+    assert (per_media["image"]["ref_count"], per_media["image"]["dropped"]) == (3, 2)
+    assert [per_media[m]["over"] for m in ("video", "audio")] == [False, False]
 
 
 async def test_the_snapshot_freezes_the_capacity(
@@ -190,17 +196,21 @@ async def test_the_snapshot_freezes_the_capacity(
     made = await three_ref_shot(tmp_path)
     use_preset(monkeypatch, "只有一个槽位", 1)
     snap = await context.snapshot(made["pid"], made["shot_id"])
-    assert snap["capacity"]["dropped"] == 1
-    assert [i["kind"] for i in snap["included"] if i["over_capacity"]] == ["prop_reference"]
+    assert snap["capacity"]["dropped"] == 2
+    assert [i["kind"] for i in snap["included"] if i["over_capacity"]] == [
+        "location_reference",
+        "prop_reference",
+    ]
+    assert {i["media"] for i in snap["included"]} == {"image"}, "冻结的条目也要带媒体类型"
 
 
 async def test_enough_slots_means_no_warning(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     made = await three_ref_shot(tmp_path)
-    use_preset(monkeypatch, "两个槽位", 2)
+    use_preset(monkeypatch, "三个槽位刚好", 3)
     cap = (await context.resolve(made["pid"], made["shot_id"]))["capacity"]
-    assert (cap["limit"], cap["ref_count"], cap["over"]) == (2, 2, False)
+    assert (cap["limit"], cap["ref_count"], cap["over"]) == (3, 3, False)
     assert cap["dropped_labels"] == []
 
 
@@ -219,8 +229,8 @@ async def test_generating_one_shot_asks_before_dropping_anything(
         await generation.enqueue_shot(pid, shot_id)
     err = caught.value
     assert err.code == "REF_OVER_CAPACITY"
-    assert "丢 1 张" in err.title
-    assert "只能喂 1 张" in err.detail
+    assert "会丢 2 个" in err.title
+    assert "只能喂 1张" in err.detail
     assert err.related_ids["confirm"] == "allow_ref_drop", "前端照它知道带哪个参数重来"
     assert err.related_ids["shot_ids"] == [shot_id]
     assert any("AIVS_REF" in s for s in err.suggestions), "得给一条不丢图的出路"
@@ -267,7 +277,8 @@ async def test_the_sequence_bill_lists_the_shots_that_will_lose_images(
 
     bill = await sequence.plan(pid)
     assert [d["shot_id"] for d in bill["ref_drops"]] == [made["shot_id"]]
-    assert bill["ref_drops"][0]["dropped"] == 1
+    assert bill["ref_drops"][0]["dropped"] == 2
+    assert [b["media"] for b in bill["ref_drops"][0]["media"]] == ["image"], "按媒体分族报"
     assert bill["ref_drops"][0]["scene_index_no"] == 1
     assert any("参考图" in n for n in bill["notes"]), "账单上要看得见，不能只在报错里说"
     assert bill["total_jobs"] == 1, "装不下不是 blocker：确认一下照样能生成"

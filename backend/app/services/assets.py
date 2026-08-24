@@ -52,6 +52,10 @@ KIND_DIR = {
 }
 IMAGE_SUFFIX = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
 VIDEO_SUFFIX = {".mp4", ".mov", ".mkv", ".webm", ".avi"}
+#: 音频后缀。加进来是因为**参考素材可以是一段音频**（S2V 那类模型靠对白音频驱动口型），
+#: 而「这个文件是什么媒体」只能由后缀回答——把 `.wav` 当成 `other` 的话，它要么被当图
+#: 填进 LoadImage（不报错也出不了片），要么在账单里被当成「不是图片」整条丢掉。
+AUDIO_SUFFIX = {".wav", ".mp3", ".flac", ".m4a", ".aac", ".ogg", ".opus"}
 
 #: **临时资源**：登记在 asset 表里（生成层与时间线都要靠 asset_id → path 找文件），
 #: 但不算「工程资产」——资产页与孤儿扫描一律不列它们，它们的生命周期挂在源文件上
@@ -88,10 +92,19 @@ def sniff_size(path: Path) -> tuple[int | None, int | None]:
 
 
 def kind_of_suffix(suffix: str) -> str:
-    if suffix.lower() in IMAGE_SUFFIX:
+    """这个文件是什么媒体：`image` / `video` / `audio` / `other`。
+
+    只看后缀，刻意不去读文件头：这句话在只读路径上被问很多次（分镜板、版本轨、账单），
+    为一张缩略图去读几百 MB 的成片不值得。认不出来就是 `other`——调用方一律
+    「不是我要的那一种」处置，绝不猜。
+    """
+    lowered = suffix.lower()
+    if lowered in IMAGE_SUFFIX:
         return "image"
-    if suffix.lower() in VIDEO_SUFFIX:
+    if lowered in VIDEO_SUFFIX:
         return "video"
+    if lowered in AUDIO_SUFFIX:
+        return "audio"
     return "other"
 
 

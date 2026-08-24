@@ -40,6 +40,7 @@ REVISION_SCHEMA: dict[str, int] = {
     "0010_project_preset": 10,
     "0011_project_video_presets": 11,
     "0012_shot_link": 12,
+    "0013_shot_frames": 13,
 }
 
 

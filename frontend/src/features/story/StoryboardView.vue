@@ -259,7 +259,7 @@ async function confirmDrop(): Promise<void> {
                     <p v-if="row.link.pending" class="text-st-review w-full text-center text-2xs">{{ row.link.blocked ? '等前后出片' : '转场暂未生成' }}</p>
                     <p v-if="row.link.blocked" class="text-fg-4 w-full text-center text-2xs">{{ row.link.blocked_how }}</p>
                     <AppButton v-if="row.link.pending" size="sm" variant="primary" :disabled="enqueuing || story.busy || !row.link.can_generate" :title="row.link.blocked ?? '只生成这一条转场'" @click="runTransitions([row.link!.id!])"><Sparkles :size="10" />生成</AppButton>
-                    <button v-else-if="transitionOf(lane, row.link)" class="bg-base-3 border-line-1 h-10 w-full overflow-hidden border" title="预览这段转场" @click="previewShot(transitionOf(lane, row.link!)!)"><img v-if="thumb(transitionOf(lane, row.link)!)" :src="thumb(transitionOf(lane, row.link)!)" alt="" class="h-full w-full object-cover" /><span v-else class="text-fg-4 text-2xs">转场已生成</span></button>
+                  <button v-else-if="transitionOf(lane, row.link)" class="bg-base-3 border-line-1 h-10 w-full overflow-hidden border" title="预览这段转场；双击进入转场编辑" @click="previewShot(transitionOf(lane, row.link!)!)" @dblclick.stop="openShot(transitionOf(lane, row.link!)!.id)"><img v-if="thumb(transitionOf(lane, row.link)!)" :src="thumb(transitionOf(lane, row.link)!)" alt="" class="h-full w-full object-cover" /><span v-else class="text-fg-4 text-2xs">转场已生成</span></button>
                   </template>
                   <template v-else-if="row.link.transition_shot_id">
                     <p class="text-st-review w-full text-center text-2xs">改成无转场了，但之前补出来的那段还在，导出照旧带上它</p>

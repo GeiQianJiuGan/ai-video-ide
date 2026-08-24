@@ -164,6 +164,27 @@ export interface Shot {
   workflow_id: string | null
   prev_shot_id: string | null
   current_version_id: string | null
+  /**
+   * 首帧 / 末帧那两个显式槽位：**「哪一张是首帧」就是用户按下去的那一下**。
+   *
+   * 以前镜头上没有这个字段，首帧只能靠上下文账单里优先级最高的那一条顶上——于是角色三视图
+   * 被标成首帧、也真被喂进 `AIVS_FIRST_FRAME`。现在没填就是没有首帧，账单里的角色表 /
+   * 地点图一律是**参考素材**，一张都不会被提拔。
+   *
+   * 两条使用规矩：
+   *   - **只能是图片**（模型端那两个入口接的是 LoadImage），视频 / 音频请在上下文检查器里
+   *     当参考素材加；后端会用 422「首帧只能是图片」拦下来；
+   *   - **清空传 `''`**——`updateShot` 的 `null` 会被后端 `exclude_none` 吃掉，等于没改。
+   */
+  first_frame_asset_id: string | null
+  last_frame_asset_id: string | null
+  /**
+   * 那两张图**相对工程目录**的路径（过 `fileUrl(pid, path)` 才是 URL），后端顺手带上，
+   * 画槽位缩略图不必再按 id 拉一遍资产。资产被删掉时是 null，但 `*_asset_id` 还在——
+   * 界面要说「指定的图已不在」，不能当没指定过。
+   */
+  first_frame_path: string | null
+  last_frame_path: string | null
   scene_title: string
   scene_index_no: number
   context_overrides: unknown[]
@@ -182,6 +203,7 @@ export interface StoryboardCard {
   title: string
   /** shot / transition —— 转场是系统按衔接补出来的，卡片上要标出来。 */
   kind: string
+  prev_shot_id: string | null
   duration: number
   status: string
   camera: string | null
@@ -361,6 +383,8 @@ export type ShotPatch = Partial<
     | 'steps'
     | 'workflow_id'
     | 'prev_shot_id'
+    | 'first_frame_asset_id'
+    | 'last_frame_asset_id'
   >
 >
 

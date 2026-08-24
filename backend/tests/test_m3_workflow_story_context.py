@@ -438,8 +438,10 @@ def test_context_bill_explains_priority_and_source(client: TestClient, pid: str)
     assert ctx["problems"] == []
     kinds = [(i["kind"], i["included"], i["priority"]) for i in ctx["items"]]
     assert kinds == [("character_sheet", True, 100), ("location_reference", True, 90)]
-    # 没有上游镜头时优先级最高的那张当首帧，其余当参考图——这条规则只在 context 里
-    assert [i["role"] for i in ctx["items"]] == ["first_frame", "reference"]
+    # 首帧只认显式指定：这个镜头没填槽位、也没有上游镜头，所以两条都是参考素材
+    # ——以前优先级最高的那张会被提拔成首帧，于是角色三视图成了画面第一格。
+    assert [i["role"] for i in ctx["items"]] == ["reference", "reference"]
+    assert [i["media"] for i in ctx["items"]] == ["image", "image"]
     sheet = ctx["items"][0]
     assert sheet["reason"] == "该角色在本镜头出场"
     assert sheet["asset_path"].startswith("assets/character_sheets/")
@@ -541,8 +543,9 @@ def test_context_snapshot_records_included_and_omitted(client: TestClient, pid: 
     )
     snap = client.get(f"/api/v1/projects/{pid}/shots/{shot_id}/context/snapshot").json()
     assert [i["kind"] for i in snap["included"]] == ["location_reference"]
-    # 首帧那一张也冻结进账单：地点参考是唯一剩下的采用条目，所以它就是首帧
-    assert [i["role"] for i in snap["included"]] == ["first_frame"]
+    # 角色 / 地点这些参考素材永远不会被提拔成首帧，剩一条也一样
+    assert [i["role"] for i in snap["included"]] == ["reference"]
+    assert [i["media"] for i in snap["included"]] == ["image"]
     assert [(i["key"], i["reason"]) for i in snap["omitted"]] == [(sheet_key, "手动移除")]
     # 当时模型端能收几张也一起冻结，事后才说得清「为什么少喂了两张」
     assert snap["capacity"]["limit"] is None

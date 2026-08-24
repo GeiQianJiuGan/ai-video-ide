@@ -3,13 +3,18 @@
 这是「本工具不维护模型端的图」这条约束的落点。做法只有一条约定：
 
     用户在 ComfyUI 里把入口节点的**标题**改成 AIVS_FIRST_FRAME / AIVS_LAST_FRAME /
-    AIVS_PROMPT / AIVS_NEGATIVE / AIVS_DURATION / AIVS_SEED / AIVS_REF_1…AIVS_REF_9，
-    然后导出 API 格式的 json。
+    AIVS_PROMPT / AIVS_NEGATIVE / AIVS_DURATION / AIVS_SEED / AIVS_REF_1…AIVS_REF_9 /
+    AIVS_REF_VIDEO_1…4 / AIVS_REF_AUDIO_1…4，然后导出 API 格式的 json。
 
-`AIVS_REF_*` 是**参考图**槽位，与首尾帧分开：首尾帧是「画面从哪一格开始 / 结束」，
-参考图是「谁出场、在哪儿」。只有首帧时人物形象只能靠那一张图带，很容易在几秒里跑掉——
-所以账单里算出来的角色表 / 地点参考图按序号填进这些槽位。图里标了几个就用几个，
-一个都没标也能生成（只是丢形象的风险照旧）。
+`AIVS_REF_*` 是**参考素材**槽位，与首尾帧分开：首尾帧是「画面从哪一格开始 / 结束」，
+参考素材是「谁出场、在哪儿、动作什么样、跟着哪段声音」。只有首帧时人物形象只能靠那一张
+图带，很容易在几秒里跑掉——所以账单里算出来的角色表 / 地点参考图按序号填进这些槽位。
+图里标了几个就用几个，一个都没标也能生成（只是丢形象的风险照旧）。
+
+**参考素材分三种媒体，各有各的槽位**，因为模型端接它们的节点根本不是一个：
+图片进 `AIVS_REF_n`（LoadImage 那类），视频进 `AIVS_REF_VIDEO_n`（VHS / LoadVideo 那类），
+音频进 `AIVS_REF_AUDIO_n`（LoadAudio 那类）。混在一起数会把一段 `.mp4` 填进 LoadImage，
+那既不报错也出不了片——所以槽位、上限、降级说明全部按媒体分开算。
 
 **首尾帧槽位也是可选的**：分工是「首尾帧那类模型补转场，R2V 出正片」，而能收多参考图的
 R2V 图往往根本没有首帧入口。所以必需入口只剩 `AIVS_PROMPT` 一个——没有
@@ -37,12 +42,42 @@ from app.core.errors import AppError, ErrorCode
 #: 入口标题 → 该往节点的哪个输入里填。按顺序取第一个命中的键，
 #: 这样 LoadImage / CLIPTextEncode / 各家的原生节点都能覆盖，而不必认识它们的 class_type。
 IMAGE_FIELDS = ("image", "filename", "url", "value")
+#: 视频参考素材的入口：VHS_LoadVideoPath 是 `video`、核心 LoadVideo 是 `file`，
+#: 其余各家用 filename / path。和图片分开是因为它们压根不是同一类节点。
+VIDEO_FIELDS = ("video", "file", "filename", "path", "url", "value")
+#: 音频参考素材的入口：LoadAudio 是 `audio`（它还有个只读的 audioUI，刻意不碰）。
+AUDIO_FIELDS = ("audio", "file", "filename", "path", "url", "value")
 
-#: 参考图槽位的上限。9 是「一眼能数清」的数目，也刚好覆盖多参考图模型的常见入参
+#: 参考素材槽位的上限。9 是「一眼能数清」的数目，也刚好覆盖多参考图模型的常见入参
 #: （例如 ref_image_0..8）。图里有几个就用几个，不必凑满。
 REF_SLOTS = 9
-#: 参考图槽位的标题，按序号排好——`ref_slots()` 取的就是这个顺序。
+#: 视频 / 音频参考素材的槽位上限。比图片少：能收多段视频或多轨音频的图极少见，
+#: 4 个已经够 VACE 那类「参考视频 + 遮罩视频」和 S2V 那类「一段说话音频」用。
+REF_VIDEO_SLOTS = 4
+REF_AUDIO_SLOTS = 4
+#: 参考素材槽位的标题，按序号排好——`ref_slots()` 取的就是这个顺序。
 REF_MARKERS: tuple[str, ...] = tuple(f"AIVS_REF_{i}" for i in range(1, REF_SLOTS + 1))
+REF_VIDEO_MARKERS: tuple[str, ...] = tuple(
+    f"AIVS_REF_VIDEO_{i}" for i in range(1, REF_VIDEO_SLOTS + 1)
+)
+REF_AUDIO_MARKERS: tuple[str, ...] = tuple(
+    f"AIVS_REF_AUDIO_{i}" for i in range(1, REF_AUDIO_SLOTS + 1)
+)
+#: 媒体 → 它的槽位标题。**这是「参考素材按媒体分开」的唯一一张表**：
+#: 账单算上限、适配器填槽位、UI 上那句提示都从这里取，别在别处再写一份。
+REF_MARKERS_BY_MEDIA: dict[str, tuple[str, ...]] = {
+    "image": REF_MARKERS,
+    "video": REF_VIDEO_MARKERS,
+    "audio": REF_AUDIO_MARKERS,
+}
+#: 媒体的中文说法，四要素错误与界面文案共用一份，别两处不一致。
+MEDIA_LABEL = {"image": "参考图", "video": "参考视频", "audio": "参考音频"}
+#: 媒体 → 它那一族槽位标题怎么写给人看（错误建议里那句「在图里加 … 标题」用它）。
+MARKER_FAMILY = {
+    "image": f"AIVS_REF_1…AIVS_REF_{REF_SLOTS}",
+    "video": f"AIVS_REF_VIDEO_1…{REF_VIDEO_SLOTS}",
+    "audio": f"AIVS_REF_AUDIO_1…{REF_AUDIO_SLOTS}",
+}
 
 MARKERS: dict[str, tuple[str, ...]] = {
     "AIVS_FIRST_FRAME": IMAGE_FIELDS,
@@ -51,12 +86,15 @@ MARKERS: dict[str, tuple[str, ...]] = {
     "AIVS_NEGATIVE": ("text", "prompt", "string", "value"),
     "AIVS_DURATION": ("length", "duration", "frames", "seconds", "num_frames", "value"),
     "AIVS_SEED": ("seed", "noise_seed", "value"),
-    #: 参考图：角色表 / 地点参考图从这里进去。首帧只能是一张，参考图想喂几张标几个。
+    #: 参考素材：角色表 / 地点参考图 / 动作参考视频 / 对白音频从这里进去。
+    #: 首帧只能是一张，参考素材想喂几个标几个。
     **dict.fromkeys(REF_MARKERS, IMAGE_FIELDS),
+    **dict.fromkeys(REF_VIDEO_MARKERS, VIDEO_FIELDS),
+    **dict.fromkeys(REF_AUDIO_MARKERS, AUDIO_FIELDS),
 }
 
 #: 少了这一个就没法生成（提示词填不进去）；其余入口缺了只是「那一项用图里原来的值」。
-#: 参考图槽位一个都没有也照样能生成——只是人物形象只能靠首帧带，容易跑偏。
+#: 参考素材槽位一个都没有也照样能生成——只是人物形象只能靠首帧带，容易跑偏。
 #: **首帧槽位刻意不是必需的**：没有它时首帧会当参考图 1 送进去（`comfy_preset._refs`），
 #: 严格首尾帧只有转场要用，所以只写进 `FLF_REQUIRED`。
 REQUIRED = ("AIVS_PROMPT",)
@@ -66,6 +104,8 @@ HOW_TO = [
     "在 ComfyUI 里右键入口节点 → Title，改成 AIVS_PROMPT / AIVS_FIRST_FRAME 等",
     "想让角色表 / 地点参考图一起喂进去：把接参考图的节点标题改成 AIVS_REF_1、AIVS_REF_2…"
     f"（最多 {REF_SLOTS} 个，有几个标几个）",
+    f"参考视频标 AIVS_REF_VIDEO_1…{REF_VIDEO_SLOTS}、参考音频标 AIVS_REF_AUDIO_1…"
+    f"{REF_AUDIO_SLOTS}——它们接的是 LoadVideo / LoadAudio 那类节点，与图片槽位分开算",
     "只有补转场的那份图需要标全 AIVS_FIRST_FRAME + AIVS_LAST_FRAME；出正片的 R2V 图不标也能用",
     "再用「Save (API Format)」导出，重新上传这份预设",
 ]
@@ -121,21 +161,29 @@ def entry_points(graph: dict[str, Any]) -> dict[str, dict[str, str]]:
     return found
 
 
-def ref_slots(points: dict[str, dict[str, str]]) -> list[str]:
-    """这份图能收几张参考图——按 AIVS_REF_1、AIVS_REF_2… 的序号排好。
+def ref_slots(points: dict[str, dict[str, str]], media: str = "image") -> list[str]:
+    """这份图能收几个某一媒体的参考素材——按 `AIVS_REF_1`、`AIVS_REF_2`… 的序号排好。
 
-    刻意按声明顺序（`REF_MARKERS`）而不是字典顺序：账单里优先级最高的那张要进 1 号槽，
-    「第几张是谁」才对得上（`base.ref_hint` 拼给模型的那句说明也是这个顺序）。
+    刻意按声明顺序（`REF_MARKERS_BY_MEDIA`）而不是字典顺序：账单里优先级最高的那个要进
+    1 号槽，「第几个是谁」才对得上（`base.ref_hint` 拼给模型的那句说明也是这个顺序）。
     中间空一号（只标了 1 和 3）也不算错，就是两个槽位——我们不去猜用户为什么跳号。
+
+    `media` 不认识时回空列表：那种素材这份图根本收不了，等于零个槽位，
+    不该因为多了一种媒体就抛（问这句话的全是只读路径）。
     """
-    return [m for m in REF_MARKERS if m in points]
+    return [m for m in REF_MARKERS_BY_MEDIA.get(media, ()) if m in points]
 
 
-#: 文件路径 → (mtime_ns, 字节数, 槽位数)。「这份图能收几张」是一句会被反复问的话
+def ref_slots_by_media(points: dict[str, dict[str, str]]) -> dict[str, list[str]]:
+    """三种媒体各有哪些槽位。适配器填槽位、账单算上限都从这一张表出发。"""
+    return {media: ref_slots(points, media) for media in REF_MARKERS_BY_MEDIA}
+
+
+#: 文件路径 → (mtime_ns, 字节数, {媒体: 槽位数})。「这份图能收几个」是一句会被反复问的话
 #: （上下文账单、编排账单、界面上每一处都要问），一次解析一份几十万字节的图太贵。
 #: key 里带上 mtime 与大小：文件一改缓存自然失效，所以这不是「可能过期的快照」，
 #: 而是「同一份文件不重复解析」。
-_slot_cache: dict[str, tuple[int, int, int]] = {}
+_slot_cache: dict[str, tuple[int, int, dict[str, int]]] = {}
 
 
 def reset_cache() -> None:
@@ -143,12 +191,15 @@ def reset_cache() -> None:
     _slot_cache.clear()
 
 
-def slot_count(name: str) -> int | None:
-    """这份预设标了几个 `AIVS_REF_*` 槽位。数不出来时回 `None`（= 别拿它当上限）。
+def slot_counts(name: str) -> dict[str, int] | None:
+    """这份预设三种媒体各标了几个槽位。数不出来时回 `None`（= 别拿它当上限）。
 
     数不出来有三种：没给名字、文件不在、文件坏了 / 缺必需入口。**一律不抛**——
     问这句话的地方全是只读路径（上下文账单、编排账单、界面），在那里因为预设坏了就
     500，人连「哪里坏了」都看不到；真正提交时 `submit()` 会拿同一份文件把话说清楚。
+
+    回的是 `{"image": n, "video": n, "audio": n}`，三个键一定齐全（数出来是 0 也写 0）：
+    调用方按媒体取上限，缺键就得到处写 `.get(media, 0)`。
     """
     if not name:
         return None
@@ -160,34 +211,58 @@ def slot_count(name: str) -> int | None:
     key = path.as_posix()
     hit = _slot_cache.get(key)
     if hit is not None and hit[0] == stat.st_mtime_ns and hit[1] == stat.st_size:
-        return hit[2]
+        return dict(hit[2])
     try:
-        count = len(ref_slots(entry_points(load(name))))
+        points = entry_points(load(name))
     except AppError:
         return None
-    _slot_cache[key] = (stat.st_mtime_ns, stat.st_size, count)
-    return count
+    counts = {media: len(slots) for media, slots in ref_slots_by_media(points).items()}
+    _slot_cache[key] = (stat.st_mtime_ns, stat.st_size, counts)
+    return dict(counts)
 
 
-def _image_hint(slots: list[str], first_frame: bool) -> str:
-    """这份图怎么收图——UI 上那一句话。四种情况分开说，别只说「有几个参考图槽位」。"""
+def slot_count(name: str, media: str = "image") -> int | None:
+    """这份预设标了几个某一媒体的槽位。默认问的是参考图（最常问的那一种）。"""
+    counts = slot_counts(name)
+    return None if counts is None else counts.get(media, 0)
+
+
+def _media_tail(by_media: dict[str, list[str]]) -> str:
+    """参考视频 / 参考音频那半句。一个都没标就什么都不说——绝大多数图只收图片，
+    给每份预设都挂一句「没有参考视频槽位」只会把真正的问题埋掉。"""
+    parts = [
+        f"{len(by_media.get(media) or [])} 个{MEDIA_LABEL[media]}"
+        for media in ("video", "audio")
+        if by_media.get(media)
+    ]
+    return f"；另外还能收 {'、'.join(parts)}" if parts else ""
+
+
+def _ref_hint(by_media: dict[str, list[str]], first_frame: bool) -> str:
+    """这份图怎么收素材——UI 上那一句话。四种情况分开说，别只说「有几个参考图槽位」。
+
+    图片那半句是主语（首帧的降级只跟它有关），视频 / 音频只在真标了槽位时补一句：
+    参考图 0 槽是需要提醒的事，参考视频 0 槽是常态。
+    """
+    slots = by_media.get("image") or []
+    tail = _media_tail(by_media)
     if not first_frame:
         if not slots:
             return (
                 "这份图收不进任何图：首帧与角色表 / 地点参考图都喂不进去，只有提示词起作用。"
                 f"要收图就加 AIVS_FIRST_FRAME 或 AIVS_REF_1…AIVS_REF_{REF_SLOTS} 标题"
-            )
+            ) + tail
         return (
             f"没有首帧槽位：首帧会当参考图 1 送进去，这份图一共收 {len(slots)} 张"
             f"（{'、'.join(slots)}）。补转场要用的严格首尾帧请另存一份标了"
             "AIVS_FIRST_FRAME + AIVS_LAST_FRAME 的预设"
-        )
+        ) + tail
     if slots:
-        return f"能收 {len(slots)} 张参考图（{'、'.join(slots)}）"
+        return f"能收 {len(slots)} 张参考图（{'、'.join(slots)}）{tail}"
     return (
         "没有参考图槽位：角色表 / 地点参考图喂不进去，人物形象只能靠首帧带。"
         f"要支持就在图里加 AIVS_REF_1…AIVS_REF_{REF_SLOTS} 标题"
-    )
+    ) + tail
 
 
 def inspect(graph: dict[str, Any]) -> dict[str, Any]:
@@ -195,7 +270,8 @@ def inspect(graph: dict[str, Any]) -> dict[str, Any]:
     points = entry_points(graph)
     missing = [m for m in REQUIRED if m not in points]
     missing_flf = [m for m in FLF_REQUIRED if m not in points]
-    slots = ref_slots(points)
+    by_media = ref_slots_by_media(points)
+    slots = by_media["image"]
     first_frame = "AIVS_FIRST_FRAME" in points
     return {
         "node_count": len(graph),
@@ -212,12 +288,21 @@ def inspect(graph: dict[str, Any]) -> dict[str, Any]:
             for capability, available in (
                 ("r2v", not missing),
                 ("flf", not missing_flf),
+                #: 能收参考视频 / 参考音频算两项独立能力：动作参考与对白音频是两类图，
+                #: UI 上要能一眼看出「这份图接不接音频」。
+                ("ref_video", bool(by_media["video"])),
+                ("ref_audio", bool(by_media["audio"])),
             )
             if available
         ],
         #: 能收几张参考图。0 不影响 ready——只是这份图喂不进角色表，UI 要提醒。
         "ref_slots": len(slots),
-        "ref_hint": _image_hint(slots, first_frame),
+        #: 参考视频 / 参考音频的槽位数。与 `ref_slots` 分开给：混成一个数会让界面
+        #: 显示「能收 5 个参考素材」而其中 2 个只吃音频，用户照着塞图必然白跑一趟。
+        "ref_video_slots": len(by_media["video"]),
+        "ref_audio_slots": len(by_media["audio"]),
+        "ref_slots_by_media": {media: len(v) for media, v in by_media.items()},
+        "ref_hint": _ref_hint(by_media, first_frame),
         "impact": (
             None
             if not missing
@@ -293,6 +378,9 @@ def listing() -> list[dict[str, Any]]:
             "first_frame_ok": False,
             "capabilities": [],
             "ref_slots": 0,
+            "ref_video_slots": 0,
+            "ref_audio_slots": 0,
+            "ref_slots_by_media": {"image": 0, "video": 0, "audio": 0},
             "ref_hint": "",
         }
         try:

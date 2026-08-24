@@ -16,6 +16,8 @@ import { api } from './client'
 
 /** 参考来源的种类，priority 由后端给，这里只用于图标与分组文案。 */
 export const CONTEXT_KIND_LABEL: Record<string, string> = {
+  first_frame: '首帧槽位',
+  last_frame: '末帧槽位',
   character_sheet: '角色表',
   location_reference: '地点参考',
   prev_frame: '上游末帧',
@@ -26,10 +28,28 @@ export const CONTEXT_KIND_LABEL: Record<string, string> = {
 /**
  * 采用的条目在生成时**充当什么**。规则只在后端（`services/context.py::_assign_roles`），
  * 前端只负责把它标出来——没被采用的是空串。
+ *
+ * **首尾帧和参考素材是两件事**：首 / 末帧决定「画面从哪一格开始 / 结束」（走
+ * `AIVS_FIRST_FRAME` / `AIVS_LAST_FRAME`，不占参考槽位），参考素材决定「谁出场、在哪儿、
+ * 什么动作、什么声音」（走 `AIVS_REF_*`）。首帧**只认镜头上那个显式槽位**或上游镜头的
+ * 真末帧，角色表 / 地点图一张都不会被提拔成首帧。
  */
 export const CONTEXT_ROLE_LABEL: Record<string, string> = {
   first_frame: '首帧',
-  reference: '参考图',
+  last_frame: '末帧',
+  reference: '参考素材',
+}
+
+/**
+ * 参考素材的媒体族。`other` 是「认不出后缀」，后端不会采用它（`reason` 里写清了）。
+ * 每一族进各自的槽位（`AIVS_REF_*` / `AIVS_REF_VIDEO_*` / `AIVS_REF_AUDIO_*`），
+ * 所以「装不下」也是各族分开算的。
+ */
+export const CONTEXT_MEDIA_LABEL: Record<string, string> = {
+  image: '参考图',
+  video: '参考视频',
+  audio: '参考音频',
+  other: '未知类型',
 }
 
 /** 账单里的一条。`included` 为 false 时 `reason` 就是「为什么没用它」。 */
@@ -42,8 +62,17 @@ export interface ContextItem {
   source_id: string | null
   reason: string
   included: boolean
-  /** `first_frame` / `reference`，没被采用时是空串。旧版本冻结的账单里可能没有这个字段。 */
+  /**
+   * `first_frame` / `last_frame` / `reference`，没被采用时是空串。
+   * 旧版本冻结的账单里可能没有这个字段。
+   */
   role?: string
+  /**
+   * `image` / `video` / `audio` / `other`——只看后缀（后端 `assets.kind_of_suffix`）。
+   * 界面照它决定用 `<img>` 还是 `<video>` / `<audio>`，也照它分组标「装不下」。
+   * 旧账单里没有这个字段，按 `image` 读。
+   */
+  media?: string
   /** 手动添加的，或被手动移除的——两种都算人工干预过。 */
   manual: boolean
   /**
@@ -56,12 +85,27 @@ export interface ContextItem {
   missing_file: boolean
 }
 
+/** 某一族参考素材的槽位账。三族各算一遍，混着数会把「音频装不下」算没了。 */
+export interface ContextCapacityMedia {
+  /** 参考图 / 参考视频 / 参考音频。 */
+  label: string
+  /** null = 不限张数；0 是有意义的答案（这一族槽位一个都没标）。 */
+  limit: number | null
+  ref_count: number
+  dropped: number
+  dropped_labels: string[]
+  over: boolean
+}
+
 /**
- * 这一次模型端能收几张参考图，以及会不会有图喂不进去。
+ * 这一次模型端能收几个参考素材，以及会不会有素材喂不进去。
  *
  * **不是应用级设置**：ComfyUI 预设数自己标了几个 `AIVS_REF_*`，通用 REST 合同不限张数，
  * 没选预设时也不限（`limit === null`）。`limit === 0` 是有意义的答案——那份图一张参考图
  * 都收不了，人物形象只能靠首帧带。
+ *
+ * 顶层那几个字段说的是**参考图**（历史口径）；视频 / 音频看 `media` 子块，
+ * `over` 是「任意一族装不下」。
  */
 export interface ContextCapacity {
   /** null = 不限张数。 */
@@ -70,7 +114,7 @@ export interface ContextCapacity {
   source: string
   /** 为什么是这个上限，直接显示给用户。 */
   detail: string
-  /** 账单里算作「参考图」的条数（首帧那一张不占槽位）。 */
+  /** 账单里算作「参考图」的条数（首 / 末帧那两张不占槽位）。 */
   ref_count: number
   /** 会喂不进去几张。 */
   dropped: number
@@ -78,6 +122,8 @@ export interface ContextCapacity {
   dropped_labels: string[]
   /** true 时生成前会先要一次确认（`REF_OVER_CAPACITY`）。 */
   over: boolean
+  /** 三族各自的账，键是 `image` / `video` / `audio`。旧账单里可能没有。 */
+  media?: Record<string, ContextCapacityMedia>
 }
 
 export interface ContextBill {

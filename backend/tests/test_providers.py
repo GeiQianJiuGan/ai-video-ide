@@ -21,7 +21,7 @@ import pytest
 from app.core.config import settings
 from app.core.errors import AppError
 from app.generation.providers import presets, registry
-from app.generation.providers.base import RefImage, VideoRequest
+from app.generation.providers.base import RefAsset, VideoRequest
 from app.generation.providers.comfy_preset import ComfyPresetProvider
 from app.generation.providers.http_api import HttpApiProvider
 
@@ -69,7 +69,8 @@ class FakeComfy:
     async def ping(self) -> dict[str, Any]:
         return {"online": True, "base_url": self.base_url, "detail": "已连接"}
 
-    async def upload_image(self, filename: str, data: bytes, subfolder: str = "aivs") -> str:
+    async def upload_input(self, filename: str, data: bytes, subfolder: str = "aivs") -> str:
+        """参考素材不只有图（视频 / 音频走同一个 `/upload/image` 端点），所以这里叫 input。"""
         self.uploaded.append(filename)
         return f"aivs/{filename}"
 
@@ -102,13 +103,20 @@ def with_ref_slots(count: int) -> dict[str, Any]:
     return graph
 
 
-def make_refs(tmp_path: Path, *labels: str) -> list[RefImage]:
-    out: list[RefImage] = []
+def make_refs(tmp_path: Path, *labels: str) -> list[RefAsset]:
+    out: list[RefAsset] = []
     for i, label in enumerate(labels, 1):
         path = tmp_path / f"ref{i}.png"
         path.write_bytes(b"R")
-        out.append(RefImage(path=path, label=label, kind="character_sheet"))
+        out.append(RefAsset(path=path, label=label, kind="character_sheet"))
     return out
+
+
+def media_ref(tmp_path: Path, name: str, media: str, label: str) -> RefAsset:
+    """一个非图片的参考素材。媒体来自后缀，这里显式传是因为测试不经过 `kind_of_suffix`。"""
+    path = tmp_path / name
+    path.write_bytes(b"M")
+    return RefAsset(path=path, label=label, kind="manual", media=media)
 
 
 async def test_preset_injection_hits_titles_and_leaves_the_rest_alone(tmp_path: Path) -> None:
@@ -170,6 +178,99 @@ async def test_preset_without_the_last_frame_title_says_how_to_fix_it(tmp_path: 
     assert any("Title" in s for s in err.suggestions), "必须告诉用户去 ComfyUI 里改标题"
 
 
+def with_media_slots(images: int = 1, videos: int = 0, audios: int = 0) -> dict[str, Any]:
+    """在 GRAPH 上加三种媒体的参考素材槽位。视频 / 音频节点的输入键也各不相同。"""
+    graph = with_ref_slots(images)
+    for i in range(1, videos + 1):
+        graph[f"2{i}"] = {
+            "class_type": "VHS_LoadVideoPath",
+            "inputs": {"video": f"占位{i}.mp4"},
+            "_meta": {"title": f"AIVS_REF_VIDEO_{i}"},
+        }
+    for i in range(1, audios + 1):
+        graph[f"3{i}"] = {
+            "class_type": "LoadAudio",
+            "inputs": {"audio": f"占位{i}.wav"},
+            "_meta": {"title": f"AIVS_REF_AUDIO_{i}"},
+        }
+    return graph
+
+
+async def test_each_media_goes_into_its_own_family_of_slots(tmp_path: Path) -> None:
+    """一段 `.mp4` 填进 LoadImage 既不报错也出不了片，所以三种媒体各走各的槽位。"""
+    write_preset("图视音", with_media_slots(images=1, videos=1, audios=1))
+    first = tmp_path / "first.png"
+    first.write_bytes(b"A")
+    fake = FakeComfy()
+    provider = ComfyPresetProvider(client=fake)  # type: ignore[arg-type]
+    req = VideoRequest(
+        mode="i2v",
+        prompt="雨夜推门",
+        first_frame=first,
+        refs=[
+            *make_refs(tmp_path, "林小雨（常服）"),
+            media_ref(tmp_path, "动作.mp4", "video", "推门的动作"),
+            media_ref(tmp_path, "对白.wav", "audio", "林小雨的台词"),
+        ],
+        extra={"preset": "图视音"},
+    )
+
+    await provider.submit(req, client_id="aivs-test")
+    graph = fake.submitted or {}
+    assert graph["11"]["inputs"]["image"] == "aivs/ref1.png"
+    assert graph["21"]["inputs"]["video"] == "aivs/动作.mp4", "视频进 AIVS_REF_VIDEO_1 那个输入键"
+    assert graph["31"]["inputs"]["audio"] == "aivs/对白.wav"
+    assert fake.uploaded == ["first.png", "ref1.png", "动作.mp4", "对白.wav"]
+    # 序号按媒体各自从 1 数：和真正填进去的槽位一一对应
+    text = graph["3"]["inputs"]["text"]
+    assert "参考图1=林小雨（常服）" in text
+    assert "参考视频1=推门的动作" in text and "参考音频1=林小雨的台词" in text
+
+
+async def test_one_media_without_slots_does_not_drop_the_others(tmp_path: Path) -> None:
+    """图片槽位够、视频槽位是 0：只有那段视频喂不进去，而且必须说出来。"""
+    write_preset("只收图", with_media_slots(images=2))
+    fake = FakeComfy()
+    provider = ComfyPresetProvider(client=fake)  # type: ignore[arg-type]
+    req = VideoRequest(
+        mode="i2v",
+        prompt="雨夜推门",
+        refs=[
+            *make_refs(tmp_path, "林小雨（常服）"),
+            media_ref(tmp_path, "动作.mp4", "video", "推门的动作"),
+        ],
+        extra={"preset": "只收图"},
+    )
+
+    await provider.submit(req, client_id="aivs-test")
+    assert fake.uploaded == ["ref1.png"], "没有视频槽位就别把它传上去"
+    note = next(n for n in req.notes if "AIVS_REF_VIDEO" in n)
+    assert "推门的动作" in note and "参考视频" in note
+    assert (fake.submitted or {})["11"]["inputs"]["image"] == "aivs/ref1.png", "图照喂"
+
+
+def test_preset_inspection_counts_each_media_separately() -> None:
+    write_preset("图视音", with_media_slots(images=3, videos=2, audios=1))
+    row = next(r for r in presets.listing() if r["name"] == "图视音")
+    assert (row["ref_slots"], row["ref_video_slots"], row["ref_audio_slots"]) == (3, 2, 1)
+    assert row["ref_slots_by_media"] == {"image": 3, "video": 2, "audio": 1}
+    assert "参考视频" in row["ref_hint"] and "参考音频" in row["ref_hint"]
+
+
+def test_capacity_is_per_media(monkeypatch: pytest.MonkeyPatch) -> None:
+    """三种媒体折成一个数字的话，「还能再喂 1 个」到底指图还是音频就说不清了。"""
+    presets.save("图视音", json.dumps(with_media_slots(images=3, audios=1), ensure_ascii=False))
+    monkeypatch.setattr(settings, "video_provider", "comfy_preset")
+    monkeypatch.setattr(settings, "video_preset", "图视音")
+    registry.reset()
+    cap = registry.ref_capacity()
+    assert (cap.limit, cap.video, cap.audio) == (3, 0, 1)
+    assert (cap.limit_of("image"), cap.limit_of("audio")) == (3, 1)
+    assert cap.dropped_of("video", 1) == 1, "没有视频槽位 = 一段都收不了"
+    assert cap.dropped_of("audio", 1) == 0
+    assert "参考音频 1 个" in cap.detail, "「另外还能收什么」得写在界面看得见的那句话里"
+
+
 async def test_preset_feeds_reference_images_into_the_ref_slots(tmp_path: Path) -> None:
     """账单里的角色表 / 地点参考图必须真的进到图里——「人物形象丢失」就是这一步漏了。"""
     write_preset("多参考图", with_ref_slots(2))
@@ -194,7 +295,7 @@ async def test_preset_feeds_reference_images_into_the_ref_slots(tmp_path: Path) 
     assert graph["3"]["inputs"]["text"].startswith("雨夜推门")
     assert "参考图1=林小雨（常服）" in graph["3"]["inputs"]["text"]
     assert "参考图2=雨夜巷口" in graph["3"]["inputs"]["text"]
-    assert any("参考图对应关系" in n for n in req.notes)
+    assert any("参考素材对应关系" in n for n in req.notes)
 
 
 async def test_ref_labels_can_be_turned_off(

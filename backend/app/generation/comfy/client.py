@@ -92,11 +92,16 @@ class ComfyClient:
         except httpx.HTTPError as exc:
             raise _offline(exc) from exc
 
-    async def upload_image(self, filename: str, data: bytes, subfolder: str = "aivs") -> str:
-        """把首/末帧传进 ComfyUI 的 input 目录，返回图里该填的文件名。
+    async def upload_input(self, filename: str, data: bytes, subfolder: str = "aivs") -> str:
+        """把首/末帧与参考素材传进 ComfyUI 的 input 目录，返回图里该填的文件名。
 
-        R2V 的入口是图，而图在我们这边；ComfyUI 只认它自己 input 目录下的名字，
+        R2V 的入口是文件，而文件在我们这边；ComfyUI 只认它自己 input 目录下的名字，
         所以每次生成前先上传。同名会被 ComfyUI 自动改名，因此**必须用它回的名字**。
+
+        **参考视频 / 参考音频走的是同一个 `/upload/image`**：ComfyUI 自己的前端上传
+        视频与音频用的也是这个端点（它只是把文件放进 input 目录，不看是什么媒体），
+        另外那两个端点（`/upload/mask`）干的是别的事。所以这里刻意不叫 `upload_image`——
+        名字里带 image 会让人以为得另找一个端点传 `.wav`。
         """
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=3.0)) as http:
@@ -108,11 +113,12 @@ class ComfyClient:
                 if resp.status_code >= 400:
                     raise AppError(
                         ErrorCode.COMFY_LOST,
-                        "参考图上传失败",
+                        "参考素材上传失败",
                         f"HTTP {resp.status_code}: {resp.text[:500]}",
                         [
                             "确认 ComfyUI 版本支持 /upload/image",
                             "确认 ComfyUI 侧 input 目录可写",
+                            "参考视频 / 音频走的是同一个上传端点，确认它没有被反向代理挡掉",
                         ],
                     )
                 body = resp.json()
@@ -121,7 +127,7 @@ class ComfyClient:
         except ValueError as exc:
             raise AppError(
                 ErrorCode.COMFY_LOST,
-                "参考图上传的响应不认识",
+                "参考素材上传的响应不认识",
                 f"{type(exc).__name__}: {exc}",
                 ["确认这个地址真的是 ComfyUI"],
             ) from exc

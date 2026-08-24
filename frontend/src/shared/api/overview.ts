@@ -116,9 +116,18 @@ export interface EnvironmentStatus {
     preset_name: string | null
     preset_ready: boolean
     ref_slots: number | null
+    /**
+     * 参考视频 / 参考音频的槽位数，和 `ref_slots`（参考图）**分开给**：
+     * 混成一个数会显示「能收 5 个参考素材」而其中 2 个只吃音频，
+     * 用户照着塞图必然白跑一趟。
+     */
+    ref_video_slots: number | null
+    ref_audio_slots: number | null
     r2v_name: string | null
     r2v_ready: boolean
     r2v_ref_slots: number | null
+    r2v_ref_video_slots: number | null
+    r2v_ref_audio_slots: number | null
     flf_name: string | null
     flf_ready: boolean
     detail: string

@@ -380,9 +380,15 @@ class OverviewService:
                 "preset_name": selected or None,
                 "preset_ready": bool(item and item.get("ready")),
                 "ref_slots": item.get("ref_slots") if item else None,
+                # 参考视频 / 参考音频的槽位数单独给。混进 `ref_slots` 会让状态条显示
+                # 「能收 5 个参考素材」而其中 2 个只吃音频——用户照着塞图必然白跑一趟。
+                "ref_video_slots": item.get("ref_video_slots") if item else None,
+                "ref_audio_slots": item.get("ref_audio_slots") if item else None,
                 "r2v_name": selected or None,
                 "r2v_ready": bool(item and item.get("r2v_ready")),
                 "r2v_ref_slots": item.get("ref_slots") if item else None,
+                "r2v_ref_video_slots": item.get("ref_video_slots") if item else None,
+                "r2v_ref_audio_slots": item.get("ref_audio_slots") if item else None,
                 "flf_name": flf_selected or None,
                 "flf_ready": bool(flf_item and flf_item.get("flf_ready")),
                 "detail": (

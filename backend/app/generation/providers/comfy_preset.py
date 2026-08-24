@@ -3,16 +3,17 @@
 与旧的 Workflow 绑定路径的区别只有一处，但很关键：**我们不维护图**。
 预设里已经按标题标好了入口（见 `presets.py`），这里做四件事：
 
-  1. 把首/末帧与参考图上传到 ComfyUI 的 input 目录（图在我们这边，ComfyUI 只认它自己的文件名）；
-  2. 按标题把首帧 / 末帧 / 参考图 / prompt / 负向 / 时长 / 种子填进去；
+  1. 把首/末帧与参考素材上传到 ComfyUI 的 input 目录（文件在我们这边，ComfyUI 只认它自己的文件名）；
+  2. 按标题把首帧 / 末帧 / 参考素材 / prompt / 负向 / 时长 / 种子填进去；
   3. 提交，拿 prompt_id 当 task_id；
   4. 轮询 history，取最后一个产物。
 
 图里的 lora、加速节点、采样器我们不看也不校验——那是模型端的事。
 
-参考图（`AIVS_REF_1…`）与首尾帧分开处理，且**槽位不够不是失败**：图里只标了 3 个槽位、
-账单给了 5 张，就填前 3 张并把这件事写进 `req.notes` 冻结进版本——降级要说出来，
-但不该让整个任务跑不了。
+参考素材（`AIVS_REF_*` / `AIVS_REF_VIDEO_*` / `AIVS_REF_AUDIO_*`）与首尾帧分开处理，
+**按媒体各填各的槽位**（图片、视频、音频接的节点根本不是一类），且**槽位不够不是失败**：
+图里只标了 3 个图片槽、账单给了 5 张，就填前 3 张并把这件事写进 `req.notes` 冻结进版本——
+降级要说出来，但不该让整个任务跑不了。
 """
 
 from __future__ import annotations
@@ -42,37 +43,44 @@ class ComfyPresetProvider:
     # --- 探测 ---
 
     def ref_capacity(self) -> base.RefCapacity:
-        """能收几张参考图 = 默认预设里标了几个 `AIVS_REF_*`。
+        """能收几个参考素材 = 默认预设里标了几个 `AIVS_REF_*` / `_VIDEO_` / `_AUDIO_`。
 
         看的是**设置里的默认预设**：问这句话的时机（算账单、给警告）都在入队之前，
         那时还没有任务、也就没有 `extra["preset"]`。某个任务临时换了预设时，真正喂了
-        几张仍然由 `_refs` 如实写进 `params.ref_notes`——账单说的是「按当前设置会怎样」。
+        几个仍然由 `_refs` 如实写进 `params.ref_notes`——账单说的是「按当前设置会怎样」。
+
+        三种媒体各回一个数：一份图标了 3 张图片槽 + 1 段音频槽是常见的事，
+        折成一个数字的话账单只能说「还能再喂 1 个」，而用户塞进去的那一个大概是图。
         """
         name = str(settings.video_preset or "")
-        count = presets.slot_count(name)
-        if count is None:
+        counts = presets.slot_counts(name)
+        if counts is None:
             return base.RefCapacity(
                 None,
                 name,
                 (
-                    f"读不到预设 {name}（文件不在或填不进去），这里先不限张数；"
+                    f"读不到预设 {name}（文件不在或填不进去），这里先不限数量；"
                     "真正生成时会先报出这份图的问题。"
                     if name
-                    else "还没有选默认预设，这里先不限张数；真正生成时会报「还没有选生成预设」。"
+                    else "还没有选默认预设，这里先不限数量；真正生成时会报「还没有选生成预设」。"
                 ),
             )
-        if count == 0:
-            return base.RefCapacity(
-                0,
-                name,
-                f"预设 {name} 里一个 AIVS_REF_* 都没标——角色图 / 场景图全都喂不进去，"
-                "人物形象只能靠首帧带。",
-            )
-        return base.RefCapacity(
-            count,
-            name,
-            f"预设 {name} 标了 {count} 个 AIVS_REF_* 槽位，一次最多喂 {count} 张参考图。",
+        image, video, audio = counts["image"], counts["video"], counts["audio"]
+        extra = "、".join(
+            f"{presets.MEDIA_LABEL[media]} {n} 个"
+            for media, n in (("video", video), ("audio", audio))
+            if n
         )
+        if image == 0:
+            detail = (
+                f"预设 {name} 里一个 AIVS_REF_* 都没标——角色图 / 场景图全都喂不进去，"
+                "人物形象只能靠首帧带。"
+            )
+        else:
+            detail = f"预设 {name} 标了 {image} 个 AIVS_REF_* 槽位，一次最多喂 {image} 张参考图。"
+        if extra:
+            detail += f"另外还能收 {extra}。"
+        return base.RefCapacity(image, name, detail, video=video, audio=audio)
 
     async def probe(self) -> dict[str, Any]:
         ping = await self._client.ping()
@@ -173,72 +181,93 @@ class ComfyPresetProvider:
     async def _refs(
         self, req: VideoRequest, name: str, points: dict[str, dict[str, str]]
     ) -> dict[str, Any]:
-        """把账单里的参考图按序号填进 `AIVS_REF_*`，顺便把「谁是谁」告诉模型。
+        """把账单里的参考素材按媒体、按序号填进 `AIVS_REF_*`，顺便把「谁是谁」告诉模型。
 
-        四条取舍：
+        五条取舍：
+          · **按媒体分开填**：图片进 `AIVS_REF_n`、视频进 `AIVS_REF_VIDEO_n`、音频进
+            `AIVS_REF_AUDIO_n`。混着数会把一段 `.mp4` 填进 LoadImage，ComfyUI 那边既不
+            报错也出不了片——一个媒体的槽位不够只影响它自己那一组，别的照喂。
           · **槽位不够只降级，不失败**——图是模型端维护的，我们没资格因为它只标了 3 个槽位
-            就拒绝生成；少喂的那几张写进 `req.notes`，跟着版本一起冻结，事后查得到。
+            就拒绝生成；少喂的那几个写进 `req.notes`，跟着版本一起冻结，事后查得到。
           · **图里没有首帧入口时，首帧插到参考图 1**：分工是「首尾帧那类模型补转场，
             R2V 出正片」，而多参考图的 R2V 图常常没有 `AIVS_FIRST_FRAME`。这时把首帧
             当第一张参考图送进去，并写一条 note——绝不静默丢掉那一张。
           · **一个槽位都没有时也照样跑**，但要留一条 note：那种图只能靠首帧带形象，
             这正是「人物形象丢失」的现场，用户得看得见原因。
-          · **顺序即语义**：账单已按优先级排好，1 号槽放优先级最高的那张；
+          · **顺序即语义**：账单已按优先级排好，每种媒体的 1 号槽放它那组里优先级最高的那个；
             要不要在 prompt 末尾附一句「参考图1=林小雨」由设置里的 `video.ref_labels` 决定
             （ComfyUI 这类图收不到标签，只能靠这句话对上号）。
         """
-        slots = presets.ref_slots(points)
+        by_slots = presets.ref_slots_by_media(points)
         refs = list(req.refs)
         first_as_ref = req.first_frame is not None and "AIVS_FIRST_FRAME" not in points
         if first_as_ref and req.first_frame is not None:
-            refs.insert(0, base.RefImage(req.first_frame, "首帧", "first_frame"))
+            refs.insert(0, base.RefAsset(req.first_frame, "首帧", "first_frame", "image"))
         if not refs:
             return {}
-        if not slots:
-            if first_as_ref:
-                req.notes.append(
-                    f"预设 {name} 既没有 AIVS_FIRST_FRAME 也没有 AIVS_REF_* 槽位，"
-                    f"首帧与账单里 {len(req.refs)} 张参考图一张都没喂进去——这一版只有提示词起作用。"
-                )
-            else:
-                req.notes.append(
-                    f"预设 {name} 里没有 AIVS_REF_* 槽位，账单里 {len(req.refs)} 张参考图"
-                    "（角色表 / 地点参考图）没有喂进去——人物形象只能靠首帧带。"
-                )
-            log.info("provider.refs_unsupported", preset=name, refs=len(refs))
-            return {}
-        if first_as_ref:
-            req.notes.append(
-                f"预设 {name} 没有 AIVS_FIRST_FRAME 槽位，首帧已当作参考图 1 送进去"
-                "（这份图做不了严格首尾帧，补转场请另选一份）。"
-            )
-        sent = refs[: len(slots)]
-        if len(refs) > len(slots):
-            dropped = "、".join(r.label or r.path.name for r in refs[len(slots) :])
-            req.notes.append(
-                f"预设 {name} 只有 {len(slots)} 个参考图槽位，账单里这几张没喂进去：{dropped}。"
-            )
-            log.info("provider.refs_truncated", preset=name, slots=len(slots), refs=len(refs))
         values: dict[str, Any] = {}
-        for marker, ref in zip(slots, sent, strict=False):
-            values[marker] = await self._upload(ref.path)
-        hint = base.ref_hint(sent) if settings.video_ref_labels else ""
+        sent_all: list[base.RefAsset] = []
+        for media, group in base.refs_by_media(refs).items():
+            if not group:
+                continue
+            slots = by_slots.get(media) or []
+            label = presets.MEDIA_LABEL.get(media, "参考素材")
+            family = presets.MARKER_FAMILY.get(media, "AIVS_REF_*")
+            if not slots:
+                names = "、".join(r.label or r.path.name for r in group)
+                if media == "image" and first_as_ref:
+                    req.notes.append(
+                        f"预设 {name} 既没有 AIVS_FIRST_FRAME 也没有 AIVS_REF_* 槽位，"
+                        f"首帧与账单里 {len(group) - 1} 张参考图一张都没喂进去"
+                        "——这一版只有提示词起作用。"
+                    )
+                else:
+                    req.notes.append(
+                        f"预设 {name} 里没有 {family} 槽位，账单里 {len(group)} 个{label}"
+                        f"没有喂进去：{names}。"
+                        + ("人物形象只能靠首帧带，这一版容易跑偏。" if media == "image" else "")
+                    )
+                log.info("provider.refs_unsupported", preset=name, media=media, refs=len(group))
+                continue
+            if media == "image" and first_as_ref:
+                req.notes.append(
+                    f"预设 {name} 没有 AIVS_FIRST_FRAME 槽位，首帧已当作参考图 1 送进去"
+                    "（这份图做不了严格首尾帧，补转场请另选一份）。"
+                )
+            sent = group[: len(slots)]
+            if len(group) > len(slots):
+                dropped = "、".join(r.label or r.path.name for r in group[len(slots) :])
+                req.notes.append(
+                    f"预设 {name} 只有 {len(slots)} 个{label}槽位，"
+                    f"账单里这几个没喂进去：{dropped}。"
+                )
+                log.info(
+                    "provider.refs_truncated",
+                    preset=name,
+                    media=media,
+                    slots=len(slots),
+                    refs=len(group),
+                )
+            for marker, ref in zip(slots, sent, strict=False):
+                values[marker] = await self._upload(ref.path)
+            sent_all += sent
+        hint = base.ref_hint(sent_all) if settings.video_ref_labels else ""
         if hint:
             values["AIVS_PROMPT"] = f"{req.prompt}\n{hint}".strip()
-            req.notes.append(f"已把参考图对应关系写进 prompt：{hint}")
+            req.notes.append(f"已把参考素材对应关系写进 prompt：{hint}")
         return values
 
     async def _upload(self, path: Path) -> str:
         if not path.is_file():  # noqa: ASYNC240 - 本地文件检查，开销可忽略
             raise AppError(
                 ErrorCode.MISSING_ASSET,
-                "参考图不在磁盘上",
+                "参考素材不在磁盘上",
                 f"{path} 找不到。",
-                ["确认该资产文件还在工程目录里", "或重新挑一张参考图"],
+                ["确认该资产文件还在工程目录里", "或重新挑一个参考素材"],
                 {"path": path.as_posix()},
             )
-        # 参考图是本地小文件，读它不值得再包一层线程
-        return await self._client.upload_image(path.name, path.read_bytes())  # noqa: ASYNC240
+        # 参考素材是本地文件，读它不值得再包一层线程（大段视频也就是一次同步读）
+        return await self._client.upload_input(path.name, path.read_bytes())  # noqa: ASYNC240
 
     async def poll(self, task_id: str) -> TaskState:
         history = await self._client.history(task_id)

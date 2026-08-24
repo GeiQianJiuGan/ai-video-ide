@@ -5,10 +5,11 @@
 
     POST {base}/submit
       body {mode, prompt, negative, duration, seed, extra, first_frame, last_frame, refs}
-      —— 两个 frame 是 base64（图在我们这边，不能指望对方能读我们的磁盘）
-      —— refs 是**首尾帧之外的参考图**，按优先级排好的数组，每项
-         {data: base64, name, label, kind}：label 是「它是谁」（角色表 / 地点参考），
-         模型端用不上可以忽略，但顺序必须当成语义——第 1 张最重要
+      —— 两个 frame 是 base64 的**图片**（图在我们这边，不能指望对方能读我们的磁盘）
+      —— refs 是**首尾帧之外的参考素材**，按优先级排好的数组，每项
+         {data: base64, name, label, kind, media}：label 是「它是谁」（角色表 / 地点参考），
+         media 是 image | video | audio（**同一个数组里三种媒体混着来**，按 media 分流，
+         别拿后缀猜），模型端用不上可以忽略，但顺序必须当成语义——同一媒体里第 1 个最重要
       resp {task_id}
 
     GET {base}/tasks/{task_id}
@@ -96,14 +97,16 @@ class HttpApiProvider:
     # --- 探测 ---
 
     def ref_capacity(self) -> base.RefCapacity:
-        """**不限张数。** 这条合同由我们定，`refs` 是整组带过去的，没有槽位这回事。
+        """**不限数量，三种媒体都是。** 这条合同由我们定，`refs` 是整组带过去的，
+        没有槽位这回事。
 
-        真限制在服务端（它能吃几张），可那件事我们既问不到也不该猜——猜低了白丢用户的图。
+        真限制在服务端（它能吃几个），可那件事我们既问不到也不该猜——猜低了白丢用户的素材。
         """
         return base.RefCapacity(
             None,
             "REST 合同",
-            "通用 REST 合同把参考图整组发过去，不存在槽位不够：账单算出几张就发几张。",
+            "通用 REST 合同把参考素材（图 / 视频 / 音频）整组发过去，不存在槽位不够："
+            "账单算出几个就发几个。",
         )
 
     async def probe(self) -> dict[str, Any]:
@@ -148,7 +151,9 @@ class HttpApiProvider:
                 continue
             body[key] = _encode(path)
             body[f"{key}_name"] = path.name
-        # 参考图整组带过去：这条合同由我们定，所以它天生支持多张，不存在槽位不够的问题。
+        # 参考素材整组带过去：这条合同由我们定，所以它天生支持多个，不存在槽位不够的问题。
+        # `media` 必须带上——服务端按它分流（图进图生视频那条、音频进 S2V 那条），
+        # 让对方拿后缀去猜的话，一个没有后缀的临时文件就能把整条链路带偏。
         if req.refs:
             body["refs"] = [
                 {
@@ -156,6 +161,7 @@ class HttpApiProvider:
                     "name": ref.path.name,
                     "label": ref.label,
                     "kind": ref.kind,
+                    "media": ref.media,
                 }
                 for ref in req.refs
             ]
@@ -250,9 +256,9 @@ def _encode(path: Path) -> str:
     if not path.is_file():
         raise AppError(
             ErrorCode.MISSING_ASSET,
-            "参考图不在磁盘上",
+            "参考素材不在磁盘上",
             f"{path} 找不到。",
-            ["确认该资产文件还在工程目录里", "或重新挑一张参考图"],
+            ["确认该资产文件还在工程目录里", "或重新挑一个参考素材"],
             {"path": path.as_posix()},
         )
     return base64.b64encode(path.read_bytes()).decode("ascii")
