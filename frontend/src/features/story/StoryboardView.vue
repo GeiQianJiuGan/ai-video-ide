@@ -53,7 +53,7 @@ const readyLinks = computed(() => pendingLinks.value.filter((l) => l.can_generat
 const blockedLinks = computed(() => pendingLinks.value.filter((l) => !l.can_generate))
 const transitionTitle = computed(() => {
   if (readyLinks.value.length) return `补齐 ${readyLinks.value.length} 条已经能补的衔接（镜头之间与幕之间一起）；已经有成片的一条都不重做${blockedLinks.value.length ? `。另外 ${blockedLinks.value.length} 条在等成片，这一次不做` : ''}`
-  if (blockedLinks.value.length) return `${blockedLinks.value.length} 条衔接配了转场，但接缝两侧还没都生成过视频——${blockedLinks.value[0].blocked_how ?? '先把这两个镜头各自生成出来'}`
+  if (blockedLinks.value.length) return `${blockedLinks.value.length} 条衔接配了转场，但接缝两侧还没都生成过视频——${blockedLinks.value[0]?.blocked_how ?? '先把这两个镜头各自生成出来'}`
   return '没有配成转场却还没出片的衔接'
 })
 
