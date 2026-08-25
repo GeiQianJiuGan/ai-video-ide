@@ -96,9 +96,7 @@ def with_shot_audio_policy(prompt: str, negative_prompt: str) -> tuple[str, str]
     positive = str(prompt or "").strip().rstrip("。；; ")
     if SHOT_AUDIO_PROMPT_SUFFIX not in positive:
         positive = (
-            f"{positive}。{SHOT_AUDIO_PROMPT_SUFFIX}"
-            if positive
-            else SHOT_AUDIO_PROMPT_SUFFIX
+            f"{positive}。{SHOT_AUDIO_PROMPT_SUFFIX}" if positive else SHOT_AUDIO_PROMPT_SUFFIX
         )
 
     negative = str(negative_prompt or "").strip().rstrip(",， ")

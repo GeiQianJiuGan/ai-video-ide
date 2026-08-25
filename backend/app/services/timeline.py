@@ -62,8 +62,93 @@ EXPORT_AUDIO_BITRATE = "192k"
 #:      顺便把上面第 1 条也解决了。改动它之前先跑一遍 12 秒的真实导出。
 EXPORT_AUDIO_FORMAT = "aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo"
 
+#: 装配铺配音的那条音频轨的名字。**单独一条**：用户自己的配乐、从画面里拆出去的声音
+#: 都在别的音频轨上，两边就不会抢同一段时间，装配也不用在这里算避让。
+DUB_TRACK_NAME = "A-配音"
+#: 时长对不上多少秒算「值得说一句」。低于它是编码误差，报出来只会变成噪音。
+AUDIO_DRIFT = 0.25
+
 #: 一次撤销快照：轨道 + 片段两张表的整体状态。
 Snapshot = dict[str, list[dict[str, Any]]]
+
+
+def _version_span(version: GenerationVersion, shot: Shot) -> tuple[float, float]:
+    """这一版**能用的源区间**（秒）。
+
+    两列都空 = 整个文件，所以老版本行为不变；长视频切段的版本各自带自己的区间，
+    `asset_id` 全部指向同一个源文件（零文件复制）。
+    """
+    start = float(version.in_point or 0.0)
+    if version.out_point is not None:
+        return start, max(start, float(version.out_point))
+    length = float(version.duration or shot.duration or 4.0)
+    return start, start + max(0.0, length)
+
+
+def _keep_trim(
+    clip: TimelineClip | None,
+    span: tuple[float, float],
+    warnings: list[dict[str, Any]],
+    label: str,
+) -> tuple[float, float]:
+    """把手工裁切带到新版本上。**装得下就原样保留，装不下就收进来并说一句。**
+
+    没有这一步，「二次处理」这一层每次重新装配都会被生成层踩平：用户剪掉的开头
+    会自己长回来。静默截断同样不行（硬约束 4），所以收窄一律进 `warnings`。
+    """
+    lo, hi = span
+    if clip is None:
+        return lo, hi
+    old_in = float(clip.in_point or 0.0)
+    old_out = float(clip.out_point) if clip.out_point is not None else old_in + float(clip.duration)
+    trimmed = old_in > lo + 0.001 or old_out + 0.001 < hi
+    if not trimmed:
+        return lo, hi
+    if old_in >= lo - 0.001 and old_out <= hi + 0.001:
+        return old_in, old_out
+    new_in = min(max(old_in, lo), hi)
+    new_out = max(min(old_out, hi), new_in)
+    if new_out - new_in < 0.05:
+        warnings.append(
+            {
+                "kind": "trim_reset",
+                "clip_id": clip.id,
+                "detail": f"「{label}」原来的裁切区间 {old_in:.2f}~{old_out:.2f}s "
+                f"在新版本（{lo:.2f}~{hi:.2f}s）里已经不存在，这一段恢复成全长。",
+                "suggestion": "重新裁一次，或者用「撤销」退回上一版装配",
+            }
+        )
+        return lo, hi
+    warnings.append(
+        {
+            "kind": "trim_clamped",
+            "clip_id": clip.id,
+            "detail": f"「{label}」的裁切区间从 {old_in:.2f}~{old_out:.2f}s "
+            f"收到了 {new_in:.2f}~{new_out:.2f}s（新版本只有 {lo:.2f}~{hi:.2f}s）。",
+            "suggestion": "确认这一段的出入点",
+        }
+    )
+    return new_in, new_out
+
+
+def _warn_audio_length(
+    audio: GenerationVersion, video_duration: float, label: str, warnings: list[dict[str, Any]]
+) -> None:
+    """配音比画面长 / 短了就说出来。**绝不静默变速**——那是把声音改了却不告诉人。"""
+    length = float(audio.duration or 0.0)
+    if length <= 0 or abs(length - video_duration) <= AUDIO_DRIFT:
+        return
+    verb = "长" if length > video_duration else "短"
+    warnings.append(
+        {
+            "kind": "audio_length",
+            "version_id": audio.id,
+            "detail": f"「{label}」的配音 {length:.2f}s，比画面 {video_duration:.2f}s "
+            f"{verb} {abs(length - video_duration):.2f}s；这一段按画面长度铺，"
+            f"{'多出来的会被切掉' if length > video_duration else '结尾会没有声音'}。",
+            "suggestion": "重新生成配音时把时长对齐，或者在音频轨上手工调这一段",
+        }
+    )
 
 
 class TimelineService:
@@ -343,62 +428,327 @@ class TimelineService:
 
     # --- 装配 ---
 
-    async def auto_assemble(self, pid: str, *, replace: bool = True) -> dict[str, Any]:
-        """按 Scene / Shot 顺序把当前版本铺到视频轨。没有当前版本的镜头明确列出来。"""
+    async def assemble_plan(self, pid: str) -> dict[str, Any]:
+        """**只读账单**：这次重新装配会新增 / 更新 / 删除 / 挪动哪些片段，哪几段有冲突。
+
+        照 `sequence.plan` / `adopt.plan` 的老规矩——「重新装配」以前是个不敢按的按钮
+        （它会清空整条视频轨），现在按之前能先看见它要干什么。
+        """
+        diff = await self._assemble_diff(pid, dub_track_id=None)
+        return {
+            "add": diff["add"],
+            "update": diff["update"],
+            "remove": diff["remove"],
+            "move": diff["move"],
+            "skipped": diff["skipped"],
+            "warnings": diff["warnings"],
+            "repaired": diff["repaired"],
+            #: 用户自己铺的片段有几段（装配一段都不会碰）。
+            "preserved": diff["preserved"],
+            #: 需要为「采用的配音」新开一条音频轨（`run` 时才真的开）。
+            "dub_track_needed": diff["dub_track_needed"],
+        }
+
+    async def auto_assemble(self, pid: str, *, replace: bool = False) -> dict[str, Any]:
+        """按 Scene / Shot 顺序把当前版本对位铺到视频轨（**只碰自己铺的那些片段**）。
+
+        这里刻意**不是**「清空整轨再重建」：
+
+          · 用户在片段上做过的手工裁切 / 静音 / 音量必须活下来，不然「二次处理」这一层
+            每次重新装配都会被生成层踩平；
+          · 片段 id 保住了，被拆到音频轨上的声音就不会集体悬空
+            （`_shape` 里那个 `source_missing` 说的就是它）；
+          · 长视频切出来的段、用户自己加的素材是 `origin="manual"`，装配永不触碰。
+
+        `replace=True` 是**兼容入口**：先把自己铺过的全删掉再铺一遍（`manual` 的仍然不动），
+        给「我就是要彻底重铺」这个诉求留一条路。
+        """
         timeline = await self.get(pid)
         video = next((t for t in timeline["tracks"] if t["kind"] == "video"), None)
         if video is None:  # pragma: no cover - get() 保证有 V1
             raise AppError(ErrorCode.CONFLICT, "时间线缺少视频轨", "", ["重建时间线"])
         db = db_of(pid)
+
+        await self._capture(pid)
+        if replace:
+            async with db.write() as session:
+                for clip in await fetch_all(db, TimelineClip):
+                    if clip.origin != "assembled":
+                        continue
+                    fresh = await session.get(TimelineClip, clip.id)
+                    if fresh is not None:
+                        await session.delete(fresh)
+
+        #: 采用了配音的镜头要有地方放。**单独一条轨**，只装装配铺的配音——和用户自己的
+        #: 配乐 / 拆出来的声音分开，两边就不会抢同一段时间，也不用在这里算避让。
+        dub_track_id = await self._ensure_dub_track(pid, needed=await self._dub_needed(pid))
+        diff = await self._assemble_diff(pid, dub_track_id=dub_track_id)
+
+        placed: list[str] = []
+        async with db.write() as session:
+            for item in diff["remove"]:
+                fresh = await session.get(TimelineClip, item["clip_id"])
+                if fresh is not None:
+                    await session.delete(fresh)
+            for item in diff["update"]:
+                fresh = await session.get(TimelineClip, item["clip_id"])
+                if fresh is None:
+                    continue
+                fresh.version_id = item["version_id"]
+                fresh.asset_id = item["asset_id"]
+                fresh.shot_id = item["shot_id"]
+                fresh.index_no = item["index_no"]
+                fresh.start = item["start"]
+                fresh.duration = item["duration"]
+                fresh.in_point = item["in_point"]
+                fresh.out_point = item["out_point"]
+                fresh.label = item["label"]
+                if item["mute"]:
+                    # 只强制静音，绝不强制取消静音——「这一段我不想让它出声」也是用户的编辑。
+                    fresh.muted = 1
+                placed.append(fresh.id)
+            for item in diff["add"]:
+                row = TimelineClip(
+                    id=new_id("timeline_clip"),
+                    track_id=item["track_id"],
+                    shot_id=item["shot_id"],
+                    version_id=item["version_id"],
+                    asset_id=item["asset_id"],
+                    index_no=item["index_no"],
+                    start=item["start"],
+                    duration=item["duration"],
+                    in_point=item["in_point"],
+                    out_point=item["out_point"],
+                    label=item["label"],
+                    muted=1 if item["mute"] else 0,
+                    volume=1.0,
+                    origin="assembled",
+                )
+                session.add(row)
+                placed.append(row.id)
+            for item in diff["repaired"]:
+                fresh = await session.get(TimelineClip, item["clip_id"])
+                if fresh is not None:
+                    fresh.source_clip_id = item["to_clip_id"]
+
+        bus.emit(
+            Channel.SHOT,
+            "timeline.assembled",
+            {
+                "clips": len(placed),
+                "added": len(diff["add"]),
+                "updated": len(diff["update"]),
+                "removed": len(diff["remove"]),
+                "skipped": len(diff["skipped"]),
+            },
+            project_id=pid,
+        )
+        return {
+            "placed": placed,
+            "added": [i["shot_id"] for i in diff["add"]],
+            "updated": [i["clip_id"] for i in diff["update"]],
+            "removed": [i["clip_id"] for i in diff["remove"]],
+            "skipped": diff["skipped"],
+            "warnings": diff["warnings"],
+            "repaired": diff["repaired"],
+            "preserved": diff["preserved"],
+            "timeline": await self.get(pid),
+        }
+
+    async def _dub_needed(self, pid: str) -> bool:
+        """有没有镜头采用了配音——没有就不要凭空开一条空轨道。"""
+        return any(bool(s.current_audio_version_id) for s in await fetch_all(db_of(pid), Shot))
+
+    async def _ensure_dub_track(self, pid: str, *, needed: bool) -> str | None:
+        if not needed:
+            return None
+        timeline = await self.get(pid)
+        existing = next(
+            (t for t in timeline["tracks"] if t["kind"] == "audio" and t["name"] == DUB_TRACK_NAME),
+            None,
+        )
+        if existing is not None:
+            return str(existing["id"])
+        track = (await self.add_track(pid, kind="audio", name=DUB_TRACK_NAME))["track"]
+        return str(track["id"])
+
+    async def _assemble_diff(self, pid: str, *, dub_track_id: str | None) -> dict[str, Any]:
+        """算出「对位调和」要做的事。**只读，不写库**，所以 plan 与 run 共用它。
+
+        对位的键是 `(轨道用途, shot_id)`：镜头还在、版本换了就只改素材；镜头没了才删；
+        顺序变了只挪 `start`。**手工裁切能活下来**——新版本装得下就原样保留，装不下就
+        收进新区间并在账单里说一句，绝不静默截断（硬约束 4）。
+        """
+        db = db_of(pid)
+        timeline = await self.get(pid)
+        video = next((t for t in timeline["tracks"] if t["kind"] == "video"), None)
+        if video is None:  # pragma: no cover
+            raise AppError(ErrorCode.CONFLICT, "时间线缺少视频轨", "", ["重建时间线"])
+        video_track_id = str(video["id"])
+
         scenes = await fetch_all(db, Scene, order_by=Scene.index_no)
         shots = await fetch_all(db, Shot, order_by=Shot.index_no)
+        shots_by_id = {s.id: s for s in shots}
         versions = {v.id: v for v in await fetch_all(db, GenerationVersion)}
         ordered: list[Shot] = []
         for scene in scenes:
             ordered += [s for s in shots if s.scene_id == scene.id]
 
-        await self._capture(pid)
-        placed, skipped = [], []
+        clips = await fetch_all(db, TimelineClip)
+        track_kind = {t["id"]: t["kind"] for t in timeline["tracks"]}
+        live_ids = {c.id for c in clips}
+        assembled: dict[tuple[str, str], TimelineClip] = {}
+        dupes: list[TimelineClip] = []
+        manual_video: list[TimelineClip] = []
+        manual_count = 0
+        for clip in sorted(clips, key=lambda c: (c.index_no, c.start)):
+            if clip.origin != "assembled":
+                manual_count += 1
+                if clip.track_id == video_track_id:
+                    manual_video.append(clip)
+                continue
+            slot = "video" if clip.track_id == video_track_id else "dub"
+            key = (slot, clip.shot_id or "")
+            if not clip.shot_id or key in assembled:
+                dupes.append(clip)
+                continue
+            assembled[key] = clip
+
+        add: list[dict[str, Any]] = []
+        update: list[dict[str, Any]] = []
+        remove: list[dict[str, Any]] = []
+        move: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+        warnings: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+        dub_track_needed = False
         cursor = 0.0
-        async with db.write() as session:
-            if replace:
-                for clip in await fetch_all(
-                    db, TimelineClip, where=TimelineClip.track_id == video["id"]
-                ):
-                    fresh = await session.get(TimelineClip, clip.id)
-                    if fresh is not None:
-                        await session.delete(fresh)
-            for shot in ordered:
-                version = versions.get(shot.current_version_id or "")
-                if version is None or version.asset_id is None:
-                    skipped.append(
-                        {"shot_id": shot.id, "index_no": shot.index_no, "reason": "还没有当前版本"}
-                    )
-                    continue
-                duration = float(version.duration or shot.duration or 4.0)
-                clip = TimelineClip(
-                    id=new_id("timeline_clip"),
-                    track_id=video["id"],
-                    shot_id=shot.id,
-                    version_id=version.id,
-                    asset_id=version.asset_id,
-                    index_no=len(placed) + 1,
-                    start=cursor,
-                    duration=duration,
-                    in_point=0.0,
-                    out_point=duration,
-                    label=f"Shot {shot.index_no} {shot.title}".strip(),
+        index = 0
+
+        for shot in ordered:
+            version = versions.get(shot.current_version_id or "")
+            if version is None or version.asset_id is None:
+                skipped.append(
+                    {"shot_id": shot.id, "index_no": shot.index_no, "reason": "还没有当前版本"}
                 )
-                session.add(clip)
-                placed.append(clip.id)
-                cursor += duration
-        bus.emit(
-            Channel.SHOT,
-            "timeline.assembled",
-            {"clips": len(placed), "skipped": len(skipped)},
-            project_id=pid,
-        )
-        return {"placed": placed, "skipped": skipped, "timeline": await self.get(pid)}
+                continue
+            index += 1
+            span = _version_span(version, shot)
+            audio_version = versions.get(shot.current_audio_version_id or "")
+            mute_video = audio_version is not None and audio_version.asset_id is not None
+            label = f"Shot {shot.index_no} {shot.title}".strip()
+
+            key = ("video", shot.id)
+            seen.add(key)
+            current = assembled.get(key)
+            window = _keep_trim(current, span, warnings, label)
+            spec = {
+                "track_id": video_track_id,
+                "shot_id": shot.id,
+                "version_id": version.id,
+                "asset_id": version.asset_id,
+                "index_no": index,
+                "start": cursor,
+                "duration": window[1] - window[0],
+                "in_point": window[0],
+                "out_point": window[1],
+                "label": label,
+                "mute": mute_video,
+            }
+            if current is None:
+                add.append(spec)
+            else:
+                if abs(current.start - cursor) > 0.001:
+                    move.append({"clip_id": current.id, "from": current.start, "to": cursor})
+                update.append({**spec, "clip_id": current.id})
+            cursor += spec["duration"]
+
+            if not mute_video:
+                continue
+            assert audio_version is not None
+            dub_track_needed = True
+            dub_key = ("dub", shot.id)
+            seen.add(dub_key)
+            dub_current = assembled.get(dub_key)
+            dub_spec = {
+                "track_id": dub_track_id or "",
+                "shot_id": shot.id,
+                "version_id": audio_version.id,
+                "asset_id": audio_version.asset_id,
+                "index_no": index,
+                "start": spec["start"],
+                "duration": spec["duration"],
+                "in_point": 0.0,
+                "out_point": spec["duration"],
+                "label": f"{label} 配音".strip(),
+                "mute": False,
+            }
+            _warn_audio_length(audio_version, spec["duration"], label, warnings)
+            if dub_current is None:
+                add.append(dub_spec)
+            else:
+                update.append({**dub_spec, "clip_id": dub_current.id})
+
+        for (slot, shot_id), clip in assembled.items():
+            if (slot, shot_id) in seen:
+                continue
+            shot = shots_by_id.get(shot_id)
+            if shot is None:
+                reason = "镜头已删除"
+            elif slot == "dub":
+                reason = "这个镜头不再采用配音"
+            else:
+                reason = "镜头不再有当前版本"
+            remove.append({"clip_id": clip.id, "shot_id": shot_id, "reason": reason})
+        for clip in dupes:
+            remove.append(
+                {
+                    "clip_id": clip.id,
+                    "shot_id": clip.shot_id,
+                    "reason": "同一个镜头有多个装配片段，只留一个",
+                }
+            )
+
+        for clip in manual_video:
+            end = float(clip.start) + float(clip.duration)
+            if float(clip.start) < cursor - 0.001 and end > 0.001:
+                warnings.append(
+                    {
+                        "kind": "manual_overlap",
+                        "clip_id": clip.id,
+                        "detail": f"「{clip.label or clip.id}」落在装配区间 0~{cursor:.2f}s 里，"
+                        "装配不会挪动它，导出时会和铺开的镜头重叠。",
+                        "suggestion": "把它移到另一条视频轨，或者删掉它",
+                    }
+                )
+
+        #: 之前用 `replace=True` 铺过的工程里，拆出去的声音多半已经指不到源片段了。
+        #: 对位调和之后片段 id 不再变，所以这里顺手把还能认出来的重新配上——
+        #: 靠 `shot_id` 认，认不出来的不动（`source_missing` 照旧如实显示）。
+        repaired: list[dict[str, Any]] = []
+        for clip in clips:
+            if track_kind.get(clip.track_id) != "audio" or not clip.source_clip_id:
+                continue
+            if clip.source_clip_id in live_ids or not clip.shot_id:
+                continue
+            target = assembled.get(("video", clip.shot_id))
+            if target is not None:
+                repaired.append(
+                    {"clip_id": clip.id, "to_clip_id": target.id, "shot_id": clip.shot_id}
+                )
+
+        return {
+            "video_track_id": video_track_id,
+            "add": add,
+            "update": update,
+            "remove": remove,
+            "move": move,
+            "skipped": skipped,
+            "warnings": warnings,
+            "repaired": repaired,
+            "preserved": manual_count,
+            "dub_track_needed": dub_track_needed and dub_track_id is None,
+        }
 
     # --- 编辑命令 ---
 
@@ -413,9 +763,7 @@ class TimelineService:
             # 真正的 start 始终由连续顺序重新计算。
             desired = max(0.0, float(start))
             ordered = sorted(siblings, key=lambda row: row.start)
-            position = sum(
-                1 for row in ordered if desired >= row.start + row.duration / 2
-            )
+            position = sum(1 for row in ordered if desired >= row.start + row.duration / 2)
             ordered.insert(position, clip)
             await self._write_contiguous_order(pid, clip.track_id, [row.id for row in ordered])
             return await self.get(pid)
@@ -537,9 +885,13 @@ class TimelineService:
                 muted=clip.muted,
                 volume=clip.volume,
                 source_clip_id=clip.source_clip_id,
+                #: **切一刀就等于接管这一段**：两半都转成 `manual`，装配从此不再动它们。
+                #: 否则两半共用一个 shot_id，下一次装配会把后半段当「多余的装配片段」删掉。
+                origin="manual",
             )
             head.duration = offset
             head.out_point = clip.in_point + offset
+            head.origin = "manual"
             session.add(tail)
         await self._reindex(pid, clip.track_id)
         return await self.get(pid)
@@ -770,7 +1122,12 @@ class TimelineService:
                 ["选择视频轨再添加空白视频段"],
             )
         if duration <= 0:
-            raise AppError(ErrorCode.VALIDATION_ERROR, "空白片段时长无效", "时长必须大于 0 秒。", ["填入正数时长"])
+            raise AppError(
+                ErrorCode.VALIDATION_ERROR,
+                "空白片段时长无效",
+                "时长必须大于 0 秒。",
+                ["填入正数时长"],
+            )
         siblings = await self._siblings(pid, track_id, None)
         await self._capture(pid)
         row = TimelineClip(
@@ -788,9 +1145,7 @@ class TimelineService:
         await self._close_gaps(pid, track_id)
         return {"clip_id": row.id, "timeline": await self.get(pid)}
 
-    async def resize_blank_clip(
-        self, pid: str, clip_id: str, *, duration: float
-    ) -> dict[str, Any]:
+    async def resize_blank_clip(self, pid: str, clip_id: str, *, duration: float) -> dict[str, Any]:
         """修改黑场占位的时长；后面的画面随即重新贴紧。"""
         db = db_of(pid)
         clip = await fetch(db, TimelineClip, clip_id, "片段")
@@ -1056,16 +1411,12 @@ class TimelineService:
                     {"track": track_name, "clip_id": other.id},
                 )
 
-    async def _write_contiguous_order(
-        self, pid: str, track_id: str, clip_ids: list[str]
-    ) -> None:
+    async def _write_contiguous_order(self, pid: str, track_id: str, clip_ids: list[str]) -> None:
         """按给定顺序重写视频轨；视频永远从 0 秒连续铺开。"""
         db = db_of(pid)
         rows = {
             c.id: c
-            for c in await fetch_all(
-                db, TimelineClip, where=TimelineClip.track_id == track_id
-            )
+            for c in await fetch_all(db, TimelineClip, where=TimelineClip.track_id == track_id)
         }
         cursor = 0.0
         async with db.write() as session:
@@ -1334,12 +1685,7 @@ class TimelineService:
         unknown = 0
         for i, clip in enumerate(clips):
             offset, cursor = cursor, cursor + clip["duration"]
-            if (
-                video_muted
-                or clip["muted"]
-                or clip["volume"] <= 0
-                or not clip["asset_path"]
-            ):
+            if video_muted or clip["muted"] or clip["volume"] <= 0 or not clip["asset_path"]:
                 continue
             probe = await audio_service.peek(proj.dir / clip["asset_path"])
             if probe is None:

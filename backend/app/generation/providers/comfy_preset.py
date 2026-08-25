@@ -161,6 +161,25 @@ class ComfyPresetProvider:
                     {"preset": name, "found": sorted(points)},
                 )
             values["AIVS_LAST_FRAME"] = await self._upload(req.last_frame)
+        # 二次处理的源视频同样**不降级**：图里没有 AIVS_SOURCE_VIDEO 就说明它不是一份
+        # 处理图。悄悄跳过的话，超分任务会变成「凭提示词重出一段」，而版本轨上写着
+        # 「从 v1 超分而来」——血缘就是假的了。
+        if req.source_video is not None:
+            if "AIVS_SOURCE_VIDEO" not in points:
+                raise AppError(
+                    ErrorCode.INVALID_WORKFLOW,
+                    "这份预设不能做二次处理",
+                    f"预设 {name} 里没有标题为 AIVS_SOURCE_VIDEO 的节点，"
+                    "接不了「要处理的那一段视频」。",
+                    [
+                        "在 ComfyUI 里把接视频的那个节点（VHS_LoadVideoPath / LoadVideo）"
+                        "标题改成 AIVS_SOURCE_VIDEO，重新上传预设",
+                        "注意它和 AIVS_REF_VIDEO_n 不是一回事：源视频是「就处理这一段」",
+                        "或在设置页把二次处理预设换成一份标了它的图",
+                    ],
+                    {"preset": name, "found": sorted(points)},
+                )
+            values["AIVS_SOURCE_VIDEO"] = await self._upload(req.source_video)
         values.update(await self._refs(req, name, points))
         for marker, spot in points.items():
             value = values.get(marker)

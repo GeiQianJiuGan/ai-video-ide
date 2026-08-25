@@ -76,9 +76,7 @@ class WorldService:
             session.add(row)
         if default_asset_id:
             variant = await self.create_variant(pid, row.id, {"name": "默认场景"})
-            await self.add_variant_reference(
-                pid, variant["id"], default_asset_id, None, None
-            )
+            await self.add_variant_reference(pid, variant["id"], default_asset_id, None, None)
         return as_dict(row)
 
     async def update_location(self, pid: str, lid: str, patch: dict[str, Any]) -> dict[str, Any]:

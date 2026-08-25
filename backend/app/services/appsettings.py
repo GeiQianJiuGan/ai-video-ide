@@ -60,6 +60,9 @@ GROUPS: tuple[tuple[str, str], ...] = (
     ("llm", "LLM（AI 协作）"),
     ("prompt", "AI 提示词"),
     ("video", "视频生成 API"),
+    ("audio", "音源生成（配音 / 环境音）"),
+    ("refine", "二次处理（超分 / 插帧）"),
+    ("ingest", "长视频导入切段"),
     ("comfy", "ComfyUI"),
     ("scene", "幕（流程图节点）"),
     ("runtime", "运行"),
@@ -150,6 +153,83 @@ FIELDS: tuple[FieldSpec, ...] = (
             "把「参考图1=林小雨（常服）」拼到 prompt 末尾。ComfyUI 那类图收不到标签，"
             "只能靠这句话让模型知道哪张是主角；不想让它动 prompt 就关掉。"
         ),
+    ),
+    # --- 音源：与视频**完全独立的一套**。声音那条链跑的往往是另一台机器 / 另一个服务
+    # （TTS 在 CPU 上就够，视频要 24G 显存），所以地址、密钥、超时、预设都不共用。
+    # `none` 是默认：没配音源不是异常，手动导入音频那条路走完全流程（硬约束 2）。
+    FieldSpec(
+        "audio.provider",
+        "audio_provider",
+        "audio",
+        "调用方式",
+        "enum",
+        ("none", "comfy_preset", "http_api"),
+        ("不配（只手动导入音频）", "ComfyUI 预设", "通用 REST API"),
+        "none 时配音按钮不可用，但「导入音频」照旧——装配、静音、配音轨都不受影响。",
+    ),
+    FieldSpec(
+        "audio.base_url",
+        "audio_base_url",
+        "audio",
+        "服务地址",
+        impact="http_api 时必填；comfy_preset 留空则用下面的 ComfyUI 地址。",
+    ),
+    FieldSpec("audio.api_key", "audio_api_key", "audio", "API Key", "secret"),
+    FieldSpec(
+        "audio.preset",
+        "audio_preset",
+        "audio",
+        "音源预设",
+        impact=(
+            "音源图是另存的一份图：把台词那个文本框标成 AIVS_AUDIO_TEXT"
+            "（只出环境音的图标 AIVS_AUDIO_PROMPT 即可）。缺它无法生成声音。"
+        ),
+    ),
+    FieldSpec("audio.timeout", "audio_timeout", "audio", "单次超时（秒）", "int"),
+    # --- 二次处理：**刻意没有单独的地址 / 密钥**。超分与出画面跑在同一台 ComfyUI 上是常态，
+    # 多一套地址只会多一处配错的地方；真要分开时换预设就够了。
+    FieldSpec(
+        "refine.preset",
+        "refine_preset",
+        "refine",
+        "二次处理预设",
+        impact=(
+            "超分 / 插帧用哪一份图：它必须标了 AIVS_SOURCE_VIDEO（要处理的那一段从这里进去）。"
+            "留空则退回视频那份默认预设。"
+        ),
+    ),
+    # --- 长视频切段：全是切点参数，不涉及任何服务（只用内置 FFmpeg）。
+    FieldSpec(
+        "ingest.scene_threshold",
+        "ingest_scene_threshold",
+        "ingest",
+        "画面切换灵敏度",
+        "float",
+        impact="0~1，越小切得越碎。认不出切点时会自动降级到对白停顿 / 固定长度。",
+    ),
+    FieldSpec(
+        "ingest.min_segment",
+        "ingest_min_segment",
+        "ingest",
+        "一段最短多少秒",
+        "float",
+        impact="比它短的切点会被合并（账单里的 merged_away）——一堆半秒碎片没人处理得了。",
+    ),
+    FieldSpec(
+        "ingest.chunk_seconds",
+        "ingest_chunk_seconds",
+        "ingest",
+        "兜底固定长度（秒）",
+        "float",
+        impact="画面与对白都认不出切点时，按这个长度铺满整段。",
+    ),
+    FieldSpec(
+        "ingest.copy_warn_mb",
+        "ingest_copy_warn_mb",
+        "ingest",
+        "多大就提醒复制会慢（MB）",
+        "int",
+        impact="超过它时账单里提醒可以「引用原地」，代价是工程不能整个拷走。",
     ),
     FieldSpec("comfy.base_url", "comfy_base_url", "comfy", "地址"),
     FieldSpec(
@@ -325,11 +405,18 @@ class AppSettingsService:
             from app.generation.providers import registry
 
             return await registry.provider().probe()
+        if what == "audio":
+            #: 音源那条链是独立的一套（provider / 地址 / 密钥都分开），所以探测也分开——
+            #: 视频通了不代表声音通了。没配时 `audio_provider()` 抛的
+            #: `MISSING_CAPABILITY` 里已经写了手动导入那条出路，不在这里另写一份。
+            from app.generation.providers import registry
+
+            return await registry.audio_provider().probe()
         raise AppError(
             ErrorCode.VALIDATION_ERROR,
             "不认识的探测对象",
             f"what={what}",
-            ["用 llm 或 video"],
+            ["用 llm / video / audio"],
         )
 
     async def models(

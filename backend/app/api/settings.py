@@ -22,7 +22,7 @@ router = APIRouter(tags=["settings"])
 
 
 class ProbeIn(BaseModel):
-    what: str = Field("llm", description="llm | video")
+    what: str = Field("llm", description="llm | video | audio")
 
 
 class ModelsIn(BaseModel):

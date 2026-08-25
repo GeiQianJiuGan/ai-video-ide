@@ -22,12 +22,19 @@ from app.core.logging import get_logger
 from app.events.bus import Channel, bus
 from app.generation.comfy.client import comfy, outputs_of
 from app.generation.providers import registry
-from app.generation.providers.base import RefAsset, TaskState, VideoRequest
+from app.generation.providers.base import AudioRequest, RefAsset, TaskState, VideoRequest
 from app.persistence.models import Project, utc_now
-from app.persistence.models_gen import GenerationVersion, Job
+from app.persistence.models_gen import (
+    AUDIO_KINDS,
+    JOB_KINDS,
+    REFINE_KINDS,
+    GenerationVersion,
+    Job,
+)
 from app.persistence.models_global import GlobalWorkflow
 from app.persistence.models_story import Scene, Shot
 from app.persistence.models_world import Asset
+from app.services import params
 from app.services.assets import assets, kind_of_suffix
 from app.services.base import as_dict, db_of, dump_json, fetch, fetch_all, load_json, project_of
 from app.services.context import context
@@ -165,11 +172,12 @@ class GenerationService:
     ) -> dict[str, Any]:
         db = db_of(pid)
         shot = await fetch(db, Shot, shot_id, "镜头")
-        # 幕级 prompt 是镜头没写 prompt 时的兜底（流程图上那个必填的小节点），
-        # 取值口径与 context.resolve 的 problems 一致，否则会出现「账单说齐了，冻结进
-        # 版本里的 prompt 却是空的」。
+        # 幕级 prompt 是镜头没写 prompt 时的兜底（流程图上那个必填的小节点）。
+        # 取值口径只有一份（`services/params.py::prompt_of`），`context.resolve` 的
+        # problems 与分镜卡片上的黄色感叹号读的是同一个函数——四处各写一遍的时候，
+        # 只要有一处漏了一级就会出现「账单说齐了，冻结进版本里的 prompt 却是空的」。
         scene_of_shot = await fetch(db, Scene, shot.scene_id, "场景")
-        prompt = shot.prompt or shot.description or scene_of_shot.prompt or ""
+        prompt = params.prompt_of(shot, scene_of_shot)
         # 直接调用旧接口时保留 prev_shot_id 的续接语义；新的批量编排会显式传
         # image2video，让所有普通 SHOT 先独立生成，再单独创建 FL2VA 衔接任务。
         capability = kind or ("first_last_frame" if shot.prev_shot_id else "image2video")
@@ -242,6 +250,52 @@ class GenerationService:
             Channel.QUEUE,
             "job.enqueued",
             {"id": row.id, "shot_id": shot_id, "status": row.status},
+            project_id=pid,
+        )
+        self.ensure_pump(pid)
+        return as_dict(row)
+
+    async def enqueue_task(
+        self,
+        pid: str,
+        shot_id: str,
+        *,
+        kind: str,
+        priority: int = 100,
+        params: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """入队一条**不出新画面**的任务：二次处理（`REFINE_KINDS`）或出声音（`AUDIO_KINDS`）。
+
+        与 `enqueue_shot` 分开，因为那一套前置检查在这里全部答非所问：上下文完整性
+        （画面已经有了）、参考素材装不装得下（这条路不喂参考素材）、上游末帧依赖
+        （不出新画面就不必等谁的末帧）。共用的是后半程——同一张 `job` 表、同一个 pump、
+        同一套取消 / 重试 / 优先级、同一个 `add_version`，所以队列面板与版本轨一行不用改。
+        """
+        if kind not in REFINE_KINDS and kind not in AUDIO_KINDS:
+            raise AppError(
+                ErrorCode.VALIDATION_ERROR,
+                "这不是一种二次处理或音源任务",
+                f"kind={kind!r} 不在 {'、'.join((*REFINE_KINDS, *AUDIO_KINDS))} 里。",
+                ["出新画面请走镜头生成入口", f"可用的 kind：{'、'.join(JOB_KINDS)}"],
+                {"kind": kind},
+            )
+        db = db_of(pid)
+        await fetch(db, Shot, shot_id, "镜头")
+        row = Job(
+            id=new_id("job"),
+            shot_id=shot_id,
+            kind=kind,
+            status="queued",
+            priority=priority,
+            params_json=dump_json(params or {}),
+            created_at=utc_now(),
+        )
+        async with db.write() as session:
+            session.add(row)
+        bus.emit(
+            Channel.QUEUE,
+            "job.enqueued",
+            {"id": row.id, "shot_id": shot_id, "status": row.status, "kind": kind},
             project_id=pid,
         )
         self.ensure_pump(pid)
@@ -553,11 +607,24 @@ class GenerationService:
     async def _execute(self, pid: str, job: Job, params: dict[str, Any]) -> dict[str, Any]:
         """跑一次生成。
 
-        两条路：**默认走生成适配层**（`app/generation/providers/*`，本工具不维护模型端的图），
-        旧的节点绑定路径只在「设置里选了 comfy_workflow 且这个任务确实绑了工作流」时才走
-        ——它是兼容选项，不是主路。产物登记与 `add_version` 两条路完全共用。
+        四条路，**按 `job.kind` 分**（`models_gen.JOB_KINDS` 是唯一那张表）：
+          · 出声音（`AUDIO_KINDS`）——音源那条链，产出 `kind="audio"` 的版本，画面不重跑；
+          · 二次处理（`REFINE_KINDS`）——输入是已经出好的那一版，产出同一个镜头上的新版本
+            并记下 `parent_version_id`；
+          · 出画面（默认）——走生成适配层（`app/generation/providers/*`）；
+          · 旧的节点绑定路径——只在「这个任务确实绑了工作流」时才走，是兼容选项不是主路。
+
+        产物登记与 `add_version` 四条路完全共用。
         """
-        if job.workflow_id:
+        if job.kind in AUDIO_KINDS:
+            return await self._run_audio(pid, job, params)
+        parent_version_id: str | None = None
+        source = "generated"
+        if job.kind in REFINE_KINDS:
+            filename, data, workflow_id = await self._run_refine(pid, job, params)
+            parent_version_id = str(params.get("source_version_id") or "") or None
+            source = "refined"
+        elif job.workflow_id:
             filename, data, workflow_id = await self._run_legacy(pid, job, params)
         else:
             filename, data, workflow_id = await self._run_provider(pid, job, params)
@@ -575,7 +642,8 @@ class GenerationService:
             workflow_id=workflow_id,
             params={k: v for k, v in params.items() if k != "context"},
             context_snapshot=params.get("context"),
-            source="generated",
+            source=source,
+            parent_version_id=parent_version_id,
         )
 
     async def _run_provider(
@@ -622,6 +690,18 @@ class GenerationService:
         ]
         if req.notes:
             params["ref_notes"] = list(req.notes)
+        filename, data = await self._await_task(pid, job, provider, task_id)
+        return filename, data, None
+
+    async def _await_task(
+        self, pid: str, job: Job, provider: Any, task_id: str
+    ) -> tuple[str, bytes]:
+        """轮询到出片，然后把产物取回来。
+
+        **出画面、二次处理、出声音共用这一份**：三条链的适配器形状完全一样
+        （`submit` / `poll` / `fetch`），各写一遍轮询只会在「取消怎么响应」「失败怎么翻译」
+        上分叉——而那正是「绝不静默失败」最容易破功的地方。
+        """
         state = TaskState("queued")
         tick = 0
         while True:
@@ -654,8 +734,114 @@ class GenerationService:
                 )
             await asyncio.sleep(POLL_INTERVAL)
             tick += 1
-        filename, data = await provider.fetch(task_id)
-        return filename, data, None
+        return await provider.fetch(task_id)
+
+    # --- 二次处理（输入是已经出好的那一版）---
+
+    async def _source_video_of(self, pid: str, params: dict[str, Any]) -> tuple[Path, Any]:
+        """要处理的那一段画面在磁盘上的位置 + 它那一版。
+
+        **只认版本，不认「这个镜头的最新文件」**：二次处理的意义是「处理我采用的这一版」，
+        按镜头去猜的话，用户在等超分的时候换了一次采用，处理出来的就是另一段画面。
+        """
+        db = db_of(pid)
+        version_id = str(params.get("source_version_id") or "")
+        version = await fetch(db, GenerationVersion, version_id, "要处理的版本")
+        if not version.asset_id:
+            raise AppError(
+                ErrorCode.MISSING_ASSET,
+                "这一版没有产物文件",
+                f"版本 {version.version_no} 上没有资产（可能是失败现场或占位版本），无法处理它。",
+                ["在版本轨里挑一个有画面的版本", "或先把这个镜头生成一次"],
+                {"version_id": version_id},
+            )
+        asset = await fetch(db, Asset, version.asset_id, "资产")
+        path = project_of(pid).dir / asset.path
+        if not await asyncio.to_thread(path.is_file):
+            raise AppError(
+                ErrorCode.MISSING_ASSET,
+                "要处理的那段视频不在磁盘上",
+                f"{asset.path} 找不到（文件可能被移走或删掉了）。",
+                ["确认工程目录完整", "或重新生成这个镜头后再处理"],
+                {"version_id": version_id, "path": asset.path},
+            )
+        return path, version
+
+    async def _run_refine(
+        self, pid: str, job: Job, params: dict[str, Any]
+    ) -> tuple[str, bytes, str | None]:
+        """二次处理：**画面不重生成，只把已经出好的那一段再过一遍图。**
+
+        输入是 `source_version_id` 那一版的文件，填进预设的 `AIVS_SOURCE_VIDEO`
+        （与参考视频严格分开，见 `providers/presets.py`）。产出仍然是同一个镜头上的一个新版本，
+        于是「只增不改」「随时回退到未处理那一版」「采用入口只有一个」全都一行不用改。
+        """
+        provider = registry.provider("comfy_preset")
+        source, version = await self._source_video_of(pid, params)
+        req = VideoRequest(
+            mode="refine",
+            prompt=str(params.get("prompt") or ""),
+            negative=str(params.get("negative_prompt") or ""),
+            source_video=source,
+            duration=float(params.get("duration") or version.duration or 4.0),
+            seed=params.get("seed"),
+            extra={**(params.get("extra") or {}), "preset": params.get("preset")},
+        )
+        task_id = await provider.submit(req, client_id=f"aivs-{pid}")
+        if req.notes:
+            params["ref_notes"] = list(req.notes)
+        return (*(await self._await_task(pid, job, provider, task_id)), None)
+
+    # --- 音源（同一个镜头上的另一版，画面一个字节都不重跑）---
+
+    async def _run_audio(self, pid: str, job: Job, params: dict[str, Any]) -> dict[str, Any]:
+        """出声音。产出 `kind="audio"` 的版本并**自动成为这个镜头采用的那条音轨**。
+
+        与出画面完全同构（提交 → 轮询 → 取回 → 登记成版本），只有三处不同：
+        另一个适配器（`registry.audio_provider()`）、另一种版本 kind、另一个采用指针
+        （`Shot.current_audio_version_id`，落在 `add_version` 里）。
+        """
+        provider = registry.audio_provider()
+        db = db_of(pid)
+        shot = await fetch(db, Shot, job.shot_id, "镜头")
+        voice_ref = await self._asset_path(pid, params.get("voice_ref_asset_id"))
+        source_video: Path | None = None
+        if params.get("source_version_id"):
+            source_video, _ = await self._source_video_of(pid, params)
+        req = AudioRequest(
+            text=str(params.get("text") or ""),
+            prompt=str(params.get("prompt") or ""),
+            negative=str(params.get("negative_prompt") or ""),
+            voice_ref=voice_ref,
+            source_video=source_video,
+            duration=float(params.get("duration") or shot.duration or 4.0),
+            seed=params.get("seed"),
+            extra={**(params.get("extra") or {}), "preset": params.get("preset")},
+        )
+        filename, data = await self._await_task(
+            pid, job, provider, await provider.submit(req, client_id=f"aivs-{pid}")
+        )
+        if req.notes:
+            params["ref_notes"] = list(req.notes)
+        asset = await assets.register_bytes(
+            pid, "generated_audio", filename, data, source="generated"
+        )
+        return await self.add_version(
+            pid,
+            job.shot_id,
+            asset_id=asset["id"],
+            kind="audio",
+            params={k: v for k, v in params.items() if k != "context"},
+            source="generated",
+            duration=req.duration,
+            parent_version_id=str(params.get("source_version_id") or "") or None,
+        )
+
+    async def _asset_path(self, pid: str, asset_id: Any) -> Path | None:
+        if not asset_id:
+            return None
+        asset = await fetch(db_of(pid), Asset, str(asset_id), "资产")
+        return project_of(pid).dir / asset.path
 
     async def _images_of(
         self, pid: str, job: Job, params: dict[str, Any]
@@ -857,7 +1043,20 @@ class GenerationService:
         context_snapshot: Any = None,
         source: str = "generated",
         duration: float | None = None,
+        parent_version_id: str | None = None,
+        in_point: float | None = None,
+        out_point: float | None = None,
     ) -> dict[str, Any]:
+        """记一版。**只增不改**（硬约束 3），三件事按 `kind` 分岔：
+
+        · `kind="audio"` 落的是**第二个指针** `Shot.current_audio_version_id`，
+          绝不碰 `current_version_id` / `status`——「换一条音轨」不该让画面那一版易主，
+          也不该把一个还没出画面的镜头标成 `generated`；
+        · `parent_version_id` 记血缘（超分 / 插帧 / 换音频从哪一版来），版本轨据此
+          画出「原始 v1 → 超分 v2」而不是两条互不相干的版本；
+        · `in_point` / `out_point` 是「只用源文件的这一段」（长视频切段），两个都空
+          = 整个文件，所以老路径行为完全不变。
+        """
         db = db_of(pid)
         await fetch(db, Shot, shot_id, "镜头")
         existing = await fetch_all(
@@ -875,6 +1074,9 @@ class GenerationService:
             context_json=dump_json(context_snapshot) if context_snapshot is not None else None,
             duration=duration,
             source=source,
+            parent_version_id=parent_version_id,
+            in_point=in_point,
+            out_point=out_point,
             created_at=utc_now(),
         )
         async with db.write() as session:
@@ -882,8 +1084,11 @@ class GenerationService:
             shot = await session.get(Shot, shot_id)
             if shot is not None:
                 # 新版本自动成为当前版本；旧版本一条都不删
-                shot.current_version_id = row.id
-                shot.status = "generated"
+                if kind == "audio":
+                    shot.current_audio_version_id = row.id
+                else:
+                    shot.current_version_id = row.id
+                    shot.status = "generated"
                 shot.updated_at = utc_now()
         if asset_id:
             await assets.link(pid, asset_id, "shot", shot_id, role="version")
@@ -906,10 +1111,13 @@ class GenerationService:
             order_by=GenerationVersion.version_no.desc(),
         )
         media = await self._version_media(pid, rows)
+        #: 音频版本比的是**另一个指针**：镜头上画面与声音各采用一版，拿
+        #: `current_version_id` 去比音频版本的话它永远显示「未采用」。
+        adopted = {"audio": shot.current_audio_version_id}
         return [
             {
                 **as_dict(r),
-                "is_current": r.id == shot.current_version_id,
+                "is_current": r.id == adopted.get(r.kind, shot.current_version_id),
                 "params": load_json(r.params_json, {}),
                 "context": load_json(r.context_json, None),
                 "error": load_json(r.error_json, None),
@@ -954,17 +1162,26 @@ class GenerationService:
         return out
 
     async def set_current_version(self, pid: str, version_id: str) -> dict[str, Any]:
+        """采用某一版。**全工程唯一的采用入口**（硬约束 3），音频走的是同一扇门。
+
+        `kind="audio"` 落 `current_audio_version_id`：镜头上有两个指针（画面一个、
+        声音一个），但采用只有这一个动作——另开一个 `/audio-current` 端点的话，
+        前端就得先判断这一版是什么再决定打哪儿，两处判断迟早分叉。
+        """
         db = db_of(pid)
         row = await fetch(db, GenerationVersion, version_id, "生成版本")
         async with db.write() as session:
             shot = await session.get(Shot, row.shot_id)
             if shot is not None:
-                shot.current_version_id = version_id
+                if row.kind == "audio":
+                    shot.current_audio_version_id = version_id
+                else:
+                    shot.current_version_id = version_id
                 shot.updated_at = utc_now()
         bus.emit(
             Channel.VERSION,
             "version.current_changed",
-            {"shot_id": row.shot_id, "version_id": version_id},
+            {"shot_id": row.shot_id, "version_id": version_id, "kind": row.kind},
             project_id=pid,
         )
         self.ensure_pump(pid)

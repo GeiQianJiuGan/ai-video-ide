@@ -11,8 +11,8 @@ from typing import Any
 
 from app.core.config import settings
 from app.core.errors import AppError, ErrorCode
-from app.generation.providers import presets
-from app.generation.providers.base import RefCapacity, VideoProvider
+from app.generation.providers import audio, presets
+from app.generation.providers.base import AudioProvider, RefCapacity, VideoProvider
 from app.generation.providers.comfy_preset import ComfyPresetProvider
 from app.generation.providers.http_api import HttpApiProvider
 
@@ -104,4 +104,54 @@ def ref_capacity(name: str | None = None) -> RefCapacity:
 def reset() -> None:
     """测试用：换掉 settings 之后丢掉缓存的实例。"""
     _cache.clear()
+    _audio_cache.clear()
     presets.reset_cache()
+
+
+# --- 音源：另一条链，另一套地址 / 密钥 / 预设（见 providers/audio.py）---
+
+_audio_cache: dict[str, AudioProvider] = {}
+
+
+def audio_listing() -> list[dict[str, Any]]:
+    """设置页的音源调用方式下拉。`none` 是**默认且第一项**——没配音源不是异常状态。"""
+    return [
+        {"name": name, "label": audio.LABELS.get(name, name)} for name in ("none", *audio.BUILTIN)
+    ]
+
+
+def audio_configured(name: str | None = None) -> bool:
+    return (name or settings.audio_provider) not in ("", "none")
+
+
+def audio_provider(name: str | None = None) -> AudioProvider:
+    """当前的音源服务。**没配就是 `MISSING_CAPABILITY`，不是崩溃**（硬约束 2）。
+
+    建议里必须写明手动那条路：外面做好的一段音频导入成这个镜头的音频版本，
+    装配、静音、配音轨全都照旧工作——音源服务只是省掉「自己去配音」这一步。
+    """
+    chosen = name or settings.audio_provider
+    if not audio_configured(chosen):
+        raise AppError(
+            ErrorCode.MISSING_CAPABILITY,
+            "还没有配置音源服务",
+            "音源是独立的一条链（另一份图 / 另一个地址），默认不开启。",
+            [
+                "在设置页的「音源生成」里选调用方式并选一份音源预设",
+                "或把外面做好的音频导入成这个镜头的音频版本——装配与静音照旧工作，"
+                "画面一个字节都不用重跑",
+            ],
+            {"audio_provider": chosen},
+        )
+    factory = audio.BUILTIN.get(chosen)
+    if factory is None:
+        raise AppError(
+            ErrorCode.VALIDATION_ERROR,
+            "不认识的音源调用方式",
+            f"设置里的 audio.provider 是 {chosen!r}。",
+            ["在设置页重新选择音源调用方式"],
+            {"available": ["none", *audio.BUILTIN]},
+        )
+    if chosen not in _audio_cache:
+        _audio_cache[chosen] = factory()
+    return _audio_cache[chosen]

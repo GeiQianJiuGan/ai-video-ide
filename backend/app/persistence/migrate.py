@@ -41,6 +41,11 @@ REVISION_SCHEMA: dict[str, int] = {
     "0011_project_video_presets": 11,
     "0012_shot_link": 12,
     "0013_shot_frames": 13,
+    "0014_clip_origin": 14,
+    "0015_scene_kind_params": 15,
+    "0016_version_lineage_range": 16,
+    "0017_shot_audio_version": 17,
+    "0018_shot_dialogue": 18,
 }
 
 

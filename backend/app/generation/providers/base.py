@@ -33,7 +33,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
-MODES = ("i2v", "flf")
+MODES = ("i2v", "flf", "refine")
 
 #: 任务状态的统一口径，与 Job.status 对齐，适配器负责把各家的说法翻译成这四个。
 STATUSES = ("queued", "running", "done", "failed")
@@ -137,6 +137,10 @@ class VideoRequest:
     refs: list[RefAsset] = field(default_factory=list)
     duration: float = 4.0
     seed: int | None = None
+    #: **二次处理的输入**：已经出好的那一段视频（`mode="refine"`）。与 `refs` 里的参考视频
+    #: 严格分开——源视频是「就处理这一段」，参考视频是「动作长这样」。混用的话超分图会把
+    #: 一段参考视频当成待处理画面，出来的东西跟这个镜头无关，而界面上会显示「已生成」。
+    source_video: Path | None = None
     extra: dict[str, Any] = field(default_factory=dict)
     #: 适配器提交时写下的降级说明，例如「这份图只有 3 个参考图槽位，账单里第 4 张没喂进去」。
     #: service 层原样冻结进版本，不解释内容——「绝不静默失败」在这里的样子是
@@ -175,6 +179,36 @@ def ref_hint(refs: Sequence[RefAsset]) -> str:
 
 
 @dataclass(slots=True)
+class AudioRequest:
+    """一次**音源**请求。与 `VideoRequest` 分开是这一轮的核心取舍。
+
+    AI 出的那条音轨往往很差，而以前想换掉它只能把整段画面重跑一次——几分钟的显存与时间，
+    只为采一段声音。所以声音独立成一条链：同一个镜头上多出一版 `kind="audio"` 的版本
+    （`Shot.current_audio_version_id`），画面一个字节都不用重跑。
+
+    `text` 与 `prompt` 是两件事，故意不合成一个字段：`text` 是**要说的话**（对白，进 TTS
+    那类图的文本框），`prompt` 是**声音长什么样**（「低沉的男声，雨声背景」，进音频生成图的
+    描述框）。合成一个的话，一份只收台词的图会把「低沉的男声」当台词念出来。
+
+    `source_video` 是这个镜头的画面：对口型那类图要它，纯 TTS 用不上——**给了但图里没有
+    对应入口时只降级并留一条 note**，不失败（模型端那份图由模型端维护）。
+    """
+
+    text: str = ""
+    prompt: str = ""
+    negative: str = ""
+    #: 音色参考（一段谁的声音）。它是**音频**文件，与 `VideoRequest.refs` 里的参考音频
+    #: 不是同一个位置：那些是喂给画面模型的，这一条是喂给音源模型的。
+    voice_ref: Path | None = None
+    source_video: Path | None = None
+    duration: float = 4.0
+    seed: int | None = None
+    extra: dict[str, Any] = field(default_factory=dict)
+    #: 降级说明，与 `VideoRequest.notes` 同一个作风：降级要说出来并冻结进版本。
+    notes: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
 class TaskState:
     """轮询结果。`detail` 是给人看的一句话，失败时它会进错误的 detail。"""
 
@@ -207,3 +241,25 @@ class VideoProvider(Protocol):
     async def fetch(self, task_id: str) -> tuple[str, bytes]:
         """取回产物：(文件名, 字节)。素材必须落进工程，不能只存在服务端。"""
         ...
+
+
+class AudioProvider(Protocol):
+    """一个**音源**服务要能做的四件事。
+
+    形状与 `VideoProvider` 一模一样（`probe` / `submit` / `poll` / `fetch`），只有请求类型
+    不同——于是 `GenerationService` 里那套「提交 → 轮询 → 取回 → 登记成版本」一行都不用改。
+    刻意不共用一个 provider 名字：音频那份图、地址、密钥与视频全是另一套
+    （`settings.audio_*`），共用一个名字就得在业务层写 `if 这次是音频`。
+
+    没有 `ref_capacity()`：音源图只收一个音色参考，不存在「槽位不够丢了哪几张」这件事。
+    """
+
+    name: str
+
+    async def probe(self) -> dict[str, Any]: ...
+
+    async def submit(self, req: AudioRequest, *, client_id: str) -> str: ...
+
+    async def poll(self, task_id: str) -> TaskState: ...
+
+    async def fetch(self, task_id: str) -> tuple[str, bytes]: ...

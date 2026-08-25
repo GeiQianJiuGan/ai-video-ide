@@ -109,9 +109,7 @@ class CastService:
         async with db.write() as session:
             session.add(row)
         # 建角色时顺手给一个根形象：没有形象的角色在镜头里无法被引用
-        appearance = await self.create_appearance(
-            pid, row.id, {"name": "默认形象"}, default=True
-        )
+        appearance = await self.create_appearance(pid, row.id, {"name": "默认形象"}, default=True)
         if default_asset_id:
             await self.add_sheet(pid, appearance["id"], default_asset_id)
         bus.emit(Channel.SHOT, "character.created", {"id": row.id, "name": name}, project_id=pid)

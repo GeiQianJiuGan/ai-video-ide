@@ -11,6 +11,7 @@ from typing import Any
 from fastapi import APIRouter
 from pydantic import BaseModel, Field
 
+from app.services import params
 from app.services.story import story
 
 router = APIRouter(tags=["story"])
@@ -32,6 +33,20 @@ class SceneBody(BaseModel):
     location_variant_id: str | None = None
     time_of_day: str | None = None
     notes: str | None = None
+    dialogue: str | None = Field(
+        default=None, description="这一幕的台词兜底（音源那条链读它）；镜头级 dialogue 优先"
+    )
+    kind: str | None = Field(
+        default=None, description="storyboard 剧本拆出来的 / ingested 从成片切出来的"
+    )
+    param_mode: str | None = Field(
+        default=None,
+        description="shared 镜头留空继承幕级参数 / per_shot 新建镜头时预填（只影响创建那一刻）",
+    )
+    params: dict[str, Any] | None = Field(
+        default=None,
+        description="幕级共用参数（prompt/negative/duration/seed/steps/preset/refs），整份替换",
+    )
 
 
 class ShotBody(BaseModel):
@@ -43,6 +58,9 @@ class ShotBody(BaseModel):
     status: str | None = None
     prompt: str | None = None
     negative_prompt: str | None = None
+    dialogue: str | None = Field(
+        default=None, description="这个镜头说的话（音源那条链用）；视频那条链不读它"
+    )
     seed: int | None = None
     steps: int | None = None
     workflow_id: str | None = None
@@ -172,6 +190,15 @@ async def get_shot(pid: str, shot_id: str) -> dict[str, Any]:
     return await story.get_shot(pid, shot_id)
 
 
+@router.get("/projects/{pid}/shots/{shot_id}/params")
+async def resolve_params(pid: str, shot_id: str, capability: str = "image2video") -> dict[str, Any]:
+    """参数账单：每一项的值 + 它来自哪一级（镜头 / 幕 / 工程 / 默认）。
+
+    界面照它标出「这一项继承自幕」——看不见的继承等于猜，改了幕以后不知道哪些镜头会变。
+    """
+    return await params.resolve(pid, shot_id, capability=capability)
+
+
 @router.patch("/projects/{pid}/shots/{shot_id}")
 async def update_shot(pid: str, shot_id: str, body: ShotBody) -> dict[str, Any]:
     """更新镜头。首帧槽位有 `prev_shot_id` 时的规则：
@@ -183,9 +210,9 @@ async def update_shot(pid: str, shot_id: str, body: ShotBody) -> dict[str, Any]:
     **转场镜头首尾帧都不能手动设置**——首帧来自上游镜头末帧，末帧来自下游镜头首帧，
     都是自动确定的，手动改只会让衔接断开。
     """
-    from app.services.base import db_of, fetch
-    from app.persistence.models_story import Shot
     from app.core.errors import AppError, ErrorCode
+    from app.persistence.models_story import Shot
+    from app.services.base import db_of, fetch
 
     shot = await fetch(db_of(pid), Shot, shot_id, "镜头")
 

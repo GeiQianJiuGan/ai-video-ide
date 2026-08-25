@@ -155,9 +155,7 @@ def auto_bindings(
         elif capability == "image2video" and "AIVS_FIRST_FRAME" in titled:
             bindings["reference_image"] = titled["AIVS_FIRST_FRAME"]
     elif ref_titled:
-        bindings.setdefault(
-            "reference_image_slots", [target for _, target in sorted(ref_titled)]
-        )
+        bindings.setdefault("reference_image_slots", [target for _, target in sorted(ref_titled)])
     return bindings
 
 

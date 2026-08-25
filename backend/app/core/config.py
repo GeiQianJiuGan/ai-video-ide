@@ -15,7 +15,7 @@ class Settings(BaseSettings):
 
     app_name: str = "AI Video Studio"
     version: str = "0.1.0"
-    schema_version: int = 13
+    schema_version: int = 18
 
     # --- 网络：只监听回环，绝不对外暴露工程数据 ---
     host: str = "127.0.0.1"
@@ -62,6 +62,33 @@ class Settings(BaseSettings):
     # 把「参考图1=林小雨（常服）」这句对应关系拼到 prompt 末尾。ComfyUI 那类图收不到
     # 标签，只能靠这句话让模型知道哪张是主角；不想让它动 prompt 就关掉。
     video_ref_labels: bool = True
+    # 二次处理（超分 / 插帧 / 重做）用哪一份图：它必须标了 AIVS_SOURCE_VIDEO。
+    # 留空时退回 video_preset——很多人就一份图，那份图上标了源视频入口也能处理。
+    # **不给它单独的地址 / 密钥**：处理与出画面跑在同一台 ComfyUI 上是常态，
+    # 真要分开时改 video_base_url 那一套即可，多一套配置只会多一处对不上。
+    refine_preset: str = ""
+
+    # --- 音频生成：与视频**各是一条路**，不共用一个 provider 名字 ---
+    # AI 生成的视频那条音轨往往很差，而以前想换掉它只能重跑整个视频。音频独立成链之后，
+    # 声音是同一个镜头上 kind="audio" 的另一版（`shot.current_audio_version_id`），
+    # 画面一个字节都不用重跑。音频图和视频图不是同一份图，所以地址 / 密钥 / 预设各一套。
+    # none 表示没配音频服务：音频入口一律回 MISSING_CAPABILITY 并说清怎么配，
+    # 手动导入音频到音频轨那条路完全不受影响（硬约束 2 的同一个作风）。
+    audio_provider: str = "none"  # none|comfy_preset|http_api
+    audio_base_url: str = ""  # 留空时 comfy_preset 用 comfy_base_url
+    audio_api_key: str = ""
+    audio_preset: str = ""  # 音源工作流：presets 目录里的另一份图
+    audio_timeout: int = 600
+
+    # --- 长视频导入与切段：全靠 FFmpeg，不需要 LLM ---
+    # 画面切换的判定阈值（0~1，越大越只认剧烈的切换）。
+    ingest_scene_threshold: float = 0.4
+    # 一段最短多少秒——比它短的相邻切点会被合并，免得切出一堆半秒的碎片。
+    ingest_min_segment: float = 1.5
+    # 认不出任何切点时按这个长度铺固定窗口。
+    ingest_chunk_seconds: float = 8.0
+    # 超过这个大小（MB）的源文件在账单里提示「复制会很慢」，并建议引用原地。
+    ingest_copy_warn_mb: int = 2048
 
     # --- LLM：默认关闭，Manual 模式必须全流程可用 ---
     llm_provider: str = "none"  # none|openai_compatible|anthropic|ollama

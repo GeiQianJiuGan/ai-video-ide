@@ -27,6 +27,11 @@ R2V 图往往根本没有首帧入口。所以必需入口只剩 `AIVS_PROMPT` �
 
 预设文件放 `runtime_dir/presets/<名字>.json`：它属于「我这台机器怎么调模型」，
 不是工程数据，所以不进 project.db，跟着应用级设置走。
+
+**一份图不只能出画面**：标了 `AIVS_SOURCE_VIDEO` 的是二次处理图（超分 / 插帧 / 重做尾段，
+输入是已经出好的那一段），标了 `AIVS_AUDIO_TEXT` / `AIVS_AUDIO_PROMPT` 的是音源图
+（另一条链，见 `providers/audio.py`）。所以 `inspect()` 回的 `ready` 是「至少能做一件事」，
+音源图与超分图不需要 `AIVS_PROMPT`——按老口径它们连保存都过不了。
 """
 
 from __future__ import annotations
@@ -79,13 +84,31 @@ MARKER_FAMILY = {
     "audio": f"AIVS_REF_AUDIO_1…{REF_AUDIO_SLOTS}",
 }
 
+#: 文本入口的候选字段。提示词、台词、声音描述都是同一类节点（CLIPTextEncode / 各家的
+#: 文本框），所以只写一份。
+TEXT_FIELDS = ("text", "prompt", "string", "value")
+#: 时长与种子的候选字段。音频那份图与视频那份图用的是同一批名字。
+DURATION_FIELDS = ("length", "duration", "frames", "seconds", "num_frames", "value")
+SEED_FIELDS = ("seed", "noise_seed", "value")
+
 MARKERS: dict[str, tuple[str, ...]] = {
     "AIVS_FIRST_FRAME": IMAGE_FIELDS,
     "AIVS_LAST_FRAME": IMAGE_FIELDS,
-    "AIVS_PROMPT": ("text", "prompt", "string", "value"),
-    "AIVS_NEGATIVE": ("text", "prompt", "string", "value"),
-    "AIVS_DURATION": ("length", "duration", "frames", "seconds", "num_frames", "value"),
-    "AIVS_SEED": ("seed", "noise_seed", "value"),
+    "AIVS_PROMPT": TEXT_FIELDS,
+    "AIVS_NEGATIVE": TEXT_FIELDS,
+    "AIVS_DURATION": DURATION_FIELDS,
+    "AIVS_SEED": SEED_FIELDS,
+    #: **二次处理的输入**：已经出好的那一段视频（超分 / 插帧 / 重做尾段都从它出发）。
+    #: 与 `AIVS_REF_VIDEO_*` 严格分开——参考视频是「动作长这样」，源视频是「就处理这一段」。
+    #: 两者混用的话，超分图会把一段参考视频当成待处理的画面，出来的东西跟这个镜头无关。
+    "AIVS_SOURCE_VIDEO": VIDEO_FIELDS,
+    #: 音源那份图的入口。**音频是另一条链**（另一份图、另一个地址、另一份预设），
+    #: 所以它有自己的一族标题：`AIVS_PROMPT` 是画面提示词，拿它当台词只会两边打架。
+    "AIVS_AUDIO_TEXT": TEXT_FIELDS,
+    "AIVS_AUDIO_PROMPT": TEXT_FIELDS,
+    "AIVS_VOICE_REF": AUDIO_FIELDS,
+    "AIVS_AUDIO_DURATION": DURATION_FIELDS,
+    "AIVS_AUDIO_SEED": SEED_FIELDS,
     #: 参考素材：角色表 / 地点参考图 / 动作参考视频 / 对白音频从这里进去。
     #: 首帧只能是一张，参考素材想喂几个标几个。
     **dict.fromkeys(REF_MARKERS, IMAGE_FIELDS),
@@ -99,6 +122,12 @@ MARKERS: dict[str, tuple[str, ...]] = {
 #: 严格首尾帧只有转场要用，所以只写进 `FLF_REQUIRED`。
 REQUIRED = ("AIVS_PROMPT",)
 FLF_REQUIRED = ("AIVS_PROMPT", "AIVS_FIRST_FRAME", "AIVS_LAST_FRAME")
+#: 二次处理（超分 / 插帧 / 重做尾段）那份图必须有的入口：待处理的那一段视频。
+#: 提示词**不是必需的**——超分图往往一个文本框都没有。
+REFINE_REQUIRED = ("AIVS_SOURCE_VIDEO",)
+#: 音源那份图必须有的入口：**至少要有一处告诉它「说什么 / 什么声音」**。
+#: 写成「二者之一」而不是两个都要：TTS 图只要台词，环境音图只要一句描述。
+AUDIO_REQUIRED_ANY = ("AIVS_AUDIO_TEXT", "AIVS_AUDIO_PROMPT")
 
 HOW_TO = [
     "在 ComfyUI 里右键入口节点 → Title，改成 AIVS_PROMPT / AIVS_FIRST_FRAME 等",
@@ -107,6 +136,11 @@ HOW_TO = [
     f"参考视频标 AIVS_REF_VIDEO_1…{REF_VIDEO_SLOTS}、参考音频标 AIVS_REF_AUDIO_1…"
     f"{REF_AUDIO_SLOTS}——它们接的是 LoadVideo / LoadAudio 那类节点，与图片槽位分开算",
     "只有补转场的那份图需要标全 AIVS_FIRST_FRAME + AIVS_LAST_FRAME；出正片的 R2V 图不标也能用",
+    "二次处理（超分 / 插帧）那份图把接待处理视频的节点标成 AIVS_SOURCE_VIDEO"
+    "——它和 AIVS_REF_VIDEO_n 不是一回事：源视频是「就处理这一段」，参考视频是「动作长这样」",
+    "音源那份图另存一份：台词标 AIVS_AUDIO_TEXT、声音描述标 AIVS_AUDIO_PROMPT"
+    "（两者有其一即可）、音色参考标 AIVS_VOICE_REF、时长与种子标 AIVS_AUDIO_DURATION /"
+    " AIVS_AUDIO_SEED——它不需要 AIVS_PROMPT",
     "再用「Save (API Format)」导出，重新上传这份预设",
 ]
 
@@ -266,21 +300,34 @@ def _ref_hint(by_media: dict[str, list[str]], first_frame: bool) -> str:
 
 
 def inspect(graph: dict[str, Any]) -> dict[str, Any]:
-    """预设的体检报告：找到哪些入口、缺哪些、缺了会怎样。"""
+    """预设的体检报告：找到哪些入口、缺哪些、缺了会怎样。
+
+    **一份图能做的事不止出画面**（`capabilities`）：出正片（r2v）、补转场（flf）、
+    二次处理（refine）、出声音（audio）。所以 `ready` 是「至少能做一件事」，
+    而不是「有 AIVS_PROMPT」——音源图与超分图压根不需要画面提示词，按老口径它们连保存
+    都过不了，用户只能被逼着往音源图里塞一个没人读的文本框。
+    """
     points = entry_points(graph)
     missing = [m for m in REQUIRED if m not in points]
     missing_flf = [m for m in FLF_REQUIRED if m not in points]
     by_media = ref_slots_by_media(points)
     slots = by_media["image"]
     first_frame = "AIVS_FIRST_FRAME" in points
+    refine_ready = all(m in points for m in REFINE_REQUIRED)
+    audio_ready = any(m in points for m in AUDIO_REQUIRED_ANY)
+    ready = not missing or refine_ready or audio_ready
     return {
         "node_count": len(graph),
         "entry_points": points,
         "found": sorted(points),
         "missing_required": missing,
-        "ready": not missing,
+        "ready": ready,
         "r2v_ready": not missing,
         "flf_ready": not missing_flf,
+        #: 能不能当二次处理 / 音源那份图用。两者各自独立，与出画面互不影响：
+        #: 同一份图既能出正片又能超分是可能的（标了 AIVS_SOURCE_VIDEO 就行）。
+        "refine_ready": refine_ready,
+        "audio_ready": audio_ready,
         #: 有没有首帧入口。没有不影响 ready，但首帧只能当参考图送——UI 要标出来。
         "first_frame_ok": first_frame,
         "capabilities": [
@@ -288,6 +335,9 @@ def inspect(graph: dict[str, Any]) -> dict[str, Any]:
             for capability, available in (
                 ("r2v", not missing),
                 ("flf", not missing_flf),
+                #: 二次处理与出声音各算一项独立能力：设置页要能一眼看出「哪一份是音源图」。
+                ("refine", refine_ready),
+                ("audio", audio_ready),
                 #: 能收参考视频 / 参考音频算两项独立能力：动作参考与对白音频是两类图，
                 #: UI 上要能一眼看出「这份图接不接音频」。
                 ("ref_video", bool(by_media["video"])),
@@ -305,8 +355,10 @@ def inspect(graph: dict[str, Any]) -> dict[str, Any]:
         "ref_hint": _ref_hint(by_media, first_frame),
         "impact": (
             None
-            if not missing
-            else f"缺少 {'、'.join(missing)}，提示词填不进这份图，无法用它生成。"
+            if ready
+            else "这份图里既没有 AIVS_PROMPT（出画面要它），也没有 AIVS_SOURCE_VIDEO"
+            "（二次处理要它）或 AIVS_AUDIO_TEXT / AIVS_AUDIO_PROMPT（出声音要它）"
+            "——本工具无法往里填任何东西。"
         ),
     }
 
@@ -375,6 +427,8 @@ def listing() -> list[dict[str, Any]]:
             "ready": False,
             "r2v_ready": False,
             "flf_ready": False,
+            "refine_ready": False,
+            "audio_ready": False,
             "first_frame_ok": False,
             "capabilities": [],
             "ref_slots": 0,

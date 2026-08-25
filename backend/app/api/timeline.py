@@ -16,7 +16,12 @@ router = APIRouter(tags=["timeline"])
 
 
 class AssembleBody(BaseModel):
-    replace: bool = Field(default=True, description="true 清空视频轨后重铺；false 追加")
+    #: 默认 false = 对位调和（只更新自己铺过的片段，手工编辑活下来）。
+    #: true 是兼容入口「彻底重铺」：先删掉所有 `origin="assembled"` 的片段再铺一遍，
+    #: `manual` 的（用户自己加的、拆出去的声音）两种模式下都不碰。
+    replace: bool = Field(
+        default=False, description="true 先删掉装配铺的片段再重铺；false 对位调和"
+    )
 
 
 class MoveBody(BaseModel):
@@ -97,6 +102,12 @@ async def get_timeline(pid: str) -> dict[str, Any]:
     return await timeline.get(pid)
 
 
+@router.post("/projects/{pid}/timeline/assemble/plan")
+async def assemble_plan(pid: str) -> dict[str, Any]:
+    """只读账单：这次装配会动哪些片段。「重新装配」按下去之前先给人看一眼。"""
+    return await timeline.assemble_plan(pid)
+
+
 @router.post("/projects/{pid}/timeline/assemble")
 async def auto_assemble(pid: str, body: AssembleBody) -> dict[str, Any]:
     return await timeline.auto_assemble(pid, replace=body.replace)
@@ -167,16 +178,12 @@ async def detach_audio(pid: str, clip_id: str) -> dict[str, Any]:
 
 
 @router.post("/projects/{pid}/clips/{clip_id}/blank-duration")
-async def resize_blank_clip(
-    pid: str, clip_id: str, body: BlankDurationBody
-) -> dict[str, Any]:
+async def resize_blank_clip(pid: str, clip_id: str, body: BlankDurationBody) -> dict[str, Any]:
     return await timeline.resize_blank_clip(pid, clip_id, duration=body.duration)
 
 
 @router.post("/projects/{pid}/clips/{clip_id}/audio-track")
-async def move_clip_to_audio_track(
-    pid: str, clip_id: str, body: MoveTrackBody
-) -> dict[str, Any]:
+async def move_clip_to_audio_track(pid: str, clip_id: str, body: MoveTrackBody) -> dict[str, Any]:
     return await timeline.move_clip_to_track(pid, clip_id, body.track_id)
 
 
@@ -217,12 +224,8 @@ async def add_clip(pid: str, track_id: str, body: AddClipBody) -> dict[str, Any]
 
 
 @router.post("/projects/{pid}/tracks/{track_id}/blank-clips", status_code=201)
-async def add_blank_clip(
-    pid: str, track_id: str, body: BlankClipBody
-) -> dict[str, Any]:
-    return await timeline.add_blank_clip(
-        pid, track_id, duration=body.duration, label=body.label
-    )
+async def add_blank_clip(pid: str, track_id: str, body: BlankClipBody) -> dict[str, Any]:
+    return await timeline.add_blank_clip(pid, track_id, duration=body.duration, label=body.label)
 
 
 @router.get("/projects/{pid}/transitions")

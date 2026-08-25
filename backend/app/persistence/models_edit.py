@@ -14,6 +14,8 @@ from app.persistence.models import utc_now
 
 TRACK_KINDS = ("video", "audio", "subtitle")
 TRANSITION_KINDS = ("cut", "dissolve", "fade_in", "fade_out")
+#: 片段是谁铺的。**装配只碰 `assembled`**，`manual` 的一律不动——理由见 TimelineClip.origin。
+CLIP_ORIGINS = ("assembled", "manual")
 
 
 class Timeline(Base):
@@ -69,6 +71,14 @@ class TimelineClip(Base):
     #: 这一段音频是从哪个片段拆出来的（只有音频轨上的片段有值）。刻意不加外键：
     #: 源片段被删掉或重新装配之后它照旧能播，只是不再知道出处。
     source_clip_id: Mapped[str | None] = mapped_column(String(40), index=True)
+    #: **谁铺的这一段**（`assembled` / `manual`）。装配只更新与删除 `assembled`；
+    #: 用户自己加的、从长视频切出来的、拆到音频轨上的声音一律 `manual`，装配永不触碰。
+    #:
+    #: 没有这一列的时候 `auto_assemble` 只能清空整条视频轨再重建，于是：手工裁切 / 静音 /
+    #: 音量全丢，被拆出去的声音因为源片段 id 消失而集体悬空（`_shape` 里那个
+    #: `source_missing`）。所以「重新装配」曾经是个不敢按的按钮——这一列 + 对位调和
+    #: （`_assemble_diff`）就是为了让它变成一次可预期的操作。
+    origin: Mapped[str] = mapped_column(String(20), nullable=False, default="manual")
 
 
 class Transition(Base):

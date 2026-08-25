@@ -977,9 +977,7 @@ class LibraryService:
                 ["先给默认形象挂一张新定妆图", "再删除旧的历史版本"],
                 {"protected_default": True},
             )
-        siblings = await fetch_all(
-            lib.db, LibSheet, where=LibSheet.appearance_id == appearance.id
-        )
+        siblings = await fetch_all(lib.db, LibSheet, where=LibSheet.appearance_id == appearance.id)
         await self._unlink_asset_ref(sheet.asset_id, "appearance", appearance.id, "sheet")
         async with lib.db.write() as session:
             if sheet.is_current:
@@ -1045,11 +1043,7 @@ class LibraryService:
                             )
                         ],
                         "current_reference": next(
-                            (
-                                as_dict(r)
-                                for r in refs
-                                if r.variant_id == v.id and r.is_current
-                            ),
+                            (as_dict(r) for r in refs if r.variant_id == v.id and r.is_current),
                             None,
                         ),
                     }
@@ -1191,12 +1185,8 @@ class LibraryService:
 
     async def delete_variant_reference(self, reference_id: str) -> None:
         lib = await self.current()
-        reference = await fetch(
-            lib.db, LibLocationReference, reference_id, "地点参考图"
-        )
-        variant = await fetch(
-            lib.db, LibLocationVariant, reference.variant_id, "地点变体预设"
-        )
+        reference = await fetch(lib.db, LibLocationReference, reference_id, "地点参考图")
+        variant = await fetch(lib.db, LibLocationVariant, reference.variant_id, "地点变体预设")
         if variant.name == "默认场景" and reference.is_current:
             raise AppError(
                 ErrorCode.CONFLICT,

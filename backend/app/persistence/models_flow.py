@@ -38,9 +38,11 @@ LINK_MODES = ("cut", "transition", "tail_frame")
 #: 改这个元组要同时改 `services/sequence.py::SHOT_LINK_HINT`。
 SHOT_LINK_MODES = ("cut", "transition")
 
-#: 镜头种类。`transition` 的镜头不是导演排的戏，是衔接生成出来的一段，
-#: 分镜板与流程图要能把它和正片镜头区分开。
-SHOT_KINDS = ("shot", "transition")
+#: 镜头种类。`transition` 的镜头不是导演排的戏，是衔接生成出来的一段；
+#: `ingested` 是从一段成片切出来的（画面已经有了，`GenerationVersion` 带 in/out 区间）。
+#: 分镜板与流程图要能把这三种区分开。**它不参与参数解析**（共用与否只看镜头上那一项
+#: 空不空，见 `services/params.py`），只用来画界面与决定要不要过上下文门槛。
+SHOT_KINDS = ("shot", "transition", "ingested")
 
 
 class SceneLink(Base):

@@ -22,7 +22,27 @@ REQUIRED_SLOTS: dict[str, tuple[str, ...]] = {
     "first_last_frame": ("first_frame", "last_frame"),
     "upscale": ("source_image",),
 }
+
+#: **任务 kind 的唯一一张表。** 以前这些字符串散在 `services/generation.py` 的
+#: `{"first_last_frame", "transition", "fl2va"}` 之类的集合里，`CAPABILITIES` 却只列了四个，
+#: 于是「有哪些 kind」在两处对不上。加音频与二次处理之前先把它收成一处。
+#:
+#: 三族，语义完全不同：
+#:   · 出画面（VIDEO_KINDS）——从首帧 / 首尾帧生成一段新画面；
+#:   · 二次处理（REFINE_KINDS）——**输入是已经出好的那一版**，产出同一个镜头上的新版本，
+#:     `parent_version_id` 记血缘。画面重跑一次很贵，能只处理就别重生成；
+#:   · 出声音（AUDIO_KINDS）——产出 `kind="audio"` 的版本，落 `current_audio_version_id`。
+VIDEO_KINDS = ("image2video", "first_last_frame", "transition", "fl2va")
+REFINE_KINDS = ("upscale", "interpolate", "recut")
+AUDIO_KINDS = ("audio",)
+JOB_KINDS = (*VIDEO_KINDS, *REFINE_KINDS, *AUDIO_KINDS)
+#: 这些 kind 要用上游镜头的末帧当首帧（严格首尾帧那条路）。判定只放这一份。
+NEEDS_LAST_FRAME = ("first_last_frame", "transition", "fl2va")
+#: 产物是音频的 kind。
+AUDIO_OUTPUT_KINDS = AUDIO_KINDS
 JOB_STATUS = ("queued", "waiting", "running", "done", "failed", "canceled", "paused")
+#: 版本产物的媒体类型。`video` 是画面那一版，`audio` 是声音那一版，`image` 是出图。
+VERSION_KINDS = ("video", "audio", "image")
 
 
 class Workflow(Base):
@@ -67,6 +87,17 @@ class GenerationVersion(Base):
     error_json: Mapped[str | None] = mapped_column(Text)
     duration: Mapped[float | None] = mapped_column(Float)
     source: Mapped[str] = mapped_column(String(20), nullable=False, default="generated")
+    #: **这一版是从哪一版处理出来的**（超分 / 插帧 / 换音频 / 重做尾段）。
+    #: 二次处理不另建一套体系：它产出的仍然是同一个镜头上的一个新版本，于是硬约束 3
+    #: （只增不改、随时回退到未处理那一版）、采用入口、装配、队列全都一行不用改。
+    #: 有了这一列，版本轨能画出「原始 v1 → 超分 v2 → 换音频 v3」这条谱系，
+    #: 而不是三条互不相干的版本。不加外键：父版本不在了按「不知道出处」处理。
+    parent_version_id: Mapped[str | None] = mapped_column(String(40))
+    #: **这一版只用源文件的某一段**（秒）。两列都空 = 整个文件，所以老版本行为不变。
+    #: 长视频切段靠它：一幕下面 N 个镜头各挂一版，`asset_id` 全部指向同一个源文件，
+    #: 各自带自己的区间——零文件复制。装配时抄进 `TimelineClip.in_point` / `out_point`。
+    in_point: Mapped[float | None] = mapped_column(Float)
+    out_point: Mapped[float | None] = mapped_column(Float)
     created_at: Mapped[str] = mapped_column(String(40), nullable=False, default=utc_now)
 
 

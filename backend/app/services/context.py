@@ -47,6 +47,7 @@ from app.persistence.models_world import (
     Prop,
     PropReference,
 )
+from app.services import params
 from app.services.assets import kind_of_suffix
 from app.services.base import as_dict, db_of, dump_json, fetch, fetch_all, load_json
 
@@ -315,21 +316,21 @@ class ContextService:
                         "asset_id": current.asset_id if current else None,
                         "source_id": app.id,
                         "eligible": bool(current and current.asset_id) and not duplicate,
-                    "reason": (
-                        "同一角色已有更高优先级形象"
-                        if duplicate
-                        else (
-                            (
-                                "该角色在本幕出场（镜头没单独挂人物）"
-                                if inherited
-                                else "该角色在本镜头出场"
+                        "reason": (
+                            "同一角色已有更高优先级形象"
+                            if duplicate
+                            else (
+                                (
+                                    "该角色在本幕出场（镜头没单独挂人物）"
+                                    if inherited
+                                    else "该角色在本镜头出场"
+                                )
+                                if current and current.asset_id
+                                else "该形象还没有角色表图"
                             )
-                            if current and current.asset_id
-                            else "该形象还没有角色表图"
-                        )
-                    ),
-                }
-            )
+                        ),
+                    }
+                )
 
             # 2. 地点参考：本 Scene 的主地点优先；幕里另外选的地点也能用，只是低一档；
             #    同地点的其他变体列出但省略，理由写清。
@@ -376,7 +377,9 @@ class ContextService:
                         "reason": (
                             "本 Scene 选定的地点变体"
                             if same
-                            else ("本幕另外选中的地点变体" if extra else "与本 Scene 的时间设定冲突")
+                            else (
+                                "本幕另外选中的地点变体" if extra else "与本 Scene 的时间设定冲突"
+                            )
                         ),
                     }
                 )
@@ -386,7 +389,9 @@ class ContextService:
             #    首帧是用不了的。抽帧要起 FFmpeg 进程，所以不在这条只读路径上做：还没抽的时候
             #    先标 pending_extract，真正抽取发生在入队前（services/generation.py）。
             if include_prev and shot.prev_shot_id:
-                prev = next((s for s in await fetch_all(db, Shot) if s.id == shot.prev_shot_id), None)
+                prev = next(
+                    (s for s in await fetch_all(db, Shot) if s.id == shot.prev_shot_id), None
+                )
                 version = None
                 if prev is not None and prev.current_version_id:
                     version = next(
@@ -502,12 +507,14 @@ class ContextService:
         capacity = _capacity_of(items, ref_capacity(selected_capacity))
 
         problems = []
-        if not scene.location_variant_id:
+        # **要什么由这一幕的来源决定**（`params.SCENE_REQUIRED`）：导入幕的画面已经有了，
+        # 再要求它选地点、挑角色、写 prompt 只是三道消不掉的门槛。
+        if params.requires(scene, "location") and not scene.location_variant_id:
             problems.append("本 Scene 还没有选定地点变体")
-        if not picks:
+        if params.requires(scene, "cast") and not picks:
             problems.append("本镜头没有出场角色")
-        # 幕级 prompt 是镜头没写 prompt 时的兜底，取值口径与 generation.enqueue_shot 一致
-        if not (shot.prompt or shot.description or scene.prompt):
+        # 取值口径只有一份（`services/params.py::prompt_of`）。
+        if params.prompt_missing(shot, scene):
             problems.append("既没有 prompt 也没有画面描述")
         if (
             include_prev

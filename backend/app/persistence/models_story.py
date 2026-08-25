@@ -16,6 +16,19 @@ from app.persistence.models import utc_now
 #: Shot 创作进度。draft 缺信息，ready 可生成，generated 有当前版本，review 待审，locked 已定稿。
 SHOT_STATUS = ("draft", "ready", "generated", "review", "locked")
 
+#: 一幕是怎么来的。
+#:   storyboard 剧本拆出来的（或手工建的）——分镜卡片 + 镜头间转场那一套；
+#:   ingested   从一段成片切出来的——镜头是同一个源文件上的区间，画面已经有了。
+#: **它不参与参数解析**（共用与否只看镜头上那一项空不空，见 services/params.py），
+#: 只决定三件事：完整性要求（`story.SCENE_REQUIRED`）、新建镜头要不要预填、界面画哪种形态。
+SCENE_KINDS = ("storyboard", "ingested")
+
+#: 新建镜头时要不要把幕级参数写实到镜头上。
+#:   shared    留空 → 解析时回退到幕，改一处三十段跟着变（长视频默认）；
+#:   per_shot  预填 → 每个镜头各自独立（剧本拆分镜的老行为）。
+#: **只影响创建那一刻**，生成路径永远只有一条。
+SCENE_PARAM_MODES = ("shared", "per_shot")
+
 
 class Story(Base):
     """剧本原文与拆解模式。一个工程一份，段落与 Scene 双向对应。"""
@@ -50,12 +63,30 @@ class Scene(Base):
     source_text: Mapped[str | None] = mapped_column(Text)
     #: 这一幕的 prompt（小节点里唯一必填的那个）。镜头级 prompt 优先，空着才用它。
     prompt: Mapped[str | None] = mapped_column(Text)
+    #: 这一幕的台词兜底（音源那条链读它，见 `services/dub.py::text_of`）。
+    #: 镜头级 `dialogue` 优先，空着才用它——长视频切出来的镜头本来没有台词，
+    #: 整幕配同一段旁白是常态。**视频那条链一个字都不读它**。
+    dialogue: Mapped[str | None] = mapped_column(Text)
     #: 主地点变体。多选地点在 scene_location 表里，这一列始终等于其中第一条。
     location_variant_id: Mapped[str | None] = mapped_column(
         String(40), ForeignKey("location_variant.id", ondelete="SET NULL")
     )
     time_of_day: Mapped[str | None] = mapped_column(String(50))
     notes: Mapped[str | None] = mapped_column(Text)
+    #: 这一幕是怎么来的（见 SCENE_KINDS）。**剧本与分镜在数据层本来就是解耦的**——
+    #: Scene 上压根没有 story_id，Story 只是工程级的一行原文。真正的耦合只有
+    #: 「一幕必须有 prompt」这个隐含假设，有了这一列它就能查表而不是散落在几处 if 里。
+    kind: Mapped[str] = mapped_column(String(20), nullable=False, default="storyboard")
+    #: 新建镜头时要不要预填幕级参数（见 SCENE_PARAM_MODES）。不参与解析。
+    param_mode: Mapped[str] = mapped_column(String(20), nullable=False, default="per_shot")
+    #: 幕级共用参数：{"negative": ..., "duration": ..., "preset": ..., "seed": ...,
+    #: "refs": [asset_id...]}。**镜头上那一项为空就继承这里**（services/params.py）。
+    #: 用一列 JSON 而不是一堆稀疏列——沿用项目里 `*_json` 的约定。
+    params_json: Mapped[str | None] = mapped_column(Text)
+    #: 导入幕的源文件（`kind="ingested"` 时有值）。这一幕所有镜头的版本都指向它，
+    #: 各自带 in_point / out_point，所以切段零文件复制。不加外键：源文件被删掉时
+    #: 按「源已不在」处理，而不是让删除被外键挡下来。
+    source_asset_id: Mapped[str | None] = mapped_column(String(40))
     created_at: Mapped[str] = mapped_column(String(40), nullable=False, default=utc_now)
     updated_at: Mapped[str] = mapped_column(String(40), nullable=False, default=utc_now)
 
@@ -83,6 +114,13 @@ class Shot(Base):
 
     prompt: Mapped[str | None] = mapped_column(Text)
     negative_prompt: Mapped[str | None] = mapped_column(Text)
+    #: **这个镜头说的话**（音源那条链要的「说什么」）。
+    #:
+    #: 为什么不复用 `description` 或 `prompt`：那两个是给**视频模型**看的（画面描述、
+    #: 提示词），台词塞进去只会让画面里长出字幕感，而音源那边仍然拿不到干净的文本。
+    #: 空 = 这个镜头不说话——只出环境音 / 音乐的镜头很常见，那时靠一句声音描述即可
+    #: （`services/dub.py`）。视频那条链一个字都不读它，所以加这一列不改变任何生成行为。
+    dialogue: Mapped[str | None] = mapped_column(Text)
     seed: Mapped[int | None] = mapped_column(Integer)
     steps: Mapped[int | None] = mapped_column(Integer)
     workflow_id: Mapped[str | None] = mapped_column(String(40))
@@ -108,6 +146,15 @@ class Shot(Base):
     #: 都读它。刻意不加外键（版本表反过来引用镜头，加外键会绕成一圈），
     #: 取不到时按「这个镜头还没出片」处理。
     current_version_id: Mapped[str | None] = mapped_column(String(40))
+    #: **这个镜头采用了哪一版声音**（`generation_version.kind == "audio"`）。
+    #:
+    #: 为什么是第二个指针而不是复用上面那一个：`current_version_id` 是画面那一版，
+    #: 装配、抽末帧、流程图上播的那一段全读它。声音塞进同一个指针，两件事必然打架。
+    #: 有了这一列，「AI 那条音轨太差想换掉」不再需要重跑视频——只是同一个镜头上多一版
+    #: `kind="audio"` 的版本 + 这里换个指向。装配时视频片段自动 `muted=1`，
+    #: 声音从音频轨来（见 `services/timeline.py::_assemble_diff`）。
+    #: 空 = 没有采用音频，画面自带的音轨照旧出声（老工程行为不变）。
+    current_audio_version_id: Mapped[str | None] = mapped_column(String(40))
     #: Context Inspector 里的人工干预记录（移除/添加/替换），JSON 列表
     context_overrides_json: Mapped[str | None] = mapped_column(Text)
 

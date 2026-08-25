@@ -47,6 +47,10 @@ KIND_DIR = {
     "upload": "assets/uploads",
     "generated_image": "generations/images",
     "generated_video": "generations/videos",
+    #: 音源那条链生成的声音。**是正经资产，不是临时文件**：它是某个镜头采用的那条音轨
+    #: （`Shot.current_audio_version_id`），删了就得重新跑一次音源服务，
+    #: 与「随时能重抽的首尾帧」完全不同，所以进 generations/ 而不是 cache/。
+    "generated_audio": "generations/audio",
     "proxy": "proxies",
     "export": "generations/exports",
 }

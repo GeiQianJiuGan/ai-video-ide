@@ -19,12 +19,15 @@ from app.api import assets as assets_api
 from app.api import cast as cast_api
 from app.api import context as context_api
 from app.api import director as director_api
+from app.api import dub as dub_api
 from app.api import files as files_api
 from app.api import fs as fs_api
 from app.api import generation as generation_api
+from app.api import ingest as ingest_api
 from app.api import library as library_api
 from app.api import overview as overview_api
 from app.api import projects as projects_api
+from app.api import refine as refine_api
 from app.api import sequence as sequence_api
 from app.api import settings as settings_api
 from app.api import story as story_api
@@ -139,6 +142,9 @@ def create_app() -> FastAPI:
     app.include_router(context_api.router, prefix=API_PREFIX)
     app.include_router(generation_api.router, prefix=API_PREFIX)
     app.include_router(sequence_api.router, prefix=API_PREFIX)
+    app.include_router(refine_api.router, prefix=API_PREFIX)
+    app.include_router(dub_api.router, prefix=API_PREFIX)
+    app.include_router(ingest_api.router, prefix=API_PREFIX)
     app.include_router(director_api.router, prefix=API_PREFIX)
     app.include_router(timeline_api.router, prefix=API_PREFIX)
     app.include_router(overview_api.router, prefix=API_PREFIX)

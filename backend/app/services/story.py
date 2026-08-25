@@ -23,6 +23,8 @@ from app.persistence.models_cast import Appearance, Character, SheetVersion
 from app.persistence.models_flow import SceneLink, ShotLink
 from app.persistence.models_gen import GenerationVersion
 from app.persistence.models_story import (
+    SCENE_KINDS,
+    SCENE_PARAM_MODES,
     SHOT_STATUS,
     Scene,
     SceneCast,
@@ -39,8 +41,9 @@ from app.persistence.models_world import (
     LocationVariant,
     Prop,
 )
+from app.services import params
 from app.services.assets import kind_of_suffix
-from app.services.base import as_dict, db_of, fetch, fetch_all, load_json
+from app.services.base import as_dict, db_of, dump_json, fetch, fetch_all, load_json
 from app.services.frames import frames, start_frame_index
 
 SCENE_FIELDS = (
@@ -51,6 +54,14 @@ SCENE_FIELDS = (
     "location_variant_id",
     "time_of_day",
     "notes",
+    #: 这一幕的台词兜底（音源那条链读它）。**视频那条链一个字都不读它**，
+    #: 所以它不在任何完整性要求里——没有台词的幕照样能出画面。
+    "dialogue",
+    #: 这一幕是怎么来的（`SCENE_KINDS`）+ 新建镜头要不要预填幕级参数（`SCENE_PARAM_MODES`）。
+    #: 两者都**不参与生成路径的分支**：完整性要求查 `params.SCENE_REQUIRED`，
+    #: 参数解析永远只看「镜头上那一项空不空」。
+    "kind",
+    "param_mode",
 )
 SHOT_FIELDS = (
     "title",
@@ -61,6 +72,9 @@ SHOT_FIELDS = (
     "status",
     "prompt",
     "negative_prompt",
+    #: 这个镜头说的话。音源那条链要的「说什么」，视频那条链不读它
+    #: （所以填不填都不影响出画面，见 `services/dub.py::text_of`）。
+    "dialogue",
     "seed",
     "steps",
     "workflow_id",
@@ -74,6 +88,23 @@ SHOT_FIELDS = (
 
 #: 首 / 末帧槽位对应的中文说法，校验错误与账单文案共用一份。
 FRAME_SLOT_LABEL = {"first_frame_asset_id": "首帧", "last_frame_asset_id": "末帧"}
+
+
+def _check_scene_kind(patch: dict[str, Any]) -> None:
+    """幕的来源与参数模式只认表里那几个值。**不要在这里做别的判断**——
+    这两个字段不参与生成路径的分支，只决定完整性要求与新建镜头要不要预填。"""
+    for key, allowed, label in (
+        ("kind", SCENE_KINDS, "幕的来源"),
+        ("param_mode", SCENE_PARAM_MODES, "参数模式"),
+    ):
+        value = patch.get(key)
+        if value is not None and value not in allowed:
+            raise AppError(
+                ErrorCode.VALIDATION_ERROR,
+                f"未知的{label}",
+                f"{value} 不在 {'、'.join(allowed)} 里。",
+                ["用列表里的值"],
+            )
 
 
 def _renumber(rows: list[Shot]) -> list[tuple[str, int]]:
@@ -384,8 +415,14 @@ def _scene_nodes(
         "cast": cast,
         "cast_names": _unique([str(c["character_name"] or c["label"]) for c in cast]),
         "locations": locs,
-        #: prompt 是唯一必填的小节点，缺它前端就该把节点标黄。
-        "prompt_ok": bool((scene.prompt or "").strip()),
+        #: prompt 是剧本幕里唯一必填的小节点，缺它前端就该把节点标黄。
+        #: **导入幕不必填**（`params.SCENE_REQUIRED`），所以那种幕这里恒为 true——
+        #: 否则长视频那些幕会永远挂着一个消不掉的黄标。
+        "prompt_ok": bool((scene.prompt or "").strip()) or not params.prompt_required(scene),
+        #: 这一项到底是不是必填，让前端能把文案从「必填」改成「可选」。
+        "prompt_required": params.prompt_required(scene),
+        "scene_kind": scene.kind,
+        "param_mode": scene.param_mode,
         "node_limit": node_limit(),
     }
 
@@ -438,7 +475,10 @@ class StoryService:
             location = locations.get(variant.location_id) if variant else None
             out.append(
                 {
-                    **as_dict(scene),
+                    **{k: v for k, v in as_dict(scene).items() if k != "params_json"},
+                    #: 幕级共用参数展开成干净字段（`*_json` 不对外，项目约定）。
+                    #: 镜头上那一项为空就继承这里，见 `services/params.py`。
+                    "params": params.scene_params(scene),
                     "shot_count": len([s for s in shots if s.scene_id == scene.id]),
                     "duration_total": sum(s.duration for s in shots if s.scene_id == scene.id),
                     "location_variant_name": (
@@ -534,13 +574,22 @@ class StoryService:
         title = str(patch.get("title") or "").strip() or "新场景"
         if patch.get("location_variant_id"):
             await fetch(db, LocationVariant, patch["location_variant_id"], "地点变体")
+        _check_scene_kind(patch)
         existing = await fetch_all(db, Scene)
         now = utc_now()
+        # 非空列（kind / param_mode）不给就别写：`patch.get` 会写进 None，把 ORM 默认值顶掉。
+        fields = {
+            k: patch.get(k)
+            for k in SCENE_FIELDS
+            if k != "title" and not (k in ("kind", "param_mode") and patch.get(k) is None)
+        }
         row = Scene(
             id=new_id("scene"),
             index_no=max((s.index_no for s in existing), default=0) + 1,
-            **{k: patch.get(k) for k in SCENE_FIELDS if k != "title"},
+            **fields,
             title=title,
+            params_json=dump_json(patch["params"]) if patch.get("params") is not None else None,
+            source_asset_id=patch.get("source_asset_id"),
             created_at=now,
             updated_at=now,
         )
@@ -555,6 +604,7 @@ class StoryService:
         await fetch(db, Scene, sid, "场景")
         if patch.get("location_variant_id"):
             await fetch(db, LocationVariant, patch["location_variant_id"], "地点变体")
+        _check_scene_kind(patch)
         # 主地点要和 scene_location 列表对齐，先把目标算出来并过上限——
         # 否则列写进去了、列表没写，两边说法不一致。
         locations: list[str] | None = None
@@ -564,8 +614,12 @@ class StoryService:
             row = await session.get(Scene, sid)
             assert row is not None
             for key in SCENE_FIELDS:
-                if key in patch:
+                if key in patch and not (key in ("kind", "param_mode") and patch[key] is None):
                     setattr(row, key, patch[key])
+            if "params" in patch:
+                # **整份替换**（与 `set_shot_cast` 同一套做法）：合并会让「删掉幕级 seed」
+                # 表达不出来。传 `{}` 就是把幕级参数清空，镜头从此没有可继承的值。
+                row.params_json = dump_json(patch["params"]) if patch["params"] else None
             row.updated_at = utc_now()
         if locations is not None:
             await self._write_scene_locations(pid, sid, locations)
@@ -611,7 +665,7 @@ class StoryService:
 
     async def create_shot(self, pid: str, sid: str, patch: dict[str, Any]) -> dict[str, Any]:
         db = db_of(pid)
-        await fetch(db, Scene, sid, "场景")
+        scene = await fetch(db, Scene, sid, "场景")
         status = patch.get("status") or "draft"
         if status not in SHOT_STATUS:
             raise AppError(
@@ -623,6 +677,11 @@ class StoryService:
         existing = await fetch_all(db, Shot)
         now = utc_now()
         await _check_frame_slots(pid, patch)
+        # **预填只发生在这一刻**（`param_mode="per_shot"`，剧本拆分镜的老行为）：
+        # 幕级值抄到镜头上，此后每个镜头各自独立。`shared` 一个字段都不抄——留空 =
+        # 解析时回退到幕，改一处三十段跟着变（长视频默认）。用户自己传了的以他为准。
+        prefill = {k: v for k, v in params.prefill(scene).items() if patch.get(k) in (None, "")}
+        patch = {**patch, **prefill}
         fields = {k: patch.get(k) for k in SHOT_FIELDS if k not in ("status", "duration")}
         row = Shot(
             id=new_id("shot"),
@@ -652,7 +711,13 @@ class StoryService:
         # 空串 = 清空首 / 末帧槽位。PATCH body 是 `exclude_none` 出来的（null 会被吃掉），
         # 而「取消首帧」必须表达得出来——否则挑错一张图就再也改不回「没有指定」。
         patch = {
-            k: (None if k in FRAME_SLOT_LABEL and v == "" else None if k == "prev_shot_id" and v == "" else v)
+            k: (
+                None
+                if k in FRAME_SLOT_LABEL and v == ""
+                else None
+                if k == "prev_shot_id" and v == ""
+                else v
+            )
             for k, v in patch.items()
         }
         if patch.get("status") and patch["status"] not in SHOT_STATUS:
@@ -1025,11 +1090,13 @@ class StoryService:
                 # 转场镜头不过上下文门槛（它没有出场角色也不需要地点变体），
                 # 所以那几条对它不算问题——列出来只会变成永远消不掉的黄色感叹号。
                 if shot.kind != "transition":
-                    if not scene.location_variant_id or scene.location_variant_id not in variants:
+                    if params.requires(scene, "location") and (
+                        not scene.location_variant_id or scene.location_variant_id not in variants
+                    ):
                         issues.append("缺少地点变体，Context 不完整")
-                    if not names:
+                    if params.requires(scene, "cast") and not names:
                         issues.append("没有出场角色")
-                    if not (shot.prompt or shot.description or scene.prompt):
+                    if params.prompt_missing(shot, scene):
                         issues.append("没有 prompt 也没有画面描述")
                 media = _shot_media(shot, versions, assets, posters)
                 cards.append(
