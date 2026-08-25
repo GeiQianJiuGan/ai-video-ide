@@ -604,3 +604,43 @@ def test_registry_refuses_the_legacy_path_and_names_the_way_out(
 
     monkeypatch.setattr(settings, "video_provider", "comfy_preset")
     assert registry.provider().name == "comfy_preset"
+
+
+async def test_preset_injects_source_video_and_ref_video(tmp_path: Path) -> None:
+    graph = {
+        "1": {
+            "class_type": "VHS_LoadVideo",
+            "inputs": {"video": "default.mp4"},
+            "_meta": {"title": "AIVS_SOURCE_VIDEO"},
+        },
+        "2": {
+            "class_type": "VHS_LoadVideoPath",
+            "inputs": {"video": "ref_default.mp4"},
+            "_meta": {"title": "AIVS_REF_VIDEO_1"},
+        },
+        "3": {
+            "class_type": "CLIPTextEncode",
+            "inputs": {"text": "原提示词"},
+            "_meta": {"title": "AIVS_PROMPT"},
+        },
+    }
+    write_preset("测试视频传入", graph)
+    source_slice = tmp_path / "slice_01_10.00_15.00.mp4"
+    source_slice.write_bytes(b"VIDEO_SLICE")
+    ref_slice = tmp_path / "ref_action.mp4"
+    ref_slice.write_bytes(b"REF_VIDEO")
+
+    fake = FakeComfy()
+    provider = ComfyPresetProvider(client=fake)  # type: ignore[arg-type]
+    req = VideoRequest(
+        mode="i2v",
+        prompt="分镜重绘",
+        source_video=source_slice,
+        refs=[RefAsset(path=ref_slice, label="动作", kind="source_video", media="video")],
+        extra={"preset": "测试视频传入"},
+    )
+    await provider.submit(req, client_id="aivs-test")
+    submitted = fake.submitted or {}
+    assert submitted["1"]["inputs"]["video"] == "aivs/slice_01_10.00_15.00.mp4"
+    assert submitted["2"]["inputs"]["video"] == "aivs/ref_action.mp4"
+    assert fake.uploaded == ["slice_01_10.00_15.00.mp4", "ref_action.mp4"]

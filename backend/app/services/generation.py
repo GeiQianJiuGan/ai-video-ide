@@ -701,12 +701,22 @@ class GenerationService:
         """默认路径：把请求交给适配器，轮询到出片。service 层不认识任何具体模型。"""
         provider = registry.provider("comfy_preset")
         first, last, refs = await self._images_of(pid, job, params)
+        source_video, version = await self._source_video_of(pid, params, shot_id=job.shot_id)
+        if source_video is not None and not any(r.media == "video" for r in refs):
+            refs.append(
+                RefAsset(
+                    path=source_video,
+                    label="分镜视频切段",
+                    kind="source_video",
+                    media="video",
+                )
+            )
         mode = (
             "flf"
             if job.kind in {"first_last_frame", "transition", "fl2va"} or last is not None
             else "i2v"
         )
-        if mode == "i2v" and first is None and not refs:
+        if mode == "i2v" and first is None and not refs and source_video is None:
             raise AppError(
                 ErrorCode.MISSING_INPUT,
                 "这个镜头既没有首帧也没有参考素材",
@@ -725,8 +735,11 @@ class GenerationService:
             negative=str(params.get("negative_prompt") or ""),
             first_frame=first,
             last_frame=last,
+            source_video=source_video,
             refs=refs,
-            duration=float(params.get("duration") or 4.0),
+            duration=float(
+                params.get("duration") or (version.duration if version else None) or 4.0
+            ),
             seed=params.get("seed"),
             extra={**(params.get("extra") or {}), "preset": params.get("preset")},
         )
@@ -810,6 +823,8 @@ class GenerationService:
             f"{dur:.3f}",
             "-c:v",
             "libx264",
+            "-pix_fmt",
+            "yuv420p",
             "-c:a",
             "aac",
             "-avoid_negative_ts",
@@ -825,33 +840,24 @@ class GenerationService:
             return src_path
         return slice_target
 
-    async def _source_video_of(self, pid: str, params: dict[str, Any]) -> tuple[Path, Any]:
-        """要处理的那一段画面在磁盘上的位置 + 它那一版。
-
-        **只认版本，不认「这个镜头的最新文件」**：二次处理的意义是「处理我采用的这一版」，
-        按镜头去猜的话，用户在等超分的时候换了一次采用，处理出来的就是另一段画面。
-        """
+    async def _source_video_of(
+        self, pid: str, params: dict[str, Any], shot_id: str | None = None
+    ) -> tuple[Path | None, Any]:
+        """要处理的那一段画面在磁盘上的位置 + 它那一版（带有区间信息时自动提取切片）。"""
         db = db_of(pid)
         version_id = str(params.get("source_version_id") or "")
+        if not version_id and shot_id:
+            shot = await fetch(db, Shot, shot_id, "镜头")
+            version_id = str(shot.current_version_id or "")
+        if not version_id:
+            return None, None
         version = await fetch(db, GenerationVersion, version_id, "要处理的版本")
-        if not version.asset_id:
-            raise AppError(
-                ErrorCode.MISSING_ASSET,
-                "这一版没有产物文件",
-                f"版本 {version.version_no} 上没有资产（可能是失败现场或占位版本），无法处理它。",
-                ["在版本轨里挑一个有画面的版本", "或先把这个镜头生成一次"],
-                {"version_id": version_id},
-            )
+        if not version or not version.asset_id:
+            return None, None
         asset = await fetch(db, Asset, version.asset_id, "资产")
         path = project_of(pid).dir / asset.path
         if not await asyncio.to_thread(path.is_file):
-            raise AppError(
-                ErrorCode.MISSING_ASSET,
-                "要处理的那段视频不在磁盘上",
-                f"{asset.path} 找不到（文件可能被移走或删掉了）。",
-                ["确认工程目录完整", "或重新生成这个镜头后再处理"],
-                {"version_id": version_id, "path": asset.path},
-            )
+            return None, None
         # 若带有区间信息（从长视频切段而来），按区间提取出当前镜头的切片分段
         if version.in_point is not None and version.out_point is not None:
             slice_path = await self._ensure_slice(
@@ -870,7 +876,15 @@ class GenerationService:
         于是「只增不改」「随时回退到未处理那一版」「采用入口只有一个」全都一行不用改。
         """
         provider = registry.provider("comfy_preset")
-        source, version = await self._source_video_of(pid, params)
+        source, version = await self._source_video_of(pid, params, shot_id=job.shot_id)
+        if not source or not version:
+            raise AppError(
+                ErrorCode.MISSING_ASSET,
+                "要处理的那段视频不存在",
+                "找不到这个镜头已采用的视频版本，无法做二次处理。",
+                ["确认该镜头已有视频版本", "或先生成一次该镜头"],
+                {"shot_id": job.shot_id},
+            )
         req = VideoRequest(
             mode="refine",
             prompt=str(params.get("prompt") or ""),
@@ -883,7 +897,8 @@ class GenerationService:
         task_id = await provider.submit(req, client_id=f"aivs-{pid}")
         if req.notes:
             params["ref_notes"] = list(req.notes)
-        return (*(await self._await_task(pid, job, provider, task_id)), None)
+        filename, data = await self._await_task(pid, job, provider, task_id)
+        return filename, data, None
 
     # --- 音源（同一个镜头上的另一版，画面一个字节都不重跑）---
 

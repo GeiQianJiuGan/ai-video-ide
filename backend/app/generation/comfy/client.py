@@ -92,7 +92,7 @@ class ComfyClient:
         except httpx.HTTPError as exc:
             raise _offline(exc) from exc
 
-    async def upload_input(self, filename: str, data: bytes, subfolder: str = "aivs") -> str:
+    async def upload_input(self, filename: str, data: bytes, subfolder: str = "") -> str:
         """把首/末帧与参考素材传进 ComfyUI 的 input 目录，返回图里该填的文件名。
 
         R2V 的入口是文件，而文件在我们这边；ComfyUI 只认它自己 input 目录下的名字，

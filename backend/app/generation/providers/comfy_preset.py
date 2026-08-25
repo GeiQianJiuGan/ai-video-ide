@@ -165,7 +165,9 @@ class ComfyPresetProvider:
         # 处理图。悄悄跳过的话，超分任务会变成「凭提示词重出一段」，而版本轨上写着
         # 「从 v1 超分而来」——血缘就是假的了。
         if req.source_video is not None:
-            if "AIVS_SOURCE_VIDEO" not in points:
+            if "AIVS_SOURCE_VIDEO" in points:
+                values["AIVS_SOURCE_VIDEO"] = await self._upload(req.source_video)
+            elif req.mode == "refine":
                 raise AppError(
                     ErrorCode.INVALID_WORKFLOW,
                     "这份预设不能做二次处理",
@@ -179,7 +181,6 @@ class ComfyPresetProvider:
                     ],
                     {"preset": name, "found": sorted(points)},
                 )
-            values["AIVS_SOURCE_VIDEO"] = await self._upload(req.source_video)
         values.update(await self._refs(req, name, points))
         for marker, spot in points.items():
             value = values.get(marker)
@@ -286,7 +287,7 @@ class ComfyPresetProvider:
                 {"path": path.as_posix()},
             )
         # 参考素材是本地文件，读它不值得再包一层线程（大段视频也就是一次同步读）
-        return await self._client.upload_input(path.name, path.read_bytes())  # noqa: ASYNC240
+        return await self._client.upload_input(path.name, path.read_bytes(), subfolder="")  # noqa: ASYNC240
 
     async def poll(self, task_id: str) -> TaskState:
         history = await self._client.history(task_id)
