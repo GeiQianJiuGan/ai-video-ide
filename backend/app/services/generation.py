@@ -15,6 +15,9 @@ import asyncio
 from pathlib import Path
 from typing import Any
 
+from sqlalchemy import select
+
+from app.core import ffmpeg as ffmpeg_tool
 from app.core.config import settings
 from app.core.errors import AppError, ErrorCode
 from app.core.ids import new_id
@@ -47,9 +50,9 @@ log = get_logger("queue")
 ACTIVE = ("queued", "waiting", "running")
 POLL_INTERVAL = 1.0
 
-#: 版本没有资产（失败现场、占位版本）时的媒体字段。**两个键永远都在**——
-#: 前端按「哪个非空」决定画 `<video>` 还是 `<img>`，键时有时无就得到处写可选判断。
-_NO_MEDIA: dict[str, Any] = {"video_path": None, "thumbnail_path": None}
+#: 版本没有资产（失败现场、占位版本）时的媒体字段。三个键永远都在——
+#: 前端按「哪个非空」决定画 `<video>` / `<img>` / `<audio>`，键时有时无就得到处写可选判断。
+_NO_MEDIA: dict[str, Any] = {"video_path": None, "thumbnail_path": None, "audio_path": None}
 
 #: 参考素材的量词：图片是「张」，视频 / 音频是「段」。只用在四要素错误的文案里。
 _UNIT = {"image": "张", "video": "段", "audio": "段"}
@@ -451,6 +454,52 @@ class GenerationService:
             await self.retry(pid, job["id"])
         return {"retried": [j["id"] for j in jobs]}
 
+    async def cancel_all(self, pid: str) -> dict[str, Any]:
+        """一键取消当前项目中所有进行中/排队中/等待中的任务。"""
+        jobs = [j for j in await self.list_jobs(pid) if j["status"] in ACTIVE]
+        cancelled_ids: list[str] = []
+        for j in jobs:
+            job_id = str(j["id"])
+            self._cancelled.add(job_id)
+            await self._set(pid, job_id, status="canceled", finished_at=utc_now())
+            cancelled_ids.append(job_id)
+        bus.emit(
+            Channel.QUEUE, "queue.cancelled_all", {"count": len(cancelled_ids)}, project_id=pid
+        )
+        return {"cancelled": cancelled_ids, "count": len(cancelled_ids)}
+
+    async def clear_failed(self, pid: str) -> dict[str, Any]:
+        """清理所有失败的任务记录。"""
+        db = db_of(pid)
+        count = 0
+        async with db.write() as session:
+            stmt = select(Job).where(Job.status == "failed")
+            failed_jobs = (await session.scalars(stmt)).all()
+            count = len(failed_jobs)
+            for job in failed_jobs:
+                await session.delete(job)
+        bus.emit(Channel.QUEUE, "queue.cleared_failed", {"count": count}, project_id=pid)
+        return {"cleared": count}
+
+    async def delete_job(self, pid: str, job_id: str) -> dict[str, Any]:
+        """删除一条已结束（已完成/失败/已取消）的任务记录。"""
+        db = db_of(pid)
+        row = await fetch(db, Job, job_id, "任务")
+        if row.status in ACTIVE:
+            raise AppError(
+                ErrorCode.CONFLICT,
+                "正在运行或排队中的任务不能直接删除",
+                f"当前状态是 {row.status}，请先取消任务后再删除记录。",
+                ["先点击取消", "或等待任务执行完成"],
+                {"job_id": job_id},
+            )
+        async with db.write() as session:
+            job_row = await session.get(Job, job_id)
+            if job_row is not None:
+                await session.delete(job_row)
+        bus.emit(Channel.QUEUE, "queue.job_deleted", {"id": job_id}, project_id=pid)
+        return {"deleted": job_id}
+
     async def _one(self, pid: str, job_id: str) -> dict[str, Any]:
         jobs = await self.list_jobs(pid)
         found = next((j for j in jobs if j["id"] == job_id), None)
@@ -738,6 +787,44 @@ class GenerationService:
 
     # --- 二次处理（输入是已经出好的那一版）---
 
+    async def _ensure_slice(
+        self, proj_dir: Path, src_path: Path, in_point: float, out_point: float, version_id: str
+    ) -> Path:
+        """从长视频中按 [in_point, out_point] 提取出该分镜专属的切片文件给 ComfyUI。"""
+        out_dir = proj_dir / "assets" / "slices"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        dur = round(max(0.1, out_point - in_point), 3)
+        slice_target = out_dir / f"slice_{version_id}_{in_point:.2f}_{out_point:.2f}.mp4"
+        if slice_target.is_file() and slice_target.stat().st_size > 0:
+            return slice_target
+
+        binary = ffmpeg_tool.require("ffmpeg")
+        cmd = [
+            binary,
+            "-y",
+            "-ss",
+            f"{in_point:.3f}",
+            "-i",
+            str(src_path),
+            "-t",
+            f"{dur:.3f}",
+            "-c:v",
+            "libx264",
+            "-c:a",
+            "aac",
+            "-avoid_negative_ts",
+            "make_zero",
+            str(slice_target),
+        ]
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
+        )
+        _, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            log.warning("slice.extract_failed", stderr=(stderr or b"").decode("utf-8", "replace"))
+            return src_path
+        return slice_target
+
     async def _source_video_of(self, pid: str, params: dict[str, Any]) -> tuple[Path, Any]:
         """要处理的那一段画面在磁盘上的位置 + 它那一版。
 
@@ -765,6 +852,12 @@ class GenerationService:
                 ["确认工程目录完整", "或重新生成这个镜头后再处理"],
                 {"version_id": version_id, "path": asset.path},
             )
+        # 若带有区间信息（从长视频切段而来），按区间提取出当前镜头的切片分段
+        if version.in_point is not None and version.out_point is not None:
+            slice_path = await self._ensure_slice(
+                project_of(pid).dir, path, version.in_point, version.out_point, version_id
+            )
+            return slice_path, version
         return path, version
 
     async def _run_refine(
@@ -1153,11 +1246,14 @@ class GenerationService:
             if asset is None:
                 out[row.id] = dict(_NO_MEDIA)
                 continue
-            is_video = kind_of_suffix(Path(asset.path).suffix) == "video"
-            poster = posters.get(asset.id) if is_video else asset
+            kind = kind_of_suffix(Path(asset.path).suffix)
+            is_video = kind == "video"
+            is_audio = kind == "audio"
+            poster = posters.get(asset.id) if is_video else (None if is_audio else asset)
             out[row.id] = {
                 "video_path": asset.path if is_video else None,
                 "thumbnail_path": poster.path if poster is not None else None,
+                "audio_path": asset.path if is_audio else None,
             }
         return out
 

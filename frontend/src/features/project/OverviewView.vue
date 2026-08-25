@@ -78,10 +78,18 @@ async function selectPreset(role: 'r2v' | 'flf', name: string): Promise<void> {
   presetBusy.value = true
   try {
     const generation = ov.environment?.generation
+    const otherPresetValid = (otherName: string | null | undefined, otherRole: 'r2v' | 'flf') => {
+      if (!otherName) return null
+      return presets.value.some(
+        (p) => p.name === otherName && (otherRole === 'r2v' ? (p.r2v_ready ?? p.ready) : p.flf_ready)
+      )
+        ? otherName
+        : null
+    }
     await projectsApi.setVideoPresets(
       pid.value,
-      role === 'r2v' ? name || null : (generation?.r2v_name ?? null),
-      role === 'flf' ? name || null : (generation?.flf_name ?? null),
+      role === 'r2v' ? name || null : otherPresetValid(generation?.r2v_name, 'r2v'),
+      role === 'flf' ? name || null : otherPresetValid(generation?.flf_name, 'flf'),
     )
     await ov.load(pid.value)
   } finally {

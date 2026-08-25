@@ -848,7 +848,7 @@ class TimelineService:
             row.out_point = new_out
             row.duration = new_out - new_in
             row.start = new_start
-        if track.kind == "video" or ripple:
+        if ripple:
             await self._close_gaps(pid, clip.track_id)
         return await self.get(pid)
 

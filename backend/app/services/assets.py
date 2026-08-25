@@ -207,7 +207,24 @@ class AssetService:
         self, pid: str, kind: str, src: str, source: str = "manual", copy: bool = True
     ) -> dict[str, Any]:
         """登记磁盘上已有的文件（桌面端选文件、从素材库采用都走这条）。"""
-        path = source_file(src)
+        proj = project_of(pid)
+        raw_path = Path(src.strip().strip('"')).expanduser()
+        if raw_path.is_file():
+            path = raw_path
+        elif (proj.dir / src).is_file():
+            path = proj.dir / src
+        elif (proj.dir / "assets" / src).is_file():
+            path = proj.dir / "assets" / src
+        elif (proj.dir / "assets/uploads" / src).is_file():
+            path = proj.dir / "assets/uploads" / src
+        else:
+            raise AppError(
+                ErrorCode.NOT_FOUND,
+                "文件不存在",
+                f"未在磁盘上找到文件：{src}。\n如果是本机文件，请填写完整绝对路径（如 D:\\video.mp4）；若在浏览器中操作，请使用「选择视频文件」上传模式。",
+                ["填写完整的本地绝对路径（如 D:\\video.mp4）", "或在界面点击「选择视频文件」直接上传", "确认文件未被移动或删除"],
+                {"path": str(src)},
+            )
         data_sha = sha1_of_file(path)
         existing = await self.by_sha1(pid, data_sha)
         if existing is not None:
@@ -216,7 +233,11 @@ class AssetService:
         target = path
         if copy:
             target = self._target_dir(pid, kind) / content_name(data_sha, path.suffix)
-            shutil.copy2(path, target)
+            try:
+                if target.resolve() != path.resolve():
+                    shutil.copy2(path, target)
+            except OSError:
+                shutil.copy2(path, target)
         return await self._insert(pid, kind, target, data_sha, source, path.name)
 
     async def _insert(

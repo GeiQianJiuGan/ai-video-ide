@@ -240,24 +240,38 @@ class WorkflowService:
 
     async def project_bindings(self, pid: str) -> dict[str, str | None]:
         project = (await fetch_all(db_of(pid), Project))[0]
-        return {
-            "generation_mode": project.generation_mode,
-            "text2image": project.default_image_workflow_id,
-            "image2video": project.default_video_workflow_id,
-            "first_last_frame": project.default_first_last_workflow_id,
-            "upscale": project.default_upscale_workflow_id,
-        }
+        global_db = await self._global_db()
+        async with global_db.read() as session:
+            async def valid_id(wid: str | None) -> str | None:
+                if not wid:
+                    return None
+                return wid if (await session.get(GlobalWorkflow, wid)) is not None else None
+
+            return {
+                "generation_mode": project.generation_mode,
+                "text2image": await valid_id(project.default_image_workflow_id),
+                "image2video": await valid_id(project.default_video_workflow_id),
+                "first_last_frame": await valid_id(project.default_first_last_workflow_id),
+                "upscale": await valid_id(project.default_upscale_workflow_id),
+            }
 
     async def set_project_bindings(
         self, pid: str, bindings: dict[str, str | None]
     ) -> dict[str, str | None]:
         db = db_of(pid)
+        global_db = await self._global_db()
+        valid_bindings: dict[str, str | None] = {}
         for capability, wid in bindings.items():
             if capability == "generation_mode":
                 continue
             if not wid:
+                valid_bindings[capability] = None
                 continue
-            row = await self._global_row(wid)
+            async with global_db.read() as session:
+                row = await session.get(GlobalWorkflow, wid)
+            if row is None:
+                valid_bindings[capability] = None
+                continue
             if row.capability != capability:
                 raise AppError(
                     ErrorCode.VALIDATION_ERROR,
@@ -272,15 +286,20 @@ class WorkflowService:
                     f"{row.name} 当前状态为 {row.status}。",
                     ["先校验 Workflow"],
                 )
+            valid_bindings[capability] = wid
         async with db.write() as session:
             project = (await session.execute(select(Project))).scalars().first()
             assert project is not None
             if bindings.get("generation_mode") in {"comfy_preset", "http_api", "workflow_api"}:
                 project.generation_mode = str(bindings["generation_mode"])
-            project.default_image_workflow_id = bindings.get("text2image")
-            project.default_video_workflow_id = bindings.get("image2video")
-            project.default_first_last_workflow_id = bindings.get("first_last_frame")
-            project.default_upscale_workflow_id = bindings.get("upscale")
+            if "text2image" in bindings:
+                project.default_image_workflow_id = valid_bindings.get("text2image")
+            if "image2video" in bindings:
+                project.default_video_workflow_id = valid_bindings.get("image2video")
+            if "first_last_frame" in bindings:
+                project.default_first_last_workflow_id = valid_bindings.get("first_last_frame")
+            if "upscale" in bindings:
+                project.default_upscale_workflow_id = valid_bindings.get("upscale")
             project.updated_at = utc_now()
         return await self.project_bindings(pid)
 
@@ -575,6 +594,13 @@ class WorkflowService:
             "first_last_frame": project.default_first_last_workflow_id,
             "upscale": project.default_upscale_workflow_id,
         }.get(capability)
+        if selected:
+            global_db = await self._global_db()
+            async with global_db.read() as session:
+                wf_row = await session.get(GlobalWorkflow, selected)
+            if wf_row is not None:
+                return await self._resolve_global(capability, selected)
+            selected = None
         explicit = any(
             (
                 project.default_image_workflow_id,
@@ -591,8 +617,6 @@ class WorkflowService:
                 ["到应用级 Workflow 管理中为项目绑定对应能力"],
                 {"capability": capability, "project_id": pid},
             )
-        if selected:
-            return await self._resolve_global(capability, selected)
         return await self._resolve_global(capability)
 
 

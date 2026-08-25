@@ -17,6 +17,7 @@ import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import { ApiError } from '@/shared/api/client'
 import { storyApi, type Shot, type ShotPatch } from '@/shared/api/story'
+import { dubApi, type AudioVersionItem } from '@/shared/api/dub'
 import {
   contextApi,
   generationApi,
@@ -29,6 +30,7 @@ export const useShotStore = defineStore('shot', () => {
   const shot = ref<Shot | null>(null)
   const bill = ref<ContextBill | null>(null)
   const versions = ref<GenerationVersion[]>([])
+  const audioVersions = ref<AudioVersionItem[]>([])
   /** 最近一次入队产生的任务；页面用它给一句「已入队，去队列页看」。 */
   const lastJob = ref<Job | null>(null)
 
@@ -38,6 +40,9 @@ export const useShotStore = defineStore('shot', () => {
   const included = computed(() => bill.value?.items.filter((i) => i.included) ?? [])
   const omitted = computed(() => bill.value?.items.filter((i) => !i.included) ?? [])
   const currentVersion = computed(() => versions.value.find((v) => v.is_current) ?? null)
+  const currentAudioVersion = computed(
+    () => audioVersions.value.find((v) => v.is_current) ?? null,
+  )
 
   function clearError(): void {
     lastError.value = null
@@ -59,12 +64,14 @@ export const useShotStore = defineStore('shot', () => {
 
   /** 账单与版本各自独立成败：账单拉不到也不该把版本列表清空。 */
   async function refresh(pid: string, shotId: string): Promise<void> {
-    const [b, v] = await Promise.all([
+    const [b, v, a] = await Promise.all([
       contextApi.bill(pid, shotId).catch(() => null),
       generationApi.versions(pid, shotId).catch(() => []),
+      dubApi.audioVersions(pid, shotId).then((r) => r.items).catch(() => []),
     ])
     bill.value = b
     versions.value = v
+    audioVersions.value = a
   }
 
   async function load(pid: string, shotId: string): Promise<void> {
@@ -72,6 +79,7 @@ export const useShotStore = defineStore('shot', () => {
       shot.value = null
       bill.value = null
       versions.value = []
+      audioVersions.value = []
       return
     }
     await guarded(async () => {
@@ -173,14 +181,47 @@ export const useShotStore = defineStore('shot', () => {
     }
   }
 
+  async function importAudio(pid: string, path: string, adopt = true): Promise<void> {
+    const id = shot.value?.id
+    if (!id) return
+    await guarded(async () => {
+      await dubApi.importAudio(pid, id, path, adopt)
+      shot.value = await storyApi.shot(pid, id)
+      await refresh(pid, id)
+    })
+  }
+
+  async function muteAudio(pid: string): Promise<void> {
+    const id = shot.value?.id
+    if (!id) return
+    await guarded(async () => {
+      await dubApi.mute(pid, id)
+      shot.value = await storyApi.shot(pid, id)
+      await refresh(pid, id)
+    })
+  }
+
+  async function splitShot(pid: string, atSeconds: number): Promise<string | null> {
+    const id = shot.value?.id
+    if (!id) return null
+    return await guarded(async () => {
+      const res = await storyApi.splitShot(pid, id, atSeconds)
+      shot.value = await storyApi.shot(pid, id)
+      await refresh(pid, id)
+      return res.new_shot_id
+    })
+  }
+
   return {
     shot,
     bill,
     versions,
+    audioVersions,
     lastJob,
     included,
     omitted,
     currentVersion,
+    currentAudioVersion,
     busy,
     lastError,
     load,
@@ -190,6 +231,9 @@ export const useShotStore = defineStore('shot', () => {
     override,
     addVersion,
     setCurrent,
+    importAudio,
+    muteAudio,
+    splitShot,
     enqueue,
     clearError,
   }

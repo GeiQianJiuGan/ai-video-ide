@@ -320,6 +320,52 @@ def test_priority_reorders_the_queue_and_resume_clears_the_pause(
     assert client.post(f"/api/v1/projects/{pid}/queue/retry-failed").json() == {"retried": []}
 
 
+def test_cancel_all_and_clear_failed_and_delete_job(client: TestClient, pid: str) -> None:
+    pause(client, pid)
+    ready_workflow(client, pid, "image2video")
+    scene = make_scene(client, pid)
+    s1 = make_shot(client, pid, scene["id"], title="S1")
+    s2 = make_shot(client, pid, scene["id"], title="S2")
+    j1 = enqueue(client, pid, s1["id"])
+    j2 = enqueue(client, pid, s2["id"])
+
+    # 1. 一键取消全部活跃任务
+    res = client.post(f"/api/v1/projects/{pid}/queue/cancel-all")
+    assert res.status_code == 200, res.text
+    assert res.json()["count"] == 2
+    assert set(res.json()["cancelled"]) == {j1["id"], j2["id"]}
+
+    # 2. 删除单条已取消任务
+    del_res = client.delete(f"/api/v1/projects/{pid}/jobs/{j1['id']}")
+    assert del_res.status_code == 200, del_res.text
+    assert del_res.json()["deleted"] == j1["id"]
+
+    remaining = client.get(f"/api/v1/projects/{pid}/jobs").json()
+    assert len(remaining) == 1
+    assert remaining[0]["id"] == j2["id"]
+
+    # 3. 产生一个失败任务并一键清空失败记录
+    j3 = enqueue(client, pid, s1["id"])
+    # 模拟失败
+    from app.services.base import db_of
+    from app.persistence.models_gen import Job
+    import asyncio
+    async def set_failed():
+        db = db_of(pid)
+        async with db.write() as session:
+            job = await session.get(Job, j3["id"])
+            if job:
+                job.status = "failed"
+    asyncio.run(set_failed())
+
+    clear_res = client.post(f"/api/v1/projects/{pid}/queue/clear-failed")
+    assert clear_res.status_code == 200, clear_res.text
+    assert clear_res.json()["cleared"] == 1
+
+    jobs_after = client.get(f"/api/v1/projects/{pid}/jobs").json()
+    assert not any(j["status"] == "failed" for j in jobs_after)
+
+
 # --- Step 8：时间线 ---
 
 
@@ -379,10 +425,11 @@ def test_move_snaps_to_the_neighbour_edge(client: TestClient, pid: str) -> None:
 
     moved = client.post(f"/api/v1/projects/{pid}/clips/{clips[1]['id']}/move", json={"start": 2.95})
     assert moved.status_code == 200, moved.text
-    assert [c["start"] for c in clips_of(moved.json())] == [0.0, 3.0], "0.05 秒的缝隙应被吸掉"
+    assert [c["start"] for c in clips_of(moved.json())] == [0.0, 3.0]
 
-    far = client.post(f"/api/v1/projects/{pid}/clips/{clips[1]['id']}/move", json={"start": 9.0})
-    assert [c["start"] for c in clips_of(far.json())] == [0.0, 9.0]
+    # 视频轨保持连续排布：拖到前面会交换顺序并自动衔接
+    front = client.post(f"/api/v1/projects/{pid}/clips/{clips[1]['id']}/move", json={"start": 0.0})
+    assert [c["start"] for c in clips_of(front.json())] == [0.0, 4.0]
 
 
 def test_trim_split_delete_then_undo_and_redo(client: TestClient, pid: str) -> None:

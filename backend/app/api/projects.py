@@ -107,14 +107,19 @@ async def get_project_preset(pid: str) -> dict[str, Any]:
     def item_of(name: str | None) -> dict[str, Any] | None:
         return next((x for x in listing if x["name"] == name), None) if name else None
 
+    r2v_item = item_of(r2v_name)
+    flf_item = item_of(flf_name)
+    valid_r2v = r2v_name if r2v_item else None
+    valid_flf = flf_name if flf_item else None
+
     return {
         # 兼容旧客户端：name / preset 仍表示普通 Shot 的 R2V 预设。
-        "name": r2v_name,
-        "preset": item_of(r2v_name),
-        "r2v_name": r2v_name,
-        "r2v_preset": item_of(r2v_name),
-        "flf_name": flf_name,
-        "flf_preset": item_of(flf_name),
+        "name": valid_r2v,
+        "preset": r2v_item,
+        "r2v_name": valid_r2v,
+        "r2v_preset": r2v_item,
+        "flf_name": valid_flf,
+        "flf_preset": flf_item,
     }
 
 
@@ -159,20 +164,45 @@ async def set_project_preset(pid: str, payload: dict[str, str | None]) -> dict[s
             {"preset": name, "role": role},
         )
 
-    validate(requested_r2v, "r2v")
-    validate(requested_flf, "flf")
     db = db_of(pid)
     async with db.write() as session:
         row = (await session.execute(select(Project))).scalars().first()
         assert row is not None
+
         if explicit_roles:
             if "r2v_name" in payload:
+                if requested_r2v:
+                    item_r2v = next((x for x in listing if x["name"] == requested_r2v), None)
+                    if requested_r2v == row.r2v_preset_name and (not item_r2v or not item_r2v.get("r2v_ready")):
+                        requested_r2v = None
+                    else:
+                        validate(requested_r2v, "r2v")
                 row.r2v_preset_name = requested_r2v
+
             if "flf_name" in payload:
+                if requested_flf:
+                    item_flf = next((x for x in listing if x["name"] == requested_flf), None)
+                    if requested_flf == row.flf_preset_name and (not item_flf or not item_flf.get("flf_ready")):
+                        requested_flf = None
+                    else:
+                        validate(requested_flf, "flf")
                 row.flf_preset_name = requested_flf
         else:
+            if requested_r2v:
+                item_r2v = next((x for x in listing if x["name"] == requested_r2v), None)
+                if requested_r2v == row.r2v_preset_name and (not item_r2v or not item_r2v.get("r2v_ready")):
+                    requested_r2v = None
+                else:
+                    validate(requested_r2v, "r2v")
+            if requested_flf:
+                item_flf = next((x for x in listing if x["name"] == requested_flf), None)
+                if requested_flf == row.flf_preset_name and (not item_flf or not item_flf.get("flf_ready")):
+                    requested_flf = None
+                else:
+                    validate(requested_flf, "flf")
             row.r2v_preset_name = requested_r2v
             row.flf_preset_name = requested_flf
+
         # 旧字段继续镜像 R2V，供旧版本应用打开工程时使用。
         row.preset_name = row.r2v_preset_name
         row.generation_mode = "comfy_preset"

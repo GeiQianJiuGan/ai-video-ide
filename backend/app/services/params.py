@@ -63,16 +63,16 @@ def _cell(value: Any, level: str) -> dict[str, Any]:
 
 
 def prompt_of(shot: Shot, scene: Scene) -> str:
-    """喂给模型的那句 prompt。**镜头 prompt → 镜头画面描述 → 幕 prompt。**
+    """喂给模型的那句 prompt。**镜头 prompt → 幕 prompt → 镜头画面描述。**
 
     `generation.enqueue_shot` 冻结进版本的、`context.resolve` 检查的、分镜卡片上标黄的
     都必须是这一个函数——三处对不上就会出现「账单说齐了，生成的时候却是空的」。
     """
     value, _ = _pick(
         (shot.prompt, "shot"),
-        (shot.description, "shot"),
         (scene_params(scene).get("prompt"), "scene"),
         (scene.prompt, "scene"),
+        (shot.description, "shot"),
     )
     return str(value or "").strip()
 
@@ -105,9 +105,9 @@ def resolve_rows(
         "prompt": _cell(
             *_pick(
                 (shot.prompt, "shot"),
-                (shot.description, "shot"),
                 (sp.get("prompt"), "scene"),
                 (scene.prompt, "scene"),
+                (shot.description, "shot"),
             )
         ),
         "negative": _cell(

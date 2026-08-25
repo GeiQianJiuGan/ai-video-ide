@@ -102,6 +102,16 @@ async def retry_failed(pid: str) -> dict[str, Any]:
     return await generation.retry_failed(pid)
 
 
+@router.post("/projects/{pid}/queue/cancel-all")
+async def cancel_all(pid: str) -> dict[str, Any]:
+    return await generation.cancel_all(pid)
+
+
+@router.post("/projects/{pid}/queue/clear-failed")
+async def clear_failed(pid: str) -> dict[str, Any]:
+    return await generation.clear_failed(pid)
+
+
 @router.post("/projects/{pid}/jobs/{job_id}/cancel")
 async def cancel_job(pid: str, job_id: str) -> dict[str, Any]:
     return await generation.cancel(pid, job_id)
@@ -110,6 +120,11 @@ async def cancel_job(pid: str, job_id: str) -> dict[str, Any]:
 @router.post("/projects/{pid}/jobs/{job_id}/retry")
 async def retry_job(pid: str, job_id: str) -> dict[str, Any]:
     return await generation.retry(pid, job_id)
+
+
+@router.delete("/projects/{pid}/jobs/{job_id}")
+async def delete_job(pid: str, job_id: str) -> dict[str, Any]:
+    return await generation.delete_job(pid, job_id)
 
 
 @router.put("/projects/{pid}/jobs/{job_id}/priority")

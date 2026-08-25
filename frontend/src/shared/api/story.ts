@@ -75,6 +75,13 @@ export interface Scene {
   location_variant_id: string | null
   time_of_day: string | null
   notes: string | null
+  /** 这一幕的台词（音源配音那条链可作为整幕兜底）。 */
+  dialogue?: string | null
+  /** storyboard 剧本拆出来的 / ingested 从长视频切出来的。 */
+  kind?: 'storyboard' | 'ingested'
+  /** shared 共用参数（默认）/ per_shot 每段独立。 */
+  param_mode?: 'shared' | 'per_shot'
+  source_asset_id?: string | null
   shot_count: number
   duration_total: number
   /** 「城南旧宅 · 雨夜」，后端拼好的，前端不再自己查地点名。 */
@@ -140,6 +147,8 @@ export interface ShotVersionRow {
   context_json: string | null
   error_json: string | null
   duration: number | null
+  in_point?: number | null
+  out_point?: number | null
   /** generated / manual —— 手工挂进来的版本也要能看出来。 */
   source: string
   created_at: string
@@ -159,11 +168,14 @@ export interface Shot {
   status: string
   prompt: string | null
   negative_prompt: string | null
+  /** 镜头台词（音源配音那条链用）。 */
+  dialogue?: string | null
   seed: number | null
   steps: number | null
   workflow_id: string | null
   prev_shot_id: string | null
   current_version_id: string | null
+  current_audio_version_id?: string | null
   /**
    * 首帧 / 末帧那两个显式槽位：**「哪一张是首帧」就是用户按下去的那一下**。
    *
@@ -208,6 +220,9 @@ export interface StoryboardCard {
   status: string
   camera: string | null
   cast_names: string[]
+  dialogue?: string | null
+  current_audio_version_id?: string | null
+  has_audio_version?: boolean
   /**
    * 卡片上那张图，**相对工程目录**的路径（过 `fileUrl(pid, path)` 才是 URL）。
    * 后端保证它**只会是图片**：优先是从成片里抽出来的真首帧，其次是该镜头生成的图片版本。
@@ -220,6 +235,8 @@ export interface StoryboardCard {
   video_path: string | null
   video_asset_id: string | null
   video_version_id: string | null
+  in_point?: number | null
+  out_point?: number | null
   /** 该 Shot 的已生成视频版本，分镜板直接展示并支持采纳。 */
   versions: {
     id: string
@@ -230,6 +247,8 @@ export interface StoryboardCard {
     video_path: string | null
     thumbnail_path: string | null
     duration: number | null
+    in_point?: number | null
+    out_point?: number | null
     source: string
     is_current: boolean
     created_at: string
@@ -288,7 +307,19 @@ export interface StoryboardLane {
   id: string
   index_no: number
   title: string
+  summary?: string | null
+  prompt?: string | null
+  source_text?: string | null
+  time_of_day?: string | null
+  notes?: string | null
+  dialogue?: string | null
+  kind?: 'storyboard' | 'ingested'
+  param_mode?: 'shared' | 'per_shot'
+  source_asset_id?: string | null
   location_variant_id: string | null
+  cast_appearance_ids?: string[]
+  cast_names?: string[]
+  location_variant_ids?: string[]
   shots: StoryboardCard[]
   /** 本幕内相邻两个正片镜头之间那条线，按顺序，比卡片数少一条。 */
   links: StoryboardConnector[]
@@ -365,7 +396,16 @@ export type StoryPatch = Partial<Pick<Story, 'title' | 'raw_text' | 'mode'>>
 export type ScenePatch = Partial<
   Pick<
     Scene,
-    'title' | 'summary' | 'source_text' | 'prompt' | 'location_variant_id' | 'time_of_day' | 'notes'
+    | 'title'
+    | 'summary'
+    | 'source_text'
+    | 'prompt'
+    | 'location_variant_id'
+    | 'time_of_day'
+    | 'notes'
+    | 'dialogue'
+    | 'kind'
+    | 'param_mode'
   >
 >
 export type ShotPatch = Partial<
@@ -379,6 +419,7 @@ export type ShotPatch = Partial<
     | 'status'
     | 'prompt'
     | 'negative_prompt'
+    | 'dialogue'
     | 'seed'
     | 'steps'
     | 'workflow_id'
@@ -420,6 +461,15 @@ export const storyApi = {
   updateShot: (pid: string, shotId: string, patch: ShotPatch) =>
     api.patch<Shot>(`/projects/${pid}/shots/${shotId}`, patch),
   deleteShot: (pid: string, shotId: string) => api.del<void>(`/projects/${pid}/shots/${shotId}`),
+  /** 将镜头在指定秒数处拆分为两个镜头 */
+  splitShot: (pid: string, shotId: string, atSeconds: number) =>
+    api.post<{
+      shot_id: string
+      new_shot_id: string
+      first_duration: number
+      second_duration: number
+      storyboard: StoryboardLane[]
+    }>(`/projects/${pid}/shots/${shotId}/split`, { at_seconds: atSeconds }),
   /** position 是目标 Scene 内 0-based 落点，省略即末尾。返回重排后的整块分镜板。 */
   moveShot: (pid: string, shotId: string, sceneId: string, position?: number) =>
     api.post<StoryboardLane[]>(`/projects/${pid}/shots/${shotId}/move`, {

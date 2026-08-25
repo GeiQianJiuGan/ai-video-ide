@@ -101,6 +101,10 @@ class PostersBody(BaseModel):
     )
 
 
+class SplitShotBody(BaseModel):
+    at_seconds: float = Field(description="在镜头内的第几秒进行拆分（如 2.5）")
+
+
 class PropsBody(BaseModel):
     items: list[dict[str, Any]] = Field(
         description='[{"prop_id": "prp_…", "state": "present|discarded"}]'
@@ -252,6 +256,12 @@ async def update_shot(pid: str, shot_id: str, body: ShotBody) -> dict[str, Any]:
 @router.delete("/projects/{pid}/shots/{shot_id}", status_code=204)
 async def delete_shot(pid: str, shot_id: str) -> None:
     await story.delete_shot(pid, shot_id)
+
+
+@router.post("/projects/{pid}/shots/{shot_id}/split")
+async def split_shot(pid: str, shot_id: str, body: SplitShotBody) -> dict[str, Any]:
+    """将镜头在指定秒数处拆分为两个镜头（长视频切段加工 / 分镜精修）。"""
+    return await story.split_shot(pid, shot_id, body.at_seconds)
 
 
 @router.post("/projects/{pid}/shots/{shot_id}/move")

@@ -149,8 +149,11 @@ export interface GenerationVersion {
   asset_id: string | null
   workflow_id: string | null
   duration: number | null
-  /** generated / manual */
+  /** generated / manual / imported / upscaled ... */
   source: string
+  parent_version_id?: string | null
+  in_point?: number | null
+  out_point?: number | null
   is_current: boolean
   params: Record<string, unknown>
   context: unknown
@@ -163,6 +166,8 @@ export interface GenerationVersion {
   video_path?: string | null
   /** 能当图显示的那一张（版本本身是图片，或这段视频抽出来的首帧）。 */
   thumbnail_path?: string | null
+  /** 针对 kind="audio" 的音频版本，相对工程目录的音频路径。 */
+  audio_path?: string | null
 }
 
 export const JOB_STATUS = [
@@ -280,8 +285,14 @@ export const generationApi = {
   pause: (pid: string) => api.post<QueueState>(`/projects/${pid}/queue/pause`),
   resume: (pid: string) => api.post<QueueState>(`/projects/${pid}/queue/resume`),
   retryFailed: (pid: string) => api.post<QueueState>(`/projects/${pid}/queue/retry-failed`),
+  cancelAll: (pid: string) =>
+    api.post<{ cancelled: string[]; count: number }>(`/projects/${pid}/queue/cancel-all`),
+  clearFailed: (pid: string) =>
+    api.post<{ cleared: number }>(`/projects/${pid}/queue/clear-failed`),
   cancel: (pid: string, jobId: string) => api.post<Job>(`/projects/${pid}/jobs/${jobId}/cancel`),
   retry: (pid: string, jobId: string) => api.post<Job>(`/projects/${pid}/jobs/${jobId}/retry`),
+  deleteJob: (pid: string, jobId: string) =>
+    api.del<{ deleted: string }>(`/projects/${pid}/jobs/${jobId}`),
   setPriority: (pid: string, jobId: string, priority: number) =>
     api.put<Job>(`/projects/${pid}/jobs/${jobId}/priority`, { priority }),
 }

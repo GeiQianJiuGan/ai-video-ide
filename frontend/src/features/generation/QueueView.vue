@@ -19,7 +19,7 @@
  */
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { ArrowUp, Ban, Pause, Play, RefreshCw, RotateCcw } from '@lucide/vue'
+import { ArrowUp, Ban, Pause, Play, RefreshCw, RotateCcw, Trash2 } from '@lucide/vue'
 import AppPanel from '@/shared/ui/AppPanel.vue'
 import AppButton from '@/shared/ui/AppButton.vue'
 import AppBadge from '@/shared/ui/AppBadge.vue'
@@ -118,6 +118,25 @@ async function bump(job: Job): Promise<void> {
         @click="queue.retryFailed(pid)"
       >
         <RotateCcw :size="10" />重试失败（{{ queue.failed.length }}）
+      </AppButton>
+      <AppButton
+        size="sm"
+        variant="ghost"
+        :disabled="queue.busy || queue.failed.length === 0"
+        title="从列表中彻底清空所有失败的任务记录"
+        @click="queue.clearFailed(pid)"
+      >
+        <Trash2 :size="10" />清空失败
+      </AppButton>
+      <AppButton
+        size="sm"
+        variant="ghost"
+        class="text-st-failed hover:bg-st-failed/10"
+        :disabled="queue.busy || queue.active === 0"
+        title="一键取消队列中所有排队中、等待中与运行中的任务"
+        @click="queue.cancelAll(pid)"
+      >
+        <Ban :size="10" />一键取消全部<span v-if="queue.active" class="tnum ml-0.5">({{ queue.active }})</span>
       </AppButton>
       <span class="text-fg-4 text-2xs">筛选</span>
       <select
@@ -249,6 +268,14 @@ async function bump(job: Job): Promise<void> {
                       @click.stop="queue.retry(pid, job.id)"
                     >
                       <RotateCcw :size="10" />
+                    </button>
+                    <button
+                      v-if="['failed', 'canceled', 'done'].includes(job.status)"
+                      class="text-fg-4 hover:text-st-failed"
+                      title="从列表中删除这条记录"
+                      @click.stop="queue.deleteJob(pid, job.id)"
+                    >
+                      <Trash2 :size="10" />
                     </button>
                   </div>
                 </td>

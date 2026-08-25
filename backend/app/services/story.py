@@ -278,6 +278,8 @@ def _shot_media(
                 "video_path": asset.path,
                 "thumbnail_path": version_poster.path if version_poster else None,
                 "duration": version.duration,
+                "in_point": version.in_point,
+                "out_point": version.out_point,
                 "source": version.source,
                 "is_current": version.id == shot.current_version_id,
                 "created_at": version.created_at,
@@ -289,6 +291,8 @@ def _shot_media(
         "video_version_id": picked.id if picked else None,
         "video_asset_id": video_asset.id if video_asset else None,
         "video_path": video_asset.path if video_asset else None,
+        "in_point": picked.in_point if picked else None,
+        "out_point": picked.out_point if picked else None,
         "versions": version_rows,
         # 有片子但还没有能当图显示的那一张：可以补抽，不是错误
         "poster_pending": bool(video_asset) and poster_path is None,
@@ -629,10 +633,18 @@ class StoryService:
         db = db_of(pid)
         await fetch(db, Scene, sid, "场景")
         async with db.write() as session:
+            all_shots = await fetch_all(db, Shot)
+            shots_in_scene = {s.id for s in all_shots if s.scene_id == sid}
+            for down in all_shots:
+                if down.prev_shot_id in shots_in_scene:
+                    down_row = await session.get(Shot, down.id)
+                    if down_row is not None:
+                        down_row.prev_shot_id = None
             fresh = await session.get(Scene, sid)
             if fresh is not None:
                 await session.delete(fresh)
         await self._resequence_scenes(pid)
+        await self.resequence_shots(pid)
 
     async def reorder_scenes(self, pid: str, order: list[str]) -> list[dict[str, Any]]:
         db = db_of(pid)
@@ -850,6 +862,110 @@ class StoryService:
                 await session.delete(fresh)
         await self.resequence_shots(pid)
 
+    async def split_shot(self, pid: str, shot_id: str, at_seconds: float) -> dict[str, Any]:
+        """将一个镜头在指定秒数处拆分为两个镜头（长视频切段加工 / 分镜精修）。
+
+        前一半保留原 Shot 并缩短区间与时长，后一半创建新 Shot（继承 prompt/参数等）并挂载后半段版本。
+        """
+        db = db_of(pid)
+        shot = await fetch(db, Shot, shot_id, "镜头")
+        total_dur = float(shot.duration or 4.0)
+        at = float(at_seconds)
+        if at < 0.1 or at > total_dur - 0.1:
+            raise AppError(
+                ErrorCode.VALIDATION_ERROR,
+                "拆分时间点不合法",
+                f"拆分点 {at:.2f}s 必须在 0.1s 到 {total_dur - 0.1:.2f}s 之间。",
+                ["选择镜头内部的有效切分时间点"],
+                {"shot_id": shot_id, "duration": total_dur, "at_seconds": at},
+            )
+        new_shot_id = new_id("shot")
+        new_version_id = None
+        first_dur = round(at, 3)
+        second_dur = round(total_dur - at, 3)
+
+        async with db.write() as session:
+            fresh_shot = await session.get(Shot, shot_id)
+            assert fresh_shot is not None
+            fresh_shot.duration = first_dur
+            fresh_shot.updated_at = utc_now()
+
+            # 创建后半段 Shot
+            new_shot = Shot(
+                id=new_shot_id,
+                scene_id=fresh_shot.scene_id,
+                index_no=fresh_shot.index_no,  # 稍后 resequence 重排
+                title=f"{fresh_shot.title} (2)",
+                kind=fresh_shot.kind,
+                description=fresh_shot.description,
+                duration=second_dur,
+                camera=fresh_shot.camera,
+                movement=fresh_shot.movement,
+                status=fresh_shot.status,
+                prompt=fresh_shot.prompt,
+                negative_prompt=fresh_shot.negative_prompt,
+                dialogue=None,
+                seed=fresh_shot.seed,
+                steps=fresh_shot.steps,
+                workflow_id=fresh_shot.workflow_id,
+                prev_shot_id=None,
+                current_version_id=None,
+                created_at=utc_now(),
+                updated_at=utc_now(),
+            )
+            session.add(new_shot)
+
+            # 处理版本（如果有）
+            if fresh_shot.current_version_id:
+                ver = await session.get(GenerationVersion, fresh_shot.current_version_id)
+                if ver is not None:
+                    old_in = float(ver.in_point or 0.0)
+                    old_out = float(ver.out_point) if ver.out_point is not None else old_in + total_dur
+                    ver.in_point = old_in
+                    ver.out_point = round(old_in + at, 3)
+                    ver.duration = first_dur
+
+                    # 为后半段创建新版本
+                    new_version_id = new_id("generation_version")
+                    new_ver = GenerationVersion(
+                        id=new_version_id,
+                        shot_id=new_shot_id,
+                        version_no=1,
+                        kind=ver.kind,
+                        status=ver.status,
+                        asset_id=ver.asset_id,
+                        workflow_id=ver.workflow_id,
+                        params_json=ver.params_json,
+                        context_json=ver.context_json,
+                        source=ver.source,
+                        parent_version_id=ver.id,
+                        duration=second_dur,
+                        in_point=round(old_in + at, 3),
+                        out_point=old_out,
+                        created_at=utc_now(),
+                    )
+                    session.add(new_ver)
+                    new_shot.current_version_id = new_version_id
+
+        # 调整同场景内镜头的顺序，把 new_shot 插在 shot 后面
+        siblings = [
+            s
+            for s in await fetch_all(db, Shot, order_by=Shot.index_no)
+            if s.scene_id == shot.scene_id
+        ]
+        idx = next((i for i, s in enumerate(siblings) if s.id == shot_id), len(siblings) - 1)
+        order = [s.id for s in siblings if s.id != new_shot_id]
+        order.insert(idx + 1, new_shot_id)
+        await self.reorder_shots(pid, shot.scene_id, order)
+
+        return {
+            "shot_id": shot_id,
+            "new_shot_id": new_shot_id,
+            "first_duration": first_dur,
+            "second_duration": second_dur,
+            "storyboard": await self.storyboard(pid),
+        }
+
     async def move_shot(
         self, pid: str, shot_id: str, scene_id: str, position: int | None = None
     ) -> list[dict[str, Any]]:
@@ -1053,6 +1169,7 @@ class StoryService:
         shots = await fetch_all(db, Shot, order_by=Shot.index_no)
         cast_rows = await fetch_all(db, ShotCast)
         scene_cast_rows = await fetch_all(db, SceneCast, order_by=SceneCast.index_no)
+        scene_location_rows = await fetch_all(db, SceneLocation, order_by=SceneLocation.index_no)
         versions = {v.id: v for v in await fetch_all(db, GenerationVersion)}
         variants = {v.id: v for v in await fetch_all(db, LocationVariant)}
         apps = {a.id: a for a in await fetch_all(db, Appearance)}
@@ -1110,6 +1227,9 @@ class StoryService:
                         "duration": shot.duration,
                         "status": shot.status,
                         "camera": shot.camera,
+                        "dialogue": shot.dialogue,
+                        "current_audio_version_id": shot.current_audio_version_id,
+                        "has_audio_version": bool(shot.current_audio_version_id),
                         "cast_names": names,
                         **media,
                         "version_count": len(
@@ -1183,7 +1303,22 @@ class StoryService:
                     "id": scene.id,
                     "index_no": scene.index_no,
                     "title": scene.title,
+                    "summary": scene.summary,
+                    "prompt": scene.prompt,
+                    "source_text": scene.source_text,
+                    "time_of_day": scene.time_of_day,
+                    "notes": scene.notes,
+                    "dialogue": scene.dialogue,
+                    "kind": scene.kind,
+                    "param_mode": scene.param_mode,
                     "location_variant_id": scene.location_variant_id,
+                    "cast_appearance_ids": [
+                        c.appearance_id for c in scene_cast_rows if c.scene_id == scene.id
+                    ],
+                    "cast_names": scene_names,
+                    "location_variant_ids": [
+                        l.location_variant_id for l in scene_location_rows if l.scene_id == scene.id
+                    ],
                     "shots": cards,
                     "links": links,
                     "next_link": next_link,

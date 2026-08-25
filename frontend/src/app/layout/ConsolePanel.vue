@@ -34,6 +34,7 @@ import {
   Play,
   RefreshCw,
   RotateCcw,
+  Trash2,
   Wand2,
 } from '@lucide/vue'
 import AppBadge from '@/shared/ui/AppBadge.vue'
@@ -235,6 +236,28 @@ function startResize(e: PointerEvent): void {
         >
           <RotateCcw :size="10" />重试失败（{{ queue.failed.length }}）
         </AppButton>
+        <AppButton
+          size="sm"
+          variant="ghost"
+          :disabled="
+            queue.busy ||
+            (queue.failed.length === 0 && !queue.breakdownTasks.some((t) => t.status === 'failed'))
+          "
+          title="清空所有失败任务记录"
+          @click="queue.clearFailed(pid)"
+        >
+          <Trash2 :size="10" />清空失败
+        </AppButton>
+        <AppButton
+          size="sm"
+          variant="ghost"
+          class="text-st-failed hover:bg-st-failed/10"
+          :disabled="queue.busy || queue.active === 0"
+          title="一键取消所有排队与运行中的任务"
+          @click="queue.cancelAll(pid)"
+        >
+          <Ban :size="10" />取消全部
+        </AppButton>
         <span class="text-fg-4 tnum text-2xs">
           并发 {{ queue.active }} / {{ queue.state?.worker_limit ?? '—' }}
         </span>
@@ -371,6 +394,14 @@ function startResize(e: PointerEvent): void {
                     @click="queue.retry(pid, job.id)"
                   >
                     <RotateCcw :size="10" />
+                  </button>
+                  <button
+                    v-if="['failed', 'canceled', 'done'].includes(job.status)"
+                    class="text-fg-4 hover:text-st-failed"
+                    title="删除这条任务记录"
+                    @click="queue.deleteJob(pid, job.id)"
+                  >
+                    <Trash2 :size="10" />
                   </button>
                 </div>
               </td>

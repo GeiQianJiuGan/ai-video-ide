@@ -159,6 +159,73 @@ def test_default_and_delete_workflow(client: TestClient, pid: str) -> None:
     assert error_of(client.get(f"/api/v1/projects/{pid}/workflows/wf_nope"))["code"] == "NOT_FOUND"
 
 
+def test_deleted_workflow_does_not_break_project_bindings(client: TestClient, pid: str) -> None:
+    wf1 = ready_workflow(client, pid, "text2image")
+    wf2 = ready_workflow(client, pid, "image2video")
+
+    # 绑定两个能力
+    resp = client.put(
+        f"/api/v1/projects/{pid}/workflow-bindings",
+        json={"text2image": wf1["id"], "image2video": wf2["id"]},
+    )
+    assert resp.status_code == 200, resp.text
+    bindings = resp.json()
+    assert bindings["text2image"] == wf1["id"]
+    assert bindings["image2video"] == wf2["id"]
+
+    # 删除 wf1
+    assert client.delete(f"/api/v1/projects/{pid}/workflows/{wf1['id']}").status_code == 204
+
+    # 查询项目绑定：已删除的工作流应自动退化为 None，而不是报 404/500
+    resp = client.get(f"/api/v1/projects/{pid}/workflow-bindings")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["text2image"] is None
+    assert resp.json()["image2video"] == wf2["id"]
+
+    # 再次保存绑定（即使带有已删的 id 或者修改其它能力），绝不能因已删除的工作流报错
+    resp = client.put(
+        f"/api/v1/projects/{pid}/workflow-bindings",
+        json={"text2image": wf1["id"], "image2video": wf2["id"], "generation_mode": "workflow_api"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["text2image"] is None
+    assert resp.json()["image2video"] == wf2["id"]
+
+
+def test_deleted_preset_does_not_break_project_preset_change(client: TestClient, pid: str) -> None:
+    from app.generation.providers import presets
+    from tests.test_providers import GRAPH
+
+    # 创建两个就绪预设
+    graph_a = json.dumps(GRAPH, ensure_ascii=False)
+    graph_b = json.dumps(GRAPH, ensure_ascii=False)
+    presets.save("预设A", graph_a)
+    presets.save("预设B", graph_b)
+
+    # 项目绑定预设A
+    resp = client.put(f"/api/v1/projects/{pid}/preset", json={"r2v_name": "预设A", "flf_name": "预设A"})
+    assert resp.status_code == 200, resp.text
+
+    # 删除预设A
+    del_resp = client.delete("/api/v1/settings/presets/预设A")
+    assert del_resp.status_code == 200, del_resp.text
+
+    # 获取预设：已删除的预设返回 None
+    preset_info = client.get(f"/api/v1/projects/{pid}/preset").json()
+    assert preset_info["r2v_name"] is None
+    assert preset_info["flf_name"] is None
+
+    # 变更 R2V 为预设B（即使 payload 里仍带着旧的已删除 flf_name 预设A，也不能 400 报死）
+    update_resp = client.put(
+        f"/api/v1/projects/{pid}/preset",
+        json={"r2v_name": "预设B", "flf_name": "预设A"},
+    )
+    assert update_resp.status_code == 200, update_resp.text
+    assert update_resp.json()["r2v_name"] == "预设B"
+    # 当 flf_preset_name 清空后，项目回退使用 R2V 预设
+    assert update_resp.json()["flf_name"] == "预设B"
+
+
 # --- Step 5：剧本 / Scene / Shot / 分镜板 ---
 
 

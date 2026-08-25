@@ -375,25 +375,27 @@ class OverviewService:
                 if flf_selected
                 else None
             )
+            r2v_name = selected if item else None
+            flf_name = flf_selected if flf_item else None
             generation = {
                 "mode": "comfy_preset",
-                "preset_name": selected or None,
+                "preset_name": r2v_name,
                 "preset_ready": bool(item and item.get("ready")),
                 "ref_slots": item.get("ref_slots") if item else None,
                 # 参考视频 / 参考音频的槽位数单独给。混进 `ref_slots` 会让状态条显示
                 # 「能收 5 个参考素材」而其中 2 个只吃音频——用户照着塞图必然白跑一趟。
                 "ref_video_slots": item.get("ref_video_slots") if item else None,
                 "ref_audio_slots": item.get("ref_audio_slots") if item else None,
-                "r2v_name": selected or None,
+                "r2v_name": r2v_name,
                 "r2v_ready": bool(item and item.get("r2v_ready")),
                 "r2v_ref_slots": item.get("ref_slots") if item else None,
                 "r2v_ref_video_slots": item.get("ref_video_slots") if item else None,
                 "r2v_ref_audio_slots": item.get("ref_audio_slots") if item else None,
-                "flf_name": flf_selected or None,
+                "flf_name": flf_name,
                 "flf_ready": bool(flf_item and flf_item.get("flf_ready")),
                 "detail": (
-                    f"R2V：{selected or '未绑定'}；FL2VA：{flf_selected or '未绑定'}"
-                    if selected
+                    f"R2V：{r2v_name or '未绑定'}；FL2VA：{flf_name or '未绑定'}"
+                    if (r2v_name or flf_name)
                     else "项目尚未绑定预设 Workflow"
                 ),
             }

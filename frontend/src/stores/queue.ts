@@ -167,9 +167,18 @@ export const useQueueStore = defineStore('queue', () => {
   const pause = (pid: string) => guarded(pid, () => generationApi.pause(pid))
   const resume = (pid: string) => guarded(pid, () => generationApi.resume(pid))
   const retryFailed = (pid: string) => guarded(pid, () => generationApi.retryFailed(pid))
+  const cancelAll = (pid: string) => guarded(pid, () => generationApi.cancelAll(pid))
+  const clearFailed = (pid: string) =>
+    guarded(pid, async () => {
+      breakdownTasks.value = breakdownTasks.value.filter((task) => task.status !== 'failed')
+      await generationApi.clearFailed(pid)
+      clearError()
+    })
   const cancel = (pid: string, jobId: string) =>
     guarded(pid, () => generationApi.cancel(pid, jobId))
   const retry = (pid: string, jobId: string) => guarded(pid, () => generationApi.retry(pid, jobId))
+  const deleteJob = (pid: string, jobId: string) =>
+    guarded(pid, () => generationApi.deleteJob(pid, jobId))
   const setPriority = (pid: string, jobId: string, priority: number) =>
     guarded(pid, () => generationApi.setPriority(pid, jobId, priority))
 
@@ -195,8 +204,11 @@ export const useQueueStore = defineStore('queue', () => {
     pause,
     resume,
     retryFailed,
+    cancelAll,
+    clearFailed,
     cancel,
     retry,
+    deleteJob,
     setPriority,
     clearError,
   }

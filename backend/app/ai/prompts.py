@@ -93,8 +93,11 @@ def _custom(raw: str) -> str:
 
 def with_shot_audio_policy(prompt: str, negative_prompt: str) -> tuple[str, str]:
     """给 AI 拆解产出的 Shot Prompt 加上可执行且幂等的无配乐约束。"""
-    positive = str(prompt or "").strip().rstrip("。；; ")
-    if SHOT_AUDIO_PROMPT_SUFFIX not in positive:
+    raw_prompt = str(prompt or "").strip()
+    if SHOT_AUDIO_PROMPT_SUFFIX in raw_prompt:
+        positive = raw_prompt
+    else:
+        positive = raw_prompt.rstrip("。；; ")
         positive = (
             f"{positive}。{SHOT_AUDIO_PROMPT_SUFFIX}" if positive else SHOT_AUDIO_PROMPT_SUFFIX
         )

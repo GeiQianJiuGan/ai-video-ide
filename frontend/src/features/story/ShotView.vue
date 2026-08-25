@@ -15,18 +15,37 @@
  */
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { ListVideo, Play, RefreshCw, RotateCcw, Sparkles, Star, Upload, X } from '@lucide/vue'
+import {
+  GitBranch,
+  ListVideo,
+  Mic,
+  Play,
+  RefreshCw,
+  RotateCcw,
+  Scissors,
+  Sparkles,
+  Star,
+  Upload,
+  VolumeX,
+  X,
+  Zap,
+} from '@lucide/vue'
 import AppPanel from '@/shared/ui/AppPanel.vue'
 import AppButton from '@/shared/ui/AppButton.vue'
 import AppBadge from '@/shared/ui/AppBadge.vue'
+import AppDialog from '@/shared/ui/AppDialog.vue'
 import EmptyState from '@/shared/ui/EmptyState.vue'
 import ErrorPanel from '@/shared/ui/ErrorPanel.vue'
 import FeatureHeader from '@/shared/ui/FeatureHeader.vue'
+import DubModal from './components/DubModal.vue'
+import RefineModal from './components/RefineModal.vue'
 import { fileUrl } from '@/shared/api/files'
 import { ApiError, confirmFlagOf } from '@/shared/api/client'
 import { assetsApi, type Asset } from '@/shared/api/assets'
 import { castApi, type AppearanceRow, type Character } from '@/shared/api/cast'
 import { worldApi, type Prop } from '@/shared/api/world'
+import type { AudioVersionItem } from '@/shared/api/dub'
+import { refineApi, type VersionLineageResult } from '@/shared/api/refine'
 import {
   CONTEXT_KIND_LABEL,
   CONTEXT_MEDIA_LABEL,
@@ -288,11 +307,54 @@ function slotUrl(path: string | null): string {
  * 把它塞进 `<img>` 只会得到一个坏图标。
  */
 function versionVideo(v: GenerationVersion): string {
-  return v.video_path ? fileUrl(pid.value, v.video_path) : ''
+  if (!v.video_path) return ''
+  const base = fileUrl(pid.value, v.video_path)
+  if (v.in_point != null && v.out_point != null) {
+    return `${base}#t=${v.in_point},${v.out_point}`
+  } else if (v.in_point != null) {
+    return `${base}#t=${v.in_point}`
+  }
+  return base
+}
+
+function onVersionLoadedMetadata(e: Event, v: GenerationVersion): void {
+  const video = e.target as HTMLVideoElement
+  if (v.in_point != null && v.in_point > 0) {
+    video.currentTime = v.in_point
+  }
+}
+
+function onVersionTimeUpdate(e: Event, v: GenerationVersion): void {
+  const video = e.target as HTMLVideoElement
+  const inPt = v.in_point ?? 0
+  const outPt = v.out_point
+  if (outPt != null && video.currentTime >= outPt) {
+    video.pause()
+    video.currentTime = inPt
+  }
 }
 
 function versionPoster(v: GenerationVersion): string {
   return v.thumbnail_path ? fileUrl(pid.value, v.thumbnail_path) : ''
+}
+
+const currentLane = computed(() => {
+  if (!editor.shot) return null
+  return story.lanes.find((l) => l.id === editor.shot?.scene_id) ?? null
+})
+
+async function promoteShotPromptToScene(): Promise<void> {
+  const promptVal = editor.shot?.prompt
+  const lane = currentLane.value
+  if (!promptVal || !lane || !pid.value) return
+  await story.updateScene(pid.value, lane.id, { prompt: promptVal }).catch(() => {})
+  await story.loadBoard(pid.value).catch(() => {})
+}
+
+async function clearShotPromptToInherit(): Promise<void> {
+  if (!pid.value) return
+  await editor.save(pid.value, { prompt: '' }).catch(() => {})
+  await reload()
 }
 
 async function loadSide(): Promise<void> {
@@ -344,8 +406,75 @@ function fmt(n: number | null | undefined): string {
   return n === null || n === undefined ? '—' : `${Math.round(n * 10) / 10}s`
 }
 
-async function saveText(key: 'prompt' | 'negative_prompt' | 'description', value: string) {
+async function saveText(key: 'prompt' | 'negative_prompt' | 'description' | 'dialogue', value: string) {
   await editor.save(pid.value, { [key]: value || null }).catch(() => {})
+}
+
+const versionTab = ref<'video' | 'audio'>('video')
+const dubModalOpen = ref(false)
+const refineModalOpen = ref(false)
+const refineVersionId = ref<string | undefined>(undefined)
+const splitDialogOpen = ref(false)
+const splitAtSeconds = ref(2.0)
+const audioInput = ref<HTMLInputElement | null>(null)
+const lineageDialogOpen = ref(false)
+const lineageResult = ref<VersionLineageResult | null>(null)
+
+function audioUrl(v: AudioVersionItem): string {
+  return v.audio_path ? fileUrl(pid.value, v.audio_path) : ''
+}
+
+async function onPickAudioFile(event: Event): Promise<void> {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  input.value = ''
+  if (!file || !pid.value) return
+  uploading.value = true
+  sideError.value = null
+  try {
+    const asset = await assetsApi.upload(pid.value, file, 'audio')
+    await editor.importAudio(pid.value, asset.path, true)
+    await loadSide()
+  } catch (err) {
+    sideError.value = err instanceof ApiError ? err : null
+  } finally {
+    uploading.value = false
+  }
+}
+
+function openRefine(versionId?: string) {
+  refineVersionId.value = versionId
+  refineModalOpen.value = true
+}
+
+async function inspectLineage(versionId: string) {
+  if (!pid.value) return
+  try {
+    lineageResult.value = await refineApi.lineage(pid.value, versionId)
+    lineageDialogOpen.value = true
+  } catch (err) {
+    sideError.value = err instanceof ApiError ? err : null
+  }
+}
+
+function openSplitDialog() {
+  const dur = shot.value?.duration || 4.0
+  splitAtSeconds.value = Math.max(0.5, Math.round((dur / 2) * 10) / 10)
+  splitDialogOpen.value = true
+}
+
+async function executeSplit() {
+  if (!pid.value || !shot.value) return
+  try {
+    const newShotId = await editor.splitShot(pid.value, splitAtSeconds.value)
+    splitDialogOpen.value = false
+    await story.loadBoard(pid.value)
+    if (newShotId) {
+      void router.push({ name: 'shot', params: { pid: pid.value, sid: newShotId } })
+    }
+  } catch (err) {
+    // editor.lastError handles it
+  }
 }
 
 async function saveNumber(key: 'seed' | 'steps' | 'duration', value: string) {
@@ -573,7 +702,18 @@ async function confirmDrop(): Promise<void> {
                 </label>
                 <div class="grid grid-cols-2 gap-1">
                   <label class="block">
-                    <span class="text-fg-4 text-2xs">时长（秒）</span>
+                    <div class="flex items-center justify-between">
+                      <span class="text-fg-4 text-2xs">时长（秒）</span>
+                      <button
+                        v-if="shot.kind !== 'transition' && (shot.duration || 0) > 0.4"
+                        type="button"
+                        class="text-accent hover:underline text-2xs flex items-center gap-0.5"
+                        title="在此秒数处切为两镜"
+                        @click="openSplitDialog"
+                      >
+                        <Scissors :size="9" />切分
+                      </button>
+                    </div>
                     <input
                       :value="shot.duration"
                       type="number"
@@ -613,6 +753,27 @@ async function confirmDrop(): Promise<void> {
                       @change="saveField('movement', ($event.target as HTMLInputElement).value)"
                     />
                   </label>
+                </div>
+                <!-- 镜头台词 (Dialogue) -->
+                <div v-if="shot.kind !== 'transition'" class="block mt-1">
+                  <div class="flex items-center justify-between">
+                    <span class="text-fg-4 text-2xs">镜头台词 (Dialogue)</span>
+                    <button
+                      type="button"
+                      class="text-accent hover:underline text-2xs flex items-center gap-0.5"
+                      title="为该镜头生成独立 AI 配音"
+                      @click="dubModalOpen = true"
+                    >
+                      <Mic :size="9" />AI 配音
+                    </button>
+                  </div>
+                  <textarea
+                    :value="shot.dialogue ?? ''"
+                    rows="2"
+                    placeholder="角色台词或旁白，AI 配音将基于此生成独立音轨..."
+                    class="border-line-1 bg-base-2 text-fg-1 placeholder:text-fg-4 focus:border-accent/60 mt-px w-full resize-none border px-1.5 py-1 text-2xs outline-none"
+                    @change="saveText('dialogue', ($event.target as HTMLTextAreaElement).value)"
+                  />
                 </div>
                 <label class="block">
                   <span class="text-fg-4 text-2xs">上游镜头（首尾帧连续性）</span>
@@ -1013,98 +1174,252 @@ async function confirmDrop(): Promise<void> {
             </p>
           </div>
         </AppPanel>
-        <!-- 右：版本轨。只增不改，换当前版本是唯一的「修改」 -->
-        <AppPanel title="版本轨" class="w-56 shrink-0">
+        <!-- 右：版本轨（画面 + 独立音轨双轨）。只增不改 -->
+        <AppPanel title="版本与音轨" class="w-64 shrink-0">
           <template #actions>
-            <AppButton
-              size="sm"
-              variant="ghost"
-              :disabled="uploading || editor.busy"
-              title="手动导入一个成片版本：不接 AI 也能把工程做完"
-              @click="versionInput?.click()"
-            >
-              <Upload :size="10" />导入
-            </AppButton>
-            <input
-              ref="versionInput"
-              type="file"
-              accept="image/*,video/*"
-              class="hidden"
-              @change="onPickVersionFile"
-            />
-          </template>
-          <div class="p-2">
-            <EmptyState
-              v-if="editor.versions.length === 0"
-              title="还没有任何版本"
-              body="「生成」入队一个，或者「导入」一个已有的成片。版本只增不改，旧的一条都不会被覆盖。"
-            />
-            <ul v-else class="space-y-1">
-              <li
-                v-for="v in editor.versions"
-                :key="v.id"
-                class="border p-1"
-                :class="
-                  v.is_current
-                    ? 'border-accent/60 bg-accent-dim/40'
-                    : 'border-line-1 bg-base-2 hover:bg-base-3'
-                "
+            <div class="flex items-center gap-1">
+              <AppButton
+                v-if="versionTab === 'video'"
+                size="sm"
+                variant="ghost"
+                :disabled="uploading || editor.busy"
+                title="手动导入一个成片版本：不接 AI 也能把工程做完"
+                @click="versionInput?.click()"
               >
-                <div class="flex items-center gap-1">
-                  <span class="text-fg-1 tnum text-2xs">v{{ v.version_no }}</span>
-                  <AppBadge :tone="v.source === 'manual' ? 'neutral' : 'accent'">
-                    {{ v.source === 'manual' ? '手动' : '生成' }}
-                  </AppBadge>
-                  <AppBadge v-if="v.status !== 'done'" tone="warn">{{ v.status }}</AppBadge>
-                  <button
-                    v-if="!v.is_current"
-                    class="text-fg-4 hover:text-accent ml-auto"
-                    title="设为当前版本（下游镜头取末帧、时间线取片段都用它）"
-                    @click="editor.setCurrent(pid, v.id).catch(() => {})"
-                  >
-                    <Star :size="10" />
-                  </button>
-                  <Star v-else :size="10" class="text-accent ml-auto" />
-                </div>
-                <!-- 视频给播放器，图片才走 <img>：两个字段绝不混用 -->
-                <div
-                  v-if="versionVideo(v) || versionPoster(v)"
-                  class="bg-base-3 mt-1 flex h-16 items-center justify-center overflow-hidden"
+                <Upload :size="10" />导入
+              </AppButton>
+              <AppButton
+                v-else
+                size="sm"
+                variant="ghost"
+                :disabled="uploading || editor.busy"
+                title="导入外部音频作为该镜头的独立音轨"
+                @click="audioInput?.click()"
+              >
+                <Upload :size="10" />导入音频
+              </AppButton>
+              <input
+                ref="versionInput"
+                type="file"
+                accept="image/*,video/*"
+                class="hidden"
+                @change="onPickVersionFile"
+              />
+              <input
+                ref="audioInput"
+                type="file"
+                accept="audio/*"
+                class="hidden"
+                @change="onPickAudioFile"
+              />
+            </div>
+          </template>
+
+          <!-- 画面 / 音频 Tab 切换 -->
+          <div class="flex items-center border-line-1 border-b bg-base-2 text-2xs">
+            <button
+              class="flex-1 py-1.5 font-medium text-center transition-colors border-r border-line-1"
+              :class="versionTab === 'video' ? 'bg-base-1 text-accent' : 'text-fg-4 hover:text-fg-2'"
+              @click="versionTab = 'video'"
+            >
+              画面版本 ({{ editor.versions.length }})
+            </button>
+            <button
+              class="flex-1 py-1.5 font-medium text-center transition-colors"
+              :class="versionTab === 'audio' ? 'bg-base-1 text-accent' : 'text-fg-4 hover:text-fg-2'"
+              @click="versionTab = 'audio'"
+            >
+              独立音轨 ({{ editor.audioVersions.length }})
+            </button>
+          </div>
+
+          <div class="p-2">
+            <!-- 画面版本 Tab -->
+            <div v-if="versionTab === 'video'">
+              <EmptyState
+                v-if="editor.versions.length === 0"
+                title="还没有任何画面版本"
+                body="「生成」入队一个，或者「导入」一个已有的成片。版本只增不改，旧的一条都不会被覆盖。"
+              />
+              <ul v-else class="space-y-1.5">
+                <li
+                  v-for="v in editor.versions"
+                  :key="v.id"
+                  class="border p-1.5"
+                  :class="
+                    v.is_current
+                      ? 'border-accent/60 bg-accent-dim/40'
+                      : 'border-line-1 bg-base-2 hover:bg-base-3'
+                  "
                 >
-                  <video
-                    v-if="versionVideo(v)"
-                    :src="versionVideo(v)"
-                    :poster="versionPoster(v) || undefined"
-                    controls
-                    preload="metadata"
-                    class="max-h-full max-w-full"
-                  />
-                  <img
-                    v-else
-                    :src="versionPoster(v)"
-                    class="max-h-full max-w-full object-contain"
-                    :alt="`v${v.version_no}`"
-                  />
-                </div>
-                <p class="text-fg-4 mt-0.5 text-2xs">
-                  {{ v.kind }} · {{ fmt(v.duration) }} · {{ v.created_at.slice(0, 16) }}
-                </p>
-                <p v-if="v.error" class="text-st-review mt-0.5 text-2xs">这个版本是失败现场</p>
-              </li>
-            </ul>
+                  <div class="flex items-center gap-1">
+                    <span class="text-fg-1 tnum text-2xs font-medium">v{{ v.version_no }}</span>
+                    <AppBadge :tone="v.source === 'manual' ? 'neutral' : 'accent'">
+                      {{ v.source === 'manual' ? '手动' : v.source === 'imported' ? '导入' : v.source === 'upscaled' ? '超分' : v.source === 'interpolated' ? '插帧' : '生成' }}
+                    </AppBadge>
+                    <AppBadge v-if="v.status !== 'done'" tone="warn">{{ v.status }}</AppBadge>
+                    <div class="ml-auto flex items-center gap-1">
+                      <button
+                        v-if="v.parent_version_id"
+                        type="button"
+                        class="text-fg-4 hover:text-accent p-0.5"
+                        title="查看版本谱系衍生关系"
+                        @click="inspectLineage(v.id)"
+                      >
+                        <GitBranch :size="10" />
+                      </button>
+                      <button
+                        type="button"
+                        class="text-fg-4 hover:text-accent p-0.5"
+                        title="对此版本进行超分/插帧优化"
+                        @click="openRefine(v.id)"
+                      >
+                        <Zap :size="10" />
+                      </button>
+                      <button
+                        v-if="!v.is_current"
+                        class="text-fg-4 hover:text-accent p-0.5"
+                        title="设为当前版本（下游镜头取末帧、时间线取片段都用它）"
+                        @click="editor.setCurrent(pid, v.id).catch(() => {})"
+                      >
+                        <Star :size="10" />
+                      </button>
+                      <Star v-else :size="10" class="text-accent" />
+                    </div>
+                  </div>
+
+                  <!-- 切段区间标识 -->
+                  <div v-if="v.in_point != null || v.out_point != null" class="mt-1 text-2xs text-accent flex items-center gap-1 font-mono">
+                    <Scissors :size="9" />
+                    <span>区间: {{ v.in_point ?? 0 }}s ~ {{ v.out_point ?? v.duration }}s</span>
+                  </div>
+
+                  <!-- 视频给播放器，图片才走 <img>：两个字段绝不混用 -->
+                  <div
+                    v-if="versionVideo(v) || versionPoster(v)"
+                    class="bg-base-3 mt-1 flex h-20 items-center justify-center overflow-hidden"
+                  >
+                    <video
+                      v-if="versionVideo(v)"
+                      :key="versionVideo(v)"
+                      :src="versionVideo(v)"
+                      :poster="versionPoster(v) || undefined"
+                      controls
+                      preload="metadata"
+                      class="max-h-full max-w-full"
+                      @loadedmetadata="onVersionLoadedMetadata($event, v)"
+                      @timeupdate="onVersionTimeUpdate($event, v)"
+                    />
+                    <img
+                      v-else
+                      :src="versionPoster(v)"
+                      class="max-h-full max-w-full object-contain"
+                      :alt="`v${v.version_no}`"
+                    />
+                  </div>
+                  <p class="text-fg-4 mt-0.5 text-2xs">
+                    {{ v.kind }} · {{ fmt(v.duration) }} · {{ v.created_at.slice(0, 16) }}
+                  </p>
+                  <p v-if="v.error" class="text-st-review mt-0.5 text-2xs">这个版本是失败现场</p>
+                </li>
+              </ul>
+            </div>
+
+            <!-- 独立音轨 Tab -->
+            <div v-else class="space-y-2">
+              <div class="border-line-1 bg-base-2 p-1.5 border text-2xs flex items-center justify-between">
+                <span class="text-fg-3">
+                  {{ editor.currentAudioVersion ? '当前：使用独立配音轨' : '当前：使用画面原生声音' }}
+                </span>
+                <button
+                  v-if="editor.currentAudioVersion"
+                  type="button"
+                  class="text-accent hover:underline flex items-center gap-0.5"
+                  title="恢复为画面原声音轨"
+                  @click="editor.muteAudio(pid)"
+                >
+                  <VolumeX :size="10" />恢复原声
+                </button>
+              </div>
+
+              <EmptyState
+                v-if="editor.audioVersions.length === 0"
+                title="暂无独立配音轨"
+                body="可点上方「导入音频」或使用左侧「AI 配音」为本镜头生成专属旁白/台词音轨。"
+              />
+              <ul v-else class="space-y-1.5">
+                <li
+                  v-for="av in editor.audioVersions"
+                  :key="av.id"
+                  class="border p-1.5"
+                  :class="
+                    av.is_current
+                      ? 'border-accent/60 bg-accent-dim/40'
+                      : 'border-line-1 bg-base-2 hover:bg-base-3'
+                  "
+                >
+                  <div class="flex items-center gap-1">
+                    <span class="text-fg-1 tnum text-2xs font-medium">v{{ av.version_no }}</span>
+                    <AppBadge :tone="av.source === 'imported' ? 'neutral' : 'accent'">
+                      {{ av.source === 'imported' ? '导入音频' : 'AI 配音' }}
+                    </AppBadge>
+                    <button
+                      v-if="!av.is_current"
+                      class="text-fg-4 hover:text-accent ml-auto p-0.5"
+                      title="采纳为当前镜头的独立音轨"
+                      @click="editor.setCurrent(pid, av.id).catch(() => {})"
+                    >
+                      <Star :size="10" />
+                    </button>
+                    <Star v-else :size="10" class="text-accent ml-auto" />
+                  </div>
+
+                  <div v-if="audioUrl(av)" class="mt-1">
+                    <audio :src="audioUrl(av)" controls preload="metadata" class="w-full h-6" />
+                  </div>
+                  <p class="text-fg-4 mt-0.5 text-2xs">
+                    {{ fmt(av.duration) }} · {{ av.created_at.slice(0, 16) }}
+                  </p>
+                </li>
+              </ul>
+            </div>
           </div>
         </AppPanel>
       </div>
       <!-- 底：prompt 与参数。这些值会在入队那一刻被冻结进版本里 -->
       <div class="border-line-1 bg-base-1 shrink-0 border-t p-2">
         <div class="flex gap-2">
-          <label class="min-w-0 flex-1">
-            <span class="text-fg-4 text-2xs">Prompt</span>
+          <label class="min-w-0 flex-1 block space-y-0.5">
+            <div class="flex items-center justify-between">
+              <span class="text-fg-4 text-2xs font-medium">Prompt</span>
+              <div class="flex items-center gap-2">
+                <AppBadge v-if="shot.prompt" tone="warn">当前 Shot 专属覆盖</AppBadge>
+                <AppBadge v-else-if="currentLane?.prompt" tone="accent">继承本幕共用</AppBadge>
+                <button
+                  v-if="shot.prompt && currentLane"
+                  type="button"
+                  class="text-accent text-3xs hover:underline flex items-center gap-0.5 cursor-pointer"
+                  title="将此 Prompt 同步为本幕所有镜头的共用 Prompt"
+                  @click.prevent="promoteShotPromptToScene"
+                >
+                  <Sparkles :size="9" />设为本幕共用
+                </button>
+                <button
+                  v-if="shot.prompt && currentLane?.prompt"
+                  type="button"
+                  class="text-fg-4 text-3xs hover:text-fg-2 cursor-pointer"
+                  title="清空此 Shot 的独立 Prompt，恢复为继承本幕共用 Prompt"
+                  @click.prevent="clearShotPromptToInherit"
+                >
+                  清空以恢复继承
+                </button>
+              </div>
+            </div>
             <textarea
               :value="shot.prompt ?? ''"
               rows="3"
-              placeholder="这条镜头要画什么。上下文里的参考素材（图 / 视频 / 音频）会和它一起喂给模型。"
-              class="border-line-1 bg-base-2 text-fg-1 placeholder:text-fg-4 focus:border-accent/60 mt-px w-full resize-none border px-1.5 py-1 text-2xs outline-none"
+              :placeholder="currentLane?.prompt ? `（留空继承本幕共用 Prompt: ${currentLane.prompt}）` : '这条镜头要画什么。上下文里的参考素材（图 / 视频 / 音频）会和它一起喂给模型。'"
+              class="border-line-1 bg-base-2 text-fg-1 placeholder:text-fg-4 focus:border-accent/60 mt-px w-full resize-none border px-1.5 py-1 text-2xs outline-none font-mono"
               @change="saveText('prompt', ($event.target as HTMLTextAreaElement).value)"
             />
           </label>
@@ -1157,6 +1472,118 @@ async function confirmDrop(): Promise<void> {
           </label>
         </div>
       </div>
+
+      <!-- 单镜头 AI 配音弹窗 -->
+      <DubModal
+        v-model:open="dubModalOpen"
+        :pid="pid"
+        :shot-id="shot.id"
+        :initial-dialogue="shot.dialogue || ''"
+        @done="reload()"
+      />
+
+      <!-- 二次超分 / 插帧优化弹窗 -->
+      <RefineModal
+        v-model:open="refineModalOpen"
+        :pid="pid"
+        :version-id="refineVersionId"
+        :shot-id="shot.id"
+        @done="reload()"
+      />
+
+      <!-- 镜头拆分对话框 -->
+      <AppDialog
+        :open="splitDialogOpen"
+        title="拆分镜头与区间"
+        subtitle="将当前镜头及对应源片区间在指定秒数处截断为两个独立镜头"
+        size="sm"
+        @update:open="splitDialogOpen = $event"
+      >
+        <div class="p-3 space-y-3">
+          <label class="block">
+            <span class="text-fg-3 text-2xs font-medium">
+              拆分点（秒数：0.1 ~ {{ ((shot?.duration || 1) - 0.1).toFixed(1) }}s）
+            </span>
+            <input
+              v-model.number="splitAtSeconds"
+              type="number"
+              min="0.1"
+              :max="(shot?.duration || 1) - 0.1"
+              step="0.1"
+              class="border-line-1 bg-base-2 text-fg-1 focus:border-accent/60 mt-1 h-7 w-full border px-2 text-xs outline-none"
+            />
+          </label>
+          <div class="border-line-1 bg-base-2 p-2 border text-2xs space-y-1">
+            <div class="flex justify-between text-fg-2">
+              <span>前半段 (保留在当前镜):</span>
+              <strong class="text-fg-1">{{ splitAtSeconds }}s</strong>
+            </div>
+            <div class="flex justify-between text-fg-2">
+              <span>后半段 (作为新镜紧随其后):</span>
+              <strong class="text-fg-1">{{ ((shot?.duration || 0) - splitAtSeconds).toFixed(1) }}s</strong>
+            </div>
+          </div>
+          <p class="text-fg-4 text-2xs">
+            若当前镜头包含长视频区间版本，后半段镜头将自动派生出继承源视频资产的新版本，并精准截取后半段区间（零文件复制）。
+          </p>
+        </div>
+        <template #footer>
+          <div class="ml-auto flex items-center gap-2">
+            <AppButton size="sm" variant="ghost" @click="splitDialogOpen = false">取消</AppButton>
+            <AppButton
+              size="sm"
+              variant="primary"
+              :disabled="editor.busy || splitAtSeconds <= 0 || splitAtSeconds >= (shot?.duration || 0)"
+              @click="executeSplit"
+            >
+              <Scissors :size="10" />确认拆分
+            </AppButton>
+          </div>
+        </template>
+      </AppDialog>
+
+      <!-- 版本衍生谱系查看对话框 -->
+      <AppDialog
+        :open="lineageDialogOpen"
+        title="版本衍生谱系"
+        subtitle="查看该版本的祖先与下游派生版本链"
+        size="sm"
+        @update:open="lineageDialogOpen = $event"
+      >
+        <div v-if="lineageResult" class="p-3 space-y-2 text-2xs">
+          <p class="text-fg-2 font-medium">祖先版本链（溯源）：</p>
+          <div class="space-y-1 border-line-1 bg-base-2 p-2 border">
+            <div
+              v-for="a in lineageResult.ancestors"
+              :key="a.id"
+              class="flex items-center justify-between"
+            >
+              <span class="text-fg-1">v{{ a.version_no }} ({{ a.source }})</span>
+              <AppBadge :tone="a.id === lineageResult.version_id ? 'accent' : 'neutral'">
+                {{ a.id === lineageResult.version_id ? '当前查看版本' : '祖先' }}
+              </AppBadge>
+            </div>
+          </div>
+          <p v-if="lineageResult.children.length" class="text-fg-2 font-medium mt-2">
+            下游衍生版本：
+          </p>
+          <div v-if="lineageResult.children.length" class="space-y-1 border-line-1 bg-base-2 p-2 border">
+            <div
+              v-for="c in lineageResult.children"
+              :key="c.id"
+              class="flex items-center justify-between"
+            >
+              <span class="text-fg-1">v{{ c.version_no }} ({{ c.source }})</span>
+              <AppBadge tone="neutral">衍生</AppBadge>
+            </div>
+          </div>
+        </div>
+        <template #footer>
+          <AppButton size="sm" variant="ghost" class="ml-auto" @click="lineageDialogOpen = false">
+            关闭
+          </AppButton>
+        </template>
+      </AppDialog>
     </template>
   </div>
 </template>

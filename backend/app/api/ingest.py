@@ -36,6 +36,7 @@ class PlanBody(BaseModel):
     method: str = Field(default="auto", description="auto / scene / silence / fixed")
     threshold: float | None = Field(default=None, description="画面切换灵敏度，越小切得越碎")
     min_segment: float | None = Field(default=None, description="一段最短多少秒，更短的切点合并")
+    max_segment: float | None = Field(default=None, description="一段最长多少秒，超过时自动细分")
     chunk_seconds: float | None = Field(default=None, description="兜底固定窗口的长度")
     cuts: list[float] | None = Field(
         default=None, description="手动切点（秒）。给了就不跑自动检测——账单上拖过的切点原样落下去"
@@ -82,6 +83,7 @@ async def plan(pid: str, body: PlanBody) -> dict[str, Any]:
         method=body.method,
         threshold=body.threshold,
         min_segment=body.min_segment,
+        max_segment=body.max_segment,
         chunk_seconds=body.chunk_seconds,
         cuts=body.cuts,
     )
@@ -98,6 +100,7 @@ async def run(pid: str, body: RunBody) -> dict[str, Any]:
         method=body.method,
         threshold=body.threshold,
         min_segment=body.min_segment,
+        max_segment=body.max_segment,
         chunk_seconds=body.chunk_seconds,
         cuts=body.cuts,
         param_mode=body.param_mode,

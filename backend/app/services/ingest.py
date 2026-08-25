@@ -73,7 +73,13 @@ class IngestService:
         一拔外置硬盘，这几十段全部变成「文件不在磁盘上」。所以 `copy=False` 时资产的
         `path` 是绝对路径，账单与界面都要标出「引用自工程外」。
         """
-        asset = await assets.register_path(pid, "upload", src, source="ingest", copy=copy)
+        if src.startswith("ast_"):
+            db = db_of(pid)
+            asset_row = await fetch(db, Asset, src, "资产")
+            from app.services.base import as_dict
+            asset = as_dict(asset_row)
+        else:
+            asset = await assets.register_path(pid, "upload", src, source="ingest", copy=copy)
         if kind_of_suffix(Path(asset["path"]).suffix) != "video":
             raise AppError(
                 ErrorCode.VALIDATION_ERROR,
@@ -114,6 +120,7 @@ class IngestService:
         method: str = "auto",
         threshold: float | None = None,
         min_segment: float | None = None,
+        max_segment: float | None = None,
         chunk_seconds: float | None = None,
         cuts: list[float] | None = None,
     ) -> dict[str, Any]:
@@ -136,6 +143,7 @@ class IngestService:
         probe = await audio_service.peek(path)
         total = float(probe.duration) if probe and probe.duration else 0.0
         floor = float(min_segment if min_segment is not None else settings.ingest_min_segment)
+        ceil_dur = float(max_segment) if (max_segment is not None and max_segment > 0) else None
         window = float(
             chunk_seconds if chunk_seconds is not None else settings.ingest_chunk_seconds
         )
@@ -144,7 +152,8 @@ class IngestService:
         else:
             points, used = await self._detect(path, method, threshold, window, total)
         merged, dropped = self._merge(points, floor, total)
-        segments = self._segments(merged, total, window)
+        segments = self._segments(merged, total, window, max_segment=ceil_dur)
+        effective_cuts = [seg["in_point"] for seg in segments[1:]] if len(segments) > 1 else []
         size_mb = round((asset.size_bytes or 0) / (1024 * 1024), 1)
         return {
             "asset_id": asset_id,
@@ -157,8 +166,9 @@ class IngestService:
                 threshold if threshold is not None else settings.ingest_scene_threshold
             ),
             "min_segment": floor,
+            "max_segment": ceil_dur,
             "chunk_seconds": window,
-            "cuts": merged,
+            "cuts": effective_cuts or merged,
             #: 太短被合并掉的切点。**不是错误**，但要说出来——否则「我明明看到那里有个切换」
             #: 会变成一桩查不到的怪事。
             "merged_away": dropped,
@@ -177,6 +187,7 @@ class IngestService:
         method: str = "auto",
         threshold: float | None = None,
         min_segment: float | None = None,
+        max_segment: float | None = None,
         chunk_seconds: float | None = None,
         cuts: list[float] | None = None,
         param_mode: str = "shared",
@@ -196,6 +207,7 @@ class IngestService:
             method=method,
             threshold=threshold,
             min_segment=min_segment,
+            max_segment=max_segment,
             chunk_seconds=chunk_seconds,
             cuts=cuts,
         )
@@ -341,23 +353,52 @@ class IngestService:
             last = point
         return kept, dropped
 
-    def _segments(self, cuts: list[float], total: float, window: float) -> list[dict[str, Any]]:
-        """切点 → 段。最后一段到 `total`；`total` 未知时按窗口长度给一个保守的结尾。"""
+    def _segments(
+        self,
+        cuts: list[float],
+        total: float,
+        window: float,
+        max_segment: float | None = None,
+    ) -> list[dict[str, Any]]:
+        """切点 → 段。如果有 max_segment 限制，超过 max_segment 的超长段自动细分。"""
         edges = [0.0, *cuts]
-        out: list[dict[str, Any]] = []
+        raw_intervals: list[tuple[float, float]] = []
         for i, start in enumerate(edges):
             end = edges[i + 1] if i + 1 < len(edges) else (total or start + max(0.5, window))
+            if end > start:
+                raw_intervals.append((start, end))
+
+        out: list[dict[str, Any]] = []
+        max_dur = float(max_segment) if (max_segment is not None and max_segment > 0) else None
+
+        for start, end in raw_intervals:
             length = round(end - start, 3)
             if length <= 0:
                 continue
-            out.append(
-                {
-                    "index_no": len(out) + 1,
-                    "in_point": round(start, 3),
-                    "out_point": round(end, 3),
-                    "duration": length,
-                }
-            )
+            if max_dur and length > max_dur:
+                sub_start = start
+                while sub_start < end:
+                    sub_end = min(end, round(sub_start + max_dur, 3))
+                    sub_len = round(sub_end - sub_start, 3)
+                    if sub_len > 0:
+                        out.append(
+                            {
+                                "index_no": len(out) + 1,
+                                "in_point": round(sub_start, 3),
+                                "out_point": round(sub_end, 3),
+                                "duration": sub_len,
+                            }
+                        )
+                    sub_start = sub_end
+            else:
+                out.append(
+                    {
+                        "index_no": len(out) + 1,
+                        "in_point": round(start, 3),
+                        "out_point": round(end, 3),
+                        "duration": length,
+                    }
+                )
         return out
 
     def _warnings(
