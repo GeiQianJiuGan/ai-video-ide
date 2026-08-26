@@ -1,0 +1,49 @@
+services:
+  backend:
+    image: xunjie_video_ide-backend:latest
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: aivs-backend
+    restart: unless-stopped
+    ports:
+      - "${AIVS_BACKEND_PORT:-8765}:8765"
+    environment:
+      - AIVS_HOST=0.0.0.0
+      - AIVS_PORT=8765
+      - AIVS_REQUIRE_HANDSHAKE=false
+      - AIVS_DEV_CORS=true
+      # 外部 ComfyUI 算力机地址（局域网 IP 或公网 IP）
+      - AIVS_COMFY_BASE_URL=${AIVS_COMFY_BASE_URL:-http://127.0.0.1:8188}
+      # LLM 与其它 API 配置（可选）
+      - AIVS_LLM_PROVIDER=${AIVS_LLM_PROVIDER:-none}
+      - AIVS_LLM_BASE_URL=${AIVS_LLM_BASE_URL:-}
+      - AIVS_LLM_API_KEY=${AIVS_LLM_API_KEY:-}
+      - AIVS_LLM_MODEL=${AIVS_LLM_MODEL:-}
+    volumes:
+      # 持久化运行时配置（settings.json、素材库等）
+      - ./data/runtime:/app/.runtime
+      # 持久化工程数据与生成产物
+      - ./data/projects:/app/data
+      # 挂载工作流目录
+      - ./workflows:/app/workflows
+    networks:
+      - aivs-network
+
+  frontend:
+    image: xunjie_video_ide-frontend:latest
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    container_name: aivs-frontend
+    restart: unless-stopped
+    ports:
+      - "${AIVS_WEB_PORT:-80}:80"
+    depends_on:
+      - backend
+    networks:
+      - aivs-network
+
+networks:
+  aivs-network:
+    driver: bridge

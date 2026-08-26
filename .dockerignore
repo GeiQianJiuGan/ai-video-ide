@@ -1,0 +1,36 @@
+# Git & IDE
+.git
+.gitignore
+.claude
+.idea
+.vscode
+*.swp
+*.swo
+
+# Node / Frontend
+**/node_modules
+frontend/dist
+frontend/.vite
+
+# Python / Backend
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/*.pyd
+**/.pytest_cache
+**/.ruff_cache
+backend/.venv
+backend/aivs_backend.egg-info
+.venv
+
+# Runtime & Local Data (should be mounted via volumes)
+.runtime
+data
+bin
+exports
+imports
+cache
+logs
+*.log
+*.sqlite
+*.db
