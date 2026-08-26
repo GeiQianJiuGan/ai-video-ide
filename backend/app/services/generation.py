@@ -41,7 +41,7 @@ from app.services import params
 from app.services.assets import assets, kind_of_suffix
 from app.services.base import as_dict, db_of, dump_json, fetch, fetch_all, load_json, project_of
 from app.services.context import context
-from app.services.frames import start_frame_index
+from app.services.frames import frame_key, poster_at, start_frame_index
 from app.services.global_registry import global_registry
 from app.services.workflows import apply_bindings, parse_graph, workflows
 
@@ -220,6 +220,12 @@ class GenerationService:
                 depends_on = prev.id
                 wait_reason = f"等待上游 Shot {prev.index_no} 完成（需要末帧）"
 
+        # 这个镜头是从长视频切段来的吗？是的话把「用哪一段」在入队这一刻就冻结下来。
+        # 不能等到执行时再去问 `shot.current_version_id`：新版本入库即成为当前版本，
+        # 第二次生成就会拿上一次的产物（整段、没有区间）当输入——那正是「传进去的片段
+        # 明显不对」的由来。
+        segment_version_id = await self._segment_version_id(pid, shot_id)
+
         row = Job(
             id=new_id("job"),
             shot_id=shot_id,
@@ -243,6 +249,8 @@ class GenerationService:
                     "extra": extra or {},
                     "generation_mode": generation_mode,
                     "preset": preset_name,
+                    #: 「这个镜头的画面素材是哪一段」。长视频切段的镜头才有值。
+                    "source_version_id": segment_version_id,
                 }
             ),
             created_at=utc_now(),
@@ -257,6 +265,32 @@ class GenerationService:
         )
         self.ensure_pump(pid)
         return as_dict(row)
+
+    async def _segment_version_id(self, pid: str, shot_id: str) -> str | None:
+        """这个镜头「从长视频里切来的那一段」是哪一版（没有就是 None）。
+
+        认的是**导入进来的那一版**（`source == "imported"` 且带区间）：一个镜头后来可能
+        生成过很多版，那些产物都没有区间，也都不是这个镜头的素材来源。
+
+        顺序是「当前采用的那一版（如果它就是导入的那一段）→ 否则最新的那一条导入版本」。
+        拆分过的镜头（`story.split_shot`，只增不改）会有两条导入版本：原来那条整段的
+        + 拆完之后本段的，取最新那条才是「现在这个镜头对应的那一段」。
+        """
+        db = db_of(pid)
+        shot = await fetch(db, Shot, shot_id, "镜头")
+        rows = await fetch_all(db, GenerationVersion, where=GenerationVersion.shot_id == shot_id)
+        mine = [
+            v
+            for v in rows
+            if v.source == "imported" and v.in_point is not None and v.out_point is not None
+        ]
+        if not mine:
+            return None
+        current = next((v for v in mine if v.id == shot.current_version_id), None)
+        if current is not None:
+            return current.id
+        mine.sort(key=lambda v: v.version_no)
+        return mine[-1].id
 
     async def enqueue_task(
         self,
@@ -803,8 +837,17 @@ class GenerationService:
     async def _ensure_slice(
         self, proj_dir: Path, src_path: Path, in_point: float, out_point: float, version_id: str
     ) -> Path:
-        """从长视频中按 [in_point, out_point] 提取出该分镜专属的切片文件给 ComfyUI。"""
-        out_dir = proj_dir / "assets" / "slices"
+        """从长视频里按 [in_point, out_point] 切出这一段专属的文件喂给模型端。
+
+        两条规矩：
+
+          · 落 `cache/slices/`（可再生的临时文件，与抽出来的首尾帧同一个待遇），
+            **不进 `assets/`**——它不是工程资产，也不该出现在资产总账里；
+          · **切不出来就报错**。以前这里在 FFmpeg 失败时 `return src_path`，于是模型端
+            收到的是**整段长视频**：既不报错也看不出来，用户只会发现「传进去的片段明显不对」。
+            切段是这条链的全部意义，切不出来必须停下来说话（绝不静默失败）。
+        """
+        out_dir = proj_dir / "cache" / "slices"
         out_dir.mkdir(parents=True, exist_ok=True)
         dur = round(max(0.1, out_point - in_point), 3)
         slice_target = out_dir / f"slice_{version_id}_{in_point:.2f}_{out_point:.2f}.mp4"
@@ -835,18 +878,46 @@ class GenerationService:
             *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
         )
         _, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            log.warning("slice.extract_failed", stderr=(stderr or b"").decode("utf-8", "replace"))
-            return src_path
+        raw = (stderr or b"").decode("utf-8", "replace")
+        ok = proc.returncode == 0 and slice_target.is_file() and slice_target.stat().st_size > 0
+        if not ok:
+            slice_target.unlink(missing_ok=True)  # 半成品必须删掉，否则下次会被当成切好的
+            log.warning("slice.extract_failed", version=version_id, stderr=raw[-500:])
+            raise AppError(
+                ErrorCode.FFMPEG_ERROR,
+                "切不出这一段视频",
+                f"FFmpeg 退出码 {proc.returncode}："
+                f"{src_path.name} 的 {in_point:.2f}s ~ {out_point:.2f}s 没能切出来。"
+                "这一段不会拿整段长视频去顶替——那样出来的画面与本镜头无关。",
+                [
+                    "确认源视频还在磁盘上且能被 FFmpeg 读取（播放器里能拖到这个位置）",
+                    "在设置页看一眼用的是哪一份 FFmpeg",
+                    "或重新导入这段长视频（导入时让它复制进工程）",
+                ],
+                {"version_id": version_id, "raw": raw[-2000:]},
+            )
         return slice_target
 
     async def _source_video_of(
-        self, pid: str, params: dict[str, Any], shot_id: str | None = None
+        self,
+        pid: str,
+        params: dict[str, Any],
+        shot_id: str | None = None,
+        *,
+        fallback_current: bool = False,
     ) -> tuple[Path | None, Any]:
-        """要处理的那一段画面在磁盘上的位置 + 它那一版（带有区间信息时自动提取切片）。"""
+        """要处理的那一段画面在磁盘上的位置 + 它那一版（带区间时自动切出本段）。
+
+        `fallback_current` 只有二次处理那条链会开：它的输入本来就是「这个镜头现在采用的
+        那一版」。**出画面那条链绝不能退回 `shot.current_version_id`**——新版本入库时会
+        自动成为当前版本（硬约束 3 那扇门），于是「重新生成一次」拿到的就是上一次的产物
+        （整段、没有区间），而不是导入时那一段。那正是「删了几个分镜再生成，传进去的片段
+        明显不对」的由来。出画面要用哪一段由 `enqueue_shot` 在入队时冻结进
+        `params.source_version_id`。
+        """
         db = db_of(pid)
         version_id = str(params.get("source_version_id") or "")
-        if not version_id and shot_id:
+        if not version_id and shot_id and fallback_current:
             shot = await fetch(db, Shot, shot_id, "镜头")
             version_id = str(shot.current_version_id or "")
         if not version_id:
@@ -876,7 +947,9 @@ class GenerationService:
         于是「只增不改」「随时回退到未处理那一版」「采用入口只有一个」全都一行不用改。
         """
         provider = registry.provider("comfy_preset")
-        source, version = await self._source_video_of(pid, params, shot_id=job.shot_id)
+        source, version = await self._source_video_of(
+            pid, params, shot_id=job.shot_id, fallback_current=True
+        )
         if not source or not version:
             raise AppError(
                 ErrorCode.MISSING_ASSET,
@@ -1264,7 +1337,11 @@ class GenerationService:
             kind = kind_of_suffix(Path(asset.path).suffix)
             is_video = kind == "video"
             is_audio = kind == "audio"
-            poster = posters.get(asset.id) if is_video else (None if is_audio else asset)
+            poster = (
+                posters.get(frame_key(asset.id, poster_at(row.in_point)))
+                if is_video
+                else (None if is_audio else asset)
+            )
             out[row.id] = {
                 "video_path": asset.path if is_video else None,
                 "thumbnail_path": poster.path if poster is not None else None,

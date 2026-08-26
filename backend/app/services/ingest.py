@@ -123,11 +123,18 @@ class IngestService:
         max_segment: float | None = None,
         chunk_seconds: float | None = None,
         cuts: list[float] | None = None,
+        range_in: float | None = None,
+        range_out: float | None = None,
     ) -> dict[str, Any]:
         """切成几段、每段哪儿到哪儿、用哪一级方法认出来的。**一行都不落库。**
 
         `cuts` 给了就是手动切点（自动那三级一概不跑）：自动切点是建议不是判决，
         用户在账单上拖过切点之后要能原样落下去。
+
+        `range_in` / `range_out` 是**片头片尾**：几乎每段成片前面都有一截台标 / 倒计时，
+        后面还有一截字幕，它们不该变成两个镜头再让用户一个个删掉。所以切段只在这个区间
+        里进行——**区间外的时间不属于任何镜头**，但源文件一帧都不动（区间只是一对数字，
+        与「零文件复制」那条一致，改主意重新出一次账单就行）。
         """
         db = db_of(pid)
         asset = await fetch(db, Asset, asset_id, "资产")
@@ -147,12 +154,15 @@ class IngestService:
         window = float(
             chunk_seconds if chunk_seconds is not None else settings.ingest_chunk_seconds
         )
+        low, high, range_notes = self._range(total, range_in, range_out, asset_id)
         if cuts is not None:
             points, used = sorted({max(0.0, float(c)) for c in cuts}), "manual"
         else:
-            points, used = await self._detect(path, method, threshold, window, total)
-        merged, dropped = self._merge(points, floor, total)
-        segments = self._segments(merged, total, window, max_segment=ceil_dur)
+            points, used = await self._detect(path, method, threshold, window, low, high)
+        #: 片头片尾里的切点直接扔掉：那一截不属于任何镜头，留着只会切出一个空段。
+        points = [p for p in points if low < p < (high or p + 1)]
+        merged, dropped = self._merge(points, floor, high, low)
+        segments = self._segments(merged, high, window, max_segment=ceil_dur, start=low)
         effective_cuts = [seg["in_point"] for seg in segments[1:]] if len(segments) > 1 else []
         size_mb = round((asset.size_bytes or 0) / (1024 * 1024), 1)
         return {
@@ -168,14 +178,64 @@ class IngestService:
             "min_segment": floor,
             "max_segment": ceil_dur,
             "chunk_seconds": window,
+            #: 切段只发生在这个区间里。`range_out` 未知（探不出长度）时是 None。
+            "range_in": low,
+            "range_out": high or None,
+            #: 被片头 / 片尾挡在外面的秒数——「少了一截」必须是账单上看得见的一句话。
+            "trimmed_head": low,
+            "trimmed_tail": round(total - high, 3) if total and high else 0.0,
             "cuts": effective_cuts or merged,
             #: 太短被合并掉的切点。**不是错误**，但要说出来——否则「我明明看到那里有个切换」
             #: 会变成一桩查不到的怪事。
             "merged_away": dropped,
             "segments": segments,
             "total": len(segments),
-            "warnings": self._warnings(total, segments, size_mb, asset),
+            "warnings": self._warnings(total, segments, size_mb, asset) + range_notes,
         }
+
+    def _range(
+        self, total: float, range_in: float | None, range_out: float | None, asset_id: str
+    ) -> tuple[float, float, list[str]]:
+        """片头片尾 → 一对可用的边界 + 要说出来的话。
+
+        探不出长度时 `high` 是 0（= 未知，段的结尾照旧靠切点与窗口估），此时给的
+        `range_out` 仍然照用——用户在预览里拖出来的位置比我们的猜测可信。
+        """
+        notes: list[str] = []
+        low = max(0.0, float(range_in or 0.0))
+        high = float(range_out) if range_out is not None and range_out > 0 else (total or 0.0)
+        if total and high > total + 0.05:
+            notes.append(
+                f"片尾位置标到 {high:.2f}s，但这段视频只有 {total:.2f}s，按文件末尾处理。"
+            )
+            high = total
+        #: 这一条先判：片头本身就超出了文件，说「什么都不剩」不算错但没指出真正的毛病。
+        if total and low > total:
+            raise AppError(
+                ErrorCode.VALIDATION_ERROR,
+                "片头切掉的比整段视频还长",
+                f"片头标在 {low:.2f}s，视频只有 {total:.2f}s。",
+                ["把片头边界拖回视频范围内"],
+                {"asset_id": asset_id, "duration": total},
+            )
+        if high and high - low < 0.5:
+            raise AppError(
+                ErrorCode.VALIDATION_ERROR,
+                "去掉片头片尾之后什么都不剩",
+                f"保留区间是 {low:.2f}s ~ {high:.2f}s，不足 0.5 秒，切不出任何镜头。",
+                [
+                    "把片头 / 片尾的边界拖回来一些",
+                    "确认要处理的是这一段视频",
+                ],
+                {"asset_id": asset_id, "range_in": low, "range_out": high},
+            )
+        if low > 0 or (total and high and high < total - 0.05):
+            tail = round(total - high, 3) if total and high else 0.0
+            notes.append(
+                f"片头 {low:.2f} 秒、片尾 {tail:.2f} 秒不进任何镜头（源文件没有被裁，"
+                "改主意重新出一次账单就行）。"
+            )
+        return low, high, notes
 
     async def run(
         self,
@@ -190,6 +250,8 @@ class IngestService:
         max_segment: float | None = None,
         chunk_seconds: float | None = None,
         cuts: list[float] | None = None,
+        range_in: float | None = None,
+        range_out: float | None = None,
         param_mode: str = "shared",
         position: int | None = None,
     ) -> dict[str, Any]:
@@ -210,6 +272,8 @@ class IngestService:
             max_segment=max_segment,
             chunk_seconds=chunk_seconds,
             cuts=cuts,
+            range_in=range_in,
+            range_out=range_out,
         )
         if not bill["segments"]:
             raise AppError(
@@ -234,6 +298,14 @@ class IngestService:
                 "notes": (
                     f"从 {Path(bill['path']).name} 自动切段（{bill['method_label']}），"
                     f"共 {bill['total']} 段。"
+                    #: 片头片尾是「为什么第一段不是从 0 秒开始」的唯一解释，记在幕上，
+                    #: 不然过两天回来看只会觉得少了一截。
+                    + (
+                        f"已去掉片头 {bill['trimmed_head']:.2f} 秒"
+                        f" / 片尾 {bill['trimmed_tail']:.2f} 秒。"
+                        if bill["trimmed_head"] or bill["trimmed_tail"]
+                        else ""
+                    )
                 ),
             },
         )
@@ -281,9 +353,20 @@ class IngestService:
     # --- 切点 ---
 
     async def _detect(
-        self, path: Path, method: str, threshold: float | None, window: float, total: float
+        self,
+        path: Path,
+        method: str,
+        threshold: float | None,
+        window: float,
+        low: float,
+        high: float,
     ) -> tuple[list[float], str]:
-        """三级降级找切点。**每一级都要能说出自己是哪一级**（账单里的 `method`）。"""
+        """三级降级找切点。**每一级都要能说出自己是哪一级**（账单里的 `method`）。
+
+        前两级扫的是整个文件（FFmpeg 的时间戳本来就是绝对的，片头片尾里的切点由调用方
+        过滤掉）；兜底那一级铺的窗口**只铺保留区间**，不然会从第 0 秒开始铺，切点全都
+        落在片头里。
+        """
         want = method if method in ("scene", "silence", "fixed") else "auto"
         level = float(threshold if threshold is not None else settings.ingest_scene_threshold)
         if want in ("auto", "scene"):
@@ -294,10 +377,11 @@ class IngestService:
             points = await self._scan(path, "silencedetect=n=-30dB:d=0.6", _SILENCE_END, audio=True)
             if points or want == "silence":
                 return points, "silence"
-        if total <= 0:
+        if high <= low:
             return [], "fixed"
         step = max(0.5, window)
-        return [step * i for i in range(1, int(total // step) + 1)], "fixed"
+        span = high - low
+        return [round(low + step * i, 3) for i in range(1, int(span // step) + 1)], "fixed"
 
     async def _scan(
         self, path: Path, filter_spec: str, pattern: re.Pattern[str], *, audio: bool = False
@@ -332,16 +416,17 @@ class IngestService:
         return sorted({round(float(m), 3) for m in pattern.findall(text)})
 
     def _merge(
-        self, points: list[float], floor: float, total: float
+        self, points: list[float], floor: float, total: float, start: float = 0.0
     ) -> tuple[list[float], list[float]]:
         """把挨得太近的切点合并掉。返回 (留下的, 合并掉的)。
 
         合并的是**后一个**切点（前一个先出现，段的开头更可信），所以「切出一堆半秒碎片」
         变成「这里的两个切换被当成一个」——后者用户看一眼账单就明白。
+        `start` 是保留区间的起点：第一段的长度要从那里量，不是从第 0 秒。
         """
         kept: list[float] = []
         dropped: list[float] = []
-        last = 0.0
+        last = start
         for point in points:
             if total and point >= total - floor:
                 dropped.append(point)  # 结尾那一点点不值得单独成段
@@ -359,9 +444,13 @@ class IngestService:
         total: float,
         window: float,
         max_segment: float | None = None,
+        start: float = 0.0,
     ) -> list[dict[str, Any]]:
-        """切点 → 段。如果有 max_segment 限制，超过 max_segment 的超长段自动细分。"""
-        edges = [0.0, *cuts]
+        """切点 → 段。如果有 max_segment 限制，超过 max_segment 的超长段自动细分。
+
+        `start` 是保留区间的起点（去掉片头之后第一段从哪里开始），`total` 是它的终点。
+        """
+        edges = [start, *cuts]
         raw_intervals: list[tuple[float, float]] = []
         for i, start in enumerate(edges):
             end = edges[i + 1] if i + 1 < len(edges) else (total or start + max(0.5, window))

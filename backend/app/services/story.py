@@ -44,7 +44,7 @@ from app.persistence.models_world import (
 from app.services import params
 from app.services.assets import kind_of_suffix
 from app.services.base import as_dict, db_of, dump_json, fetch, fetch_all, load_json
-from app.services.frames import frames, start_frame_index
+from app.services.frames import frame_key, frames, poster_at, start_frame_index
 
 SCENE_FIELDS = (
     "title",
@@ -254,7 +254,13 @@ def _shot_media(
     )
     video_asset = assets.get(picked.asset_id or "") if picked else None
 
-    poster = posters.get(video_asset.id) if video_asset else None
+    # 长视频切段的版本共用一个源文件，封面必须按**本段的区间起点**索引
+    # （`frames.poster_at`）——只按 asset id 取的话一幕几十段会全都拿到长片第 0 秒那张。
+    poster = (
+        posters.get(frame_key(video_asset.id, poster_at(picked.in_point)))
+        if video_asset is not None and picked is not None
+        else None
+    )
     poster_path = poster.path if poster else None
     if poster_path is None:
         chosen = next((v for v in images if current and v.id == current.id), None) or (
@@ -267,7 +273,7 @@ def _shot_media(
         asset = assets.get(version.asset_id or "")
         if asset is None:
             continue
-        version_poster = posters.get(asset.id)
+        version_poster = posters.get(frame_key(asset.id, poster_at(version.in_point)))
         version_rows.append(
             {
                 "id": version.id,
@@ -863,9 +869,15 @@ class StoryService:
         await self.resequence_shots(pid)
 
     async def split_shot(self, pid: str, shot_id: str, at_seconds: float) -> dict[str, Any]:
-        """将一个镜头在指定秒数处拆分为两个镜头（长视频切段加工 / 分镜精修）。
+        """把一个镜头在第 `at_seconds` 秒拆成两个镜头（长视频切段之后的精修）。
 
-        前一半保留原 Shot 并缩短区间与时长，后一半创建新 Shot（继承 prompt/参数等）并挂载后半段版本。
+        `at_seconds` 是**镜头内部的偏移**，不是源文件上的绝对时间：区间从
+        `version.in_point` 起算，所以拆分点落在 `in_point + at`。
+
+        **两半各得一个新版本，原来那一版一个字段都不改**（硬约束 3：生成版本只增不改）。
+        以前这里是把原版本的 `in_point` / `out_point` / `duration` 直接改小——那样一来
+        「这一版当初是哪一段」就永久丢了，撤销拆分也无从谈起。现在两半都是
+        `parent_version_id` 指向原版本的新版本，原版本留在版本轨上随时可以回退。
         """
         db = db_of(pid)
         shot = await fetch(db, Shot, shot_id, "镜头")
@@ -880,9 +892,14 @@ class StoryService:
                 {"shot_id": shot_id, "duration": total_dur, "at_seconds": at},
             )
         new_shot_id = new_id("shot")
+        first_version_id: str | None = None
         new_version_id = None
         first_dur = round(at, 3)
         second_dur = round(total_dur - at, 3)
+        existing = await fetch_all(
+            db, GenerationVersion, where=GenerationVersion.shot_id == shot_id
+        )
+        next_no = max((v.version_no for v in existing), default=0) + 1
 
         async with db.write() as session:
             fresh_shot = await session.get(Shot, shot_id)
@@ -920,31 +937,48 @@ class StoryService:
                 ver = await session.get(GenerationVersion, fresh_shot.current_version_id)
                 if ver is not None:
                     old_in = float(ver.in_point or 0.0)
-                    old_out = float(ver.out_point) if ver.out_point is not None else old_in + total_dur
-                    ver.in_point = old_in
-                    ver.out_point = round(old_in + at, 3)
-                    ver.duration = first_dur
-
-                    # 为后半段创建新版本
-                    new_version_id = new_id("generation_version")
-                    new_ver = GenerationVersion(
-                        id=new_version_id,
-                        shot_id=new_shot_id,
-                        version_no=1,
-                        kind=ver.kind,
-                        status=ver.status,
-                        asset_id=ver.asset_id,
-                        workflow_id=ver.workflow_id,
-                        params_json=ver.params_json,
-                        context_json=ver.context_json,
-                        source=ver.source,
-                        parent_version_id=ver.id,
-                        duration=second_dur,
-                        in_point=round(old_in + at, 3),
-                        out_point=old_out,
-                        created_at=utc_now(),
+                    old_out = (
+                        float(ver.out_point)
+                        if ver.out_point is not None
+                        else old_in + total_dur
                     )
-                    session.add(new_ver)
+                    cut = round(old_in + at, 3)
+
+                    def half(
+                        version_id: str,
+                        owner: str,
+                        version_no: int,
+                        start: float,
+                        end: float,
+                        length: float,
+                    ) -> GenerationVersion:
+                        assert ver is not None
+                        return GenerationVersion(
+                            id=version_id,
+                            shot_id=owner,
+                            version_no=version_no,
+                            kind=ver.kind,
+                            status=ver.status,
+                            asset_id=ver.asset_id,
+                            workflow_id=ver.workflow_id,
+                            params_json=ver.params_json,
+                            context_json=ver.context_json,
+                            source=ver.source,
+                            parent_version_id=ver.id,
+                            duration=length,
+                            in_point=start,
+                            out_point=end,
+                            created_at=utc_now(),
+                        )
+
+                    first_version_id = new_id("generation_version")
+                    session.add(
+                        half(first_version_id, shot_id, next_no, old_in, cut, first_dur)
+                    )
+                    fresh_shot.current_version_id = first_version_id
+
+                    new_version_id = new_id("generation_version")
+                    session.add(half(new_version_id, new_shot_id, 1, cut, old_out, second_dur))
                     new_shot.current_version_id = new_version_id
 
         # 调整同场景内镜头的顺序，把 new_shot 插在 shot 后面
@@ -961,6 +995,9 @@ class StoryService:
         return {
             "shot_id": shot_id,
             "new_shot_id": new_shot_id,
+            #: 两半各自那一版（原来那一版原样留在版本轨上）。
+            "first_version_id": first_version_id,
+            "second_version_id": new_version_id,
             "first_duration": first_dur,
             "second_duration": second_dur,
             "storyboard": await self.storyboard(pid),
@@ -1349,7 +1386,9 @@ class StoryService:
         failed: list[dict[str, Any]] = []
         for card in pending:
             try:
-                asset = await frames.extract(pid, card["video_asset_id"], "start")
+                asset = await frames.extract(
+                    pid, card["video_asset_id"], poster_at(card.get("in_point"))
+                )
             except AppError as err:
                 if err.code == ErrorCode.FFMPEG_MISSING:
                     raise

@@ -41,6 +41,14 @@ class PlanBody(BaseModel):
     cuts: list[float] | None = Field(
         default=None, description="手动切点（秒）。给了就不跑自动检测——账单上拖过的切点原样落下去"
     )
+    #: 片头片尾。切段只在 [range_in, range_out] 里进行，**源文件一帧都不动**。
+    #: 留空 = 整段都要。
+    range_in: float | None = Field(
+        default=None, ge=0, description="片头结束的位置（秒）。这之前的时间不进任何镜头"
+    )
+    range_out: float | None = Field(
+        default=None, gt=0, description="片尾开始的位置（秒）。这之后的时间不进任何镜头"
+    )
 
 
 class RunBody(PlanBody):
@@ -76,6 +84,7 @@ async def plan(pid: str, body: PlanBody) -> dict[str, Any]:
     """只出账单：切成几段、每段多长、哪几个切点太短被合并了、用哪一级方法认出来的。
 
     **一行都不落库、一个文件都不切。** 切点是建议不是判决——改完再走 `run`。
+    `range_in` / `range_out` 是片头片尾：区间外的时间不进任何镜头，源文件不动。
     """
     return await ingest.plan(
         pid,
@@ -86,6 +95,8 @@ async def plan(pid: str, body: PlanBody) -> dict[str, Any]:
         max_segment=body.max_segment,
         chunk_seconds=body.chunk_seconds,
         cuts=body.cuts,
+        range_in=body.range_in,
+        range_out=body.range_out,
     )
 
 
@@ -103,6 +114,8 @@ async def run(pid: str, body: RunBody) -> dict[str, Any]:
         max_segment=body.max_segment,
         chunk_seconds=body.chunk_seconds,
         cuts=body.cuts,
+        range_in=body.range_in,
+        range_out=body.range_out,
         param_mode=body.param_mode,
         position=body.position,
     )

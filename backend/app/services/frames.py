@@ -41,6 +41,10 @@ log = get_logger("frames")
 #: 一旦落在最后一帧之后，FFmpeg 会「成功」地什么都不输出。
 TAIL_BACKOFF = 0.5
 
+#: 从一段**区间**里取末帧时往回退的秒数。区间的 `out_point` 就是下一段的 `in_point`，
+#: 直接 seek 到那里取到的是下一段的第一帧（内容已经换了），所以必须退进本段里一点。
+SEGMENT_TAIL_EPS = 0.08
+
 
 def _label(at: str | float) -> str:
     if at == "end":
@@ -50,13 +54,39 @@ def _label(at: str | float) -> str:
     return f"t{float(at):.3f}".replace(".", "_")
 
 
-def start_frame_index(rows: list[Asset]) -> dict[str, Asset]:
-    """源视频 asset id → 已经从它抽出来的**首帧**图。
+def poster_at(in_point: float | None = None) -> str | float:
+    """这一版的封面该抽哪个位置。
 
-    `extract(pid, asset_id, "start")` 把出处写进 `Asset.meta_json`
-    （`{from_asset_id, at}`），所以读路径不用再问 FFmpeg，只按这条线索认出
-    「这段视频的首帧抽过了」。**抽帧是写操作，读路径绝不顺手起 FFmpeg**——
-    要补抽走各自的显式入口（分镜板的 `POST /storyboard/posters`）。
+    **长视频切段出来的那些版本共用同一个源文件**（零文件复制，见 `services/ingest.py`），
+    区别只在 `in_point` / `out_point`。所以封面必须按区间起点抽，否则一幕里几十个镜头
+    全都指向整段长片的第 0 秒那一张——那正是「分镜里每一段看起来都一样」的由来。
+    """
+    return float(in_point) if in_point is not None else "start"
+
+
+def tail_at(out_point: float | None, in_point: float | None = None) -> str | float:
+    """这一版的末帧该抽哪个位置（没有区间就是整段的末帧 `"end"`）。"""
+    if out_point is None:
+        return "end"
+    low = float(in_point or 0.0)
+    return max(low, round(float(out_point) - SEGMENT_TAIL_EPS, 3))
+
+
+def frame_key(asset_id: str, at: str | float = "start") -> str:
+    """帧索引的键：**同一个源文件的不同位置是不同的帧**，所以键里必须带位置。"""
+    return f"{asset_id}#{_label(at)}"
+
+
+def start_frame_index(rows: list[Asset]) -> dict[str, Asset]:
+    """`frame_key(源视频 asset id, 位置)` → 已经从它抽出来的那张图。
+
+    `extract(pid, asset_id, at)` 把出处写进 `Asset.meta_json`（`{from_asset_id, at}`），
+    所以读路径不用再问 FFmpeg，只按这条线索认出「这个位置的帧抽过了」。
+    **抽帧是写操作，读路径绝不顺手起 FFmpeg**——要补抽走各自的显式入口
+    （分镜板的 `POST /storyboard/posters`）。
+
+    键里带位置这件事是必须的：长视频切段的版本共用一个源文件，只按 asset id 索引的话
+    几十段会撞在同一张图上。取值一律 `index.get(frame_key(asset_id, poster_at(in_point)))`。
 
     这条线索的解读只放在这一处：分镜板卡片（`story._shot_media`）与版本轨
     （`generation.list_versions`）都从这里拿，两边各写一遍迟早对不上。
@@ -67,8 +97,14 @@ def start_frame_index(rows: list[Asset]) -> dict[str, Asset]:
             continue
         meta = load_json(asset.meta_json, {})
         src = meta.get("from_asset_id")
-        if meta.get("at") == "start" and isinstance(src, str):
-            out[src] = asset
+        at = meta.get("at")
+        if not isinstance(src, str) or at is None:
+            continue
+        if at == "end":
+            continue
+        if isinstance(at, str) and at != "start":
+            continue
+        out[frame_key(src, at)] = asset
     return out
 
 

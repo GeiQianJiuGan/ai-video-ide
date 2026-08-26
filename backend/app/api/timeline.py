@@ -154,6 +154,12 @@ async def isolate_audio_selection(
     )
 
 
+@router.post("/projects/{pid}/clips/{clip_id}/clear")
+async def clear_clip(pid: str, clip_id: str) -> dict[str, Any]:
+    """清空这一段的内容（位置与长度留着，变成黑场 / 静音占位）。"""
+    return await timeline.clear_clip(pid, clip_id)
+
+
 @router.delete("/projects/{pid}/clips/{clip_id}")
 async def delete_clip(pid: str, clip_id: str, ripple: bool = True) -> dict[str, Any]:
     return await timeline.delete_clip(pid, clip_id, ripple=ripple)

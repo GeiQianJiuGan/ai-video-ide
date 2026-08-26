@@ -4,11 +4,14 @@
  *
  * 流程：
  *   1. 选片登记 (Register)：选择本机视频文件，支持复制进工程（推荐）或原地引用；
- *   2. 切段账单 (Plan)：选择切段方式（自动画面切换/静音停顿/固定步长），实时生成切段账单；
- *   3. 幕参数与落库 (Run)：设置幕标题、Prompt 继承模式，一键落库创建分镜与零复制区间版本。
+ *   2. 预览裁切 (Trim)：先看一遍，把片头片尾框出来——几乎每段成片前面都有一截台标、
+ *      后面都有一截字幕，它们不该先被自动切成两个镜头再让用户一个个删掉。裁出来的只是
+ *      一对数字（`range_in` / `range_out`），**源文件一帧都不动**；
+ *   3. 切段账单 (Plan)：选择切段方式（自动画面切换/静音停顿/固定步长），只读地出账单；
+ *   4. 幕参数与落库 (Run)：设置幕标题、Prompt 继承模式，一键落库创建分镜与零复制区间版本。
  */
 
-import { ref, watch } from 'vue'
+import { computed, ref, watch } from 'vue'
 import {
   ArrowLeft,
   ArrowRight,
@@ -21,8 +24,10 @@ import AppDialog from '@/shared/ui/AppDialog.vue'
 import AppButton from '@/shared/ui/AppButton.vue'
 import AppBadge from '@/shared/ui/AppBadge.vue'
 import ErrorPanel from '@/shared/ui/ErrorPanel.vue'
+import VideoTrimmer from './VideoTrimmer.vue'
 import { ApiError } from '@/shared/api/client'
 import { assetsApi } from '@/shared/api/assets'
+import { fileUrl } from '@/shared/api/files'
 import {
   ingestApi,
   type IngestMethod,
@@ -40,7 +45,7 @@ const emit = defineEmits<{
   done: []
 }>()
 
-const step = ref<1 | 2 | 3>(1)
+const step = ref<1 | 2 | 3 | 4>(1)
 const busy = ref(false)
 const error = ref<ApiError | null>(null)
 
@@ -54,7 +59,22 @@ const copyIntoProject = ref(true)
 const registeredAsset = ref<IngestRegisterResult | null>(null)
 const methodsList = ref<IngestMethod[]>([])
 
-// Step 2 状态
+// Step 2 状态（预览裁切：片头片尾）
+const rangeIn = ref(0)
+const rangeOut = ref<number | null>(null)
+
+/**
+ * 裁切那一屏要播的地址。资产 `path` 相对工程目录存，所以走 `fileUrl`；
+ * **原地引用（工程外的绝对路径）拿不到这个地址**——文件服务只服务工程目录里的东西，
+ * 此时不画一个必然加载失败的播放器，改用填秒数那一路（裁切条自己会说明原因）。
+ */
+const trimSrc = computed(() => {
+  const path = registeredAsset.value?.path
+  if (!path || /^([a-zA-Z]:[\\/]|\/|\\\\)/.test(path)) return ''
+  return fileUrl(props.pid, path)
+})
+
+// Step 3 状态
 const selectedMethod = ref('auto')
 const threshold = ref(0.3)
 const minSegment = ref(1.0)
@@ -62,10 +82,18 @@ const maxSegment = ref<number | undefined>(10.0)
 const chunkSeconds = ref(4.0)
 const planResult = ref<IngestPlanResult | null>(null)
 
-// Step 3 状态
+// Step 4 状态
 const sceneTitle = ref('')
 const paramMode = ref<'shared' | 'per_shot'>('shared')
 const scenePrompt = ref('')
+
+/** 保留区间总长——账单那条时间条量的是它，不是整个文件（不然裁掉的那截会占着宽度）。 */
+const keptSpan = computed(() => {
+  const bill = planResult.value
+  if (!bill) return 0
+  const end = bill.range_out ?? bill.duration ?? 0
+  return Math.max(0, end - bill.range_in)
+})
 
 watch(
   () => props.open,
@@ -79,6 +107,8 @@ watch(
       uploading.value = false
       registeredAsset.value = null
       planResult.value = null
+      rangeIn.value = 0
+      rangeOut.value = null
       sceneTitle.value = ''
       scenePrompt.value = ''
       maxSegment.value = 10.0
@@ -109,8 +139,9 @@ async function onPickUploadFile(e: Event) {
     const res = await ingestApi.register(props.pid, asset.id, true)
     registeredAsset.value = res
     sceneTitle.value = `成片：${file.name.replace(/\.[^.]+$/, '')}`
+    //: 登记完先去裁切那一屏，**不急着出账单**：片头片尾没框出来的话，账单里前后两段
+    //: 一定是台标和字幕，用户只能一个个删掉。
     step.value = 2
-    await fetchPlan()
   } catch (err) {
     error.value = err instanceof ApiError ? err : null
   } finally {
@@ -128,12 +159,17 @@ async function handleRegisterPath() {
     registeredAsset.value = res
     sceneTitle.value = `成片：${res.path.split(/[/\\]/).pop()?.replace(/\.[^.]+$/, '') || '导入片段'}`
     step.value = 2
-    await fetchPlan()
   } catch (err) {
     error.value = err instanceof ApiError ? err : null
   } finally {
     busy.value = false
   }
+}
+
+/** 裁切确认：进账单那一屏，顺手出第一份账单。 */
+async function goToPlan() {
+  step.value = 3
+  await fetchPlan()
 }
 
 async function fetchPlan() {
@@ -148,9 +184,13 @@ async function fetchPlan() {
       min_segment: minSegment.value,
       max_segment: maxSegment.value && maxSegment.value > 0 ? maxSegment.value : undefined,
       chunk_seconds: chunkSeconds.value,
+      //: 片头片尾一路带下去：账单、落库两处必须是同一对数字，不然「切出来跟预览不一样」。
+      range_in: rangeIn.value > 0 ? rangeIn.value : undefined,
+      range_out: rangeOut.value ?? undefined,
     })
   } catch (err) {
     error.value = err instanceof ApiError ? err : null
+    planResult.value = null
   } finally {
     busy.value = false
   }
@@ -172,6 +212,8 @@ async function handleRun() {
       max_segment: maxSegment.value && maxSegment.value > 0 ? maxSegment.value : undefined,
       chunk_seconds: chunkSeconds.value,
       cuts: planResult.value.cuts,
+      range_in: rangeIn.value > 0 ? rangeIn.value : undefined,
+      range_out: rangeOut.value ?? undefined,
     })
     emit('done')
     emit('update:open', false)
@@ -207,9 +249,11 @@ function fmtSec(sec: number | null | undefined): string {
       <div class="border-line-1 bg-base-2 flex items-center justify-between border px-3 py-1.5 text-2xs">
         <span :class="step === 1 ? 'text-accent font-medium' : 'text-fg-3'">1. 选片登记</span>
         <span class="text-fg-4">→</span>
-        <span :class="step === 2 ? 'text-accent font-medium' : 'text-fg-3'">2. 智能切段账单</span>
+        <span :class="step === 2 ? 'text-accent font-medium' : 'text-fg-3'">2. 预览裁片头片尾</span>
         <span class="text-fg-4">→</span>
-        <span :class="step === 3 ? 'text-accent font-medium' : 'text-fg-3'">3. 幕参数与生成</span>
+        <span :class="step === 3 ? 'text-accent font-medium' : 'text-fg-3'">3. 智能切段账单</span>
+        <span class="text-fg-4">→</span>
+        <span :class="step === 4 ? 'text-accent font-medium' : 'text-fg-3'">4. 幕参数与生成</span>
       </div>
 
       <ErrorPanel v-if="error" :error="error" @dismiss="error = null" />
@@ -287,8 +331,89 @@ function fmtSec(sec: number | null | undefined): string {
         </div>
       </div>
 
-      <!-- Step 2: 切段配置与账单 -->
-      <div v-else-if="step === 2" class="space-y-3">
+      <!-- Step 2: 预览并裁掉片头片尾（切段之前的那一步） -->
+      <div v-else-if="step === 2" class="space-y-2">
+        <div
+          v-if="registeredAsset"
+          class="border-line-1 bg-base-2 flex items-center justify-between border p-2 text-2xs"
+        >
+          <div class="flex items-center gap-1.5">
+            <Film :size="12" class="text-accent" />
+            <span class="text-fg-1 max-w-xs truncate font-medium">{{ registeredAsset.path }}</span>
+          </div>
+          <div class="text-fg-3 flex items-center gap-3">
+            <span>
+              时长: <strong class="text-fg-1">{{ fmtSec(registeredAsset.duration) }}</strong>
+            </span>
+            <span>
+              音频轨: <strong class="text-fg-1">{{ registeredAsset.has_audio ? '有' : '无' }}</strong>
+            </span>
+          </div>
+        </div>
+
+        <ul
+          v-if="registeredAsset?.warnings.length"
+          class="border-st-review/40 bg-st-review/5 text-st-review space-y-0.5 border p-2 text-2xs"
+        >
+          <li v-for="(w, i) in registeredAsset.warnings" :key="i">· {{ w }}</li>
+        </ul>
+
+        <VideoTrimmer
+          v-if="trimSrc"
+          :key="trimSrc"
+          :src="trimSrc"
+          :duration="registeredAsset?.duration ?? null"
+          :range-in="rangeIn"
+          :range-out="rangeOut"
+          @update:range-in="rangeIn = $event"
+          @update:range-out="rangeOut = $event"
+        />
+        <!--
+          原地引用的文件在工程目录之外，文件服务不给它地址（越界会被拒），所以放不出画面。
+          这里不画一个必然加载失败的播放器，只留填秒数那一路——切段与导出走 FFmpeg，不受影响。
+        -->
+        <div v-else class="border-line-1 bg-base-2 space-y-2 border p-2.5">
+          <p class="text-st-review text-2xs leading-relaxed">
+            这段视频在工程目录之外（原地引用），浏览器里放不出来，所以没法拖着裁。
+            片头片尾可以直接填秒数；要能预览就回上一步改成「复制进工程」。
+          </p>
+          <div class="grid grid-cols-2 gap-2">
+            <label class="block">
+              <span class="text-fg-4 text-2xs">片头结束（秒）</span>
+              <input
+                v-model.number="rangeIn"
+                type="number"
+                min="0"
+                step="0.1"
+                class="border-line-1 bg-base-2 text-fg-1 mt-1 h-6 w-full border px-1.5 text-2xs outline-none"
+              />
+            </label>
+            <label class="block">
+              <div class="flex items-center justify-between">
+                <span class="text-fg-4 text-2xs">片尾开始（秒）</span>
+                <span class="text-fg-4 text-2xs">空 = 到结尾</span>
+              </div>
+              <input
+                :value="rangeOut ?? ''"
+                type="number"
+                min="0"
+                step="0.1"
+                placeholder="到文件结尾"
+                class="border-line-1 bg-base-2 text-fg-1 placeholder:text-fg-4 mt-1 h-6 w-full border px-1.5 text-2xs outline-none"
+                @change="
+                  rangeOut =
+                    ($event.target as HTMLInputElement).value.trim() === ''
+                      ? null
+                      : Number(($event.target as HTMLInputElement).value)
+                "
+              />
+            </label>
+          </div>
+        </div>
+      </div>
+
+      <!-- Step 3: 切段配置与账单 -->
+      <div v-else-if="step === 3" class="space-y-3">
         <!-- 视频探测摘要 -->
         <div v-if="registeredAsset" class="border-line-1 bg-base-2 flex items-center justify-between border p-2 text-2xs">
           <div class="flex items-center gap-1.5">
@@ -376,13 +501,27 @@ function fmtSec(sec: number | null | undefined): string {
             <AppButton size="sm" variant="ghost" :disabled="busy" @click="fetchPlan">重新计算</AppButton>
           </div>
 
-          <!-- 可视化时间条 -->
+          <!--
+            「少了一截」必须是账单上看得见的一句话：片头片尾去掉了多少秒写在这里，
+            否则过两天回来看只会觉得第一段莫名不是从 0 秒开始。
+          -->
+          <p
+            v-if="planResult.trimmed_head || planResult.trimmed_tail"
+            class="text-fg-3 text-2xs"
+          >
+            只切 {{ planResult.range_in.toFixed(2) }}s ~
+            {{ planResult.range_out == null ? '结尾' : `${planResult.range_out.toFixed(2)}s` }}：
+            已去掉片头 {{ planResult.trimmed_head.toFixed(2) }} 秒 / 片尾
+            {{ planResult.trimmed_tail.toFixed(2) }} 秒（源文件没有被裁）。
+          </p>
+
+          <!-- 可视化时间条：量的是保留区间，不是整个文件 -->
           <div class="bg-base-3 flex h-3 w-full overflow-hidden rounded-xs">
             <div
               v-for="seg in planResult.segments"
               :key="seg.index_no"
               class="border-base-1 border-r bg-accent/70 transition-all hover:bg-accent"
-              :style="{ width: `${Math.max(2, (seg.duration / (planResult.duration || 1)) * 100)}%` }"
+              :style="{ width: `${Math.max(2, (seg.duration / (keptSpan || 1)) * 100)}%` }"
               :title="`第 ${seg.index_no} 段: ${seg.in_point}s ~ ${seg.out_point}s (${seg.duration}s)`"
             />
           </div>
@@ -397,14 +536,25 @@ function fmtSec(sec: number | null | undefined): string {
               <span class="text-fg-1 font-medium">第 {{ seg.index_no }} 段</span>
               <span class="text-fg-3 tnum">{{ seg.in_point.toFixed(1) }}s ~ {{ seg.out_point.toFixed(1) }}s</span>
               <AppBadge tone="neutral">{{ seg.duration.toFixed(1) }}s</AppBadge>
-              <span class="text-fg-4 truncate max-w-[12rem]">{{ seg.reason }}</span>
             </div>
           </div>
+
+          <!-- 拿不准的事情一律显示出来（合并掉的切点不是错误，但必须说） -->
+          <p v-if="planResult.merged_away.length" class="text-fg-4 text-2xs">
+            有 {{ planResult.merged_away.length }} 个切点挨得太近被合并了（比「单段最小时长」还短）：
+            {{ planResult.merged_away.map((c) => c.toFixed(2)).join('、') }}s
+          </p>
+          <ul
+            v-if="planResult.warnings.length"
+            class="border-st-review/40 bg-st-review/5 text-st-review space-y-0.5 border p-2 text-2xs"
+          >
+            <li v-for="(w, i) in planResult.warnings" :key="i">· {{ w }}</li>
+          </ul>
         </div>
       </div>
 
-      <!-- Step 3: 幕参数设置 -->
-      <div v-else-if="step === 3" class="space-y-3">
+      <!-- Step 4: 幕参数设置 -->
+      <div v-else-if="step === 4" class="space-y-3">
         <label class="block">
           <span class="text-fg-3 text-2xs font-medium">生成的幕标题</span>
           <input
@@ -456,19 +606,29 @@ function fmtSec(sec: number | null | undefined): string {
           :disabled="busy || !filePath.trim()"
           @click="handleRegisterPath"
         >
-          登记并出账单<ArrowRight :size="12" />
+          登记并预览<ArrowRight :size="12" />
         </AppButton>
         <AppButton
           v-else-if="step === 2"
           size="sm"
           variant="primary"
+          :disabled="busy || !registeredAsset"
+          title="按框出来的区间出切段账单（源文件不动）"
+          @click="goToPlan"
+        >
+          裁好了，出切段账单<ArrowRight :size="12" />
+        </AppButton>
+        <AppButton
+          v-else-if="step === 3"
+          size="sm"
+          variant="primary"
           :disabled="busy || !planResult?.segments.length"
-          @click="step = 3"
+          @click="step = 4"
         >
           配置幕参数<ArrowRight :size="12" />
         </AppButton>
         <AppButton
-          v-else-if="step === 3"
+          v-else-if="step === 4"
           size="sm"
           variant="primary"
           :disabled="busy"

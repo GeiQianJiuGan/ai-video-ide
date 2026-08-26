@@ -848,7 +848,10 @@ class TimelineService:
             row.out_point = new_out
             row.duration = new_out - new_in
             row.start = new_start
-        if ripple:
+        #: 视频轨上「空档」不是一种表达（要留白得显式加黑场片段），所以裁完必须贴紧，
+        #: 与 `ripple` 无关——不然往右拖左边缘会在前一段后面留下一段黑帧。
+        #: 音频轨相反：那里的空档是静默，用户要留就留。
+        if ripple or track.kind == "video":
             await self._close_gaps(pid, clip.track_id)
         return await self.get(pid)
 
@@ -1172,6 +1175,53 @@ class TimelineService:
             row.in_point = 0.0
             row.out_point = float(duration)
         await self._close_gaps(pid, clip.track_id)
+        return await self.get(pid)
+
+    async def clear_clip(self, pid: str, clip_id: str) -> dict[str, Any]:
+        """清空一个片段的内容，**位置与长度原样留着**。
+
+        和「删除」是两件事：删掉之后后面的画面会贴上来（或者留下一个谁都不认识的空档），
+        而清空要的是「这一格先空着，长度别动，等下换个东西进来」。所以这里只把
+        `shot_id` / `version_id` / `asset_id` 三个指针摘掉，`start` / `duration` 一个不改：
+
+          · 视频轨上清空 = 一段黑场占位（与 `add_blank_clip` 出来的东西完全一样，
+            导出时走 `color=c=black` 那一路，不需要任何新的导出逻辑）；
+          · 音频轨上清空 = 一段静音占位（导出时它不进混音，`build_command` 会把
+            「有 N 段音频是空的」写进 warnings——空段不发声是对的，但不该悄悄发生）。
+
+        **不连带删拆出去的声音**（同 `delete_clip`）：声音一旦独立成段就是音频轨上的素材，
+        用户完全可能就是想「把这段画面清掉、声音留着」。
+        """
+        db = db_of(pid)
+        clip = await fetch(db, TimelineClip, clip_id, "片段")
+        track = await fetch(db, Track, clip.track_id, "轨道")
+        if not (clip.shot_id or clip.version_id or clip.asset_id):
+            raise AppError(
+                ErrorCode.VALIDATION_ERROR,
+                "这一段已经是空的",
+                f"{clip.label or clip_id} 上没有任何素材，不需要再清空。",
+                [
+                    "要改它的长度：视频轨上的空白段可以直接设置时长",
+                    "要把它从轨道上去掉：用「删除」",
+                ],
+                {"clip_id": clip_id},
+            )
+        await self._capture(pid)
+        async with db.write() as session:
+            row = await session.get(TimelineClip, clip_id)
+            assert row is not None
+            row.shot_id = None
+            row.version_id = None
+            row.asset_id = None
+            row.in_point = 0.0
+            row.out_point = float(row.duration)
+            row.muted = 0
+            row.label = "空白视频段" if track.kind == "video" else "静音占位"
+            #: **清空就等于接管这一段**（同 `split_clip`）：不转成 manual 的话，它还是一条
+            #: `origin="assembled"` 却没有 shot_id 的片段，下一次装配对位时会被当成
+            #: 「多余的装配片段」删掉——用户刚留出来的那一格就这么没了。
+            row.origin = "manual"
+        await self._reindex(pid, clip.track_id)
         return await self.get(pid)
 
     async def move_clip_to_track(
@@ -1606,6 +1656,7 @@ class TimelineService:
             gaps += max(0.0, clip["start"] - prev_end)
             prev_end = clip["start"] + clip["duration"]
         audio_clips: list[dict[str, Any]] = []
+        emptied_audio = 0
         for track in timeline["tracks"]:
             if track["kind"] != "audio" or not track["clips"]:
                 continue
@@ -1614,7 +1665,15 @@ class TimelineService:
                     f"音频轨 {track['name']} 是静音的，上面 {len(track['clips'])} 段不会进入成片。"
                 )
                 continue
-            audio_clips += [c for c in track["clips"] if not c["muted"] and c["volume"] > 0]
+            live = [c for c in track["clips"] if not c["muted"] and c["volume"] > 0]
+            # 被「清空内容」摘掉素材的音频段是**静音占位**：它不进混音（没有音源可以延迟、
+            # 配比例），但也不该悄悄消失——下面写进 warnings。
+            emptied_audio += sum(1 for c in live if not c["asset_path"])
+            audio_clips += [c for c in live if c["asset_path"]]
+        if emptied_audio:
+            warnings.append(
+                f"有 {emptied_audio} 段音频已被清空内容，这一段时间里那条轨道是静音的。"
+            )
         if gaps > 0.05:
             warnings.append(
                 f"视频轨上有 {gaps:.2f} 秒空档，导出会把它们合掉（画面一段接一段）——"

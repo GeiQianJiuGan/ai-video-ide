@@ -350,6 +350,61 @@ def test_video_trim_closes_the_gap_in_one_step(client: TestClient, pid: str) -> 
     )
 
 
+def test_clear_keeps_the_slot_and_undoes_in_one_step(client: TestClient, pid: str) -> None:
+    """清空内容只摘素材：位置与长度一格不动，后面的片段也不许贴上来。"""
+    clips = make_clips(client, pid, 4.0, 4.0)
+    resp = client.post(f"/api/v1/projects/{pid}/clips/{clips[0]['id']}/clear")
+    assert resp.status_code == 200, resp.text
+    cleared = clip_in(resp.json(), clips[0]["id"])
+    assert (cleared["start"], cleared["duration"]) == (0.0, 4.0), "清空不是删除，位置与长度要留着"
+    assert cleared["shot_id"] is None
+    assert cleared["version_id"] is None
+    assert cleared["asset_id"] is None
+    assert cleared["asset_path"] is None
+    assert cleared["in_point"] == 0.0 and cleared["out_point"] == 4.0
+    assert clip_in(resp.json(), clips[1]["id"])["start"] == 4.0, "后面那段不该被贴上来"
+
+    again = client.post(f"/api/v1/projects/{pid}/clips/{clips[0]['id']}/clear")
+    assert again.status_code == 422, "已经空了的段没什么可清，要明说而不是白跑一趟"
+    err = error_of(again)
+    assert err["title"] == "这一段已经是空的"
+    assert err["suggestions"]
+
+    undone = client.post(f"/api/v1/projects/{pid}/timeline/undo")
+    assert undone.status_code == 200, undone.text
+    back = clip_in(undone.json(), clips[0]["id"])
+    assert back["version_id"] == clips[0]["version_id"], "撤一次就把素材整段还回来"
+    assert (back["start"], back["duration"]) == (0.0, 4.0)
+
+
+def test_cleared_clip_survives_a_reassemble(client: TestClient, pid: str) -> None:
+    """清空 = 接管这一段：再装配一次不许把它当「多余的装配片段」删掉。"""
+    clips = make_clips(client, pid, 4.0, 4.0)
+    assert client.post(f"/api/v1/projects/{pid}/clips/{clips[0]['id']}/clear").status_code == 200
+    resp = client.post(f"/api/v1/projects/{pid}/timeline/assemble", json={"replace": False})
+    assert resp.status_code == 200, resp.text
+    kept = clip_in(resp.json()["timeline"], clips[0]["id"])
+    assert kept["version_id"] is None, "装配不该把清掉的素材又填回来"
+    assert (kept["start"], kept["duration"]) == (0.0, 4.0)
+
+
+def test_export_warns_about_an_emptied_audio_clip(
+    client: TestClient, pid: str, fake_probe: None
+) -> None:
+    """空音频段不进混音是对的，但不能悄悄发生——导出预检里必须有这一句。"""
+    make_clips(client, pid, 4.0)
+    placed = add_music(client, pid, duration=2.0)
+    assert placed.status_code == 201, placed.text
+    cleared = client.post(f"/api/v1/projects/{pid}/clips/{placed.json()['clip_id']}/clear")
+    assert cleared.status_code == 200, cleared.text
+
+    plan = client.get(f"/api/v1/projects/{pid}/export/command")
+    assert plan.status_code == 200, plan.text
+    body = plan.json()
+    assert body["audio_clips"] == 0, "空段不该被当成一路音源送进 amix"
+    assert any("清空内容" in w for w in body["warnings"]), body["warnings"]
+
+
 def test_video_trim_ignores_a_requested_gap(client: TestClient, pid: str) -> None:
     clips = make_clips(client, pid, 4.0, 4.0)
     resp = client.post(

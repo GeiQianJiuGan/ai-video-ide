@@ -37,6 +37,7 @@ import AppDialog from '@/shared/ui/AppDialog.vue'
 import EmptyState from '@/shared/ui/EmptyState.vue'
 import ErrorPanel from '@/shared/ui/ErrorPanel.vue'
 import FeatureHeader from '@/shared/ui/FeatureHeader.vue'
+import SegmentPlayer from '@/shared/ui/SegmentPlayer.vue'
 import DubModal from './components/DubModal.vue'
 import RefineModal from './components/RefineModal.vue'
 import { fileUrl } from '@/shared/api/files'
@@ -305,33 +306,13 @@ function slotUrl(path: string | null): string {
  * 版本轨上那一格：**视频走 `<video>`、图片走 `<img>`**。两个字段由后端分开给
  * （`generation._version_media`），因为版本的资产几乎总是一段 `.mp4`——
  * 把它塞进 `<img>` 只会得到一个坏图标。
+ *
+ * 地址是光秃秃的文件地址，**不带 `#t=in,out`**：长视频切出来的版本共用一个源文件，
+ * 区间交给 `SegmentPlayer`（它的进度条只有本段）。原生进度条量的是整个文件，
+ * 那样得到的是「限制了播放时间的长片」而不是单段预览。
  */
 function versionVideo(v: GenerationVersion): string {
-  if (!v.video_path) return ''
-  const base = fileUrl(pid.value, v.video_path)
-  if (v.in_point != null && v.out_point != null) {
-    return `${base}#t=${v.in_point},${v.out_point}`
-  } else if (v.in_point != null) {
-    return `${base}#t=${v.in_point}`
-  }
-  return base
-}
-
-function onVersionLoadedMetadata(e: Event, v: GenerationVersion): void {
-  const video = e.target as HTMLVideoElement
-  if (v.in_point != null && v.in_point > 0) {
-    video.currentTime = v.in_point
-  }
-}
-
-function onVersionTimeUpdate(e: Event, v: GenerationVersion): void {
-  const video = e.target as HTMLVideoElement
-  const inPt = v.in_point ?? 0
-  const outPt = v.out_point
-  if (outPt != null && video.currentTime >= outPt) {
-    video.pause()
-    video.currentTime = inPt
-  }
+  return v.video_path ? fileUrl(pid.value, v.video_path) : ''
 }
 
 function versionPoster(v: GenerationVersion): string {
@@ -472,7 +453,7 @@ async function executeSplit() {
     if (newShotId) {
       void router.push({ name: 'shot', params: { pid: pid.value, sid: newShotId } })
     }
-  } catch (err) {
+  } catch {
     // editor.lastError handles it
   }
 }
@@ -1294,24 +1275,22 @@ async function confirmDrop(): Promise<void> {
                     <span>区间: {{ v.in_point ?? 0 }}s ~ {{ v.out_point ?? v.duration }}s</span>
                   </div>
 
-                  <!-- 视频给播放器，图片才走 <img>：两个字段绝不混用 -->
+                  <!-- 视频给单段播放器，图片才走 <img>：两个字段绝不混用 -->
+                  <!-- 播放器自带一条「只有本段」的进度条，所以它比一格缩略图高一点 -->
+                  <SegmentPlayer
+                    v-if="versionVideo(v)"
+                    :key="versionVideo(v)"
+                    class="border-line-1 bg-base-3 mt-1 border"
+                    :src="versionVideo(v)"
+                    :in-point="v.in_point"
+                    :out-point="v.out_point"
+                    :poster="versionPoster(v)"
+                  />
                   <div
-                    v-if="versionVideo(v) || versionPoster(v)"
+                    v-else-if="versionPoster(v)"
                     class="bg-base-3 mt-1 flex h-20 items-center justify-center overflow-hidden"
                   >
-                    <video
-                      v-if="versionVideo(v)"
-                      :key="versionVideo(v)"
-                      :src="versionVideo(v)"
-                      :poster="versionPoster(v) || undefined"
-                      controls
-                      preload="metadata"
-                      class="max-h-full max-w-full"
-                      @loadedmetadata="onVersionLoadedMetadata($event, v)"
-                      @timeupdate="onVersionTimeUpdate($event, v)"
-                    />
                     <img
-                      v-else
                       :src="versionPoster(v)"
                       class="max-h-full max-w-full object-contain"
                       :alt="`v${v.version_no}`"

@@ -36,6 +36,7 @@ import {
   Clapperboard,
   Crop,
   Download,
+  Eraser,
   FolderOpen,
   Lock,
   LockOpen,
@@ -581,6 +582,24 @@ async function endDrag(event: PointerEvent): Promise<void> {
 
 async function doRemove(clipId: string, ripple: boolean): Promise<void> {
   await tl.remove(pid.value, clipId, ripple).catch(() => {})
+  const next = { ...trimDrafts.value }
+  delete next[clipId]
+  trimDrafts.value = next
+  closeClipMenu()
+}
+
+/**
+ * 「清空内容」与「删除」是两件事：这里只把素材摘掉，位置与长度留在原处
+ * （画面变黑场、声音变静音），后面那些片段一格都不动。要腾出时间才用删除。
+ * 已经空了的段没什么可清，按钮直接禁用——后端那边也会拒（422）。
+ */
+function hasContent(clip: Clip): boolean {
+  return Boolean(clip.asset_id || clip.version_id || clip.shot_id)
+}
+
+async function doClear(clipId: string): Promise<void> {
+  await tl.clear(pid.value, clipId).catch(() => {})
+  // 内容没了，挂在它上面的裁切草稿也没有意义了
   const next = { ...trimDrafts.value }
   delete next[clipId]
   trimDrafts.value = next
@@ -1184,6 +1203,18 @@ function goShot(shotId: string | null): void {
                 <Plus :size="11" />移到新音频轨
               </button>
               <div class="bg-line-1 my-1 h-px" />
+              <button
+                class="text-fg-1 hover:bg-base-2 flex w-full items-center gap-1.5 px-2 py-1 text-left text-2xs disabled:cursor-not-allowed disabled:opacity-40"
+                :disabled="tl.busy || !hasContent(menuClip)"
+                :title="
+                  hasContent(menuClip)
+                    ? '摘掉这一段的素材，位置和长度留着（画面变黑场，声音变静音）'
+                    : '这一段已经是空的'
+                "
+                @click="doClear(menuClip.id)"
+              >
+                <Eraser :size="11" />清空内容
+              </button>
               <button
                 class="text-st-failed hover:bg-base-2 flex w-full items-center gap-1.5 px-2 py-1 text-left text-2xs"
                 :disabled="tl.busy"

@@ -207,6 +207,9 @@ export const timelineApi = {
     ),
   remove: (pid: string, clipId: string, ripple = true) =>
     api.del<Timeline>(`/projects/${pid}/clips/${clipId}?ripple=${ripple}`),
+  /** 清空这一段的内容：位置与长度留着，变成黑场（视频轨）/ 静音（音频轨）占位。 */
+  clear: (pid: string, clipId: string) =>
+    api.post<Timeline>(`/projects/${pid}/clips/${clipId}/clear`),
   /** 只换这一个片段的版本，整条线不重排。 */
   replaceVersion: (pid: string, clipId: string, versionId: string) =>
     api.post<Timeline>(`/projects/${pid}/clips/${clipId}/version`, { version_id: versionId }),

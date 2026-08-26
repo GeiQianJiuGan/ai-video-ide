@@ -29,7 +29,6 @@ export interface IngestSegment {
   in_point: number
   out_point: number
   duration: number
-  reason: string
 }
 
 export interface IngestPlanResult {
@@ -43,6 +42,14 @@ export interface IngestPlanResult {
   min_segment: number
   max_segment?: number | null
   chunk_seconds: number
+  /** 保留区间的起点（片头结束的位置）。 */
+  range_in: number
+  /** 保留区间的终点；探不出长度时是 null。 */
+  range_out: number | null
+  /** 被片头挡在外面的秒数。 */
+  trimmed_head: number
+  /** 被片尾挡在外面的秒数。 */
+  trimmed_tail: number
   cuts: number[]
   merged_away: number[]
   segments: IngestSegment[]
@@ -58,6 +65,12 @@ export interface IngestPlanParams {
   max_segment?: number
   chunk_seconds?: number
   cuts?: number[]
+  /**
+   * 片头片尾：切段只在 [range_in, range_out] 里进行，**源文件一帧都不动**。
+   * 留空 = 整段都要。
+   */
+  range_in?: number
+  range_out?: number
 }
 
 export interface IngestRunParams extends IngestPlanParams {
@@ -68,10 +81,12 @@ export interface IngestRunParams extends IngestPlanParams {
 }
 
 export interface IngestRunResult {
+  plan: IngestPlanResult
   scene: Scene
   shots: StoryboardCard[]
-  position: number
-  reordered_after: number
+  created: number
+  /** 插到中间时有多少幕被推后——顺序是用户的东西，动了必须说出来。 */
+  scenes_shifted: number
 }
 
 export const ingestApi = {

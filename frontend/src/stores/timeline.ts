@@ -158,6 +158,13 @@ export const useTimelineStore = defineStore('timeline', () => {
     transitions.value = await timelineApi.transitions(pid).catch(() => transitions.value)
   }
 
+  /** 清空这一段的内容（位置与长度不动）。删除是另一件事，见 `remove`。 */
+  async function clear(pid: string, clipId: string): Promise<void> {
+    await guarded(async () => {
+      timeline.value = await timelineApi.clear(pid, clipId)
+    })
+  }
+
   async function replaceVersion(pid: string, clipId: string, versionId: string): Promise<void> {
     await guarded(async () => {
       timeline.value = await timelineApi.replaceVersion(pid, clipId, versionId)
@@ -319,6 +326,7 @@ export const useTimelineStore = defineStore('timeline', () => {
     split,
     isolateAudioSelection,
     remove,
+    clear,
     replaceVersion,
     setMix,
     detachAudio,

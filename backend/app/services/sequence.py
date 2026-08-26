@@ -52,7 +52,7 @@ from app.persistence.models_world import Asset
 from app.services.assets import kind_of_suffix
 from app.services.base import as_dict, db_of, fetch, fetch_all
 from app.services.context import context
-from app.services.frames import frames, start_frame_index
+from app.services.frames import frame_key, frames, poster_at, start_frame_index
 from app.services.generation import drop_entry, generation, over_capacity_error
 from app.services.story import FOOTAGE_HOW, footage_blocker, node_limit, story
 
@@ -1303,11 +1303,13 @@ class SequenceService:
         if kind_of_suffix(Path(asset.path).suffix) == "image":
             # 采用的那一版本身就是一张图：它就是第一格，没什么可抽的。
             return str(asset.id), "real_frame"
-        done = start_frame_index(list(assets.values())).get(str(asset.id))
+        # 有区间的版本（长视频切段）按**本段的起点**抽，不是整段长片的第 0 秒。
+        want = poster_at(version.in_point if version else None)
+        done = start_frame_index(list(assets.values())).get(frame_key(str(asset.id), want))
         if done is not None:
             return str(done.id), "real_frame"
         if extract:
-            made = await frames.extract(pid, str(asset.id), "start")
+            made = await frames.extract(pid, str(asset.id), want)
             return str(made["id"]), "real_frame"
         return None, "extract"
 

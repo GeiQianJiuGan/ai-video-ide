@@ -199,21 +199,37 @@ def _capacity_of(items: list[dict[str, Any]], cap: RefCapacity) -> dict[str, Any
     }
 
 
-def _extracted_frame(assets: Any, from_asset_id: str | None) -> str | None:
-    """找一找这段视频的末帧是不是已经抽过了（frames.extract 会把出处记进 meta）。"""
+def _extracted_frame(assets: Any, from_asset_id: str | None, at: str | float = "end") -> str | None:
+    """找一找这段视频（这一段区间）的末帧是不是已经抽过了。
+
+    `at` 不只有 `"end"`：长视频切段出来的版本共用同一个源文件，**上游那一段的末帧是
+    区间末尾那个时间点**（`frames.tail_at`），拿整段长片的 `"end"` 当它的末帧就会接到
+    片尾字幕上去。
+    """
     if not from_asset_id:
         return None
     for asset in assets:
         if asset.kind != "frame":
             continue
         meta = load_json(asset.meta_json, {})
-        if (
-            isinstance(meta, dict)
-            and meta.get("from_asset_id") == from_asset_id
-            and meta.get("at") == "end"
-        ):
+        if not isinstance(meta, dict) or meta.get("from_asset_id") != from_asset_id:
+            continue
+        got = meta.get("at")
+        if isinstance(at, str):
+            if got == at:
+                return str(asset.id)
+        elif isinstance(got, (int, float)) and abs(float(got) - float(at)) < 0.001:
             return str(asset.id)
     return None
+
+
+def _tail_at(version: Any) -> str | float:
+    """上游那一版的末帧该抽哪个位置。位置判定只有一份（`frames.tail_at`）。"""
+    from app.services.frames import tail_at  # 延迟导入：context 不该在模块级依赖 FFmpeg 层
+
+    if version is None:
+        return "end"
+    return tail_at(version.out_point, version.in_point)
 
 
 class ContextService:
@@ -404,7 +420,10 @@ class ContextService:
                     )
                 source_asset = version.asset_id if version else None
                 ready = source_asset is not None
-                frame = _extracted_frame(assets.values(), source_asset) if ready else None
+                # 上游那一版有区间时（长视频切段），末帧是**区间末尾**那个时间点，
+                # 不是整段源文件的结尾——否则一幕里所有镜头都会接到长片的片尾去。
+                want_at = _tail_at(version)
+                frame = _extracted_frame(assets.values(), source_asset, want_at) if ready else None
                 items.append(
                     {
                         "key": f"prev_frame:{shot.prev_shot_id}",
@@ -416,6 +435,8 @@ class ContextService:
                         "eligible": ready,
                         "pending_extract": bool(ready and frame is None),
                         "from_asset_id": source_asset,
+                        #: 抽帧要抽哪个位置（`ensure_frames` 照它抽）。"end" = 整段的结尾。
+                        "extract_at": want_at,
                         "reason": (
                             "已抽取的上游末帧，用于保持连续性"
                             if frame
@@ -551,7 +572,8 @@ class ContextService:
         from app.services.frames import frames  # 延迟导入：context 不该在模块级依赖 FFmpeg 层
 
         for item in pending:
-            await frames.extract(pid, str(item["from_asset_id"]), "end")
+            at = item.get("extract_at")
+            await frames.extract(pid, str(item["from_asset_id"]), "end" if at is None else at)
         return await self.resolve(pid, shot_id, include_prev=include_prev)
 
     async def require_complete(

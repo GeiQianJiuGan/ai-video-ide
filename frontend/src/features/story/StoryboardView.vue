@@ -39,6 +39,7 @@ import AppDialog from '@/shared/ui/AppDialog.vue'
 import EmptyState from '@/shared/ui/EmptyState.vue'
 import ErrorPanel from '@/shared/ui/ErrorPanel.vue'
 import FeatureHeader from '@/shared/ui/FeatureHeader.vue'
+import SegmentPlayer from '@/shared/ui/SegmentPlayer.vue'
 import IngestVideoModal from './components/IngestVideoModal.vue'
 import DubModal from './components/DubModal.vue'
 import RefineModal from './components/RefineModal.vue'
@@ -136,35 +137,12 @@ function fmtDuration(n: number | null | undefined): string {
   return n == null ? '—' : `${Math.round(n * 10) / 10}s`
 }
 
-const previewVideoUrl = computed(() => {
-  if (!preview.value) return ''
-  const base = preview.value.path
-  if (preview.value.in_point != null && preview.value.out_point != null) {
-    return `${base}#t=${preview.value.in_point},${preview.value.out_point}`
-  } else if (preview.value.in_point != null) {
-    return `${base}#t=${preview.value.in_point}`
-  }
-  return base
-})
-
-function onPreviewLoadedMetadata(e: Event): void {
-  const video = e.target as HTMLVideoElement
-  if (!preview.value) return
-  if (preview.value.in_point != null && preview.value.in_point > 0) {
-    video.currentTime = preview.value.in_point
-  }
-}
-
-function onPreviewTimeUpdate(e: Event): void {
-  const video = e.target as HTMLVideoElement
-  if (!preview.value) return
-  const inPt = preview.value.in_point ?? 0
-  const outPt = preview.value.out_point
-  if (outPt != null && video.currentTime >= outPt) {
-    video.pause()
-    video.currentTime = inPt
-  }
-}
+/**
+ * 预览地址是**光秃秃的文件地址**：不带 `#t=in,out`。
+ * 区间交给 `SegmentPlayer`——片段锚点配上原生进度条量的是整个文件，长视频切出来的
+ * 一段在 40 分钟的长片里只有半个像素，那不是「单段预览」而是「限制了播放时间的长片」。
+ */
+const previewVideoUrl = computed(() => preview.value?.path ?? '')
 
 function previewShot(card: StoryboardCard): void {
   story.selectShot(pid.value, card.id).catch(() => {})
@@ -369,7 +347,7 @@ async function confirmDeleteScene(): Promise<void> {
     deleteSceneDialogOpen.value = false
     sceneToDelete.value = null
     await story.loadBoard(pid.value)
-  } catch (err) {
+  } catch {
     // handled by store
   }
 }
@@ -615,14 +593,13 @@ async function confirmDeleteScene(): Promise<void> {
           <AppButton size="sm" variant="ghost" @click="preview = null">关闭</AppButton>
           <AppButton size="sm" variant="primary" @click="openShot(preview.shotId)">进入 Shot 工作台</AppButton>
         </div>
-        <video
+        <SegmentPlayer
           :key="previewVideoUrl"
           :src="previewVideoUrl"
-          controls
+          :in-point="preview.in_point"
+          :out-point="preview.out_point"
           autoplay
           class="bg-black max-h-[70vh] w-full"
-          @loadedmetadata="onPreviewLoadedMetadata"
-          @timeupdate="onPreviewTimeUpdate"
         />
       </div>
     </div>
