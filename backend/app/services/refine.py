@@ -25,6 +25,7 @@ from typing import Any
 
 from app.core.config import settings
 from app.core.errors import AppError, ErrorCode
+from app.core.ids import new_id
 from app.generation.providers import presets
 from app.persistence.models_gen import REFINE_KINDS, GenerationVersion
 from app.persistence.models_story import Scene, Shot
@@ -208,7 +209,10 @@ class RefineService:
                 {"skipped": bill["skipped"]},
             )
         jobs = []
-        for item in bill["items"]:
+        # 一次批量二次处理也是「一次编排」：队列里合并成一条可展开的任务（只有一条时不建批次）。
+        batch_id = new_id("job_batch") if len(bill["items"]) > 1 else None
+        label = f"{LABELS.get(kind, kind)} · {len(bill['items'])} 段"
+        for i, item in enumerate(bill["items"]):
             job = await generation.enqueue_task(
                 pid,
                 item["shot_id"],
@@ -222,9 +226,14 @@ class RefineService:
                     "refine_kind": kind,
                     "extra": extra or {},
                 },
+                batch=(
+                    {"id": batch_id, "label": label, "kind": "refine", "seq": i + 1}
+                    if batch_id
+                    else None
+                ),
             )
             jobs.append({"job_id": job["id"], **item})
-        return {"plan": bill, "jobs": jobs, "enqueued": len(jobs)}
+        return {"plan": bill, "jobs": jobs, "enqueued": len(jobs), "batch_id": batch_id}
 
     async def _targets(
         self,

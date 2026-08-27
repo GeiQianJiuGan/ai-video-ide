@@ -150,6 +150,23 @@ def over_capacity_error(drops: list[dict[str, Any]]) -> AppError:
     )
 
 
+def _batch_fields(batch: dict[str, Any] | None) -> dict[str, Any]:
+    """把一次编排的身份摊成 Job 的四列。
+
+    **没有编排就是四个空值**——单个镜头的生成不属于任何一批，队列里照旧一行一条。
+    调用方给的 `seq` 允许缺（转场这种「补几段」的批次没有严格的第几步），此时界面
+    按 `created_at` 的先后当步序。
+    """
+    if not batch or not batch.get("id"):
+        return {}
+    return {
+        "batch_id": str(batch["id"]),
+        "batch_label": str(batch.get("label") or "")[:200] or None,
+        "batch_kind": str(batch.get("kind") or "")[:30] or None,
+        "batch_seq": batch.get("seq"),
+    }
+
+
 class GenerationService:
     def __init__(self) -> None:
         self._pumps: dict[str, asyncio.Task[None]] = {}
@@ -172,6 +189,7 @@ class GenerationService:
         last_frame_asset_id: str | None = None,
         wait_for_job_id: str | None = None,
         extra: dict[str, Any] | None = None,
+        batch: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         db = db_of(pid)
         shot = await fetch(db, Shot, shot_id, "镜头")
@@ -254,6 +272,7 @@ class GenerationService:
                 }
             ),
             created_at=utc_now(),
+            **_batch_fields(batch),
         )
         async with db.write() as session:
             session.add(row)
@@ -300,6 +319,7 @@ class GenerationService:
         kind: str,
         priority: int = 100,
         params: dict[str, Any] | None = None,
+        batch: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """入队一条**不出新画面**的任务：二次处理（`REFINE_KINDS`）或出声音（`AUDIO_KINDS`）。
 
@@ -326,6 +346,7 @@ class GenerationService:
             priority=priority,
             params_json=dump_json(params or {}),
             created_at=utc_now(),
+            **_batch_fields(batch),
         )
         async with db.write() as session:
             session.add(row)
@@ -361,7 +382,7 @@ class GenerationService:
         self, pid: str, scene_id: str, priority: int = 100, *, allow_ref_drop: bool = False
     ) -> dict[str, Any]:
         db = db_of(pid)
-        await fetch(db, Scene, scene_id, "场景")
+        scene = await fetch(db, Scene, scene_id, "场景")
         shots = [
             s for s in await fetch_all(db, Shot, order_by=Shot.index_no) if s.scene_id == scene_id
         ]
@@ -379,17 +400,29 @@ class GenerationService:
             if drops:
                 raise over_capacity_error(drops)
         queued, skipped = [], []
-        for shot in shots:
+        # 整幕生成也是「一次编排」：队列里合并成一条可展开的任务，
+        # 只有一个镜头时不建批次（为一条任务画一个壳只是多一层）。
+        batch_id = new_id("job_batch") if len(shots) > 1 else None
+        label = f"整幕生成 · 第 {scene.index_no} 幕 · {len(shots)} 个镜头"
+        for i, shot in enumerate(shots):
             try:
                 job = await self.enqueue_shot(
-                    pid, shot.id, priority=priority, allow_ref_drop=allow_ref_drop
+                    pid,
+                    shot.id,
+                    priority=priority,
+                    allow_ref_drop=allow_ref_drop,
+                    batch=(
+                        {"id": batch_id, "label": label, "kind": "scene", "seq": i + 1}
+                        if batch_id
+                        else None
+                    ),
                 )
                 queued.append(job["id"])
             except AppError as err:
                 skipped.append(
                     {"shot_id": shot.id, "index_no": shot.index_no, "error": err.to_dict()}
                 )
-        return {"queued": queued, "skipped": skipped, "total": len(shots)}
+        return {"queued": queued, "skipped": skipped, "total": len(shots), "batch_id": batch_id}
 
     # --- 队列视图与控制 ---
 
@@ -431,7 +464,161 @@ class GenerationService:
             "counts": counts,
             "active": sum(counts.get(s, 0) for s in ACTIVE),
             "jobs": jobs,
+            "batches": self.batches_of(jobs),
         }
+
+    def batches_of(self, jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """把一次编排入队的那一批任务折成一条。**纯计算，不读库。**
+
+        为什么不存一张 batch 表：一次编排没有任何独立于成员任务的状态——总数、走到第几步、
+        失败在哪一条，全部是成员算出来的。存第二份只会多一个可能和任务表对不上的真相。
+
+        进度是**第 N/M 步**，不是百分比：ComfyUI 不回显进度，那个百分比是本地按秒数编的
+        （`_await_task` 里的假爬升），把它画成进度条等于拿编出来的数字骗人。这里只说
+        「12 步里做完了 3 步」——这句话是真的。
+
+        `status` 是这一批的聚合结论，按「有没有还没了结的」优先，因为用户问的是
+        「我还要不要等」：running / waiting / queued → 还在跑；一条都不剩时 failed >
+        canceled > done。
+        """
+        groups: dict[str, list[dict[str, Any]]] = {}
+        for job in jobs:
+            bid = job.get("batch_id")
+            if bid:
+                groups.setdefault(str(bid), []).append(job)
+        out: list[dict[str, Any]] = []
+        for bid, members in groups.items():
+            members.sort(key=lambda j: (j.get("batch_seq") or 0, str(j["created_at"])))
+            counts: dict[str, int] = {}
+            for m in members:
+                counts[m["status"]] = counts.get(m["status"], 0) + 1
+            settled = sum(counts.get(s, 0) for s in ("done", "failed", "canceled"))
+            if counts.get("running"):
+                status = "running"
+            elif counts.get("waiting") or counts.get("queued") or counts.get("paused"):
+                status = "queued"
+            elif counts.get("failed"):
+                status = "failed"
+            elif counts.get("canceled"):
+                status = "canceled"
+            else:
+                status = "done"
+            running = next((m for m in members if m["status"] == "running"), None)
+            failed = [m for m in members if m["status"] == "failed"]
+            first = members[0]
+            finished = [str(m["finished_at"]) for m in members if m.get("finished_at")]
+            out.append(
+                {
+                    "id": bid,
+                    "label": first.get("batch_label") or "一批生成任务",
+                    "kind": first.get("batch_kind") or "",
+                    "total": len(members),
+                    "counts": counts,
+                    "status": status,
+                    #: 做完了几步（含失败与取消——它们也不会再动了）
+                    "settled": settled,
+                    #: 正在做第几步（1 起）。没有正在跑的就是已了结的条数，
+                    #: 于是界面上那句「第 N/M 步」在跑完之后停在 M 上，而不是回到 0。
+                    "step": (members.index(running) + 1) if running else settled,
+                    "running_job_id": running["id"] if running else None,
+                    "running_label": (
+                        f"{running.get('shot_index_no') or '?'}. "
+                        f"{running.get('shot_title') or running['shot_id']}"
+                        if running
+                        else None
+                    ),
+                    #: 第一条失败的四要素直接给出来：合并之后不展开也得看得见失败原因
+                    "error": failed[0]["error"] if failed else None,
+                    "failed_count": len(failed),
+                    #: 有失败或被取消的成员才能整批重跑；已完成的成员一条都不会重做
+                    "retryable": bool(counts.get("failed") or counts.get("canceled")),
+                    "job_ids": [m["id"] for m in members],
+                    "created_at": first["created_at"],
+                    "finished_at": max(finished) if finished and status != "running" else None,
+                }
+            )
+        out.sort(key=lambda b: str(b["created_at"]), reverse=True)
+        return out
+
+    async def retry_batch(self, pid: str, batch_id: str) -> dict[str, Any]:
+        """整批重跑：把这一批里失败 / 已取消的成员重新排上去。
+
+        单线程续接一条失败会连带停掉后面全部（`_claim` 里的 `UPSTREAM_NOT_READY`），
+        于是「重跑」必须是一次动作而不是几十次点击——这就是那一次动作。
+
+        两条刻意的规矩：
+          · **已完成的成员一条都不重做**——版本永不覆盖，重跑它只会凭空多一版；
+          · **等上游的仍然回到 waiting**——链条的先后是这一批的意义所在，全部塞成
+            queued 会让它们一拥而上，下游拿不到上游这次的真末帧。
+        """
+        db = db_of(pid)
+        rows = [j for j in await fetch_all(db, Job) if j.batch_id == batch_id]
+        if not rows:
+            raise AppError(
+                ErrorCode.NOT_FOUND,
+                "找不到这一批任务",
+                f"batch_id={batch_id} 下面一条任务都没有（可能已经被清理掉了）。",
+                ["刷新任务框后重试", "或重新执行一次编排"],
+                {"batch_id": batch_id},
+            )
+        targets = [r for r in rows if r.status in ("failed", "canceled")]
+        if not targets:
+            raise AppError(
+                ErrorCode.CONFLICT,
+                "这一批没有需要重跑的任务",
+                "成员里没有失败或已取消的任务；已经完成的不会重做（版本永不覆盖）。",
+                ["想再生成一版请重新执行一次编排", "或在版本轨上挑一版已有的成片"],
+                {"batch_id": batch_id},
+            )
+        retried: list[str] = []
+        for row in targets:
+            params = load_json(row.params_json, {})
+            waits = bool(params.get("wait_for_job_id")) or bool(row.depends_on)
+            self._cancelled.discard(row.id)
+            await self._set(
+                pid,
+                row.id,
+                status="waiting" if waits else "queued",
+                error_json=None,
+                progress=0.0,
+                finished_at=None,
+                started_at=None,
+                wait_reason="等待这一批里上一条任务完成（需要末帧）" if waits else None,
+            )
+            retried.append(row.id)
+        bus.emit(
+            Channel.QUEUE,
+            "queue.batch_retried",
+            {"batch_id": batch_id, "count": len(retried)},
+            project_id=pid,
+        )
+        self.ensure_pump(pid)
+        return {"batch_id": batch_id, "retried": retried, "count": len(retried)}
+
+    async def cancel_batch(self, pid: str, batch_id: str) -> dict[str, Any]:
+        """整批取消：这一批里还没了结的成员一起停。已经出的版本一条都不动。"""
+        db = db_of(pid)
+        rows = [j for j in await fetch_all(db, Job) if j.batch_id == batch_id]
+        if not rows:
+            raise AppError(
+                ErrorCode.NOT_FOUND,
+                "找不到这一批任务",
+                f"batch_id={batch_id} 下面一条任务都没有。",
+                ["刷新任务框后重试"],
+                {"batch_id": batch_id},
+            )
+        cancelled: list[str] = []
+        for row in [r for r in rows if r.status in ACTIVE]:
+            self._cancelled.add(row.id)
+            await self._set(pid, row.id, status="canceled", finished_at=utc_now())
+            cancelled.append(row.id)
+        bus.emit(
+            Channel.QUEUE,
+            "queue.batch_cancelled",
+            {"batch_id": batch_id, "count": len(cancelled)},
+            project_id=pid,
+        )
+        return {"batch_id": batch_id, "cancelled": cancelled, "count": len(cancelled)}
 
     async def pause(self, pid: str) -> dict[str, Any]:
         self._paused.add(pid)

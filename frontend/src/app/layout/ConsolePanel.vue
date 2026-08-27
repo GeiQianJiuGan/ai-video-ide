@@ -28,8 +28,10 @@ import {
   ArrowUp,
   Ban,
   ChevronDown,
+  ChevronRight,
   Eraser,
   ExternalLink,
+  Layers,
   Pause,
   Play,
   RefreshCw,
@@ -41,7 +43,7 @@ import AppBadge from '@/shared/ui/AppBadge.vue'
 import AppButton from '@/shared/ui/AppButton.vue'
 import EmptyState from '@/shared/ui/EmptyState.vue'
 import ErrorPanel from '@/shared/ui/ErrorPanel.vue'
-import { JOB_STATUS_LABEL, type Job } from '@/shared/api/generation'
+import { JOB_STATUS_LABEL, type Job, type JobBatch } from '@/shared/api/generation'
 import type { BusEvent, Channel } from '@/shared/api/ws'
 import { useConsoleStore } from '@/stores/console'
 import { useQueueStore } from '@/stores/queue'
@@ -83,12 +85,22 @@ const TONE: Record<string, 'neutral' | 'accent' | 'ok' | 'warn' | 'fail'> = {
   paused: 'warn',
 }
 
-/** 排序权重：越小越靠上。同权重之间保持后端给的顺序（sort 是稳定的）。 */
-const RANK: Record<string, number> = { running: 0, waiting: 1, queued: 1, failed: 2 }
+/**
+ * 任务框的行来自 store 的 `rows`：**一次编排合并成一条，零散任务各一条，按入队时间倒序**。
+ * 以前这里按状态重排（running → queued → failed → 其余），于是一条跑完就掉到最底下，
+ * 用户以为它丢了；而一次「单线程续接」会刷出几十行长得一模一样的东西。
+ * 排序与合并的口径只留一份（`stores/queue.ts::rows`），这里只管画。
+ */
+const rows = computed(() => queue.rows)
 
-const rows = computed(() =>
-  [...queue.jobs].sort((a, b) => (RANK[a.status] ?? 3) - (RANK[b.status] ?? 3)),
-)
+/** 展开了哪几条合并任务。**默认全收起**：控制台只有两百来像素高。 */
+const opened = ref<Set<string>>(new Set())
+
+function toggle(batchId: string): void {
+  const next = new Set(opened.value)
+  if (!next.delete(batchId)) next.add(batchId)
+  opened.value = next
+}
 
 const breakdownRows = computed(() =>
   [...queue.breakdownTasks].sort((a, b) => {
@@ -129,6 +141,31 @@ function elapsed(job: Job): string {
   if (!job.started_at) return '—'
   const end = job.finished_at ? Date.parse(job.finished_at) : Date.now()
   const sec = Math.max(0, Math.round((end - Date.parse(job.started_at)) / 1000))
+  return sec < 60 ? `${sec}s` : `${Math.floor(sec / 60)}m${sec % 60}s`
+}
+
+/**
+ * 合并任务显示「执行到第 N/M 步」，**不显示百分比进度条**——ComfyUI 不回显进度，
+ * 后端那个 `progress` 是按等待秒数编出来的假爬升，画成进度条就是拿编的数字骗人。
+ * 「12 步里做完了 3 步」这句话是真的。
+ */
+function stepText(batch: JobBatch): string {
+  if (batch.status === 'running') return `执行到第 ${batch.step}/${batch.total} 步`
+  if (batch.status === 'queued') return `已完成 ${batch.settled}/${batch.total} 步，正在排队`
+  if (batch.status === 'failed') return `第 ${batch.step}/${batch.total} 步失败，后面的没有继续`
+  if (batch.status === 'canceled') return `已取消，做到第 ${batch.settled}/${batch.total} 步`
+  return `${batch.total} 步全部完成`
+}
+
+/** 一批用了多久：第一条开始到最后一条结束（没开始过就是 —）。 */
+function batchElapsed(members: Job[]): string {
+  const starts = members.map((m) => m.started_at).filter(Boolean) as string[]
+  if (!starts.length) return '—'
+  const begin = Math.min(...starts.map((s) => Date.parse(s)))
+  const done = members.every((m) => !['queued', 'waiting', 'running'].includes(m.status))
+  const ends = members.map((m) => m.finished_at).filter(Boolean) as string[]
+  const end = done && ends.length ? Math.max(...ends.map((s) => Date.parse(s))) : Date.now()
+  const sec = Math.max(0, Math.round((end - begin) / 1000))
   return sec < 60 ? `${sec}s` : `${Math.floor(sec / 60)}m${sec % 60}s`
 }
 
@@ -188,8 +225,8 @@ function startResize(e: PointerEvent): void {
         @click="panel.tab = 'jobs'"
       >
         任务框
-        <span v-if="queue.jobs.length + queue.breakdownTasks.length" class="tnum text-fg-4">
-          {{ queue.jobs.length + queue.breakdownTasks.length }}
+        <span v-if="rows.length + queue.breakdownTasks.length" class="tnum text-fg-4">
+          {{ rows.length + queue.breakdownTasks.length }}
         </span>
       </button>
       <button
@@ -338,74 +375,192 @@ function startResize(e: PointerEvent): void {
         />
         <table v-if="rows.length" class="w-full border-collapse text-2xs">
           <tbody>
-            <tr v-for="job in rows" :key="job.id" class="hover:bg-base-2">
-              <td class="border-line-1 w-20 border-b px-1.5 py-1 align-top">
-                <AppBadge :tone="TONE[job.status] ?? 'neutral'">
-                  {{ JOB_STATUS_LABEL[job.status] ?? job.status }}
-                </AppBadge>
-              </td>
-              <td class="border-line-1 text-fg-2 min-w-0 border-b py-1 pr-1 align-top">
-                <button class="hover:text-accent truncate text-left" @click="goShot(job.shot_id)">
-                  {{ job.shot_index_no ?? '?' }}. {{ job.shot_title ?? job.shot_id }}
-                </button>
-                <p v-if="job.wait_reason" class="text-st-review">{{ job.wait_reason }}</p>
-                <p v-else-if="job.error" class="text-st-failed" :title="job.error.detail">
-                  {{ job.error.title }}
-                  <span class="text-fg-4">{{ job.error.code }}</span>
-                </p>
-              </td>
-              <td class="border-line-1 text-fg-3 w-16 border-b py-1 pr-1 align-top">
-                {{ job.kind }}
-              </td>
-              <td class="border-line-1 w-24 border-b py-1 pr-1 align-top">
-                <div class="bg-base-3 h-1 w-16">
-                  <div
-                    class="bg-accent h-1"
-                    :style="{ width: `${Math.round(job.progress * 100)}%` }"
-                  />
-                </div>
-                <span class="text-fg-4 tnum">{{ Math.round(job.progress * 100) }}%</span>
-              </td>
-              <td class="border-line-1 text-fg-3 tnum w-14 border-b py-1 pr-1 align-top">
-                {{ elapsed(job) }}
-              </td>
-              <td class="border-line-1 w-16 border-b py-1 pr-1.5 align-top">
-                <div class="flex items-center gap-1">
+            <template v-for="row in rows" :key="row.key">
+              <!-- 一次编排合并成的那一条：进度是「第 N/M 步」，不是编出来的百分比 -->
+              <tr v-if="row.batch" class="hover:bg-base-2">
+                <td class="border-line-1 w-20 border-b px-1.5 py-1 align-top">
+                  <AppBadge :tone="TONE[row.batch.status] ?? 'neutral'">
+                    {{ JOB_STATUS_LABEL[row.batch.status] ?? row.batch.status }}
+                  </AppBadge>
+                </td>
+                <td class="border-line-1 text-fg-2 min-w-0 border-b py-1 pr-1 align-top">
                   <button
-                    v-if="['queued', 'waiting'].includes(job.status)"
-                    class="text-fg-4 hover:text-accent"
-                    title="提到队首（把优先级调到当前最小值之前）"
-                    @click="bump(job)"
+                    class="hover:text-accent flex items-center gap-1 text-left"
+                    :title="
+                      opened.has(row.batch.id) ? '收起这一批的成员' : '展开看这一批里的每一条任务'
+                    "
+                    @click="toggle(row.batch.id)"
                   >
-                    <ArrowUp :size="10" />
+                    <ChevronRight
+                      :size="10"
+                      class="shrink-0 transition-transform"
+                      :class="opened.has(row.batch.id) ? 'rotate-90' : ''"
+                    />
+                    <Layers :size="10" class="text-fg-4 shrink-0" />
+                    <span class="text-fg-1 truncate">{{ row.batch.label }}</span>
                   </button>
+                  <p class="text-fg-4">
+                    {{ stepText(row.batch) }}
+                    <span v-if="row.batch.running_label" class="text-accent">
+                      · 正在做 {{ row.batch.running_label }}
+                    </span>
+                  </p>
+                  <p v-if="row.batch.error" class="text-st-failed" :title="row.batch.error.detail">
+                    {{ row.batch.error.title }}
+                    <span class="text-fg-4">{{ row.batch.error.code }}</span>
+                    <span v-if="row.batch.failed_count > 1" class="text-fg-4">
+                      （共 {{ row.batch.failed_count }} 条失败）
+                    </span>
+                  </p>
+                </td>
+                <td class="border-line-1 text-fg-3 w-16 border-b py-1 pr-1 align-top">
+                  {{ row.batch.kind || '一批' }}
+                </td>
+                <td class="border-line-1 text-fg-3 tnum w-24 border-b py-1 pr-1 align-top">
+                  {{ row.batch.settled }}/{{ row.batch.total }} 步
+                </td>
+                <td class="border-line-1 text-fg-3 tnum w-14 border-b py-1 pr-1 align-top">
+                  {{ batchElapsed(row.members) }}
+                </td>
+                <td class="border-line-1 w-16 border-b py-1 pr-1.5 align-top">
+                  <div class="flex items-center gap-1">
+                    <button
+                      v-if="['queued', 'running'].includes(row.batch.status)"
+                      class="text-fg-4 hover:text-st-failed"
+                      title="整批取消：还没了结的一起停，已经出的版本一条都不动"
+                      @click="queue.cancelBatch(pid, row.batch.id)"
+                    >
+                      <Ban :size="10" />
+                    </button>
+                    <button
+                      v-if="row.batch.retryable"
+                      class="text-fg-4 hover:text-accent"
+                      title="整批重跑：失败与已取消的成员重新排上去（单线程一条失败会连带停掉后面全部）。已完成的一条都不重做"
+                      @click="queue.retryBatch(pid, row.batch.id)"
+                    >
+                      <RotateCcw :size="10" />
+                    </button>
+                  </div>
+                </td>
+              </tr>
+              <!-- 展开后的成员：每一条还是那条真任务，动作与零散任务完全一样 -->
+              <tr
+                v-for="m in row.batch && opened.has(row.batch.id) ? row.members : []"
+                :key="`m-${m.id}`"
+                class="hover:bg-base-2 bg-base-2/40"
+              >
+                <td class="border-line-1 w-20 border-b py-0.5 pr-1.5 pl-4 align-top">
+                  <AppBadge :tone="TONE[m.status] ?? 'neutral'">
+                    {{ JOB_STATUS_LABEL[m.status] ?? m.status }}
+                  </AppBadge>
+                </td>
+                <td class="border-line-1 text-fg-2 min-w-0 border-b py-0.5 pr-1 align-top">
+                  <button class="hover:text-accent truncate text-left" @click="goShot(m.shot_id)">
+                    <span class="text-fg-4 tnum mr-1">{{ m.batch_seq ?? '·' }}.</span>
+                    {{ m.shot_index_no ?? '?' }}. {{ m.shot_title ?? m.shot_id }}
+                  </button>
+                  <p v-if="m.wait_reason" class="text-st-review">{{ m.wait_reason }}</p>
+                  <p v-else-if="m.error" class="text-st-failed" :title="m.error.detail">
+                    {{ m.error.title }} <span class="text-fg-4">{{ m.error.code }}</span>
+                  </p>
+                </td>
+                <td class="border-line-1 text-fg-3 w-16 border-b py-0.5 pr-1 align-top">
+                  {{ m.kind }}
+                </td>
+                <td class="border-line-1 border-b py-0.5 pr-1 align-top" />
+                <td class="border-line-1 text-fg-3 tnum w-14 border-b py-0.5 pr-1 align-top">
+                  {{ elapsed(m) }}
+                </td>
+                <td class="border-line-1 w-16 border-b py-0.5 pr-1.5 align-top">
+                  <div class="flex items-center gap-1">
+                    <button
+                      v-if="['queued', 'waiting', 'running'].includes(m.status)"
+                      class="text-fg-4 hover:text-st-failed"
+                      title="只取消这一条。已经产生的版本不会被删"
+                      @click="queue.cancel(pid, m.id)"
+                    >
+                      <Ban :size="10" />
+                    </button>
+                    <button
+                      v-if="['failed', 'canceled'].includes(m.status)"
+                      class="text-fg-4 hover:text-accent"
+                      title="只重跑这一条；想把整批接着跑完请用合并那一行的重跑"
+                      @click="queue.retry(pid, m.id)"
+                    >
+                      <RotateCcw :size="10" />
+                    </button>
+                  </div>
+                </td>
+              </tr>
+              <!-- 零散任务：单个镜头的生成不属于任何编排，照旧一行一条 -->
+              <tr v-if="!row.batch && row.job" class="hover:bg-base-2">
+                <td class="border-line-1 w-20 border-b px-1.5 py-1 align-top">
+                  <AppBadge :tone="TONE[row.job.status] ?? 'neutral'">
+                    {{ JOB_STATUS_LABEL[row.job.status] ?? row.job.status }}
+                  </AppBadge>
+                </td>
+                <td class="border-line-1 text-fg-2 min-w-0 border-b py-1 pr-1 align-top">
                   <button
-                    v-if="['queued', 'waiting', 'running'].includes(job.status)"
-                    class="text-fg-4 hover:text-st-failed"
-                    title="取消这个任务。已经产生的版本不会被删"
-                    @click="queue.cancel(pid, job.id)"
+                    class="hover:text-accent truncate text-left"
+                    @click="goShot(row.job.shot_id)"
                   >
-                    <Ban :size="10" />
+                    {{ row.job.shot_index_no ?? '?' }}.
+                    {{ row.job.shot_title ?? row.job.shot_id }}
                   </button>
-                  <button
-                    v-if="['failed', 'canceled'].includes(job.status)"
-                    class="text-fg-4 hover:text-accent"
-                    title="沿用原参数重跑；旧版本一条都不会被覆盖"
-                    @click="queue.retry(pid, job.id)"
-                  >
-                    <RotateCcw :size="10" />
-                  </button>
-                  <button
-                    v-if="['failed', 'canceled', 'done'].includes(job.status)"
-                    class="text-fg-4 hover:text-st-failed"
-                    title="删除这条任务记录"
-                    @click="queue.deleteJob(pid, job.id)"
-                  >
-                    <Trash2 :size="10" />
-                  </button>
-                </div>
-              </td>
-            </tr>
+                  <p v-if="row.job.wait_reason" class="text-st-review">{{ row.job.wait_reason }}</p>
+                  <p v-else-if="row.job.error" class="text-st-failed" :title="row.job.error.detail">
+                    {{ row.job.error.title }}
+                    <span class="text-fg-4">{{ row.job.error.code }}</span>
+                  </p>
+                </td>
+                <td class="border-line-1 text-fg-3 w-16 border-b py-1 pr-1 align-top">
+                  {{ row.job.kind }}
+                </td>
+                <td class="border-line-1 text-fg-4 w-24 border-b py-1 pr-1 align-top">
+                  <!-- 刻意留空：ComfyUI 不回显进度，这里没有一个真数字可写 -->
+                  {{ row.job.status === 'running' ? '正在跑' : '' }}
+                </td>
+                <td class="border-line-1 text-fg-3 tnum w-14 border-b py-1 pr-1 align-top">
+                  {{ elapsed(row.job) }}
+                </td>
+                <td class="border-line-1 w-16 border-b py-1 pr-1.5 align-top">
+                  <div class="flex items-center gap-1">
+                    <button
+                      v-if="['queued', 'waiting'].includes(row.job.status)"
+                      class="text-fg-4 hover:text-accent"
+                      title="提到队首（把优先级调到当前最小值之前）"
+                      @click="bump(row.job)"
+                    >
+                      <ArrowUp :size="10" />
+                    </button>
+                    <button
+                      v-if="['queued', 'waiting', 'running'].includes(row.job.status)"
+                      class="text-fg-4 hover:text-st-failed"
+                      title="取消这个任务。已经产生的版本不会被删"
+                      @click="queue.cancel(pid, row.job.id)"
+                    >
+                      <Ban :size="10" />
+                    </button>
+                    <button
+                      v-if="['failed', 'canceled'].includes(row.job.status)"
+                      class="text-fg-4 hover:text-accent"
+                      title="沿用原参数重跑；旧版本一条都不会被覆盖"
+                      @click="queue.retry(pid, row.job.id)"
+                    >
+                      <RotateCcw :size="10" />
+                    </button>
+                    <button
+                      v-if="['failed', 'canceled', 'done'].includes(row.job.status)"
+                      class="text-fg-4 hover:text-st-failed"
+                      title="删除这条任务记录"
+                      @click="queue.deleteJob(pid, row.job.id)"
+                    >
+                      <Trash2 :size="10" />
+                    </button>
+                  </div>
+                </td>
+              </tr>
+            </template>
           </tbody>
         </table>
         <ul v-if="breakdownRows.length" class="divide-line-1 divide-y">

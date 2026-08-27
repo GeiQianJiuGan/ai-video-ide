@@ -122,6 +122,26 @@ class Job(Base):
     version_id: Mapped[str | None] = mapped_column(String(40))
     error_json: Mapped[str | None] = mapped_column(Text)
     params_json: Mapped[str | None] = mapped_column(Text)
+    #: **这条任务属于哪一次编排**（一次「单线程续接」/「并发生成」/「整幕配音」…）。
+    #: 一次编排会一口气入队几十条任务，队列里逐条平铺时用户根本看不出「这是我刚才点的
+    #: 那一下」；有了这一列，界面把它们合并成**一条可展开的任务**，进度是「第 N/M 步」
+    #: 而不是一个假的百分比（ComfyUI 不回显进度，画进度条就是在编）。
+    #:
+    #: 三条刻意的规矩：
+    #:   · **空值是常态**——单个镜头的生成不属于任何编排，界面照旧一行一条；
+    #:   · **不加外键、不建 batch 表**——一次编排没有任何独立于任务的状态，
+    #:     全部能从成员任务算出来（总数 / 走到第几步 / 失败在哪一条），
+    #:     另立一张表只会多一份可能对不上的真相；
+    #:   · **失败了不清空这一列**——重跑整批就是靠它把成员找回来的。
+    batch_id: Mapped[str | None] = mapped_column(String(40), index=True)
+    #: 这一批在界面上叫什么（「单线程续接 · 12 个镜头」）。入队那一刻就定死，
+    #: 事后镜头改名也不改它——它说的是「你当时点的那一下」。
+    batch_label: Mapped[str | None] = mapped_column(String(200))
+    #: 这一批是哪一种编排：sequential / parallel / scene / transition / dub / refine。
+    #: 只用于文案与图标，**业务逻辑一律不按它分支**。
+    batch_kind: Mapped[str | None] = mapped_column(String(30))
+    #: 在这一批里排第几（从 1 起）。单线程续接靠它说「执行到第 3/12 步」。
+    batch_seq: Mapped[int | None] = mapped_column(Integer)
     created_at: Mapped[str] = mapped_column(String(40), nullable=False, default=utc_now)
     started_at: Mapped[str | None] = mapped_column(String(40))
     finished_at: Mapped[str | None] = mapped_column(String(40))

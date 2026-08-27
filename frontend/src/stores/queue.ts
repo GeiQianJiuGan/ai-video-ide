@@ -17,8 +17,20 @@
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import { ApiError } from '@/shared/api/client'
-import { generationApi, type Job, type QueueState } from '@/shared/api/generation'
+import { generationApi, type Job, type JobBatch, type QueueState } from '@/shared/api/generation'
 import { EventClient, type ConnState } from '@/shared/api/ws'
+
+/**
+ * 任务框里的一行：要么是一次编排合并成的那一条（`batch` 有值，`members` 是它的成员），
+ * 要么是一条零散任务（`job` 有值）。两者互斥，界面照 `batch` 有没有值分支。
+ */
+export interface QueueRow {
+  key: string
+  at: string
+  batch: JobBatch | null
+  job: Job | null
+  members: Job[]
+}
 
 export interface BreakdownTask {
   id: string
@@ -45,6 +57,38 @@ export const useQueueStore = defineStore('queue', () => {
   const breakdownTasks = ref<BreakdownTask[]>([])
 
   const jobs = computed(() => state.value?.jobs ?? [])
+  const batches = computed(() => state.value?.batches ?? [])
+  /**
+   * 任务框要显示的行：**一次编排一行，剩下的零散任务各一行**。
+   * 合并那一行的成员不再单独出现在顶层（展开才看得到），否则点一下「单线程续接」
+   * 会在队列里刷出几十行长得一模一样的东西——那正是要修的毛病。
+   *
+   * **排序按入队时间倒序，一条完成了不会跳到最底下**：任务框读的是「我刚才让它做的
+   * 那些事现在怎么样了」，按状态重排会让刚跑完的那条从眼前消失，用户以为它丢了。
+   */
+  const rows = computed<QueueRow[]>(() => {
+    const merged = new Set<string>()
+    for (const b of batches.value) for (const id of b.job_ids) merged.add(id)
+    const out: QueueRow[] = [
+      ...batches.value.map((batch) => ({
+        key: `batch-${batch.id}`,
+        at: batch.created_at,
+        batch,
+        job: null,
+        members: jobs.value.filter((j) => j.batch_id === batch.id),
+      })),
+      ...jobs.value
+        .filter((j) => !merged.has(j.id))
+        .map((job) => ({
+          key: `job-${job.id}`,
+          at: job.created_at,
+          batch: null,
+          job,
+          members: [],
+        })),
+    ]
+    return out.sort((a, b) => String(b.at).localeCompare(String(a.at)))
+  })
   const paused = computed(() => state.value?.paused ?? false)
   const counts = computed(() => state.value?.counts ?? {})
   const active = computed(() => state.value?.active ?? 0)
@@ -181,6 +225,11 @@ export const useQueueStore = defineStore('queue', () => {
     guarded(pid, () => generationApi.deleteJob(pid, jobId))
   const setPriority = (pid: string, jobId: string, priority: number) =>
     guarded(pid, () => generationApi.setPriority(pid, jobId, priority))
+  /** 整批重跑：失败 / 已取消的成员重新排上去，已完成的一条都不重做。 */
+  const retryBatch = (pid: string, batchId: string) =>
+    guarded(pid, () => generationApi.retryBatch(pid, batchId))
+  const cancelBatch = (pid: string, batchId: string) =>
+    guarded(pid, () => generationApi.cancelBatch(pid, batchId))
 
   return {
     state,
@@ -188,6 +237,8 @@ export const useQueueStore = defineStore('queue', () => {
     busy,
     lastError,
     jobs,
+    batches,
+    rows,
     paused,
     counts,
     active,
@@ -210,6 +261,8 @@ export const useQueueStore = defineStore('queue', () => {
     retry,
     deleteJob,
     setPriority,
+    retryBatch,
+    cancelBatch,
     clearError,
   }
 })

@@ -207,6 +207,15 @@ export interface Job {
   shot_index_no: number | null
   shot_title: string | null
   params: Record<string, unknown>
+  /**
+   * 这条任务属于哪一次编排（「单线程续接」/「并发生成」/「整幕配音」…）。
+   * **空是常态**——单个镜头的生成不属于任何一批，任务框里照旧一行一条。
+   */
+  batch_id: string | null
+  batch_label: string | null
+  batch_kind: string | null
+  /** 在这一批里排第几（1 起）。合并那条任务靠它说「执行到第 3/12 步」。 */
+  batch_seq: number | null
   /** 失败现场：结构化错误四要素，直接丢给 ErrorPanel 显示。 */
   error: {
     code: string
@@ -220,12 +229,43 @@ export interface Job {
   finished_at: string | null
 }
 
+/**
+ * 一次编排在任务框里合并成的那一条。**后端纯算出来的**，没有 batch 表——
+ * 总数、走到第几步、失败在哪一条全部由成员任务推出来，前端不再自己拼一遍。
+ */
+export interface JobBatch {
+  id: string
+  /** 入队那一刻定死的名字（「单线程续接 · 12 个镜头」）。 */
+  label: string
+  /** sequential / parallel / scene / transition / dub / refine，只用于文案与图标。 */
+  kind: string
+  total: number
+  counts: Record<string, number>
+  /** 这一批的聚合状态：running / queued / failed / canceled / done。 */
+  status: string
+  /** 已经了结的条数（含失败与取消——它们不会再动了）。 */
+  settled: number
+  /** 正在做第几步（1 起）；跑完之后停在 total 上，不回到 0。 */
+  step: number
+  running_job_id: string | null
+  running_label: string | null
+  error: Job['error']
+  failed_count: number
+  /** 有失败 / 已取消的成员才能整批重跑（已完成的一条都不重做）。 */
+  retryable: boolean
+  job_ids: string[]
+  created_at: string
+  finished_at: string | null
+}
+
 export interface QueueState {
   paused: boolean
   worker_limit: number
   counts: Record<string, number>
   active: number
   jobs: Job[]
+  /** 合并视图：一次编排一条。空数组表示这个工程里只有零散的单条任务。 */
+  batches: JobBatch[]
 }
 
 export interface EnqueueSceneResult {
@@ -291,6 +331,16 @@ export const generationApi = {
     api.post<{ cleared: number }>(`/projects/${pid}/queue/clear-failed`),
   cancel: (pid: string, jobId: string) => api.post<Job>(`/projects/${pid}/jobs/${jobId}/cancel`),
   retry: (pid: string, jobId: string) => api.post<Job>(`/projects/${pid}/jobs/${jobId}/retry`),
+  /** 整批重跑：单线程一条失败会连带停掉后面全部，重跑必须是一次动作。 */
+  retryBatch: (pid: string, batchId: string) =>
+    api.post<{ batch_id: string; retried: string[]; count: number }>(
+      `/projects/${pid}/queue/batches/${batchId}/retry`,
+    ),
+  /** 整批取消：这一批里还没了结的成员一起停。 */
+  cancelBatch: (pid: string, batchId: string) =>
+    api.post<{ batch_id: string; cancelled: string[]; count: number }>(
+      `/projects/${pid}/queue/batches/${batchId}/cancel`,
+    ),
   deleteJob: (pid: string, jobId: string) =>
     api.del<{ deleted: string }>(`/projects/${pid}/jobs/${jobId}`),
   setPriority: (pid: string, jobId: string, priority: number) =>

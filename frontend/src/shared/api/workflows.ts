@@ -140,8 +140,11 @@ export const workflowsApi = {
     api.get<CapabilityMatrix>(pid ? `/projects/${pid}/capabilities` : '/capabilities'),
   import: (_pid: string, body: ImportWorkflowBody) =>
     api.post<Workflow>('/workflows', body),
-  update: (_pid: string, wid: string, patch: { name?: string; notes?: string; status?: string }) =>
-    api.patch<Workflow>(`/workflows/${wid}`, patch),
+  update: (
+    _pid: string,
+    wid: string,
+    patch: { name?: string; notes?: string; capability?: string; status?: string },
+  ) => api.patch<Workflow>(`/workflows/${wid}`, patch),
   bind: (_pid: string, wid: string, bindings: Record<string, string>) =>
     api.put<Workflow>(`/workflows/${wid}/bindings`, { bindings }),
   /** `probe=false` 时不碰 ComfyUI，只查绑定；离线也能把工作流配到「就绪」以外的所有问题查清。 */

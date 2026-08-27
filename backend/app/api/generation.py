@@ -112,6 +112,18 @@ async def clear_failed(pid: str) -> dict[str, Any]:
     return await generation.clear_failed(pid)
 
 
+@router.post("/projects/{pid}/queue/batches/{batch_id}/retry")
+async def retry_batch(pid: str, batch_id: str) -> dict[str, Any]:
+    """整批重跑（单线程续接一条失败会连带停掉后面全部，重跑必须是一次动作）。"""
+    return await generation.retry_batch(pid, batch_id)
+
+
+@router.post("/projects/{pid}/queue/batches/{batch_id}/cancel")
+async def cancel_batch(pid: str, batch_id: str) -> dict[str, Any]:
+    """整批取消：这一批里还没了结的成员一起停，已出的版本一条都不动。"""
+    return await generation.cancel_batch(pid, batch_id)
+
+
 @router.post("/projects/{pid}/jobs/{job_id}/cancel")
 async def cancel_job(pid: str, job_id: str) -> dict[str, Any]:
     return await generation.cancel(pid, job_id)

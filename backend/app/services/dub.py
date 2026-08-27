@@ -24,6 +24,7 @@ from typing import Any
 
 from app.core.config import settings
 from app.core.errors import AppError, ErrorCode
+from app.core.ids import new_id
 from app.generation.providers import audio as audio_providers
 from app.generation.providers import presets, registry
 from app.persistence.models_gen import GenerationVersion
@@ -200,7 +201,10 @@ class DubService:
         if voice_ref_asset_id:
             await self._require_audio_asset(pid, voice_ref_asset_id)
         jobs = []
-        for item in bill["items"]:
+        # 一次批量配音也是「一次编排」：队列里合并成一条可展开的任务（只有一条时不建批次）。
+        batch_id = new_id("job_batch") if len(bill["items"]) > 1 else None
+        label = f"批量配音 · {len(bill['items'])} 个镜头"
+        for i, item in enumerate(bill["items"]):
             job = await generation.enqueue_task(
                 pid,
                 item["shot_id"],
@@ -216,9 +220,14 @@ class DubService:
                     "source_version_id": item["source_version_id"],
                     "preset": bill["preset"],
                 },
+                batch=(
+                    {"id": batch_id, "label": label, "kind": "dub", "seq": i + 1}
+                    if batch_id
+                    else None
+                ),
             )
             jobs.append({"job_id": job["id"], **item})
-        return {"plan": bill, "jobs": jobs, "enqueued": len(jobs)}
+        return {"plan": bill, "jobs": jobs, "enqueued": len(jobs), "batch_id": batch_id}
 
     async def import_audio(
         self, pid: str, shot_id: str, src: str, *, adopt: bool = True

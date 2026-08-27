@@ -45,6 +45,7 @@ import AppPanel from '@/shared/ui/AppPanel.vue'
 import AppThumb from '@/shared/ui/AppThumb.vue'
 import EmptyState from '@/shared/ui/EmptyState.vue'
 import ErrorPanel from '@/shared/ui/ErrorPanel.vue'
+import ConfirmErrorDialog from '@/shared/ui/ConfirmErrorDialog.vue'
 import FeatureHeader from '@/shared/ui/FeatureHeader.vue'
 import { ApiError, confirmFlagOf } from '@/shared/api/client'
 import { fileUrl } from '@/shared/api/files'
@@ -368,6 +369,12 @@ async function confirmDrop(): Promise<void> {
   if (pending.scope === 'scene') await generateScene(true)
   else await generate(pending.skipContext, true)
 }
+
+/** 取消执行：把那条待确认的拦截一起清掉，页面回到刚才什么都没做的样子。 */
+function cancelDrop(): void {
+  pendingDrop.value = null
+  workbench.clearError()
+}
 </script>
 
 <template>
@@ -440,25 +447,19 @@ async function confirmDrop(): Promise<void> {
       </AppButton>
     </div>
     <ErrorPanel
-      v-if="workbench.lastError"
+      v-if="workbench.lastError && !askDrop"
       class="mx-2 mt-2"
       :error="workbench.lastError"
       @dismiss="workbench.clearError()"
-    >
-      <!-- 参考素材装不下不是失败，是一次确认：这颗按钮把刚才那一次原样重来 -->
-      <template #actions>
-        <AppButton
-          v-if="askDrop"
-          size="sm"
-          variant="primary"
-          :disabled="workbench.busy"
-          title="按模型端那份图的槽位顺序喂前几个；少喂了哪几个会记进版本参数，事后查得到"
-          @click="confirmDrop()"
-        >
-          <Sparkles :size="10" />知道会丢素材，继续生成
-        </AppButton>
-      </template>
-    </ErrorPanel>
+    />
+    <!-- 参考素材装不下不是失败，是一次确认：弹窗问一句，两颗按钮都在眼前 -->
+    <ConfirmErrorDialog
+      :error="askDrop ? workbench.lastError : null"
+      :busy="workbench.busy"
+      confirm-label="知道会少喂几个，确认执行"
+      @confirm="confirmDrop()"
+      @cancel="cancelDrop()"
+    />
     <ErrorPanel
       v-if="showSideError"
       class="mx-2 mt-2"

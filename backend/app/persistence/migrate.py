@@ -46,6 +46,7 @@ REVISION_SCHEMA: dict[str, int] = {
     "0016_version_lineage_range": 16,
     "0017_shot_audio_version": 17,
     "0018_shot_dialogue": 18,
+    "0019_job_batch": 19,
 }
 
 

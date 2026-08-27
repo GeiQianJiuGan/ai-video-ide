@@ -20,6 +20,8 @@ PREFIX = {
     "prompt_version": "prm",
     "generation_version": "gen",
     "job": "job",
+    #: 一次编排入队的那一批任务（队列里合并成一条可展开的任务）
+    "job_batch": "jbt",
     "workflow": "wf",
     "asset": "ast",
     "timeline": "tml",

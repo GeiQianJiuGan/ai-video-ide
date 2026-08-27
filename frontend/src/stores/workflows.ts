@@ -151,7 +151,7 @@ export const useWorkflowStore = defineStore('workflows', () => {
   async function update(
     pid: string,
     wid: string,
-    patch: { name?: string; notes?: string; status?: string },
+    patch: { name?: string; notes?: string; capability?: string; status?: string },
   ): Promise<void> {
     await guarded(async () => {
       detail.value = await workflowsApi.update(pid, wid, patch)

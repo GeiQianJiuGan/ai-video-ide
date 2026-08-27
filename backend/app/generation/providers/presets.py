@@ -116,6 +116,58 @@ MARKERS: dict[str, tuple[str, ...]] = {
     **dict.fromkeys(REF_AUDIO_MARKERS, AUDIO_FIELDS),
 }
 
+#: 入口标题 → 人看得懂的说法。**只有这一份**：错误文案、设置页的手动对应表、
+#: 「这一格是干什么的」都从这里取，写两份必然对不上。
+MARKER_LABEL: dict[str, str] = {
+    "AIVS_PROMPT": "画面提示词",
+    "AIVS_NEGATIVE": "负向提示词",
+    "AIVS_FIRST_FRAME": "首帧",
+    "AIVS_LAST_FRAME": "末帧",
+    "AIVS_DURATION": "时长 / 帧数",
+    "AIVS_SEED": "随机种子",
+    "AIVS_SOURCE_VIDEO": "待处理的那一段视频",
+    "AIVS_AUDIO_TEXT": "台词",
+    "AIVS_AUDIO_PROMPT": "声音描述",
+    "AIVS_VOICE_REF": "音色参考",
+    "AIVS_AUDIO_DURATION": "音频时长",
+    "AIVS_AUDIO_SEED": "音频随机种子",
+    **{m: f"参考图 {i + 1}" for i, m in enumerate(REF_MARKERS)},
+    **{m: f"参考视频 {i + 1}" for i, m in enumerate(REF_VIDEO_MARKERS)},
+    **{m: f"参考音频 {i + 1}" for i, m in enumerate(REF_AUDIO_MARKERS)},
+}
+
+#: 入口分组，**按这个顺序显示**。手动对应表一次要摆三十个格子，不分组没人找得到。
+#: 每组是 `(键, 组名, 这一组的标题)`。
+MARKER_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    (
+        "video",
+        "画面入口",
+        (
+            "AIVS_PROMPT",
+            "AIVS_NEGATIVE",
+            "AIVS_FIRST_FRAME",
+            "AIVS_LAST_FRAME",
+            "AIVS_DURATION",
+            "AIVS_SEED",
+        ),
+    ),
+    ("ref_image", "参考图槽位", REF_MARKERS),
+    ("ref_video", "参考视频槽位", REF_VIDEO_MARKERS),
+    ("ref_audio", "参考音频槽位", REF_AUDIO_MARKERS),
+    ("refine", "二次处理（超分 / 插帧）", ("AIVS_SOURCE_VIDEO",)),
+    (
+        "audio",
+        "音源（另一条链，另一份图）",
+        (
+            "AIVS_AUDIO_TEXT",
+            "AIVS_AUDIO_PROMPT",
+            "AIVS_VOICE_REF",
+            "AIVS_AUDIO_DURATION",
+            "AIVS_AUDIO_SEED",
+        ),
+    ),
+)
+
 #: 少了这一个就没法生成（提示词填不进去）；其余入口缺了只是「那一项用图里原来的值」。
 #: 参考素材槽位一个都没有也照样能生成——只是人物形象只能靠首帧带，容易跑偏。
 #: **首帧槽位刻意不是必需的**：没有它时首帧会当参考图 1 送进去（`comfy_preset._refs`），

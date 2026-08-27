@@ -36,6 +36,7 @@ import {
 import AppButton from '@/shared/ui/AppButton.vue'
 import AppBadge from '@/shared/ui/AppBadge.vue'
 import AppDialog from '@/shared/ui/AppDialog.vue'
+import ConfirmErrorDialog from '@/shared/ui/ConfirmErrorDialog.vue'
 import EmptyState from '@/shared/ui/EmptyState.vue'
 import ErrorPanel from '@/shared/ui/ErrorPanel.vue'
 import FeatureHeader from '@/shared/ui/FeatureHeader.vue'
@@ -175,7 +176,12 @@ function previewVersion(card: StoryboardCard, versionId: string): void {
 }
 function openShot(shotId: string): void { void router.push({ name: 'shot', params: { pid: pid.value, sid: shotId } }) }
 async function adoptVersion(versionId: string): Promise<void> { await generationApi.setCurrent(pid.value, versionId).catch(() => {}); await reload() }
-async function reload(): Promise<void> { if (pid.value) await story.loadBoard(pid.value).catch(() => {}) }
+async function reload(): Promise<void> {
+  if (!pid.value) return
+  await story.loadBoard(pid.value).catch(() => {})
+  // 幕列表换了以后旧的锚点可能已经不在了，回落到第一幕，别让锚点条整条不高亮
+  if (!story.lanes.some((l) => l.id === activeLaneId.value)) activeLaneId.value = story.lanes[0]?.id ?? ''
+}
 onMounted(reload)
 watch(pid, reload)
 async function moveWithin(laneId: string, shotId: string, delta: number): Promise<void> {
@@ -274,9 +280,22 @@ async function runTransitions(only?: string[], allowRefDrop = false): Promise<vo
   finally { enqueuing.value = false }
 }
 async function confirmDrop(): Promise<void> {
-  if (pendingDrop.value === 'scene') await generateScene(true)
-  else if (pendingDrop.value === 'shot') await generateShot(true)
-  else if (pendingDrop.value === 'transition') await runTransitions(transitionOnly.value, true)
+  const scope = pendingDrop.value
+  if (scope === 'scene') await generateScene(true)
+  else if (scope === 'shot') await generateShot(true)
+  else if (scope === 'transition') await runTransitions(transitionOnly.value, true)
+}
+
+/**
+ * 确认类拦截（参考图装不下）走弹窗而不是顶上那块方框：它一个任务都没入队，
+ * 要的是一句回答。真失败照旧留在 `ErrorPanel` 里。
+ */
+const dropAsk = computed(() =>
+  pendingDrop.value && confirmFlagOf(enqueueError.value) ? enqueueError.value : null,
+)
+function cancelDrop(): void {
+  pendingDrop.value = null
+  enqueueError.value = null
 }
 
 const ingestModalOpen = ref(false)
@@ -332,6 +351,43 @@ async function clearShotPromptToInherit(): Promise<void> {
   await reload()
 }
 
+/**
+ * 幕锚点：幕一多，泳道就是一条几屏高的长列表，靠滚轮找「第 12 幕」是在碰运气。
+ * 顶上那一排锚点按钮把「跳到某一幕」变成一次点击——它只滚动，不选中、不改数据，
+ * 所以点错了没有代价。滚动容器与每个幕节点各存一个 ref：`scrollIntoView` 在
+ * 嵌套滚动容器里会把外层也一起滚，这里只滚泳道那一层。
+ */
+const laneScroller = ref<HTMLElement | null>(null)
+const laneEls = ref<Record<string, HTMLElement | null>>({})
+const activeLaneId = ref('')
+
+function setLaneEl(id: string, el: unknown): void {
+  laneEls.value[id] = el instanceof HTMLElement ? el : null
+}
+
+function jumpToLane(id: string): void {
+  const box = laneScroller.value
+  const el = laneEls.value[id]
+  if (!box || !el) return
+  // offsetTop 是相对定位父级的，这里滚动容器就是那个父级（relative），所以能直接用
+  box.scrollTo({ top: Math.max(0, el.offsetTop - 8), behavior: 'smooth' })
+  activeLaneId.value = id
+}
+
+/** 滚到哪一幕了：锚点条要跟着高亮，否则长列表里不知道自己在哪。 */
+function onLaneScroll(): void {
+  const box = laneScroller.value
+  if (!box) return
+  let current = ''
+  for (const lane of story.lanes) {
+    const el = laneEls.value[lane.id]
+    if (!el) continue
+    if (el.offsetTop - 12 <= box.scrollTop) current = lane.id
+    else break
+  }
+  activeLaneId.value = current || story.lanes[0]?.id || ''
+}
+
 const sceneToDelete = ref<StoryboardLane | null>(null)
 const deleteSceneDialogOpen = ref(false)
 
@@ -370,18 +426,44 @@ async function confirmDeleteScene(): Promise<void> {
     </div>
     <ErrorPanel v-if="story.lastError" class="mx-2 mt-2" :error="story.lastError" @dismiss="story.clearError()" />
     <ErrorPanel v-if="posterError" class="mx-2 mt-2" :error="posterError" @dismiss="posterError = null" />
-    <ErrorPanel v-if="enqueueError" class="mx-2 mt-2" :error="enqueueError" @dismiss="enqueueError = null"><template #actions><AppButton v-if="pendingDrop" size="sm" variant="primary" :disabled="enqueuing" @click="confirmDrop()"><Sparkles :size="10" />确认并继续</AppButton></template></ErrorPanel>
+    <ErrorPanel v-if="enqueueError && !dropAsk" class="mx-2 mt-2" :error="enqueueError" @dismiss="enqueueError = null" />
     <div v-if="enqueueNote" class="border-line-1 bg-base-2 mx-2 mt-2 border p-1.5 text-2xs"><p class="text-fg-2">{{ enqueueNote }}</p><p v-for="s in skipped" :key="s.shot_id" class="text-st-review">跳过 {{ s.index_no }}：{{ s.error?.title }} — {{ s.error?.detail }}</p><template v-if="transitionRun"><p v-for="made in transitionRun.transitions" :key="made.shot_id" class="text-fg-3">{{ made.reused ? '已有成片，跳过' : '已入队' }}：{{ made.note ?? made.shot_id }}</p><p v-for="s in transitionRun.skipped" :key="s.link_id" class="text-st-review">跳过 {{ s.where }}：{{ s.error ? `${s.error.title} — ${s.error.detail}` : s.reason }}</p><p v-for="b in transitionRun.plan.blocked" :key="b.link_id" class="text-st-review">{{ b.why }} — {{ b.how }}</p></template></div>
     <div class="flex min-h-0 flex-1 gap-2 p-2">
-      <section class="border-line-1 bg-base-1 min-h-0 min-w-0 flex-1 border">
-        <header class="border-line-1 flex items-center gap-2 border-b px-2 py-1.5">
+      <section class="border-line-1 bg-base-1 flex min-h-0 min-w-0 flex-1 flex-col border">
+        <header class="border-line-1 flex shrink-0 items-center gap-2 border-b px-2 py-1.5">
           <span class="text-fg-1 text-xs">Scene 泳道</span>
           <span class="text-fg-4 text-2xs">点击图片预览 · 双击卡片进入 Shot 工作台 · 卡片之间那条线是转场，没配过就是无转场（直接硬切）</span>
           <span v-if="filter !== 'all'" class="text-st-review text-2xs">筛选中：屏幕上相邻的两张卡片不一定真的相邻，所以只在「全部 Shot」下画那条线</span>
         </header>
+        <!-- 幕锚点：只滚动，不选中，也不改任何数据 -->
+        <nav v-if="story.lanes.length > 1" class="border-line-1 flex shrink-0 items-center gap-1 overflow-x-auto border-b px-2 py-1">
+          <span class="text-fg-4 shrink-0 text-2xs">跳到</span>
+          <button
+            v-for="lane in story.lanes"
+            :key="`anchor-${lane.id}`"
+            type="button"
+            class="border-line-1 shrink-0 border px-1.5 py-px text-2xs"
+            :class="activeLaneId === lane.id ? 'border-accent/60 text-fg-1 bg-base-2' : 'text-fg-3 hover:text-fg-1'"
+            :title="`滚动到第 ${lane.index_no} 幕 · ${lane.title}`"
+            @click="jumpToLane(lane.id)"
+          >
+            <span class="tnum">{{ lane.index_no }}</span>
+            <span class="ml-1 inline-block max-w-24 truncate align-bottom">{{ lane.title }}</span>
+          </button>
+        </nav>
         <EmptyState v-if="!story.lanes.length" title="还没有 Shot" body="去剧本页创建镜头，或让 AI 先拆解剧本。" />
-        <div v-else class="min-h-0 space-y-2 overflow-auto p-2">
-          <section v-for="lane in story.lanes" :key="lane.id" class="border-line-1 border bg-base-2">
+        <div
+          v-else
+          ref="laneScroller"
+          class="relative min-h-0 flex-1 space-y-2 overflow-y-auto p-2"
+          @scroll="onLaneScroll()"
+        >
+          <section
+            v-for="lane in story.lanes"
+            :key="lane.id"
+            :ref="(el) => setLaneEl(lane.id, el)"
+            class="border-line-1 border bg-base-2"
+          >
             <header class="border-line-1 flex items-center gap-1.5 border-b px-2 py-1">
               <span class="text-fg-4 tnum text-2xs">{{ lane.index_no }}</span>
               <span class="text-fg-1 min-w-0 flex-1 truncate text-xs">{{ lane.title }}</span>
@@ -630,6 +712,15 @@ async function confirmDeleteScene(): Promise<void> {
       :pid="pid"
       :lane="sceneToConfig"
       @done="reload()"
+    />
+
+    <!-- 参考图装不下：弹窗问一句，不是顶上那块找不到按钮的方框 -->
+    <ConfirmErrorDialog
+      :error="dropAsk"
+      :busy="enqueuing"
+      confirm-label="知道会少喂几张，确认执行"
+      @confirm="confirmDrop()"
+      @cancel="cancelDrop()"
     />
 
     <!-- 一键删除长视频 / 整幕确认对话框 -->

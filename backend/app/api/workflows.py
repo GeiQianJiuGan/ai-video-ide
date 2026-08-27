@@ -43,6 +43,7 @@ class ProjectBindingsBody(BaseModel):
 class UpdateBody(BaseModel):
     name: str | None = None
     notes: str | None = None
+    capability: str | None = None
     status: str | None = Field(default=None, description="只允许改为 disabled / draft")
 
 

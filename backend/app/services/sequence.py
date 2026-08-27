@@ -694,9 +694,20 @@ class SequenceService:
         bill = await self.plan(pid, mode)
         if bill["ref_drops"] and not allow_ref_drop:
             raise over_capacity_error(bill["ref_drops"])
+        # 一次编排 = 队列里一条可展开的任务。批次身份在这里定死（`batch_label` 说的是
+        # 「你刚才点的那一下」），成员任务只是把它抄进自己那四列。
+        batch_id = new_id("job_batch")
         if mode == "sequential":
-            return {**await self._run_sequential(pid, priority, allow_ref_drop), "plan": bill}
-        return {**await self._run_parallel(pid, bill, priority, allow_ref_drop), "plan": bill}
+            return {
+                **await self._run_sequential(pid, priority, allow_ref_drop, batch_id=batch_id),
+                "plan": bill,
+                "batch_id": batch_id,
+            }
+        return {
+            **await self._run_parallel(pid, bill, priority, allow_ref_drop, batch_id=batch_id),
+            "plan": bill,
+            "batch_id": batch_id,
+        }
 
     def _require_mode(self, mode: str) -> None:
         if mode not in MODES:
@@ -713,11 +724,19 @@ class SequenceService:
     # --- 两种模式的执行 ---
 
     async def _run_parallel(
-        self, pid: str, bill: dict[str, Any], priority: int, allow_ref_drop: bool = False
+        self,
+        pid: str,
+        bill: dict[str, Any],
+        priority: int,
+        allow_ref_drop: bool = False,
+        *,
+        batch_id: str | None = None,
     ) -> dict[str, Any]:
         db = db_of(pid)
         queued: list[str] = []
         skipped: list[dict[str, Any]] = []
+        label = f"并发生成 · {bill['total_jobs']} 个任务"
+        seq = 0
         for row in bill["scenes"]:
             shots = [
                 s
@@ -725,6 +744,7 @@ class SequenceService:
                 if s.scene_id == row["scene_id"] and s.kind != "transition"
             ]
             for shot in shots:
+                seq += 1
                 try:
                     job = await generation.enqueue_shot(
                         pid,
@@ -732,6 +752,7 @@ class SequenceService:
                         kind="image2video",
                         priority=priority,
                         allow_ref_drop=allow_ref_drop,
+                        batch=self._batch(batch_id, label, "parallel", seq),
                     )
                     queued.append(job["id"])
                 except AppError as err:
@@ -742,14 +763,37 @@ class SequenceService:
         for edge in bill["links"]:
             if not edge["will_create_transition"]:
                 continue
+            seq += 1
             try:
-                made.append(await self._make_transition(pid, edge, priority, allow_ref_drop))
+                made.append(
+                    await self._make_transition(
+                        pid,
+                        edge,
+                        priority,
+                        allow_ref_drop,
+                        batch=self._batch(batch_id, label, "parallel", seq),
+                    )
+                )
             except AppError as err:
                 skipped.append({"link": edge, "error": err.to_dict()})
         return {"mode": "parallel", "queued": queued, "transitions": made, "skipped": skipped}
 
+    @staticmethod
+    def _batch(
+        batch_id: str | None, label: str, kind: str, seq: int | None
+    ) -> dict[str, Any] | None:
+        """把批次身份摊成 `enqueue_*` 收的那个 dict。没有批次就是 None（照旧一行一条）。"""
+        if not batch_id:
+            return None
+        return {"id": batch_id, "label": label, "kind": kind, "seq": seq}
+
     async def _run_sequential(
-        self, pid: str, priority: int, allow_ref_drop: bool = False
+        self,
+        pid: str,
+        priority: int,
+        allow_ref_drop: bool = False,
+        *,
+        batch_id: str | None = None,
     ) -> dict[str, Any]:
         """把全片的镜头串成一条链再入队。链头要真首帧，其余等上游末帧。"""
         db = db_of(pid)
@@ -773,6 +817,7 @@ class SequenceService:
         queued: list[str] = []
         skipped: list[dict[str, Any]] = []
         previous_job_id: str | None = None
+        label = f"单线程续接 · {len(chain)} 个镜头"
         for i, shot in enumerate(chain):
             try:
                 # 链头必须自己有首帧，所以照常过门槛；后面的首帧要等上游出片，
@@ -785,6 +830,7 @@ class SequenceService:
                     check_context=i == 0,
                     allow_ref_drop=allow_ref_drop,
                     wait_for_job_id=previous_job_id,
+                    batch=self._batch(batch_id, label, "sequential", i + 1),
                 )
                 queued.append(job["id"])
                 previous_job_id = job["id"]
@@ -987,6 +1033,15 @@ class SequenceService:
         made: list[dict[str, Any]] = []
         skipped: list[dict[str, Any]] = []
         shot_links = {r.id: r for r in await fetch_all(db, ShotLink)}
+        todo = [
+            i
+            for i in bill["items"]
+            if i["will_generate"] and (not wanted or i["link_id"] in wanted)
+        ]
+        # 只补一条时不建批次：队列里为一条任务画一个可展开的壳只是多一层。
+        batch_id = new_id("job_batch") if len(todo) > 1 else None
+        label = f"补转场 · {len(todo)} 段"
+        seq = 0
         for item in bill["items"]:
             if wanted and item["link_id"] not in wanted:
                 continue
@@ -999,11 +1054,17 @@ class SequenceService:
                     }
                 )
                 continue
+            seq += 1
+            batch = self._batch(batch_id, label, "transition", seq)
             try:
                 if item["level"] == "shot":
                     made.append(
                         await self._make_shot_transition(
-                            pid, shot_links[item["link_id"]], priority, allow_ref_drop
+                            pid,
+                            shot_links[item["link_id"]],
+                            priority,
+                            allow_ref_drop,
+                            batch=batch,
                         )
                     )
                 else:
@@ -1012,7 +1073,9 @@ class SequenceService:
                         "to_scene_id": item["to_scene_id"],
                         "duration": item["duration"],
                     }
-                    out = await self._make_transition(pid, edge, priority, allow_ref_drop)
+                    out = await self._make_transition(
+                        pid, edge, priority, allow_ref_drop, batch=batch
+                    )
                     made.append({**out, "level": "scene", "link_id": item["link_id"]})
             except AppError as err:
                 skipped.append(
@@ -1026,6 +1089,7 @@ class SequenceService:
             "transitions": made,
             "queued": [m["job_id"] for m in made if m.get("job_id")],
             "skipped": skipped,
+            "batch_id": batch_id,
             "plan": bill,
         }
 
@@ -1077,7 +1141,13 @@ class SequenceService:
         )
 
     async def _make_transition(
-        self, pid: str, edge: dict[str, Any], priority: int, allow_ref_drop: bool = False
+        self,
+        pid: str,
+        edge: dict[str, Any],
+        priority: int,
+        allow_ref_drop: bool = False,
+        *,
+        batch: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """造一个 `kind="transition"` 的镜头并入队。它属于上一幕、排在最后。
 
@@ -1170,11 +1240,18 @@ class SequenceService:
             allow_ref_drop=allow_ref_drop,
             last_frame_asset_id=last_frame,
             extra={"transition": True},
+            batch=batch,
         )
         return {"link": edge, "shot_id": shot_id, "job_id": job["id"], "reused": False}
 
     async def _make_shot_transition(
-        self, pid: str, link: ShotLink, priority: int, allow_ref_drop: bool = False
+        self,
+        pid: str,
+        link: ShotLink,
+        priority: int,
+        allow_ref_drop: bool = False,
+        *,
+        batch: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """造一段**镜头之间**的转场并入队。它属于 from_shot 所在的那一幕、紧跟在 from_shot 之后。
 
@@ -1249,6 +1326,7 @@ class SequenceService:
             allow_ref_drop=allow_ref_drop,
             last_frame_asset_id=last_frame,
             extra={"transition": True},
+            batch=batch,
         )
         return {
             "level": "shot",

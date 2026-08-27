@@ -156,6 +156,114 @@ def auto_bindings(
             bindings["reference_image"] = titled["AIVS_FIRST_FRAME"]
     elif ref_titled:
         bindings.setdefault("reference_image_slots", [target for _, target in sorted(ref_titled)])
+
+    if existing is not None:
+        return bindings
+
+    # 智能启发式回退：当没有显式提供绑定且节点标题没有标注 AIVS_* 前缀时，通过 class_type / 字段名启发式推测
+    prompt_candidates: list[str] = []
+    neg_prompt_candidates: list[str] = []
+    load_images: list[tuple[str, str, str, str]] = []
+    samplers: list[tuple[str, dict[str, Any]]] = []
+    latents: list[tuple[str, dict[str, Any]]] = []
+
+    for node_id, node in graph.items():
+        class_type = str(node.get("class_type") or "")
+        title = str((node.get("_meta") or {}).get("title") or "").strip()
+        inputs = node.get("inputs") or {}
+        upper_title = title.upper()
+
+        if class_type in (
+            "CLIPTextEncode",
+            "CLIPTextEncodeSDXL",
+            "ShowText",
+            "PrimitiveNode",
+            "CR Prompt Text",
+            "Text Multiline",
+            "Text",
+        ) or "text" in inputs:
+            if "text" in inputs and not isinstance(inputs["text"], list):
+                target = f"{node_id}.text"
+                if any(w in upper_title for w in ("NEG", "负", "NEGATIVE", "反向")):
+                    neg_prompt_candidates.append(target)
+                else:
+                    prompt_candidates.append(target)
+            elif "prompt" in inputs and not isinstance(inputs["prompt"], list):
+                target = f"{node_id}.prompt"
+                if any(w in upper_title for w in ("NEG", "负", "NEGATIVE", "反向")):
+                    neg_prompt_candidates.append(target)
+                else:
+                    prompt_candidates.append(target)
+
+        if "LoadImage" in class_type or "image" in inputs:
+            for f in ("image", "image_path", "file_path"):
+                if f in inputs and not isinstance(inputs[f], list):
+                    load_images.append((node_id, f, upper_title, f"{node_id}.{f}"))
+                    break
+
+        if "Sampler" in class_type or "KSampler" in class_type:
+            samplers.append((node_id, inputs))
+
+        if any(w in class_type for w in ("Latent", "EmptyLatentImage", "EmptyHunyuan", "EmptyWan", "EmptyLTXV")):
+            latents.append((node_id, inputs))
+
+    if "prompt" not in bindings and prompt_candidates:
+        bindings["prompt"] = prompt_candidates[0]
+        if len(prompt_candidates) > 1 and "negative_prompt" not in bindings and not neg_prompt_candidates:
+            bindings["negative_prompt"] = prompt_candidates[1]
+
+    if "negative_prompt" not in bindings and neg_prompt_candidates:
+        bindings["negative_prompt"] = neg_prompt_candidates[0]
+
+    if load_images:
+        first_img = next((tgt for _, _, t, tgt in load_images if any(w in t for w in ("FIRST", "首", "START", "起始"))), None)
+        last_img = next((tgt for _, _, t, tgt in load_images if any(w in t for w in ("LAST", "末", "尾", "END", "结束"))), None)
+        ref_img = next((tgt for _, _, t, tgt in load_images if any(w in t for w in ("REF", "参考"))), None)
+
+        if capability == "first_last_frame":
+            if "first_frame" not in bindings:
+                bindings["first_frame"] = first_img or load_images[0][3]
+            if "last_frame" not in bindings:
+                if last_img:
+                    bindings["last_frame"] = last_img
+                elif len(load_images) > 1:
+                    bindings["last_frame"] = load_images[1][3]
+        elif capability == "image2video":
+            tgt = first_img or load_images[0][3]
+            if "first_frame" not in bindings:
+                bindings["first_frame"] = tgt
+            if "reference_image" not in bindings:
+                bindings["reference_image"] = tgt
+            if "source_image" not in bindings:
+                bindings["source_image"] = tgt
+        elif capability == "text2image":
+            if "reference_image" not in bindings:
+                bindings["reference_image"] = ref_img or load_images[0][3]
+        elif capability == "upscale":
+            if "source_image" not in bindings:
+                bindings["source_image"] = first_img or load_images[0][3]
+
+    if samplers:
+        s_id, s_inputs = samplers[0]
+        if "seed" not in bindings and "seed" in s_inputs and not isinstance(s_inputs["seed"], list):
+            bindings["seed"] = f"{s_id}.seed"
+        elif "seed" not in bindings and "noise_seed" in s_inputs and not isinstance(s_inputs["noise_seed"], list):
+            bindings["seed"] = f"{s_id}.noise_seed"
+        if "steps" not in bindings and "steps" in s_inputs and not isinstance(s_inputs["steps"], list):
+            bindings["steps"] = f"{s_id}.steps"
+
+    if latents:
+        l_id, l_inputs = latents[0]
+        if "width" not in bindings and "width" in l_inputs and not isinstance(l_inputs["width"], list):
+            bindings["width"] = f"{l_id}.width"
+        if "height" not in bindings and "height" in l_inputs and not isinstance(l_inputs["height"], list):
+            bindings["height"] = f"{l_id}.height"
+        if "duration" not in bindings:
+            for f in ("length", "num_frames", "frames", "duration"):
+                if f in l_inputs and not isinstance(l_inputs[f], list):
+                    bindings["duration"] = f"{l_id}.{f}"
+                    break
+
     return bindings
 
 
@@ -534,7 +642,7 @@ class WorkflowService:
         async with db.write() as session:
             row = await session.get(GlobalWorkflow, wid)
             assert row is not None
-            for key in ("name", "notes"):
+            for key in ("name", "notes", "capability"):
                 if key in patch:
                     setattr(row, key, patch[key])
             if patch.get("status") in ("disabled", "draft"):
