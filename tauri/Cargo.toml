@@ -2,6 +2,7 @@
 name = "aivs-desktop"
 version = "0.1.0"
 description = "AI Video Studio 桌面壳（托管 Python 后端 sidecar）"
+license = "MIT"
 edition = "2021"
 rust-version = "1.77"
 publish = false

@@ -171,6 +171,31 @@ token}` 写进 `.runtime/endpoint.json` → 壳校验后用 `window.__AIVS_ENDPO
 列，**都不是外键，运行期不解析**。库关掉、目录改名，工程照常打开与列资产（`tests/test_adopt.py`
 盯的就是这条）。之后库改了不回流工程，工程改了也不影响库，UI 必须把这句话写出来。
 
+**跨环境搬迁 = 工程包 / 场景包**（`services/packages.py` + `api/packages.py`，前端
+`features/packages/`）：一个包是一个 zip（`.aivspkg`，`manifest.kind = "aivs-package"`），
+两种粒度——整个工程（`project.db` 的 `backup()` 快照 + `assets/`，勾了才带 `generations/`）
+与单独一幕（行级快照，能导进**任意**已打开的工程）。它照 `services/adopt.py` 的规矩办：
+**先账单再动手**，落库全部转调已有写方法，不新增写路径、不加迁移、不加列
+（出处只进 `Asset.meta_json`，`ids.PREFIX` 只多一项 `"package": "pkg"`）。五条不许绕的：
+
+- **包里不带预设图，只带一份环境要求清单**（`manifest.env`）。图属于用户那台 ComfyUI，
+  本工具从来不维护它（见上面的 provider 适配层那段），带走一份只会在目标机器上和那边真正
+  装了什么打架。清单里 `presets[].markers` 是从导出机上那份预设数出来的**入口标题**，
+  于是目标机器没有同名预设时，至少能说出「要一份标了这几个入口的图」。
+- **密钥与服务地址一律不进包**：`settings.json` 不是包成员，manifest 里也没有任何
+  `api_key` / `base_url`。理由和「API key 永不回明文」是同一条——包会被随手转发。
+- **`cache/` / `proxies/` / `.runtime/` 永不进包**（可再生），成片默认不带、可勾选。
+- **导入时必须重新生成 project id**（`new_id("project")`，同时改 `project` 表那一行）：
+  `ProjectService._open` 是按 pid 索引的，同机导入一份副本后两个目录同 id 会互相顶掉。
+  别「顺手」把它改回保留原 id。
+- **`inspect` 与导入那道门必须读同一个数**：schema 比对读的是顶层
+  `manifest["schema_version"]`（不是 `env.schema_version`），否则 inspect 说「吃得下」、
+  到导入才 `SCHEMA_MISMATCH`。包内成员越界（绝对路径 / 盘符 / `..` / symlink）在写第一个字节
+  之前全部查完，报 `VALIDATION_ERROR`「包内路径越界」。
+
+`plan` 的 `omitted[]`（跨幕 `SceneLink`、幕外 `prev_shot_id`、job 历史、时间线、`DirectorTurn`）
+前端**原样显示**——跳过不是失败，但必须说出来。
+
 **文件服务与目录浏览**：`api/files.py` 的 `GET /projects/{pid}/files/{rel}` 与
 `GET /library/files/{rel}` 是所有缩略图 / 预览的唯一来源（`<img src>` 带不了自定义头，所以只有它
 们接受 `?token=`）；越界一律 `VALIDATION_ERROR`「路径越界」。`api/fs.py` + `services/fsbrowse.py`

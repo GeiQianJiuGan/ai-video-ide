@@ -2,6 +2,9 @@
 name = "aivs-backend"
 version = "0.1.0"
 description = "AI Video Studio backend — 视频工程与编排器"
+# 许可全文在仓库根的 LICENSE（这里不写 license-files：那是 setuptools>=77 才认的
+# PEP 639 字段，且不接受 `..` 跑到 backend/ 外面去）。
+license = { text = "MIT" }
 requires-python = ">=3.11"
 dependencies = [
   "fastapi>=0.115.0",

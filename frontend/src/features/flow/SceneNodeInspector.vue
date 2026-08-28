@@ -20,7 +20,7 @@
  *      没有图的照旧列出来并给占位——没有角色表的形象能挂，只是喂不出参考图。
  */
 import { computed, ref, watch } from 'vue'
-import { Check, MapPin, Star, Type, Users } from '@lucide/vue'
+import { Check, MapPin, PackagePlus, Star, Type, Users } from '@lucide/vue'
 import AppBadge from '@/shared/ui/AppBadge.vue'
 import AppButton from '@/shared/ui/AppButton.vue'
 import AppPanel from '@/shared/ui/AppPanel.vue'
@@ -28,6 +28,7 @@ import AppThumb from '@/shared/ui/AppThumb.vue'
 import EmptyState from '@/shared/ui/EmptyState.vue'
 import { fileUrl } from '@/shared/api/files'
 import type { FlowNode } from '@/shared/api/sequence'
+import ExportPackageDialog from '@/features/packages/ExportPackageDialog.vue'
 import { useFlowStore } from '@/stores/flow'
 
 const props = defineProps<{ pid: string; node: FlowNode }>()
@@ -36,6 +37,8 @@ const emit = defineEmits<{ open: [] }>()
 
 const flow = useFlowStore()
 const prompt = ref(props.node.prompt ?? '')
+/** 「导出这一幕」：把这一幕的设定搬到另一个工程去（人物 / 地点 / 道具 / 镜头结构 + 素材）。 */
+const exporting = ref(false)
 /** 列表里正在预览的那一段。一次只开一个播放器，十几段视频同时解码没必要。 */
 const previewId = ref('')
 
@@ -49,6 +52,8 @@ watch(
   () => props.node.id,
   () => {
     previewId.value = ''
+    // 换了一幕就关掉导出弹窗：里面那份账单说的是上一幕，留着只会导错。
+    exporting.value = false
   },
 )
 
@@ -114,6 +119,14 @@ async function adopt(versionId: string): Promise<void> {
 <template>
   <AppPanel :title="`第 ${node.index_no} 幕`" class="min-h-0 flex-1">
     <template #actions>
+      <AppButton
+        size="sm"
+        variant="ghost"
+        title="把这一幕的设定导出成一个包，搬到另一个工程去"
+        @click="exporting = true"
+      >
+        <PackagePlus :size="10" />导出这一幕
+      </AppButton>
       <AppButton
         size="sm"
         variant="ghost"
@@ -281,7 +294,9 @@ async function adopt(versionId: string): Promise<void> {
                 :class="v.is_adopted ? 'border-accent/60' : 'border-line-1'"
               >
                 <div class="flex items-center gap-1">
-                  <span class="text-fg-2 min-w-0 flex-1 truncate text-2xs">v{{ v.version_no }}</span>
+                  <span class="text-fg-2 min-w-0 flex-1 truncate text-2xs"
+                    >v{{ v.version_no }}</span
+                  >
                   <span class="text-fg-4 tnum text-2xs">{{ fmt(v.duration) }}</span>
                 </div>
                 <div class="mt-0.5 flex flex-wrap items-center gap-1">
@@ -334,5 +349,7 @@ async function adopt(versionId: string): Promise<void> {
         <p v-if="flow.videos" class="text-fg-4 mt-1 text-2xs">{{ flow.videos.note }}</p>
       </section>
     </div>
+
+    <ExportPackageDialog v-model:open="exporting" :pid="pid" :sid="node.id" />
   </AppPanel>
 </template>

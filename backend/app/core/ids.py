@@ -44,6 +44,9 @@ PREFIX = {
     #: 镜头之间的衔接（同一幕内相邻两镜之间要不要补一段转场）
     "shot_link": "slk",
     "director_turn": "dtn",
+    # --- 导入导出包（工程 / 一幕的设定，manifest 里的 package_id）---
+    #: 只出现在包清单里，不是任何一张表的主键——导入时用它给资产的 meta 记出处。
+    "package": "pkg",
     # --- 应用级素材库（独立目录 + library.db，不属于任何工程） ---
     "library": "lib",
     "library_asset": "las",

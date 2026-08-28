@@ -26,6 +26,7 @@ from app.api import generation as generation_api
 from app.api import ingest as ingest_api
 from app.api import library as library_api
 from app.api import overview as overview_api
+from app.api import packages as packages_api
 from app.api import projects as projects_api
 from app.api import refine as refine_api
 from app.api import sequence as sequence_api
@@ -148,6 +149,7 @@ def create_app() -> FastAPI:
     app.include_router(director_api.router, prefix=API_PREFIX)
     app.include_router(timeline_api.router, prefix=API_PREFIX)
     app.include_router(overview_api.router, prefix=API_PREFIX)
+    app.include_router(packages_api.router, prefix=API_PREFIX)
     app.include_router(ws.router, prefix=API_PREFIX)
     return app
 

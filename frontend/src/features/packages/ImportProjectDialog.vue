@@ -1,0 +1,182 @@
+<script setup lang="ts">
+/**
+ * 导入工程包：还原成一个新工程目录并打开它。
+ *
+ * 两条不许绕的规矩：
+ *   1. **账单没看过不给按导入**（照 adopt 的老规矩）——先 `/packages/inspect` 把
+ *      「这个包要什么环境、本机缺什么」摊开，缺哪份预设要在导入之前就看见；
+ *   2. **绝不覆盖用户文件**——目标目录里已经有工程时后端报 `CONFLICT`，这里照原样显示。
+ *
+ * 导入的副本会拿到一个**新的工程 id**：注册表按 pid 索引，同机导入一份副本后
+ * 两个目录同 id 会互相顶掉。
+ *
+ * 包文件路径是手输的：后端的目录浏览器只列目录、不返回文件内容（`/fs/dirs`），
+ * 所以「浏览…」只能把包所在的**文件夹**填进来，文件名还得自己补。
+ */
+import { computed, ref, watch } from 'vue'
+import { FolderSearch, PackageOpen, ScanSearch } from '@lucide/vue'
+import AppBadge from '@/shared/ui/AppBadge.vue'
+import AppButton from '@/shared/ui/AppButton.vue'
+import AppDialog from '@/shared/ui/AppDialog.vue'
+import DirPicker from '@/shared/ui/DirPicker.vue'
+import ErrorPanel from '@/shared/ui/ErrorPanel.vue'
+import PackageBillPanel from './PackageBillPanel.vue'
+import { humanBytes } from '@/shared/api/library'
+import { packagesApi, type PackageInfo } from '@/shared/api/packages'
+import type { ApiError } from '@/shared/api/client'
+
+const props = defineProps<{ open: boolean }>()
+const emit = defineEmits<{ 'update:open': [boolean]; done: [string] }>()
+
+const path = ref('')
+const dir = ref('')
+const info = ref<PackageInfo | null>(null)
+const busy = ref(false)
+const error = ref<ApiError | null>(null)
+const picking = ref<'package' | 'target' | null>(null)
+
+/** 看过的是**这一个**包吗：换了路径就得重新看一遍，否则按下的是上一份账单。 */
+const seen = ref('')
+const billSeen = computed(() => info.value !== null && seen.value === path.value.trim())
+
+async function inspect(): Promise<void> {
+  busy.value = true
+  error.value = null
+  info.value = null
+  try {
+    info.value = await packagesApi.inspect(path.value.trim())
+    seen.value = path.value.trim()
+  } catch (e) {
+    error.value = e as ApiError
+  } finally {
+    busy.value = false
+  }
+}
+
+async function run(): Promise<void> {
+  busy.value = true
+  error.value = null
+  try {
+    const res = await packagesApi.importProject(path.value.trim(), dir.value.trim())
+    emit('done', res.project.dir)
+  } catch (e) {
+    error.value = e as ApiError
+  } finally {
+    busy.value = false
+  }
+}
+
+function picked(p: string): void {
+  if (picking.value === 'package') path.value = `${p}/`
+  else if (picking.value === 'target') dir.value = p
+  picking.value = null
+}
+
+watch(
+  () => props.open,
+  (now) => {
+    if (!now) return
+    info.value = null
+    seen.value = ''
+    error.value = null
+  },
+)
+
+const wrongScope = computed(() => info.value !== null && info.value.scope !== 'project')
+const canImport = computed(
+  () => billSeen.value && !wrongScope.value && !busy.value && dir.value.trim() !== '',
+)
+</script>
+
+<template>
+  <AppDialog
+    :open="open"
+    title="导入工程包"
+    subtitle="先看清单，再还原成一个新工程"
+    size="lg"
+    @update:open="emit('update:open', $event)"
+  >
+    <div class="space-y-2 p-3">
+      <label class="block">
+        <span class="text-fg-3 text-2xs">包文件的绝对路径（.aivspkg）</span>
+        <div class="mt-0.5 flex items-center gap-1.5">
+          <input
+            v-model="path"
+            type="text"
+            placeholder="E:/包/我的片子.aivspkg"
+            class="border-line-1 bg-base-2 text-fg-1 placeholder:text-fg-4 focus:border-accent/60 h-row min-w-0 flex-1 rounded-sm border px-2 font-mono text-xs outline-none"
+          />
+          <AppButton title="选到包所在的文件夹，文件名自己补" @click="picking = 'package'">
+            <FolderSearch :size="12" />浏览…
+          </AppButton>
+          <AppButton variant="primary" :disabled="busy || path.trim() === ''" @click="inspect()">
+            <ScanSearch :size="12" />看一眼
+          </AppButton>
+        </div>
+      </label>
+
+      <div v-if="info" class="border-line-1 bg-base-2 border p-2 text-2xs">
+        <p class="text-fg-1 flex items-center gap-1.5">
+          {{ info.project.name || '未命名' }}
+          <AppBadge :tone="info.scope === 'project' ? 'accent' : 'warn'">
+            {{ info.scope === 'project' ? '工程包' : `${info.scope} 包` }}
+          </AppBadge>
+          <AppBadge v-if="info.include_generated" tone="ok">带成片</AppBadge>
+        </p>
+        <p class="text-fg-4 mt-0.5">
+          {{ humanBytes(info.bytes) }} ·
+          <span v-for="(value, key) in info.counts" :key="key" class="mr-2">
+            {{ key }} <span class="tnum text-fg-2">{{ value }}</span>
+          </span>
+        </p>
+        <p class="text-fg-4">
+          由 {{ info.app || '未知版本' }} 于 {{ info.created_at || '未知时间' }} 导出
+        </p>
+      </div>
+
+      <p v-if="wrongScope" class="text-st-failed text-2xs">
+        这是一个「一幕的设定」包，不能还原成工程——请先打开一个工程，再用流程图上的「导入一幕」。
+      </p>
+
+      <label v-if="billSeen && !wrongScope" class="block">
+        <span class="text-fg-3 text-2xs">新工程放在哪个目录（空目录；已有工程会被拒绝）</span>
+        <div class="mt-0.5 flex items-center gap-1.5">
+          <input
+            v-model="dir"
+            type="text"
+            placeholder="E:/aivs/还原的片子"
+            class="border-line-1 bg-base-2 text-fg-1 placeholder:text-fg-4 focus:border-accent/60 h-row min-w-0 flex-1 rounded-sm border px-2 font-mono text-xs outline-none"
+          />
+          <AppButton title="浏览本机文件夹" @click="picking = 'target'">
+            <FolderSearch :size="12" />浏览…
+          </AppButton>
+        </div>
+      </label>
+
+      <PackageBillPanel v-if="info" :omitted="info.omitted" :env-check="info.env_check" />
+    </div>
+
+    <ErrorPanel v-if="error" class="mx-3 mb-3" :error="error" @dismiss="error = null" />
+
+    <template #footer>
+      <p class="text-fg-4 min-w-0 flex-1 text-2xs">
+        {{
+          billSeen ? '导入的副本会拿到一个新的工程 id，原工程不受影响。' : '先「看一眼」才能导入。'
+        }}
+      </p>
+      <AppButton variant="ghost" @click="emit('update:open', false)">取消</AppButton>
+      <AppButton variant="primary" :disabled="!canImport" @click="run()">
+        <PackageOpen :size="12" />{{ busy ? '还原中…' : '导入并打开' }}
+      </AppButton>
+    </template>
+  </AppDialog>
+
+  <DirPicker
+    :open="picking !== null"
+    :start="picking === 'package' ? path : dir"
+    :title="picking === 'package' ? '选到包所在的文件夹' : '选择新工程放在哪个文件夹'"
+    :confirm-label="picking === 'package' ? '就是这个文件夹' : '还原到这里'"
+    @update:open="picking = $event ? picking : null"
+    @pick="picked"
+  />
+</template>

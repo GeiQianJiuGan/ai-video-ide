@@ -14,7 +14,15 @@
  */
 import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { FolderOpen, FolderPlus, FolderSearch, RefreshCw, Trash2 } from '@lucide/vue'
+import {
+  FolderOpen,
+  FolderPlus,
+  FolderSearch,
+  PackageOpen,
+  PackagePlus,
+  RefreshCw,
+  Trash2,
+} from '@lucide/vue'
 import AppPanel from '@/shared/ui/AppPanel.vue'
 import AppButton from '@/shared/ui/AppButton.vue'
 import AppBadge from '@/shared/ui/AppBadge.vue'
@@ -22,6 +30,8 @@ import AppDialog from '@/shared/ui/AppDialog.vue'
 import EmptyState from '@/shared/ui/EmptyState.vue'
 import ErrorPanel from '@/shared/ui/ErrorPanel.vue'
 import DirPicker from '@/shared/ui/DirPicker.vue'
+import ExportPackageDialog from '@/features/packages/ExportPackageDialog.vue'
+import ImportProjectDialog from '@/features/packages/ImportProjectDialog.vue'
 import type { DurationUnit } from '@/shared/api/projects'
 import { useProjectStore } from '@/stores/project'
 import { useSystemStore } from '@/stores/system'
@@ -34,6 +44,15 @@ const connected = computed(() => sys.health !== null)
 /** 弹窗开关。两个动作互斥，同时开两张表单没有意义。 */
 const creating = ref(false)
 const opening = ref(false)
+
+/**
+ * 跨机搬迁：导出当前打开的工程成一个 `.aivspkg`，或把一个包还原成新工程。
+ *
+ * 「导出当前工程」要求先打开一个——导出的是**这个**工程的库与素材，
+ * 没打开的时候连问谁都不知道，所以按钮 disabled 并在 tooltip 里说原因。
+ */
+const exporting = ref(false)
+const importing = ref(false)
 
 const form = ref({
   dir: '',
@@ -121,6 +140,15 @@ function startOpen(): void {
   opening.value = true
 }
 
+/**
+ * 包已经还原好了，后端那边这个工程也已经打开。这里再走一次 `open(dir)`：
+ * 前端的 store 需要持有那份 Project（`current` + 最近列表），而 open 是幂等的。
+ */
+async function imported(dir: string): Promise<void> {
+  importing.value = false
+  await open(dir)
+}
+
 function fmtTime(iso: string): string {
   const d = new Date(iso)
   return Number.isNaN(d.getTime()) ? iso : d.toLocaleString()
@@ -144,6 +172,25 @@ onMounted(() => void proj.refreshRecent())
         </AppButton>
         <AppButton :disabled="!connected" @click="startOpen()">
           <FolderOpen :size="12" />打开工程
+        </AppButton>
+      </div>
+
+      <!-- 跨机搬迁：导出的是「当前打开的那个」工程，没打开时无从下手，所以禁用并说原因 -->
+      <div class="border-line-1 mt-3 flex items-center gap-2 border-t pt-2">
+        <p class="text-fg-4 min-w-0 flex-1 text-2xs">
+          换机器继续：把工程导出成一个 <code class="text-fg-3">.aivspkg</code> 包，在另一台机器上
+          导入。包里带工程库与素材，密钥与服务地址一律不进包。
+        </p>
+        <AppButton
+          size="sm"
+          :disabled="!connected || !proj.current"
+          :title="proj.current ? '导出当前打开的工程' : '先打开一个工程，导出的是那个工程'"
+          @click="exporting = true"
+        >
+          <PackagePlus :size="10" />导出当前工程
+        </AppButton>
+        <AppButton size="sm" :disabled="!connected" @click="importing = true">
+          <PackageOpen :size="10" />导入工程包
         </AppButton>
       </div>
 
@@ -372,5 +419,9 @@ onMounted(() => void proj.refreshRecent())
       @update:open="picking = $event ? picking : null"
       @pick="picked"
     />
+
+    <!-- 导出要有一个「当前工程」；v-if 让它随工程切换重建，不留上一个工程的账单 -->
+    <ExportPackageDialog v-if="proj.current" v-model:open="exporting" :pid="proj.current.id" />
+    <ImportProjectDialog v-model:open="importing" @done="imported" />
   </div>
 </template>

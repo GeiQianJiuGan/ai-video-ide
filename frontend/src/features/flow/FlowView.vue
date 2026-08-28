@@ -18,7 +18,17 @@
  */
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { ArrowRight, Bot, ClipboardList, ListVideo, Play, Plus, RefreshCw, X } from '@lucide/vue'
+import {
+  ArrowRight,
+  Bot,
+  ClipboardList,
+  ListVideo,
+  PackageOpen,
+  Play,
+  Plus,
+  RefreshCw,
+  X,
+} from '@lucide/vue'
 import AppBadge from '@/shared/ui/AppBadge.vue'
 import AppButton from '@/shared/ui/AppButton.vue'
 import AppPanel from '@/shared/ui/AppPanel.vue'
@@ -28,6 +38,7 @@ import FeatureHeader from '@/shared/ui/FeatureHeader.vue'
 import DirectorPanel from './DirectorPanel.vue'
 import SceneNodeCard from './SceneNodeCard.vue'
 import SceneNodeInspector from './SceneNodeInspector.vue'
+import ImportSceneDialog from '@/features/packages/ImportSceneDialog.vue'
 import {
   LINK_MODES,
   LINK_MODE_LABEL,
@@ -48,6 +59,8 @@ const pid = computed(() => String(route.params.pid ?? ''))
 const newSceneTitle = ref('')
 /** AI 协作栏。默认开着——它是这一级的核心；关掉也不影响手动编排走完全程。 */
 const showDirector = ref(true)
+/** 从别的工程导一幕的设定进来。 */
+const importing = ref(false)
 
 /** 相邻两幕之间那一段：图上画的连线就是这张表。 */
 const segments = computed(() =>
@@ -160,6 +173,14 @@ function switchMode(value: string): void {
       />
       <AppButton size="sm" variant="ghost" :disabled="flow.busy" @click="addScene()">
         <Plus :size="10" />加一幕
+      </AppButton>
+      <AppButton
+        size="sm"
+        variant="ghost"
+        title="把别的工程导出的一幕（人物 / 地点 / 道具 / 镜头结构 + 素材）导进这个工程"
+        @click="importing = true"
+      >
+        <PackageOpen :size="10" />导入一幕
       </AppButton>
       <AppButton
         size="sm"
@@ -366,5 +387,8 @@ function switchMode(value: string): void {
       <!-- 最右：AI 协作栏。提案落库后重拉整张图（幕数、镜头数、衔接都可能变了） -->
       <DirectorPanel v-if="showDirector" :pid="pid" @applied="reload()" />
     </div>
+
+    <!-- 导进来的是一整幕，图上多了一个节点，所以照 DirectorPanel 的规矩重拉整张图 -->
+    <ImportSceneDialog v-model:open="importing" :pid="pid" @done="reload()" />
   </div>
 </template>
