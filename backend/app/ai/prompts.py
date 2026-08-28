@@ -40,7 +40,8 @@ location 写剧本中该幕的地点原文，location_variant 写更具体的地
 prompt 是兼容旧字段的完整提示词。新输出必须额外提供 camera_motion、visual_prompt、audio_dialogue：
 camera_motion 写机位、景别和运镜；visual_prompt 只写画面中可见的主体、动作、场景、光线与环境；
 audio_dialogue 写同期环境声、动作音效和对白（对白保留说话人、语气与原台词）。
-最终每个 Shot 会按 [SHOT]、Camera Motion、Visual Prompt、Audio / Dialogue 四段拼成可直接喂给视频模型的正向提示词；
+最终每个 Shot 会按 [SHOT]、Camera Motion、Visual Prompt、Audio / Dialogue 四段拼成
+可直接喂给视频模型的正向提示词；
 negative_prompt 是这一镜的负向提示词，写成逗号分隔的模型规避项。即使描述很短，也必须生成
 这两个字段。
 
@@ -74,8 +75,8 @@ SHOT_AUDIO_PROMPT_SUFFIX = (
 SHOT_AUDIO_NEGATIVE_TERMS = ("background music", "BGM", "soundtrack", "musical score")
 
 #: AI 导演（协作栏）——可改的那一段。
-DIRECTOR_TASK = """你是一部 AI 生成短片的助理导演。你面对的是「幕流程图」：整部片子由若干幕组成，
-每一幕挂着地点变体、出场角色、道具与镜头，幕与幕之间有明确的衔接方式
+DIRECTOR_TASK = """你是一部 AI 生成短片的助理导演，同时也是它的分镜师。你面对的是「幕流程图」：
+整部片子由若干幕组成，每一幕挂着地点变体、出场角色、道具与镜头，幕与幕之间有明确的衔接方式
 （cut 硬切 / transition 生成 1~2 秒转场 / tail_frame 上一幕真末帧当下一幕首帧）。
 
 规则：
@@ -84,7 +85,43 @@ DIRECTOR_TASK = """你是一部 AI 生成短片的助理导演。你面对的是
 2. 你的写工具**不会改数据库**，只是提案，用户会逐条审阅。所以每条都要给 why：
    一句话说清为什么要这么改。
 3. 宁少勿多：一次只提真正需要的几条。不要为了凑数改标题。
-4. 用中文。最后用一两句话总结你提了什么，不要罗列 id。"""
+4. 用中文。最后用一两句话总结你提了什么，不要罗列 id。
+
+**把剧本拆成幕与镜头时，一段一段来，不要想一次拆完。** 一次完整的往返长这样：
+
+1. `read_script(offset)` 取原文的一段（第一次 offset 给 0，之后用上一次返回的
+   `next_offset`）。返回里的 `total` / `next_offset` / `done` 告诉你还剩多少。
+2. 只就**读到的这一段**提案：`add_scene`（一幕 = 同一地点、同一时间的一段连续戏）+
+   若干 `add_shot`（一镜 = 一段不间断的运镜，一幕通常 3~8 镜，对话戏正反打拆开，
+   每镜 2~8 秒：空镜短、情绪戏长）。
+3. 写镜头 prompt 之前先 `read_skill` 取一份结构说明——挂了首帧的镜头和什么都没挂的镜头
+   写法不一样，照那份范例的段落写。同一轮里同一份 SKILL 只读一次。
+4. 结尾说清「原文读到第几个字 / 共多少字」，然后停下来等用户说「继续」。
+   **不要**在一轮里把整个剧本读完。
+
+人名只用剧本里出现过的原文，同一个人前后必须用同一个名字——系统靠它把角色对到角色库，
+名字一飘，形象就跟着飘。旁白、路人之类没有名字的不要填。"""
+
+#: SKILL 与镜头字段的契约。**代码始终追加，用户在设置页改不到**（照本文件开头那条 rule 1）：
+#: 形状被改坏了链路就落不了库。SKILL 清单只放这一行摘要，全文靠 `read_skill` 取。
+DIRECTOR_SKILL_CONTRACT_HEAD = """镜头 prompt 的写法（内置 SKILL，用 read_skill 取全文）：
+"""
+
+DIRECTOR_SKILL_CONTRACT_TAIL = """
+add_shot / update_shot（以及 add_scene 里的 shots[]）**不要自己拼那段完整 prompt**，
+分四个字段给，系统会按固定格式拼好并补上声音约束：
+
+  - camera_motion：机位、景别与运镜（如「中景，缓慢推进」）；
+  - visual_prompt：只写画面里看得见的东西——主体与动作、环境、光线、以及所选 SKILL 要求的
+    那句锚定语（挂了首帧就写「画面从首帧建立的构图开始」，挂了末帧就写「结尾精确落回末帧」）；
+  - audio_dialogue：同期环境声、必要动作音效与对白（对白保留说话人与剧本原台词，没有不要编）；
+  - negative_prompt：逗号分隔的模型规避项。
+
+另外给一个 skill 字段，写你照的是哪一份（flf / i2v / l2v / ref），方便用户核对。
+
+声音硬约束：本项目不生成背景音乐 / 配乐 / BGM / 配乐轨。SKILL 里的 non_diegetic_music 一节
+固定写 none；正向 prompt 末尾的「声音设计：」与负向里的 background music, BGM, soundtrack,
+musical score 由系统自动补齐，你不用重复写。"""
 
 
 def _custom(raw: str) -> str:
@@ -129,6 +166,32 @@ def format_shot_prompt(
     )
 
 
+#: `format_shot_prompt` 里那三个段名。解析回来时共用这一份，别在别处再写一遍字面量。
+SHOT_PROMPT_SECTIONS = (
+    ("camera_motion", "Camera Motion:"),
+    ("visual_prompt", "Visual Prompt:"),
+    ("audio_dialogue", "Audio / Dialogue:"),
+)
+
+
+def parse_shot_prompt(prompt: str) -> dict[str, str]:
+    """把四段格式拆回三个字段。**只认自己拼出来的那种形状**，认不出就回空 dict。
+
+    为什么需要它：改一个镜头的 prompt 时模型往往只给 `visual_prompt` 一项，
+    直接重拼就会把原来的机位与对白抹成默认值。格式只有 `format_shot_prompt` 一处产出，
+    所以解析也只放在它旁边。
+    """
+    lines = [ln.strip() for ln in str(prompt or "").splitlines()]
+    out: dict[str, str] = {}
+    for key, label in SHOT_PROMPT_SECTIONS:
+        hit = next((ln for ln in lines if ln.startswith(label)), None)
+        if hit:
+            value = hit[len(label) :].strip()
+            if value:
+                out[key] = value
+    return out
+
+
 def breakdown() -> str:
     """剧本拆解用的系统提示词：可改的那一段 + 始终追加的形状契约。"""
     return (
@@ -137,6 +200,29 @@ def breakdown() -> str:
     )
 
 
-def director() -> str:
-    """AI 导演用的系统提示词（工具循环那条路）。"""
-    return _custom(settings.prompt_director) or DIRECTOR_TASK
+#: 用户现在开着哪一页。**只影响这一次请求拼出来的系统提示词**，不落库、不加列——
+#: 同一个会话在剧本页与流程图页共用，换页不该让历史对话变味。
+SCOPE_HINT = {
+    "script": (
+        "用户现在在**剧本页**：左边是剧本原文，中间是已落库的幕与镜头。"
+        "他要的是把原文拆成幕与镜头，所以先 read_script 读一段再提案。"
+    ),
+    "flow": (
+        "用户现在在**幕流程图页**：他看到的是幕节点与幕之间的衔接线。"
+        "改结构（顺序、衔接、地点、出场）比改文字更常见。"
+    ),
+}
+
+
+def director(scope: str = "flow") -> str:
+    """AI 导演用的系统提示词（工具循环那条路）。
+
+    可改的那一段 + **代码始终追加**的 SKILL 与镜头字段契约（用户改不到，见开头 rule 1）
+    + 一句「用户现在在哪一页」。SKILL 只进清单那几行，全文靠 `read_skill` 取——
+    四份全塞进来等于每一轮都多烧几千 token。
+    """
+    from app.ai import skills  # 局部 import：让 skills 只依赖单向的 core，避免绕圈
+
+    contract = f"{DIRECTOR_SKILL_CONTRACT_HEAD}{skills.catalog()}\n{DIRECTOR_SKILL_CONTRACT_TAIL}"
+    hint = SCOPE_HINT.get(str(scope or "").strip(), SCOPE_HINT["flow"])
+    return f"{_custom(settings.prompt_director) or DIRECTOR_TASK}\n\n{contract}\n\n{hint}"

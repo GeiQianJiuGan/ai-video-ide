@@ -26,8 +26,9 @@ from app.core.logging import get_logger
 
 log = get_logger("director")
 
-#: 转多少轮就停手。六轮够它「看一眼现状 → 提三五条改动 → 说句话」，再多就是在绕圈。
-MAX_ROUNDS = 6
+#: 转多少轮就停手。一轮正常的拆解是「read_script 读一段 → read_skill 取一份写法 →
+#: add_scene → 若干 add_shot → 说句话」，六轮根本不够；十六轮之后仍在绕圈就该停手了。
+MAX_ROUNDS = 16
 
 #: 角色与规则那一段是**可配的**（设置页「AI 提示词」→「AI 导演」），内置默认在
 #: `app/ai/prompts.py::DIRECTOR_TASK`。这里只负责把它取出来用。
@@ -38,10 +39,15 @@ FALLBACK_SHAPE = """你现在没有工具可用。根据用户的要求与下面
 %s
 
 所有 id 必须来自「工程现状」里出现过的 id。每个 args 里都要带 why 字段说明理由。
+SKILL 全文这条路上取不到（这个端不支持工具），照清单里那句「什么时候用」判断该写哪种锚定语。
 只输出 JSON，不要解释。"""
 
+#: 退化路径喂进去的剧本原文最多多少字。这条路没法分段读，所以只给开头一段，
+#: 并在提示里说清「这只是开头」——比悄悄截断然后让它以为拆完了要好。
+FALLBACK_SCRIPT_CHARS = 4000
 
-def _fallback_system() -> str:
+
+def _fallback_system(scope: str = "flow") -> str:
     """不支持工具的端用的系统提示词。
 
     形状那一段（`FALLBACK_SHAPE`）永远由代码拼在最后，用户改不到——和
@@ -53,27 +59,45 @@ def _fallback_system() -> str:
         for name, spec in TOOLS.items()
         if spec["kind"] == "write"
     )
-    return f"{prompts.director()}\n\n{FALLBACK_SHAPE % lines}"
+    return f"{prompts.director(scope)}\n\n{FALLBACK_SHAPE % lines}"
 
 
 async def _snapshot(pid: str) -> str:
-    """退化路径用：模型没法自己查，就把现状喂给它。"""
-    data = {
+    """退化路径用：模型没法自己查，就把现状喂给它。
+
+    **剧本原文的开头一段也塞进来**：这条路没有 `read_script`，不给它原文就只能凭空编。
+    只给开头是刻意的——整段塞进一次请求正是「一次性拆解」那个毛病。
+    """
+    data: dict[str, Any] = {
         "scenes": await run_read(pid, "list_scenes", {}),
         "characters": await run_read(pid, "list_characters", {}),
         "locations": await run_read(pid, "list_locations", {}),
         "props": await run_read(pid, "list_props", {}),
     }
+    try:
+        head = await run_read(pid, "read_script", {"offset": 0, "limit": FALLBACK_SCRIPT_CHARS})
+    except Exception:  # noqa: BLE001 —— 没存剧本原文很正常，不是失败
+        head = None
+    if head:
+        data["script_head"] = head
     return json.dumps(data, ensure_ascii=False)
 
 
-async def propose(pid: str, message: str, history: list[dict[str, Any]]) -> dict[str, Any]:
-    """跑一轮协作。返回 `{reply, ops, rounds, over_limit, degraded}`，**不落库**。"""
+async def propose(
+    pid: str,
+    message: str,
+    history: list[dict[str, Any]],
+    scope: str = "flow",
+) -> dict[str, Any]:
+    """跑一轮协作。返回 `{reply, ops, rounds, over_limit, degraded}`，**不落库**。
+
+    `scope` 只透传给 `prompts.director()`（那一句「用户现在在哪一页」），不影响别的。
+    """
     llm.require_configured()
     if not llm.supports_tools():
-        return await _propose_without_tools(pid, message)
+        return await _propose_without_tools(pid, message, scope)
 
-    messages: list[dict[str, Any]] = [{"role": "system", "content": prompts.director()}]
+    messages: list[dict[str, Any]] = [{"role": "system", "content": prompts.director(scope)}]
     messages.extend(history)
     messages.append({"role": "user", "content": message})
     ops: list[dict[str, Any]] = []
@@ -145,10 +169,10 @@ async def _run_one(pid: str, call: dict[str, Any], ops: list[dict[str, Any]]) ->
         return f"这个工具失败了：{title}。{detail} 请换一种做法或先用读工具确认 id。"
 
 
-async def _propose_without_tools(pid: str, message: str) -> dict[str, Any]:
+async def _propose_without_tools(pid: str, message: str, scope: str = "flow") -> dict[str, Any]:
     """不支持 function calling 的端：一次性产出 ops 数组，再走同一套翻译。"""
     data = await llm.complete_json(
-        _fallback_system(),
+        _fallback_system(scope),
         f"工程现状：\n{await _snapshot(pid)}\n\n用户的要求：{message}",
     )
     ops: list[dict[str, Any]] = []

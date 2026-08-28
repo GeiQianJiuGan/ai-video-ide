@@ -23,6 +23,7 @@ import {
   type DirectorApply,
   type DirectorHistory,
   type DirectorOp,
+  type DirectorScope,
   type DirectorTurn,
 } from '@/shared/api/director'
 
@@ -89,11 +90,12 @@ export const useDirectorStore = defineStore('director', () => {
   /**
    * 说一句话。**不落库**——回来的只是提案。
    *
+   * `scope` 只透传给后端拼系统提示词（剧本页 / 流程图页），不落库：两页共用同一个会话。
    * 「转了太多轮」那种错误也照旧重拉历史：提案已经落成记录了，用户还能接着审。
    */
-  async function send(pid: string, message: string): Promise<boolean> {
+  async function send(pid: string, message: string, scope: DirectorScope = 'flow'): Promise<boolean> {
     try {
-      const out = await guarded(() => directorApi.chat(pid, message))
+      const out = await guarded(() => directorApi.chat(pid, message, scope))
       degraded.value = out.degraded
       lastApply.value = null
       history.value = await directorApi.history(pid).catch(() => history.value)

@@ -14,6 +14,45 @@
 
 import { api } from './client'
 
+/** 用户现在开着哪一页。只影响后端拼系统提示词的那一句，不落库。 */
+export type DirectorScope = 'script' | 'flow'
+
+/**
+ * 提案里的字段名在界面上叫什么。**放在这里而不是组件里**：剧本页与流程图页共用同一个
+ * 协作栏组件，这份口径也得只有一处。对不上的直接显示原名，不猜。
+ */
+export const OP_FIELD_LABEL: Record<string, string> = {
+  title: '标题',
+  summary: '概要',
+  time_of_day: '时间',
+  location_variant_id: '地点变体',
+  prompt: '画面描述',
+  cast: '出场角色',
+  props: '道具',
+  shots: '镜头',
+  mode: '衔接方式',
+  duration: '时长',
+  order: '顺序',
+  titles: '顺序（标题）',
+  shot_count: '镜头数',
+  from_title: '从',
+  to_title: '到',
+  from_scene_id: '上一幕',
+  to_scene_id: '下一幕',
+  // 镜头级
+  description: '镜头描述',
+  camera: '景别',
+  movement: '运镜',
+  camera_motion: '机位与运镜',
+  visual_prompt: '画面内容',
+  audio_dialogue: '声音与对白',
+  negative_prompt: '负向提示词',
+  skill: '照的 SKILL',
+  scene_title: '所属幕',
+  index_no: '第几镜',
+  position: '插在第几个',
+}
+
 /** 写工具名 = 提案的 op。用户丢弃一条时，前端把它改成 'reject'。 */
 export const DIRECTOR_OPS = [
   'add_scene',
@@ -24,6 +63,11 @@ export const DIRECTOR_OPS = [
   'set_link',
   'reorder_scenes',
   'delete_scene',
+  'add_shot',
+  'update_shot',
+  'delete_shot',
+  'reorder_shots',
+  'set_shot_link',
 ] as const
 export type DirectorOpName = (typeof DIRECTOR_OPS)[number]
 
@@ -37,14 +81,20 @@ export const OP_LABEL: Record<string, string> = {
   set_link: '改衔接方式',
   reorder_scenes: '重排幕顺序',
   delete_scene: '删掉一幕',
+  add_shot: '加一个镜头',
+  update_shot: '改这个镜头',
+  delete_shot: '删掉一个镜头',
+  reorder_shots: '重排镜头顺序',
+  set_shot_link: '改镜头之间的衔接',
 }
 
 export interface DirectorOp {
   /** 写工具名；丢弃时被改成 'reject'。 */
   op: string
-  target: 'scene' | 'link' | string
+  target: 'scene' | 'link' | 'shot' | 'shot_link' | string
   temp_id: string
   scene_id?: string
+  shot_id?: string
   /** 库里现在的样子；新增时是 null。 */
   before: Record<string, unknown> | null
   /** 提案要改成什么；删除时是 null。 */
@@ -90,8 +140,14 @@ export interface DirectorApply {
 
 export const directorApi = {
   history: (pid: string) => api.get<DirectorHistory>(`/projects/${pid}/director`),
-  chat: (pid: string, message: string) =>
-    api.post<DirectorChat>(`/projects/${pid}/director/chat`, { message }),
+  /**
+   * 说一句话，拿回一份提案。**一行库都不动。**
+   *
+   * `scope` 是「用户现在开着哪一页」（`script` 剧本页 / `flow` 幕流程图页）。它只影响这一次
+   * 请求拼出来的系统提示词，不落库——两页共用同一个会话，换页不该让历史对话变味。
+   */
+  chat: (pid: string, message: string, scope: DirectorScope = 'flow') =>
+    api.post<DirectorChat>(`/projects/${pid}/director/chat`, { message, scope }),
   apply: (pid: string, ops: DirectorOp[]) =>
     api.post<DirectorApply>(`/projects/${pid}/director/apply`, { ops }),
   clear: (pid: string) => api.del<void>(`/projects/${pid}/director`),

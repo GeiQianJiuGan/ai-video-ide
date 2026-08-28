@@ -2,12 +2,15 @@
 /**
  * 剧本工作台（Step 5 的前端）。
  *
- * 三条与后端一致的规矩，UI 上必须看得出来：
- *   1. **AI 只出提案**——`breakdown/propose` 一个字都不写库。提案画在主区，逐条可标
- *      「不要」，按「落库」才真的写进工程。所以 LLM 没配置也不挡路：右边那排手动
- *      入口能把同一件事做完，只是慢。
- *   2. **序号是时间顺序**——Scene / Shot 的 index_no 由后端重排，前端只提交顺序。
- *   3. Scene 挂的是**地点变体**（雨夜 / 白天），不是地点本身，所以下拉框按地点分组。
+ * 四条与后端一致的规矩，UI 上必须看得出来：
+ *   1. **AI 是右栏那个协作者，不是一个「一键拆解」按钮**。它自己用 `read_script` 一段一段
+ *      地读左栏的原文，每次只就读到的那一段提案——这就是「一次性拆解会超时」的解药。
+ *      提案一个字都不写库，逐条审阅、按「采用」才落。
+ *      老的一次性拆解（`breakdown/propose`）后端原样保留当兼容路径，这一页不再有入口。
+ *   2. **剧本页与幕流程图共用同一个会话**（同一份 `DirectorTurn`）：在这里聊到一半去流程图
+ *      页，看到的是同一段对话。`scope` 只让后端多说一句「用户现在在剧本页」。
+ *   3. **序号是时间顺序**——Scene / Shot 的 index_no 由后端重排，前端只提交顺序。
+ *   4. Scene 挂的是**地点变体**（雨夜 / 白天），不是地点本身，所以下拉框按地点分组。
  *
  * 已落库的每个 Shot 都可以通过右侧编辑按钮在弹窗里查看剧情详情、AI 选中的角色和生成 Prompt；
  * 需要上下文账单、版本轨等高级操作时，再进入单 Shot 工作台。
@@ -23,8 +26,6 @@ import {
   Save,
   Sparkles,
   Trash2,
-  Wand2,
-  X,
 } from '@lucide/vue'
 import AppPanel from '@/shared/ui/AppPanel.vue'
 import AppButton from '@/shared/ui/AppButton.vue'
@@ -33,17 +34,15 @@ import AppDialog from '@/shared/ui/AppDialog.vue'
 import EmptyState from '@/shared/ui/EmptyState.vue'
 import ErrorPanel from '@/shared/ui/ErrorPanel.vue'
 import FeatureHeader from '@/shared/ui/FeatureHeader.vue'
-import type { ProposedScene, ProposedShot } from '@/shared/api/story'
+import DirectorPanel from '../director/DirectorPanel.vue'
 import { castApi, type AppearanceRow, type Character } from '@/shared/api/cast'
 import { useStoryStore } from '@/stores/story'
 import { useWorldStore } from '@/stores/world'
-import { useQueueStore } from '@/stores/queue'
 
 const route = useRoute()
 const router = useRouter()
 const story = useStoryStore()
 const world = useWorldStore()
-const queue = useQueueStore()
 
 const pid = computed(() => String(route.params.pid ?? ''))
 
@@ -59,8 +58,23 @@ const dirty = computed(
 const newSceneTitle = ref('')
 const newShotTitle = ref('')
 
-const proposal = computed(() => story.proposal)
-const llmReady = computed(() => story.llm?.configured ?? false)
+/** 右栏两个 Tab：跟 AI 聊 / 改这一场的属性。 */
+const rightTab = ref<'ai' | 'scene'>('ai')
+const RIGHT_TABS = [
+  { key: 'ai', label: 'AI 编剧' },
+  { key: 'scene', label: '场景属性' },
+] as const
+
+/**
+ * 剧本页的快捷句。点一下只是填进输入框——发出去之前用户还能改。
+ * 「继续」这一条是关键：agent 上一轮会说清原文读到第几个字，说「继续」它就接着往下拆。
+ */
+const QUICK_ACTIONS = [
+  '从头开始拆这个剧本',
+  '继续拆下一段',
+  '给第 1 幕补齐镜头 prompt',
+  '按首尾帧规范重写这一幕的 prompt',
+]
 
 type ShotDraft = {
   title: string
@@ -93,16 +107,6 @@ const shotDirty = computed(() => {
     shotCastIds.value.slice().sort().join(',') !==
       current.cast.map((row) => row.appearance_id).slice().sort().join(',')
   )
-})
-
-/** 提案里被接受的条数——落库按钮上写清「要写几条」，别让人蒙着点。 */
-const accepted = computed(() => {
-  const list = proposal.value?.scenes ?? []
-  const scenes = list.filter((s) => s.op !== 'reject')
-  return {
-    scenes: scenes.length,
-    shots: scenes.reduce((n, s) => n + s.shots.filter((c) => c.op !== 'reject').length, 0),
-  }
 })
 
 function syncDraft(): void {
@@ -288,34 +292,9 @@ async function setVariant(value: string): Promise<void> {
   await story.updateScene(pid.value, sid, { location_variant_id: value || null }).catch(() => {})
 }
 
-/** 逐条审阅：标 reject 就是「不要它」，后端 apply 时跳过。 */
-function toggleScene(scene: ProposedScene): void {
-  scene.op = scene.op === 'reject' ? 'create' : 'reject'
-}
-
-function toggleShot(shot: ProposedShot): void {
-  shot.op = shot.op === 'reject' ? 'create' : 'reject'
-}
-
-async function propose(): Promise<void> {
-  const taskId = queue.beginBreakdown()
-  try {
-    await story.propose(pid.value, draftText.value.trim() || undefined)
-    const result = story.proposal
-    queue.finishBreakdown(
-      taskId,
-      result
-        ? `拆解完成：${result.scene_count} 场 / ${result.shot_count} 镜，提案已准备好审阅。`
-        : '拆解完成，提案已准备好审阅。',
-    )
-  } catch (err) {
-    const message = err instanceof Error ? err.message : '请求失败'
-    queue.failBreakdown(taskId, message)
-  }
-}
-
-async function applyProposal(): Promise<void> {
-  await story.applyProposal(pid.value).catch(() => {})
+/** 提案落库之后：幕、镜头、顺序都可能变了，整页重拉。 */
+async function onDirectorApplied(): Promise<void> {
+  await reload()
   await story.loadBoard(pid.value).catch(() => {})
 }
 
@@ -329,21 +308,9 @@ function fmtDuration(n: number): string {
     <FeatureHeader />
 
     <div class="border-line-1 bg-base-1 flex h-row shrink-0 items-center gap-1 border-b px-2">
-      <AppButton
-        size="sm"
-        variant="primary"
-        :disabled="story.busy || !llmReady"
-        :title="
-          llmReady
-            ? '把左边的原文交给 LLM 拆成 Scene / Shot；结果只是提案，要你审阅后才落库'
-            : '还没配置 LLM（AIVS_LLM_PROVIDER）。手动新建 Scene 与 Shot 能把同一件事做完，只是慢'
-        "
-        @click="propose()"
-      >
-        <Wand2 :size="10" />AI 自动拆解
-      </AppButton>
       <span class="text-fg-4 text-2xs">
-        {{ llmReady ? story.llm?.hint : 'LLM 未配置 —— 右边手动新建同样能走完整条链路' }}
+        AI 编剧在右栏：它自己一段一段读左边的原文，每次只就读到的那一段提案，按「采用」才落库。
+        手动新建 Scene 与 Shot 能把同一件事做完，不依赖 LLM。
       </span>
       <AppButton size="sm" variant="ghost" class="ml-auto" :disabled="story.busy" @click="reload()">
         <RefreshCw :size="10" />刷新
@@ -381,125 +348,41 @@ function fmtDuration(n: number): string {
           />
           <textarea
             v-model="draftText"
-            placeholder="把剧本贴进来。也可以不写一个字——直接在右边手动建 Scene 与 Shot。"
+            placeholder="把剧本贴进来。也可以不写一个字——直接在中间手动建 Scene 与 Shot。"
             class="border-line-1 bg-base-2 text-fg-1 placeholder:text-fg-4 focus:border-accent/60 min-h-0 flex-1 resize-none border p-1.5 text-2xs leading-relaxed outline-none"
           />
           <p class="text-fg-4 shrink-0 text-2xs">
-            原文只是素材：真正的真源是下面拆出来的 Scene / Shot（存在 project.db 里）。
+            右栏的 AI 编剧读的就是这里**保存后**的原文（它按 offset 一段一段取）。原文只是素材：
+            真正的真源是中间那些 Scene / Shot（存在 project.db 里）。
           </p>
         </div>
       </AppPanel>
 
-      <!-- 中：提案审阅（有提案时）或已落库的 Scene / Shot -->
-      <AppPanel :title="proposal ? 'AI 提案（尚未落库）' : 'Scene 与 Shot'" class="min-h-0 flex-1">
+      <!-- 中：已落库的 Scene / Shot。AI 的提案不画在这里——它在右栏逐条审阅 -->
+      <AppPanel title="Scene 与 Shot" class="min-h-0 flex-1">
         <template #actions>
-          <template v-if="proposal">
-            <span class="text-fg-4 text-2xs">
-              打叉的条目不会写进工程；提案不落库，刷新页面就没了
-            </span>
-            <AppButton size="sm" variant="ghost" @click="story.discardProposal()">
-              <X :size="10" />丢弃
-            </AppButton>
-            <AppButton
-              size="sm"
-              variant="primary"
-              :disabled="story.busy || accepted.scenes === 0"
-              @click="applyProposal()"
-            >
-              <Plus :size="10" />落库 {{ accepted.scenes }} 场 / {{ accepted.shots }} 镜
-            </AppButton>
-          </template>
-          <template v-else>
-            <input
-              v-model="newSceneTitle"
-              placeholder="新场景名，例如 城南旧宅 · 雨夜"
-              class="border-line-1 bg-base-2 text-fg-1 placeholder:text-fg-4 focus:border-accent/60 h-5 w-52 border px-1.5 text-2xs outline-none"
-              @keyup.enter="createScene()"
-            />
-            <AppButton
-              size="sm"
-              variant="primary"
-              :disabled="story.busy"
-              title="建一场；名字空着就叫「第 N 场」"
-              @click="createScene()"
-            >
-              <Plus :size="10" />新建场景
-            </AppButton>
-          </template>
-        </template>
-
-        <!-- 提案：逐条 Diff -->
-        <div v-if="proposal" class="space-y-2 p-2">
-          <p class="text-fg-4 text-2xs">{{ proposal.note }}</p>
-          <section
-            v-for="scene in proposal.scenes"
-            :key="scene.temp_id"
-            class="border bg-base-2"
-            :class="scene.op === 'reject' ? 'border-line-1 opacity-50' : 'border-accent/40'"
+          <input
+            v-model="newSceneTitle"
+            placeholder="新场景名，例如 城南旧宅 · 雨夜"
+            class="border-line-1 bg-base-2 text-fg-1 placeholder:text-fg-4 focus:border-accent/60 h-5 w-52 border px-1.5 text-2xs outline-none"
+            @keyup.enter="createScene()"
+          />
+          <AppButton
+            size="sm"
+            variant="primary"
+            :disabled="story.busy"
+            title="建一场；名字空着就叫「第 N 场」"
+            @click="createScene()"
           >
-            <header class="border-line-1 flex items-center gap-1.5 border-b px-2 py-1">
-              <span class="text-fg-1 min-w-0 flex-1 truncate text-xs">{{ scene.title }}</span>
-              <span v-if="scene.time_of_day" class="text-fg-4 text-2xs">{{
-                scene.time_of_day
-              }}</span>
-              <AppBadge>{{ scene.shots.length }} 镜</AppBadge>
-              <AppButton size="sm" variant="ghost" @click="toggleScene(scene)">
-                {{ scene.op === 'reject' ? '要它' : '不要' }}
-              </AppButton>
-            </header>
-            <p v-if="scene.summary" class="text-fg-3 px-2 py-1 text-2xs">{{ scene.summary }}</p>
-            <ul class="divide-line-1 divide-y">
-              <li
-                v-for="shot in scene.shots"
-                :key="shot.temp_id"
-                class="space-y-1.5 px-2 py-2 text-2xs"
-                :class="shot.op === 'reject' ? 'opacity-50' : ''"
-              >
-                <div class="flex items-center gap-1.5">
-                  <span class="text-fg-1 min-w-0 flex-1 truncate">{{ shot.title }}</span>
-                  <span v-if="shot.camera" class="text-fg-4 shrink-0">{{ shot.camera }}</span>
-                  <span class="text-fg-3 tnum shrink-0">{{ fmtDuration(shot.duration) }}</span>
-                  <AppButton size="sm" variant="ghost" @click="toggleShot(shot)">
-                    {{ shot.op === 'reject' ? '要它' : '不要' }}
-                  </AppButton>
-                </div>
-                <div class="grid grid-cols-2 gap-1.5">
-                  <label class="block">
-                    <span class="text-fg-4">剧情详情</span>
-                    <textarea
-                      v-model="shot.description"
-                      rows="2"
-                      class="border-line-1 bg-base-1 text-fg-2 mt-px w-full resize-none border px-1.5 py-1 text-2xs outline-none"
-                      placeholder="这个镜头发生了什么"
-                    />
-                  </label>
-                  <label class="block">
-                    <span class="text-fg-4">生成 Prompt</span>
-                    <textarea
-                      v-model="shot.prompt"
-                      rows="2"
-                      class="border-line-1 bg-base-1 text-fg-2 mt-px w-full resize-none border px-1.5 py-1 text-2xs outline-none"
-                      placeholder="AI 生成的画面提示词"
-                    />
-                  </label>
-                </div>
-                <div class="flex items-center gap-1.5">
-                  <span class="text-fg-4 shrink-0">AI 选用角色</span>
-                  <span v-if="shot.characters.length" class="text-fg-2 min-w-0 truncate">
-                    {{ shot.characters.join(' / ') }}
-                  </span>
-                  <span v-else class="text-fg-4">未识别角色</span>
-                </div>
-              </li>
-            </ul>
-          </section>
-        </div>
+            <Plus :size="10" />新建场景
+          </AppButton>
+        </template>
 
         <!-- 已落库 -->
         <EmptyState
-          v-else-if="story.scenes.length === 0"
+          v-if="story.scenes.length === 0"
           title="还没有场景"
-          body="从上面「新建场景」开始，或者把剧本贴进左栏交给 AI 拆一版提案。手动与 AI 出的东西在库里没有区别。"
+          body="从上面「新建场景」开始，或者把剧本贴进左栏保存，再让右栏的 AI 编剧一段一段拆。手动与 AI 出的东西在库里没有区别。"
         />
         <div v-else class="space-y-1.5 p-2">
           <section
@@ -597,38 +480,32 @@ function fmtDuration(n: number): string {
         </div>
       </AppPanel>
 
-      <!-- 右：提案时看角色映射，平时改场景属性 -->
-      <AppPanel :title="proposal ? '角色映射' : '场景属性'" class="w-72 shrink-0">
-        <template v-if="proposal">
-          <EmptyState
-            v-if="proposal.character_mapping.length === 0"
-            title="文本里没认出人名"
-            body="没有映射不影响落库：场景与镜头照样写进去，出场角色可以之后在镜头编辑器里挂。"
-          />
-          <ul v-else class="divide-line-1 divide-y">
-            <li
-              v-for="m in proposal.character_mapping"
-              :key="m.name"
-              class="flex items-center gap-1.5 px-2 py-1 text-2xs"
-            >
-              <span class="text-fg-1 min-w-0 flex-1 truncate">{{ m.name }}</span>
-              <AppBadge
-                :tone="
-                  m.confidence === 'exact' ? 'ok' : m.confidence === 'fuzzy' ? 'warn' : 'neutral'
-                "
-              >
-                {{
-                  m.confidence === 'exact' ? '同名' : m.confidence === 'fuzzy' ? '相近' : '库里没有'
-                }}
-              </AppBadge>
-              <span class="text-fg-4 shrink-0 truncate">{{ m.match_name ?? '待新建' }}</span>
-            </li>
-          </ul>
-          <p class="text-fg-4 border-line-1 border-t p-2 text-2xs">
-            映射只是提示：落库不会自动建角色，也不会自动改已有角色。缺的人去角色页建或从素材库采用。
-          </p>
-        </template>
-        <template v-else>
+      <!-- 右：两个 Tab。AI 编剧与场景属性都是「就这一场做事」，共用这一栏 -->
+      <div class="flex w-80 shrink-0 flex-col gap-2">
+        <div class="border-line-1 bg-base-1 flex shrink-0 border">
+          <button
+            v-for="t in RIGHT_TABS"
+            :key="t.key"
+            type="button"
+            class="flex-1 px-2 py-1 text-2xs"
+            :class="rightTab === t.key ? 'bg-accent/10 text-fg-1' : 'text-fg-4 hover:text-fg-2'"
+            @click="rightTab = t.key"
+          >
+            {{ t.label }}
+          </button>
+        </div>
+        <!-- 与幕流程图页共用同一个会话：在这里聊过的，那边也看得见 -->
+        <DirectorPanel
+          v-if="rightTab === 'ai'"
+          class="min-h-0 flex-1"
+          :pid="pid"
+          scope="script"
+          title="AI 编剧"
+          empty-body="把剧本贴进左栏保存，再说一句「从头开始拆这个剧本」。它自己一段一段读原文，每次只就读到的那一段提案——按下采用之前，库里什么都不会变。"
+          :quick-actions="QUICK_ACTIONS"
+          @applied="onDirectorApplied()"
+        />
+        <AppPanel v-else title="场景属性" class="min-h-0 flex-1">
           <EmptyState
             v-if="!story.selectedScene"
             title="尚无选中场景"
@@ -706,8 +583,8 @@ function fmtDuration(n: number): string {
               </AppButton>
             </section>
           </div>
-        </template>
-      </AppPanel>
+        </AppPanel>
+      </div>
     </div>
 
     <AppDialog

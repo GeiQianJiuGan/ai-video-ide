@@ -2,10 +2,11 @@
 
 工具分成两类，这条界线是整个 agent 的安全边界：
 
-  - **读工具**（`list_*` / `get_scene`）**立刻执行**。它们没有副作用，模型需要先看清
-    这个工程里已经有谁、有哪些地点、现在几幕，才可能提出像样的建议。
-  - **写工具**（`add_scene` / `set_link` / …）**永远不落库**，只被翻译成一条**提案**
-    塞进缓冲区。数据库是用户的，改它必须经过用户逐条点头（照
+  - **读工具**（`list_*` / `get_scene` / `read_script` / `read_skill`）**立刻执行**。
+    它们没有副作用，模型需要先看清这个工程里已经有谁、有哪些地点、现在几幕、
+    剧本原文写了什么，才可能提出像样的建议。
+  - **写工具**（`add_scene` / `add_shot` / `set_link` / …）**永远不落库**，只被翻译成一条
+    **提案**塞进缓冲区。数据库是用户的，改它必须经过用户逐条点头（照
     `story.propose_breakdown` / `apply_breakdown` 的老规矩）。
 
 提案条目的形状固定为 `{op, target, temp_id, before, after, why, warnings}`：
@@ -16,18 +17,55 @@
     有这两半，前端才能画出真正的 Diff 而不是「模型说它要改点东西」；
   - `warnings` 是「这条能落，但有点不对」（比如角色名对不上任何角色）。
     对不上就写出来，绝不静默丢掉。
+
+**`read_script` 是「一次性拆解会超时」那个毛病的解药**：模型自己按 offset 分段读原文，
+一段一段地提案，于是每一轮 chat 的输入输出都是有界的——不再需要一次吐出整部片子。
 """
 
 from __future__ import annotations
 
 from typing import Any
 
+from app.ai import prompts, skills
 from app.core.errors import AppError, ErrorCode
-from app.persistence.models_flow import LINK_MODES
+from app.persistence.models_flow import LINK_MODES, SHOT_LINK_MODES
 from app.services.cast import cast
 from app.services.sequence import sequence
 from app.services.story import story
 from app.services.world import world
+
+#: `read_script` 一次最多给多少字。再大就等于把整部剧本塞回上下文，那正是要治的病。
+SCRIPT_CHUNK = 2000
+SCRIPT_CHUNK_MAX = 6000
+
+#: 镜头 prompt 的三段 + 负向 + 照的哪份 SKILL。**只有这一处口径**：`add_shot` /
+#: `update_shot` / `add_scene` 里的 `shots[]` 收的都是这几个字段，正向那段完整 prompt
+#: 由 `prompts.format_shot_prompt()` 拼、再过 `prompts.with_shot_audio_policy()`。
+SHOT_PROMPT_PARAMS: dict[str, dict[str, Any]] = {
+    "camera_motion": {"type": "string", "description": "机位、景别与运镜，如「中景，缓慢推进」"},
+    "visual_prompt": {"type": "string", "description": "只写画面里看得见的东西 + SKILL 的锚定语"},
+    "audio_dialogue": {"type": "string", "description": "同期环境声、动作音效与对白原文"},
+    "negative_prompt": {"type": "string", "description": "逗号分隔的模型规避项"},
+    "skill": {
+        "type": "string",
+        "enum": list(skills.NAMES),
+        "description": "照的是哪一份内置 SKILL（先用 read_skill 取全文）",
+    },
+}
+
+#: 镜头上那些「不是 prompt」的字段。
+SHOT_PLAIN_PARAMS: dict[str, dict[str, Any]] = {
+    "title": {"type": "string", "description": "一句话概括这一镜在讲什么"},
+    "description": {"type": "string", "description": "这一镜的画面描述（人也要看的那份）"},
+    "duration": {"type": "number", "description": "秒，2~8：空镜短、情绪戏长"},
+    "camera": {"type": "string", "description": "景别：远景 / 全景 / 中景 / 近景 / 特写"},
+    "movement": {"type": "string", "description": "运镜：固定 / 推 / 拉 / 摇 / 跟"},
+    "character_names": {
+        "type": "array",
+        "items": {"type": "string"},
+        "description": "这一镜的出场角色，用剧本里的人名原文",
+    },
+}
 
 #: 工具白名单。模型只能调这里面的东西——名字不在这张表里直接报错，
 #: 不去猜「它大概是想调 add_scene」。
@@ -54,6 +92,35 @@ TOOLS: dict[str, dict[str, Any]] = {
         "params": {"scene_id": {"type": "string", "description": "幕 id"}},
         "required": ["scene_id"],
     },
+    "read_script": {
+        "kind": "read",
+        "desc": (
+            "读剧本原文的一段。一次只给一段，返回里的 next_offset / done 告诉你还剩多少——"
+            "拆长剧本时一段一段读、一段一段提案，不要想一次读完。"
+        ),
+        "params": {
+            "offset": {"type": "integer", "description": "从第几个字开始，第一次给 0"},
+            "limit": {
+                "type": "integer",
+                "description": f"这一段最多多少字，默认 {SCRIPT_CHUNK}，上限 {SCRIPT_CHUNK_MAX}",
+            },
+        },
+    },
+    "read_skill": {
+        "kind": "read",
+        "desc": (
+            "取一份内置 SKILL 的全文（镜头 prompt 该怎么写）。写镜头 prompt 之前先读对应的"
+            "那一份：\n" + skills.catalog()
+        ),
+        "params": {
+            "name": {
+                "type": "string",
+                "enum": list(skills.NAMES),
+                "description": "SKILL 名",
+            }
+        },
+        "required": ["name"],
+    },
     "add_scene": {
         "kind": "write",
         "desc": "提议加一幕。可以顺带给出这一幕的镜头清单。",
@@ -67,13 +134,7 @@ TOOLS: dict[str, dict[str, Any]] = {
                 "description": "这一幕的镜头，按时间顺序",
                 "items": {
                     "type": "object",
-                    "properties": {
-                        "title": {"type": "string"},
-                        "description": {"type": "string"},
-                        "duration": {"type": "number", "description": "秒，常用 3~6"},
-                        "prompt": {"type": "string"},
-                        "character_names": {"type": "array", "items": {"type": "string"}},
-                    },
+                    "properties": {**SHOT_PLAIN_PARAMS, **SHOT_PROMPT_PARAMS},
                 },
             },
             "why": {"type": "string", "description": "为什么要加这一幕"},
@@ -159,6 +220,67 @@ TOOLS: dict[str, dict[str, Any]] = {
         "desc": "提议删掉一幕（它的镜头与版本会一起没，所以 why 要写清楚）。",
         "params": {"scene_id": {"type": "string"}, "why": {"type": "string"}},
         "required": ["scene_id"],
+    },
+    "add_shot": {
+        "kind": "write",
+        "desc": "提议往某一幕里加一个镜头。prompt 分四段给，别自己拼整段。",
+        "params": {
+            "scene_id": {"type": "string", "description": "加到哪一幕"},
+            "position": {
+                "type": "integer",
+                "description": "插在这一幕的第几个（1 起）。不给就排在最后",
+            },
+            **SHOT_PLAIN_PARAMS,
+            **SHOT_PROMPT_PARAMS,
+            "why": {"type": "string"},
+        },
+        "required": ["scene_id"],
+    },
+    "update_shot": {
+        "kind": "write",
+        "desc": (
+            "提议改一个镜头。只给要改的字段；给了 prompt 三段里的任意一段就会重拼那段"
+            "完整 prompt，没给的那几段保留原样。"
+        ),
+        "params": {
+            "shot_id": {"type": "string"},
+            **SHOT_PLAIN_PARAMS,
+            **SHOT_PROMPT_PARAMS,
+            "why": {"type": "string"},
+        },
+        "required": ["shot_id"],
+    },
+    "delete_shot": {
+        "kind": "write",
+        "desc": "提议删掉一个镜头（它生成过的版本会一起没）。",
+        "params": {"shot_id": {"type": "string"}, "why": {"type": "string"}},
+        "required": ["shot_id"],
+    },
+    "reorder_shots": {
+        "kind": "write",
+        "desc": "提议重排一幕里镜头的顺序。order 要给出这一幕全部镜头 id。",
+        "params": {
+            "scene_id": {"type": "string"},
+            "order": {"type": "array", "items": {"type": "string"}},
+            "why": {"type": "string"},
+        },
+        "required": ["scene_id", "order"],
+    },
+    "set_shot_link": {
+        "kind": "write",
+        "desc": (
+            "提议同一幕内相邻两镜之间怎么接：cut 直接切 / transition 补一段短转场。"
+            "「续接上游末帧」不在这里——那是镜头的上游依赖（prev_shot_id）。"
+        ),
+        "params": {
+            "from_shot_id": {"type": "string"},
+            "to_shot_id": {"type": "string"},
+            "mode": {"type": "string", "enum": list(SHOT_LINK_MODES)},
+            "duration": {"type": "number", "description": "转场秒数，只有 transition 用"},
+            "prompt": {"type": "string", "description": "转场的画面描述"},
+            "why": {"type": "string"},
+        },
+        "required": ["from_shot_id", "to_shot_id", "mode"],
     },
 }
 
@@ -260,12 +382,52 @@ async def run_read(pid: str, name: str, args: dict[str, Any]) -> Any:
                 ["先调 list_scenes 拿到正确的 id"],
             )
         return lane
+    if name == "read_script":
+        return await _read_script(pid, args)
+    if name == "read_skill":
+        return {"skill": args.get("name"), "text": skills.render(args.get("name", ""))}
     raise AppError(
         ErrorCode.VALIDATION_ERROR,
         "不认识这个工具",
         f"{name} 不在工具白名单里。",
         [f"可用的工具：{'、'.join(TOOLS)}"],
     )
+
+
+async def _read_script(pid: str, args: dict[str, Any]) -> dict[str, Any]:
+    """读剧本原文的一段。**分段读是「不再超时」的关键**，所以这里只回一段，
+    并且把「还剩多少」写清楚——模型靠 `next_offset` / `done` 自己决定要不要再读一段。"""
+    text = str((await story.get_story(pid)).get("raw_text") or "")
+    if not text.strip():
+        raise AppError(
+            ErrorCode.VALIDATION_ERROR,
+            "剧本原文是空的",
+            "这个工程还没有存过剧本原文。",
+            ["在剧本页左栏把剧本贴进去并保存", "或者直接告诉我剧情，我按你说的提幕与镜头"],
+        )
+    total = len(text)
+    try:
+        offset = max(0, int(args.get("offset") or 0))
+        limit = int(args.get("limit") or SCRIPT_CHUNK)
+    except (TypeError, ValueError) as exc:
+        raise AppError(
+            ErrorCode.VALIDATION_ERROR,
+            "offset / limit 只能是整数",
+            f"offset={args.get('offset')!r}，limit={args.get('limit')!r}：{exc}",
+            ["第一次读给 offset=0，之后用上一次返回的 next_offset"],
+        ) from exc
+    limit = min(max(1, limit), SCRIPT_CHUNK_MAX)
+    if offset >= total:
+        return {"total": total, "offset": total, "next_offset": total, "done": True, "text": ""}
+    chunk = text[offset : offset + limit]
+    nxt = offset + len(chunk)
+    return {
+        "total": total,
+        "offset": offset,
+        "next_offset": nxt,
+        "done": nxt >= total,
+        "text": chunk,
+    }
 
 
 # --- 写工具：只翻译成提案，永不落库 ---
@@ -341,6 +503,101 @@ async def _scene(pid: str, sid: str) -> dict[str, Any]:
     return hit
 
 
+async def _shot(pid: str, shot_id: str) -> dict[str, Any]:
+    """按 id 取一个镜头。取不到报错回给模型（它可以 get_scene 再看一遍镜头清单）。"""
+    try:
+        return await story.get_shot(pid, str(shot_id or ""))
+    except AppError as exc:
+        if exc.code is not ErrorCode.NOT_FOUND:
+            raise
+        raise AppError(
+            ErrorCode.NOT_FOUND,
+            "没有这个镜头",
+            f"shot_id = {shot_id or '（空）'}。",
+            ["先调 get_scene 看这一幕的镜头清单，用里面的 id"],
+        ) from exc
+
+
+#: 镜头上「直接落库」的那几个字段（`story.SHOT_FIELDS` 的子集）。
+SHOT_PLAIN_KEYS = ("title", "description", "duration", "camera", "movement")
+#: prompt 那三段。顺序即 `format_shot_prompt` 的段落顺序。
+SHOT_SEGMENT_KEYS = ("camera_motion", "visual_prompt", "audio_dialogue")
+
+
+async def _shot_after(
+    pid: str,
+    args: dict[str, Any],
+    index: int,
+    before: dict[str, Any] | None,
+) -> tuple[dict[str, Any], list[str]]:
+    """把镜头类写工具的参数拼成提案的 `after`。**正向 prompt 只在这里拼一次。**
+
+    三段里没给的那几段从 `before` 的 prompt 里解析出来接着用——改一个镜头时模型往往只给
+    `visual_prompt`，直接重拼会把原来的机位与对白抹成默认值。
+    """
+    warnings: list[str] = []
+    after: dict[str, Any] = _clean(args, SHOT_PLAIN_KEYS)
+    if "duration" in after:
+        after["duration"] = float(after["duration"])
+
+    segs = dict(prompts.parse_shot_prompt(str((before or {}).get("prompt") or "")))
+    given = {k: str(args[k]).strip() for k in SHOT_SEGMENT_KEYS if args.get(k) is not None}
+    segs.update({k: v for k, v in given.items() if v})
+    if not segs.get("camera_motion"):
+        camera = str(args.get("camera") or (before or {}).get("camera") or "").strip()
+        movement = str(args.get("movement") or (before or {}).get("movement") or "").strip()
+        if camera or movement:
+            segs["camera_motion"] = "，".join(x for x in (camera, movement) if x)
+    fallback = str(
+        after.get("description") or (before or {}).get("description") or after.get("title") or ""
+    )
+    prompt, negative = prompts.with_shot_audio_policy(
+        prompts.format_shot_prompt(
+            index,
+            segs.get("camera_motion", ""),
+            segs.get("visual_prompt", ""),
+            segs.get("audio_dialogue", ""),
+            fallback,
+        ),
+        str(args.get("negative_prompt") or (before or {}).get("negative_prompt") or ""),
+    )
+    after.update({k: segs[k] for k in SHOT_SEGMENT_KEYS if k in segs})
+    after["prompt"] = prompt
+    after["negative_prompt"] = negative
+
+    if args.get("skill") is not None:
+        declared = str(args["skill"]).strip().lower()
+        if declared not in skills.NAMES:
+            warnings.append(f"skill「{declared}」不是内置的那四份，只当备注看")
+        after["skill"] = declared
+        expected = skills.pick(
+            bool((before or {}).get("first_frame_asset_id")),
+            bool((before or {}).get("last_frame_asset_id")),
+        )
+        if before is not None and declared in skills.NAMES and declared != expected:
+            warnings.append(
+                f"这个镜头挂的图对应 {expected} 那一份，但 prompt 是照 {declared} 写的——"
+                "锚定语可能与实际首 / 末帧不符"
+            )
+
+    if args.get("character_names") is not None or args.get("appearance_ids") is not None:
+        picked, warn = await _resolve_appearances(pid, args)
+        after["cast"] = picked
+        warnings.extend(warn)
+    return after, warnings
+
+
+#: 每个写工具动的是哪一类东西。前端按 target 分组显示提案，所以这张表是它的唯一来源。
+_TARGET = {
+    "set_link": "link",
+    "add_shot": "shot",
+    "update_shot": "shot",
+    "delete_shot": "shot",
+    "reorder_shots": "shot",
+    "set_shot_link": "shot_link",
+}
+
+
 async def to_op(pid: str, name: str, args: dict[str, Any], temp_no: int) -> dict[str, Any]:
     """把一次写工具调用翻译成一条提案。**这里绝不碰数据库的写路径。**"""
     if name not in WRITE_TOOLS:
@@ -353,7 +610,7 @@ async def to_op(pid: str, name: str, args: dict[str, Any], temp_no: int) -> dict
     why = str(args.get("why") or "").strip()
     op: dict[str, Any] = {
         "op": name,
-        "target": "link" if name == "set_link" else "scene",
+        "target": _TARGET.get(name, "scene"),
         "temp_id": f"op{temp_no}",
         "before": None,
         "after": {},
@@ -366,17 +623,13 @@ async def to_op(pid: str, name: str, args: dict[str, Any], temp_no: int) -> dict
         for raw in args.get("shots") or []:
             if not isinstance(raw, dict):
                 continue
-            picked, warn = await _resolve_appearances(
-                pid, {"character_names": raw.get("character_names")}
-            )
+            after, warn = await _shot_after(pid, raw, len(shots) + 1, None)
             op["warnings"].extend(warn)
             shots.append(
                 {
                     "title": str(raw.get("title") or f"镜头 {len(shots) + 1}"),
-                    "description": raw.get("description"),
                     "duration": float(raw.get("duration") or 4.0),
-                    "prompt": raw.get("prompt"),
-                    "cast": picked,
+                    **after,
                 }
             )
         op["after"] = {
@@ -461,6 +714,115 @@ async def to_op(pid: str, name: str, args: dict[str, Any], temp_no: int) -> dict
         op["after"] = {
             "order": order + missing,
             "titles": [known[i]["title"] for i in order + missing],
+        }
+        return op
+
+    if name == "add_shot":
+        row = await _scene(pid, args.get("scene_id", ""))
+        count = int(row["shot_count"] or 0)
+        raw_pos = args.get("position")
+        position = None if raw_pos is None else max(1, min(int(raw_pos), count + 1))
+        after, warn = await _shot_after(pid, args, position or count + 1, None)
+        op["scene_id"] = row["id"]
+        op["before"] = {"scene_title": row["title"], "shot_count": count}
+        op["after"] = {
+            "scene_id": row["id"],
+            "title": str(args.get("title") or f"镜头 {position or count + 1}"),
+            "duration": float(args.get("duration") or 4.0),
+            **after,
+            **({"position": position} if position else {}),
+        }
+        op["warnings"].extend(warn)
+        return op
+
+    if name == "update_shot":
+        row = await _shot(pid, args.get("shot_id", ""))
+        after, warn = await _shot_after(pid, args, int(row["index_no"] or 1), row)
+        op["shot_id"] = row["id"]
+        op["before"] = {
+            "scene_title": row["scene_title"],
+            "index_no": row["index_no"],
+            **{k: row.get(k) for k in SHOT_PLAIN_KEYS},
+            "prompt": row.get("prompt"),
+            "negative_prompt": row.get("negative_prompt"),
+            "cast": [
+                {"appearance_id": c["appearance_id"], "label": c.get("character_name") or ""}
+                for c in row.get("cast") or []
+            ],
+        }
+        op["after"] = after
+        op["warnings"].extend(warn)
+        if row.get("version_count"):
+            op["warnings"].append(
+                f"这个镜头已经生成过 {row['version_count']} 版；改 prompt 不影响已有版本，"
+                "要看新写法的效果得再生成一次"
+            )
+        return op
+
+    if name == "delete_shot":
+        row = await _shot(pid, args.get("shot_id", ""))
+        op["shot_id"] = row["id"]
+        op["before"] = {
+            "scene_title": row["scene_title"],
+            "index_no": row["index_no"],
+            "title": row["title"],
+            "version_count": row.get("version_count"),
+        }
+        op["after"] = None
+        if row.get("version_count"):
+            op["warnings"].append(f"它生成过 {row['version_count']} 版，删掉后这些版本一起没")
+        return op
+
+    if name == "reorder_shots":
+        row = await _scene(pid, args.get("scene_id", ""))
+        lane = await run_read(pid, "get_scene", {"scene_id": row["id"]})
+        rows = [s for s in lane.get("shots") or [] if s.get("kind") != "transition"]
+        known = {s["id"]: s for s in rows}
+        order = [str(i) for i in args.get("order") or [] if str(i) in known]
+        missing = [s["id"] for s in rows if s["id"] not in order]
+        if missing:
+            op["warnings"].append(f"有 {len(missing)} 个镜头没出现在新顺序里，会按原顺序排在后面")
+        op["scene_id"] = row["id"]
+        op["before"] = {"order": [f"{s['index_no']}. {s['title']}" for s in rows]}
+        op["after"] = {
+            "scene_id": row["id"],
+            "order": order + missing,
+            "titles": [known[i]["title"] for i in order + missing],
+        }
+        return op
+
+    if name == "set_shot_link":
+        head = await _shot(pid, args.get("from_shot_id", ""))
+        tail = await _shot(pid, args.get("to_shot_id", ""))
+        mode = str(args.get("mode") or "")
+        if mode not in SHOT_LINK_MODES:
+            raise AppError(
+                ErrorCode.VALIDATION_ERROR,
+                "未知的镜头衔接方式",
+                f"{mode or '（空）'} 不在 {'、'.join(SHOT_LINK_MODES)} 里。",
+                [
+                    "mode 只能是 cut / transition",
+                    "「续接上游末帧」请改 update_shot 的上游依赖，镜头级没有 tail_frame",
+                ],
+            )
+        existing = next(
+            (
+                link
+                for link in await sequence.list_shot_links(pid)
+                if link["from_shot_id"] == head["id"] and link["to_shot_id"] == tail["id"]
+            ),
+            None,
+        )
+        op["before"] = (
+            {"mode": existing["mode"], "duration": existing["duration"]} if existing else None
+        )
+        op["after"] = {
+            "from_shot_id": head["id"],
+            "to_shot_id": tail["id"],
+            "from_title": head["title"],
+            "to_title": tail["title"],
+            "mode": mode,
+            **_clean(args, ("duration", "prompt")),
         }
         return op
 

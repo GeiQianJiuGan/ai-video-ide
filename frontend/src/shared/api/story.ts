@@ -4,9 +4,11 @@
  * 字段与后端 app/api/story.py + services/story.py 一一对应。
  *
  * 三个形状上的要点：
- *   1. **AI 只出提案**——`breakdown/propose` 不写库，返回的每条带 `op`，
- *      前端逐条审阅后把整个 `scenes` 数组回传给 `breakdown/apply` 才落库；
- *      把某条标成 `op: 'reject'` 就是「不要它」。
+ *   1. **`breakdown/propose|apply` 是兼容路径**——后端原样保留，但界面上已经没有入口了：
+ *      一次调用要吐出全部幕 + 全部镜头 + 每镜的 prompt，长剧本必然超时或被截断。
+ *      现在拆剧本走 AI 编剧那一栏（`features/director/DirectorPanel.vue`，`scope="script"`），
+ *      它自己 `read_script` 一段一段读、每次只就读到的那一段提案。这两个方法的老规矩
+ *      照旧：不写库，返回的每条带 `op`，标成 `op: 'reject'` 就是「不要它」。
  *   2. **index_no 就是时间顺序**——跨 Scene 移动镜头后由后端统一重排，
  *      前端不自己算序号，移动完拿后端返回的分镜板覆盖本地。
  *   3. Scene 引用的是**地点变体**而不是地点（`location_variant_id`）。

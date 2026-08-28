@@ -181,7 +181,12 @@ def test_director_prompt_reaches_both_paths(client: TestClient) -> None:
 
     resp = client.patch("/api/v1/settings", json={"prompt.director": "你是一位克制的导演。"})
     assert resp.status_code == 200, resp.text
-    assert prompts.director() == "你是一位克制的导演。"
+    system = prompts.director()
+    assert system.startswith("你是一位克制的导演。")
+    # SKILL 清单与镜头字段契约由代码始终追加，用户在设置页改不到
+    assert "read_skill" in system and "camera_motion" in system
+    assert "剧本页" not in system, "默认 scope 是流程图页"
+    assert "剧本页" in prompts.director("script")
 
     fallback = agent._fallback_system()  # noqa: SLF001 —— 就是要盯这条退化路径的拼法
     assert fallback.startswith("你是一位克制的导演。")

@@ -69,8 +69,13 @@ class DirectorService:
                 if fresh is not None:
                     await session.delete(fresh)
 
-    async def chat(self, pid: str, message: str) -> dict[str, Any]:
-        """说一句话，拿回一份提案。**不改任何业务数据。**"""
+    async def chat(self, pid: str, message: str, scope: str = "flow") -> dict[str, Any]:
+        """说一句话，拿回一份提案。**不改任何业务数据。**
+
+        `scope` 是「用户现在开着哪一页」（`script` 剧本页 / `flow` 幕流程图页）。它**只影响
+        这一次请求拼出来的系统提示词**那一句提示，不落库、不加列——两页共用同一个会话，
+        换页不该让历史对话变味。
+        """
         text = str(message or "").strip()
         if not text:
             raise AppError(
@@ -82,7 +87,7 @@ class DirectorService:
         llm.require_configured()
         await self._add_turn(pid, "user", {"text": text})
         history = await self._llm_history(pid)
-        out = await agent.propose(pid, text, history)
+        out = await agent.propose(pid, text, history, scope=scope)
         turns = [
             await self._add_turn(
                 pid,
@@ -166,6 +171,19 @@ class DirectorService:
         )
         return {"applied": applied, "failed": failed, "count": len(applied)}
 
+    #: 提案的 `after` 里能直接落库的镜头字段。**只有这一张表**——`camera_motion` /
+    #: `visual_prompt` / `audio_dialogue` / `skill` 是给人看的过程量，正向 prompt 已经在
+    #: `ai/director/tools.py::_shot_after` 里拼好写进 `after["prompt"]` 了。
+    SHOT_PATCH_KEYS = (
+        "title",
+        "description",
+        "duration",
+        "camera",
+        "movement",
+        "prompt",
+        "negative_prompt",
+    )
+
     async def _one(self, pid: str, op: dict[str, Any]) -> dict[str, Any]:
         """一条提案怎么落。**全部转调已有的写方法**，这里不碰 ORM。"""
         name = str(op["op"])
@@ -183,9 +201,7 @@ class DirectorService:
             made = 0
             for shot in after.get("shots") or []:
                 created = await story.create_shot(
-                    pid,
-                    row["id"],
-                    {k: shot.get(k) for k in ("title", "description", "duration", "prompt")},
+                    pid, row["id"], {k: shot.get(k) for k in self.SHOT_PATCH_KEYS}
                 )
                 made += 1
                 ids = [c["appearance_id"] for c in shot.get("cast") or []]
@@ -210,6 +226,66 @@ class DirectorService:
                 pid,
                 str(after.get("from_scene_id") or ""),
                 str(after.get("to_scene_id") or ""),
+                mode=str(after.get("mode") or "cut"),
+                duration=after.get("duration"),
+                prompt=after.get("prompt"),
+            )
+            return {"link_id": row["id"], "mode": row["mode"]}
+
+        if name == "add_shot":
+            created = await story.create_shot(
+                pid,
+                str(after.get("scene_id") or sid),
+                {k: after.get(k) for k in self.SHOT_PATCH_KEYS},
+            )
+            ids = [c["appearance_id"] for c in after.get("cast") or []]
+            if ids:
+                await story.set_shot_cast(pid, created["id"], ids)
+            #: 插在中间要走 `move_shot`（它内部重排 + 全局重排）。`position` 是 1 起的，
+            #: `move_shot` 收 0 起的落点。
+            if after.get("position"):
+                await story.move_shot(
+                    pid,
+                    created["id"],
+                    str(after.get("scene_id") or sid),
+                    int(after["position"]) - 1,
+                )
+            return {"shot_id": created["id"], "title": created["title"]}
+
+        if name == "update_shot":
+            shot_id = str(op.get("shot_id") or "")
+            patch = {k: after[k] for k in self.SHOT_PATCH_KEYS if k in after}
+            if patch:
+                row = await story.update_shot(pid, shot_id, patch)
+            else:
+                row = await story.get_shot(pid, shot_id)
+            if "cast" in after:
+                await story.set_shot_cast(
+                    pid, shot_id, [c["appearance_id"] for c in after.get("cast") or []]
+                )
+            return {"shot_id": row["id"], "title": row["title"]}
+
+        if name == "delete_shot":
+            shot_id = str(op.get("shot_id") or "")
+            await story.delete_shot(pid, shot_id)
+            return {"shot_id": shot_id, "deleted": True}
+
+        if name == "reorder_shots":
+            scene_id = str(after.get("scene_id") or sid)
+            #: 提案是在审阅之前算出来的，同一批里可能有一条 delete_shot 已经把某个镜头删了。
+            #: 所以落库前按**现在**这一幕有哪些镜头对一遍：删掉的丢弃，没提到的排在后面——
+            #: `story.reorder_shots` 收到不属于这一幕的 id 会整条失败。
+            live = await self._real_shots(pid, scene_id)
+            order = [str(i) for i in after.get("order") or [] if str(i) in live]
+            order += [i for i in live if i not in order]
+            await story.reorder_shots(pid, scene_id, order)
+            return {"scene_id": scene_id, "reordered": len(order)}
+
+        if name == "set_shot_link":
+            row = await sequence.set_shot_link(
+                pid,
+                str(after.get("from_shot_id") or ""),
+                str(after.get("to_shot_id") or ""),
                 mode=str(after.get("mode") or "cut"),
                 duration=after.get("duration"),
                 prompt=after.get("prompt"),

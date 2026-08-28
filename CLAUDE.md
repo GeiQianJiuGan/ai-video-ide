@@ -324,16 +324,36 @@ kind / priority / included / reason / **media**（`image` / `video` / `audio`，
   「分镜里截取的首帧加载失败」与版本轨上那一排坏图都是这么来的。
 - **第二级：场景工作台**（前端 `features/flow/SceneWorkbench.vue`）：单幕的首帧 / 末帧槽位 →
   R2V 生成 → 版本轨。**本轮没有 T2V。** 从第一级过去的手势是**双击节点**（单击只选中）。
-- **AI 协作栏**（`app/ai/director/` + `services/director.py` + `api/director.py`，前端
-  `features/flow/DirectorPanel.vue`）：`ai/director/tools.py` 里那条**读 / 写分界就是安全边界**——
-  读工具（`list_*` / `get_scene`）立刻执行，写工具（`add_scene` / `set_link` / …）**永不落库**，
-  只翻译成一条提案 `{op, target, temp_id, before, after, why, warnings}`。`chat` 一行库都不改，
+- **AI 协作栏**（`app/ai/director/` + `app/ai/skills/` + `services/director.py` +
+  `api/director.py`，前端 `features/director/DirectorPanel.vue`——**剧本页与幕流程图页共用这一个
+  组件，也共用同一个会话**，所以它不在任何一个 feature 目录下面）：`ai/director/tools.py` 里那条
+  **读 / 写分界就是安全边界**——读工具（`list_*` / `get_scene` / `read_script` / `read_skill`）
+  立刻执行，写工具（幕级 `add_scene` / `set_link` / … + 镜头级 `add_shot` / `update_shot` /
+  `delete_shot` / `reorder_shots` / `set_shot_link`）**永不落库**，只翻译成一条提案
+  `{op, target, temp_id, before, after, why, warnings}`。`chat` 一行库都不改，
   只有 `POST /director/apply` 才落，且只落 `op != "reject"` 的条目（照
   `story.propose_breakdown` / `apply_breakdown` 的老规矩），逐条转调已有的 `story` / `sequence`
-  写方法——绝不另写一份写库逻辑。工具循环上限 `agent.MAX_ROUNDS = 6`；转满轮数时**先把提案落成
+  写方法——绝不另写一份写库逻辑。工具循环上限 `agent.MAX_ROUNDS = 16`；转满轮数时**先把提案落成
   `DirectorTurn` 记录再报错**，已产出的提案照旧可审阅。不支持 function calling 的端（Ollama）
   退化成一次性 `complete_json()`，提案形状完全一样。会话与提案存 `DirectorTurn`（只增不改），
   审阅到一半刷新页面不丢。
+  - **拆长剧本靠分段读，不靠一次吐完**：`read_script(offset, limit)` 回
+    `{total, offset, next_offset, done, text}`，模型自己一段一段读、每次只就读到的那一段提案，
+    于是每一轮 chat 的输入输出都是有界的。老的一次性拆解（`POST /story/breakdown[/apply]` +
+    `story.propose_breakdown`）**降级为兼容路径**：后端与它的测试原样保留，界面上已经没有入口
+    了——一次调用要吐出全部幕 + 全部镜头 + 每镜的 prompt，长剧本必然超时或被截断。
+  - **镜头 prompt 照内置 SKILL 写**（`app/ai/skills/video_prompt.py`，四份 `flf` / `i2v` /
+    `l2v` / `ref` 对应四种首尾帧形态，详见 docs/05）：**渐进披露**——只有 `catalog()` 那几行
+    进系统提示词，全文由 `read_skill(name)` 按需取一份。写工具收的是三段字段
+    （`camera_motion` / `visual_prompt` / `audio_dialogue` / `negative_prompt` + `skill`），
+    最终那段正向 prompt 由**已有的** `prompts.format_shot_prompt()` 再过
+    `with_shot_audio_policy()` 拼出来——**无配乐那条硬约束只有一处口径**，SKILL 里的
+    `non_diegetic_music` 一节固定写「无配乐」而不是再实现一遍。`update_shot` 没给的那几段从
+    库里现有 prompt 用 `parse_shot_prompt()` 解析出来补上，改一段不会把机位与对白擦掉。
+  - **`scope` 只是一句提示**（`chat(pid, message, scope)`，`script` / `flow`）：只影响这一次
+    请求拼出来的系统提示词里那一句「用户现在在哪一页」，**不落库、不分会话、不需要迁移**——
+    换页不该让历史对话变味。剧本页右栏是「AI 编剧」Tab（`scope="script"`），
+    幕流程图页右栏是「AI 协作」（`scope="flow"`），两边看到的是同一份对话。
 - **provider 适配层**（`app/generation/providers/`）：`base.py` 定义与模型无关的 `VideoRequest`
   （`mode` = `i2v` / `flf`、prompt、首尾帧、**参考素材 `refs`**（`RefAsset`，带 `media` =
   `image` / `video` / `audio`）、时长、seed、透传 `extra`、降级说明 `notes`）与 `VideoProvider`

@@ -19,6 +19,7 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
+from app.ai.director import agent
 from app.ai.llm import client as llm
 from app.core.config import settings
 from tests.conftest import error_of
@@ -169,7 +170,7 @@ def test_over_limit_keeps_what_it_already_proposed(
 
     history = client.get(f"{API}/projects/{pid}/director").json()
     proposal = next(t for t in history["turns"] if t["role"] == "proposal")
-    assert len(proposal["content"]["ops"]) == 6, "六轮各提一条，一条都不该丢"
+    assert len(proposal["content"]["ops"]) == agent.MAX_ROUNDS, "每轮各提一条，一条都不该丢"
     assert client.get(f"{API}/projects/{pid}/scenes").json() == []
 
 
@@ -217,3 +218,287 @@ def test_degrades_to_one_shot_json_without_tool_support(
     assert body["degraded"] is True
     assert [o["op"] for o in body["ops"]] == ["add_scene"], "指向不存在的幕那条不成立"
     assert client.get(f"{API}/projects/{pid}/scenes").json() == []
+
+
+# --- 剧本原文分段读（「不再超时」的那一半） ---
+
+
+def test_read_script_pages_through_the_raw_text(
+    client: TestClient, pid: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """一段一段地读：offset / next_offset / done 必须自洽，否则模型会漏读或重复读。"""
+    text = "".join(f"第{i}句。" for i in range(200))
+    client.patch(f"{API}/projects/{pid}/story", json={"raw_text": text})
+
+    seen: list[dict[str, Any]] = []
+
+    async def fake(messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> dict[str, Any]:
+        tool_msgs = [m for m in messages if m.get("role") == "tool"]
+        if tool_msgs:
+            seen.append(json.loads(str(tool_msgs[-1]["content"])))
+        if len(seen) >= 2:
+            return {"content": "读到一半，等你说继续。", "tool_calls": []}
+        offset = seen[-1]["next_offset"] if seen else 0
+        return {
+            "content": "",
+            "tool_calls": [call("read_script", offset=offset, limit=300)],
+        }
+
+    monkeypatch.setattr(settings, "llm_provider", "openai_compatible")
+    monkeypatch.setattr(settings, "llm_model", "fake-model")
+    monkeypatch.setattr(settings, "llm_base_url", "http://127.0.0.1:9/v1")
+    monkeypatch.setattr(llm, "complete_tools", fake)
+
+    resp = client.post(
+        f"{API}/projects/{pid}/director/chat", json={"message": "开始拆", "scope": "script"}
+    )
+    assert resp.status_code == 201, resp.text
+    assert len(seen) == 2
+    assert seen[0]["total"] == len(text)
+    assert seen[0]["offset"] == 0 and seen[0]["next_offset"] == 300
+    assert seen[0]["text"] == text[:300] and seen[0]["done"] is False
+    assert seen[1]["offset"] == 300 and seen[1]["text"] == text[300:600]
+
+
+def test_read_script_without_raw_text_says_what_to_do(
+    client: TestClient, pid: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """没存剧本原文时，回给模型的是四要素错误的文字，不是一句空字符串。"""
+    use_fake_llm(
+        monkeypatch,
+        [
+            {"content": "", "tool_calls": [call("read_script", offset=0)]},
+            {"content": "没有原文可读。", "tool_calls": []},
+        ],
+    )
+    resp = client.post(f"{API}/projects/{pid}/director/chat", json={"message": "开始拆"})
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["ops"] == []
+
+
+# --- 内置 SKILL ---
+
+
+def test_read_skill_gives_the_full_text_and_rejects_unknown_names(
+    client: TestClient, pid: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.ai import skills
+    from app.core.errors import AppError
+
+    for name in skills.NAMES:
+        text = skills.render(name)
+        assert "## 怎么写" in text and "## 范例" in text
+        assert "non_diegetic_music" in text, "无配乐那条必须写在每一份里"
+
+    with pytest.raises(AppError) as caught:
+        skills.render("不存在的 skill")
+    err = caught.value.to_dict()
+    assert err["code"] == "VALIDATION_ERROR"
+    assert err["title"] and err["detail"] and err["suggestions"]
+
+    # 清单只有一行一份：它是唯一进系统提示词的部分
+    assert len(skills.catalog().splitlines()) == len(skills.NAMES)
+
+    use_fake_llm(
+        monkeypatch,
+        [
+            {
+                "content": "",
+                # 不用 call()：这个工具的参数就叫 name，会和辅助函数的形参撞上
+                "tool_calls": [{"id": "c1", "name": "read_skill", "arguments": {"name": "flf"}}],
+            },
+            {"content": "照 flf 写。", "tool_calls": []},
+        ],
+    )
+    resp = client.post(f"{API}/projects/{pid}/director/chat", json={"message": "怎么写 prompt"})
+    assert resp.status_code == 201, resp.text
+
+
+def test_skill_pick_covers_every_frame_combination() -> None:
+    from app.ai import skills
+
+    assert skills.pick(True, True) == "flf"
+    assert skills.pick(True, False) == "i2v"
+    assert skills.pick(False, True) == "l2v"
+    assert skills.pick(False, False, True) == "ref"
+    assert skills.pick(False, False, False) == "ref", "一张参考图都没有也退化到 ref"
+
+
+# --- 镜头级写工具 ---
+
+
+def test_shot_tools_are_proposal_only_then_land_with_a_four_part_prompt(
+    client: TestClient, pid: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """镜头级工具与幕级同一条边界：chat 之后库里镜头数不变，apply 之后才真落库。"""
+    sid = scene(client, pid, "第一幕")
+    use_fake_llm(
+        monkeypatch,
+        [
+            {
+                "content": "",
+                "tool_calls": [
+                    call(
+                        "add_shot",
+                        scene_id=sid,
+                        title="雨中疾驰",
+                        duration=5,
+                        camera_motion="中景，缓慢推进",
+                        visual_prompt="轿车在雨幕里疾驰，路灯拉出长长的光带",
+                        audio_dialogue="雨声与轮胎摩擦水面的声音",
+                        negative_prompt="模糊, 变形",
+                        skill="i2v",
+                        why="这一幕还没有开场镜头",
+                    )
+                ],
+            },
+            {"content": "提了一个镜头。", "tool_calls": []},
+        ],
+    )
+    body = client.post(f"{API}/projects/{pid}/director/chat", json={"message": "补个镜头"}).json()
+    ops = body["ops"]
+    assert [o["op"] for o in ops] == ["add_shot"]
+    assert ops[0]["target"] == "shot" and ops[0]["before"]["shot_count"] == 0
+    assert client.get(f"{API}/projects/{pid}/scenes/{sid}").json()["shot_count"] == 0, (
+        "提案不该落库"
+    )
+
+    after = ops[0]["after"]
+    assert after["prompt"].startswith("[SHOT 1]")
+    assert "Camera Motion: 中景，缓慢推进" in after["prompt"]
+    assert "Visual Prompt: 轿车在雨幕里疾驰" in after["prompt"]
+    assert "声音设计：" in after["prompt"], "无配乐硬约束由代码补，不靠模型自觉"
+    assert "background music" in after["negative_prompt"]
+
+    resp = client.post(f"{API}/projects/{pid}/director/apply", json={"ops": ops})
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["count"] == 1
+
+    shots = client.get(f"{API}/projects/{pid}/storyboard").json()[0]["shots"]
+    assert len(shots) == 1
+    shot = client.get(f"{API}/projects/{pid}/shots/{shots[0]['id']}").json()
+    assert shot["title"] == "雨中疾驰" and shot["duration"] == 5
+    assert shot["prompt"].startswith("[SHOT 1]")
+    assert "background music" in shot["negative_prompt"]
+
+
+def test_update_shot_keeps_the_segments_it_was_not_given(
+    client: TestClient, pid: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """只给 visual_prompt 时，机位与对白不该被抹成默认值。"""
+    sid = scene(client, pid, "第一幕")
+    created = client.post(
+        f"{API}/projects/{pid}/scenes/{sid}/shots",
+        json={
+            "title": "旧镜头",
+            "prompt": (
+                "[SHOT 1]\nCamera Motion: 特写，固定\n"
+                "Visual Prompt: 旧的画面\nAudio / Dialogue: 老王：别追了"
+            ),
+        },
+    ).json()
+
+    use_fake_llm(
+        monkeypatch,
+        [
+            {
+                "content": "",
+                "tool_calls": [
+                    call(
+                        "update_shot",
+                        shot_id=created["id"],
+                        visual_prompt="新的画面：雨点砸在挡风玻璃上",
+                        why="原来的画面描述太空",
+                    )
+                ],
+            },
+            {"content": "改了一条。", "tool_calls": []},
+        ],
+    )
+    ops = client.post(f"{API}/projects/{pid}/director/chat", json={"message": "重写画面"}).json()[
+        "ops"
+    ]
+    prompt = ops[0]["after"]["prompt"]
+    assert "Camera Motion: 特写，固定" in prompt, "没给的那一段要从原 prompt 里接着用"
+    assert "Audio / Dialogue: 老王：别追了" in prompt
+    assert "新的画面：雨点砸在挡风玻璃上" in prompt
+
+    client.post(f"{API}/projects/{pid}/director/apply", json={"ops": ops})
+    shot = client.get(f"{API}/projects/{pid}/shots/{created['id']}").json()
+    assert "特写，固定" in shot["prompt"] and "老王：别追了" in shot["prompt"]
+
+
+def test_delete_and_reorder_shots_go_through_the_same_review(
+    client: TestClient, pid: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sid = scene(client, pid, "第一幕")
+    ids = [
+        client.post(f"{API}/projects/{pid}/scenes/{sid}/shots", json={"title": t}).json()["id"]
+        for t in ("A", "B", "C")
+    ]
+    use_fake_llm(
+        monkeypatch,
+        [
+            {
+                "content": "",
+                "tool_calls": [
+                    call("delete_shot", shot_id=ids[1], why="这一镜和上一镜重复"),
+                    call(
+                        "reorder_shots",
+                        scene_id=sid,
+                        order=[ids[2], ids[0]],
+                        why="先给全景再给特写",
+                    ),
+                ],
+            },
+            {"content": "两条。", "tool_calls": []},
+        ],
+    )
+    ops = client.post(f"{API}/projects/{pid}/director/chat", json={"message": "理一下顺序"}).json()[
+        "ops"
+    ]
+    assert [o["op"] for o in ops] == ["delete_shot", "reorder_shots"]
+    titles = [s["title"] for s in client.get(f"{API}/projects/{pid}/storyboard").json()[0]["shots"]]
+    assert titles == ["A", "B", "C"], "提案阶段一行都不该动"
+
+    resp = client.post(f"{API}/projects/{pid}/director/apply", json={"ops": ops})
+    assert resp.status_code == 201 and resp.json()["failed"] == []
+    titles = [s["title"] for s in client.get(f"{API}/projects/{pid}/storyboard").json()[0]["shots"]]
+    assert titles == ["C", "A"]
+
+
+def test_set_shot_link_lands_a_transition(
+    client: TestClient, pid: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sid = scene(client, pid, "第一幕")
+    ids = [
+        client.post(f"{API}/projects/{pid}/scenes/{sid}/shots", json={"title": t}).json()["id"]
+        for t in ("A", "B")
+    ]
+    use_fake_llm(
+        monkeypatch,
+        [
+            {
+                "content": "",
+                "tool_calls": [
+                    call(
+                        "set_shot_link",
+                        from_shot_id=ids[0],
+                        to_shot_id=ids[1],
+                        mode="transition",
+                        duration=1.5,
+                        why="两镜之间画面接不上",
+                    )
+                ],
+            },
+            {"content": "一条。", "tool_calls": []},
+        ],
+    )
+    ops = client.post(f"{API}/projects/{pid}/director/chat", json={"message": "加个转场"}).json()[
+        "ops"
+    ]
+    assert ops[0]["target"] == "shot_link" and ops[0]["after"]["mode"] == "transition"
+
+    resp = client.post(f"{API}/projects/{pid}/director/apply", json={"ops": ops})
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["applied"][0]["mode"] == "transition"

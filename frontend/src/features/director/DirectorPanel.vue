@@ -1,8 +1,9 @@
 <script setup lang="ts">
 /**
- * AI 协作栏（幕流程图右栏）。
+ * AI 协作栏。**剧本页与幕流程图页共用这一个组件，也共用同一个会话**（同一份
+ * `DirectorTurn`）——所以它放在 `features/director/` 而不是某一个 feature 下面。
  *
- * 这一栏的全部意义是**把「加一幕雨夜追车」变成一份可逐条审阅的 Diff**。四个刻意的设计：
+ * 这一栏的全部意义是**把「加一幕雨夜追车」变成一份可逐条审阅的 Diff**。五个刻意的设计：
  *
  *   1. **提案不是改动**。这里列出来的每一条，数据库里都还没有发生。只有按下「采用」
  *      才落库，所以每条都要给出 `before → after`——不是「AI 说它要改点东西」。
@@ -12,6 +13,8 @@
  *      改衔接、编排生成全都不依赖 LLM，这一栏关掉整条链路照旧能走完。
  *   4. **警告与失败都摆出来**。`warnings` 是「能落但有点不对」（角色名对不上），
  *      `failed` 里每条带四要素错误，一条失败不影响其余几条已经落进去的。
+ *   5. **`scope` 只是一句提示**。它透传给后端拼系统提示词（用户现在在哪一页），
+ *      不落库、不分会话——换页不该让历史对话变味。
  */
 import { onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
@@ -21,37 +24,35 @@ import AppButton from '@/shared/ui/AppButton.vue'
 import AppPanel from '@/shared/ui/AppPanel.vue'
 import EmptyState from '@/shared/ui/EmptyState.vue'
 import ErrorPanel from '@/shared/ui/ErrorPanel.vue'
-import { OP_LABEL, type DirectorOp } from '@/shared/api/director'
+import { OP_FIELD_LABEL, OP_LABEL, type DirectorOp, type DirectorScope } from '@/shared/api/director'
 import { useDirectorStore } from '@/stores/director'
 
-const props = defineProps<{ pid: string }>()
-/** 落库成功后通知外面重拉流程图——幕数、镜头数、衔接都可能变了。 */
+const props = withDefaults(
+  defineProps<{
+    pid: string
+    /** 用户现在开着哪一页。只影响后端拼的系统提示词。 */
+    scope?: DirectorScope
+    title?: string
+    placeholder?: string
+    emptyBody?: string
+    /** 一排 chip，点一下把这句话填进输入框（不直接发送——发出去之前用户还能改）。 */
+    quickActions?: string[]
+  }>(),
+  {
+    scope: 'flow',
+    title: 'AI 协作',
+    placeholder: '要它做什么？Enter 发送，Shift+Enter 换行',
+    emptyBody:
+      '例如「在第 2 幕后面加一幕雨夜追车」「把第 1 幕的出场角色改成只有阿岚」。它会先看清现状，再提一份提案——按下采用之前，库里什么都不会变。',
+    quickActions: () => [],
+  },
+)
+/** 落库成功后通知外面重拉——幕数、镜头数、衔接都可能变了。 */
 const emit = defineEmits<{ applied: [] }>()
 
 const router = useRouter()
 const director = useDirectorStore()
 const draft = ref('')
-
-/** 字段名在界面上叫什么。对不上的直接显示原名，不猜。 */
-const FIELD_LABEL: Record<string, string> = {
-  title: '标题',
-  summary: '概要',
-  time_of_day: '时间',
-  location_variant_id: '地点变体',
-  prompt: '画面描述',
-  cast: '出场角色',
-  props: '道具',
-  shots: '镜头',
-  mode: '衔接方式',
-  duration: '时长',
-  order: '顺序',
-  titles: '顺序（标题）',
-  shot_count: '镜头数',
-  from_title: '从',
-  to_title: '到',
-  from_scene_id: '上一幕',
-  to_scene_id: '下一幕',
-}
 
 /** 把任意值压成一行能看的字。角色 / 道具那种数组显示 label，不显示 id。 */
 function show(value: unknown): string {
@@ -83,7 +84,15 @@ interface DiffRow {
 }
 
 /** before / after 并成几行。id 那种给人看没意义的字段不进 Diff。 */
-const HIDDEN_KEYS = new Set(['from_scene_id', 'to_scene_id', 'location_variant_id', 'order'])
+const HIDDEN_KEYS = new Set([
+  'from_scene_id',
+  'to_scene_id',
+  'from_shot_id',
+  'to_shot_id',
+  'scene_id',
+  'location_variant_id',
+  'order',
+])
 
 function rowsOf(op: DirectorOp): DiffRow[] {
   const before = op.before ?? {}
@@ -94,7 +103,7 @@ function rowsOf(op: DirectorOp): DiffRow[] {
   return keys.map((key) => {
     const from = show((before as Record<string, unknown>)[key])
     const to = op.after === null ? '（删掉）' : show((after as Record<string, unknown>)[key])
-    return { key, label: FIELD_LABEL[key] ?? key, from, to, changed: from !== to }
+    return { key, label: OP_FIELD_LABEL[key] ?? key, from, to, changed: from !== to }
   })
 }
 
@@ -114,7 +123,7 @@ async function send(): Promise<void> {
   const text = draft.value.trim()
   if (!text) return
   draft.value = ''
-  await director.send(props.pid, text)
+  await director.send(props.pid, text, props.scope)
 }
 
 async function accept(op: DirectorOp): Promise<void> {
@@ -129,7 +138,7 @@ async function acceptAll(): Promise<void> {
 </script>
 
 <template>
-  <AppPanel title="AI 协作" class="w-80 shrink-0">
+  <AppPanel :title="title" class="w-80 shrink-0">
     <template #actions>
       <AppBadge
         v-if="director.degraded"
@@ -182,7 +191,7 @@ async function acceptAll(): Promise<void> {
           <EmptyState
             v-if="!director.messages.length"
             title="跟它说一句话"
-            body="例如「在第 2 幕后面加一幕雨夜追车」「把第 1 幕的出场角色改成只有阿岚」。它会先看清现状，再提一份提案——按下采用之前，库里什么都不会变。"
+            :body="emptyBody"
           />
           <ul v-else class="space-y-1.5">
             <li
@@ -305,10 +314,23 @@ async function acceptAll(): Promise<void> {
 
         <!-- 输入 -->
         <div class="border-line-1 shrink-0 border-t p-2">
+          <!-- 快捷句：点一下只是填进输入框，不直接发送——发出去之前用户还能改 -->
+          <div v-if="quickActions.length" class="mb-1 flex flex-wrap gap-1">
+            <button
+              v-for="q in quickActions"
+              :key="q"
+              type="button"
+              class="border-line-1 bg-base-2 text-fg-3 hover:border-accent/60 hover:text-fg-1 border px-1 py-0.5 text-2xs"
+              :title="`填进输入框：${q}`"
+              @click="draft = q"
+            >
+              {{ q }}
+            </button>
+          </div>
           <textarea
             v-model="draft"
             rows="2"
-            placeholder="要它做什么？Enter 发送，Shift+Enter 换行"
+            :placeholder="placeholder"
             class="border-line-1 bg-base-2 text-fg-1 placeholder:text-fg-4 focus:border-accent/60 w-full resize-none border p-1.5 text-2xs leading-relaxed outline-none"
             @keydown.enter.exact.prevent="send()"
           />
