@@ -11,10 +11,21 @@
 
 失败的处理刻意不是「一条挂了整批回滚」：每条独立落，失败的连四要素错误一起回给前端。
 一条角色名对不上，不该让另外四条通过审阅的改动也进不去。
+
+**流式（`chat_stream()`）与不流式（`chat()`）落的是同一份记录。** 两条路都走
+`agent.collaborate()` 那一个循环，落库那几步也只有一份实现（`_persist()`）——
+于是「刷新页面提案还在」这件事不会因为走了哪条路而不一样。三条边界：
+
+  · **能先报的错先报**（`stream_precheck()`）：消息空的、LLM 没配、工程没打开，
+    这些在 SSE 的 200 头发出去之前就抛，前端拿到的是正常的 JSON 四要素错误；
+  · **半路挂了也不白干**：已经说过的话与已经攒出的提案先落成记录，再吐 `error`
+    事件——和「转满轮数」那条老规矩同一个理由；
+  · **`error` 之后没有 `done`**：两者互斥，前端收到任一个都该重拉一次历史。
 """
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from typing import Any
 
 from app.ai.director import agent
@@ -75,6 +86,26 @@ class DirectorService:
         `scope` 是「用户现在开着哪一页」（`script` 剧本页 / `flow` 幕流程图页）。它**只影响
         这一次请求拼出来的系统提示词**那一句提示，不落库、不加列——两页共用同一个会话，
         换页不该让历史对话变味。
+
+        这是不流式那条路（兼容 + 不支持 SSE 的调用方）。流式那条见 `chat_stream()`，
+        两条共用 `_persist()` 与 `_over_limit()`。
+        """
+        text = await self.stream_precheck(pid, message)
+        await self._add_turn(pid, "user", {"text": text})
+        history = await self._llm_history(pid)
+        out = await agent.propose(pid, text, history, scope=scope)
+        turns = await self._persist(pid, out)
+        if out["over_limit"]:
+            # 提案已经落好了才报错：转够了轮数不代表这几条不能用。
+            raise self._over_limit(len(out["ops"]))
+        return {"turns": turns, "ops": out["ops"], "degraded": out["degraded"]}
+
+    async def stream_precheck(self, pid: str, message: str) -> str:
+        """能在开流之前报的错，就别等到流里再报。返回收拾干净的那句话。
+
+        `api/director.py` 的流式端点先 `await` 这一下，于是「消息是空的」「LLM 没配置」
+        「这个工程没打开」拿到的仍是正常的 4xx/503 JSON 四要素错误——不是一个 200
+        然后夹在 `text/event-stream` 里的 `error` 事件（那种前端得写两套错误处理）。
         """
         text = str(message or "").strip()
         if not text:
@@ -85,9 +116,103 @@ class DirectorService:
                 ["比如「在第 2 幕后面加一幕雨夜追车」", "或直接在流程图上手动加一幕"],
             )
         llm.require_configured()
+        db_of(pid)  # 工程没打开就在这里 404，别等流开了才发现
+        return text
+
+    async def chat_stream(
+        self, pid: str, message: str, scope: str = "flow"
+    ) -> AsyncIterator[dict[str, Any]]:
+        """说一句话，把过程当 SSE 事件吐出来。**一行业务数据都不改。**
+
+        产出的是**线上形状**（`{"event": …, "data": {…}}`），`api/director.py` 只负责
+        照 SSE 的格式把它们写出去——那一层照旧极薄。事件：
+
+          · `delta` `{text}`                     模型正在写的文字；
+          · `tool`  `{name, phase, ok?, error?}` 一次工具调用的开始 / 结束；
+          · `op`    一条提案（形状与 `chat()` 回的 `ops[]` 里那条一模一样）；
+          · `done`  `{turns, ops, degraded, rounds}`  **正常收尾**，`turns` 是刚落的记录；
+          · `error` `{error: {code, title, detail, suggestions}}`  收尾的另一种。
+
+        `done` 与 `error` **互斥且必有其一**；收到任一个前端都该重拉一次历史
+        （提案已经落成记录了，刷新也不丢）。
+        """
+        text = await self.stream_precheck(pid, message)
         await self._add_turn(pid, "user", {"text": text})
         history = await self._llm_history(pid)
-        out = await agent.propose(pid, text, history, scope=scope)
+        said: list[str] = []
+        ops: list[dict[str, Any]] = []
+        out: dict[str, Any] = {}
+        try:
+            async for event in agent.collaborate(pid, text, history, scope=scope):
+                kind = event["kind"]
+                if kind == "delta":
+                    said.append(event["text"])
+                    yield {"event": "delta", "data": {"text": event["text"]}}
+                elif kind == "tool":
+                    data = {"name": event["name"], "phase": event["phase"]}
+                    if event["phase"] == "done":
+                        data["ok"] = event["ok"]
+                        data["error"] = event["error"]
+                    yield {"event": "tool", "data": data}
+                elif kind == "op":
+                    ops.append(event["op"])
+                    yield {"event": "op", "data": event["op"]}
+                elif kind == "result":
+                    out = event["result"]
+        except AppError as exc:
+            # 半路挂了也不白干：说过的话与攒出的提案先落成记录，再把错误吐出去。
+            await self._persist(pid, self._salvage(said, ops))
+            yield {"event": "error", "data": {"error": exc.to_dict()}}
+            return
+        except Exception as exc:  # noqa: BLE001 —— 归一成四要素，绝不静默
+            log.warning("director stream failed: %s", exc)
+            await self._persist(pid, self._salvage(said, ops))
+            yield {
+                "event": "error",
+                "data": {
+                    "error": AppError(
+                        ErrorCode.LLM_UNAVAILABLE,
+                        "这一轮中断了",
+                        f"{type(exc).__name__}: {exc}",
+                        [
+                            f"已产出的 {len(ops)} 条提案仍在右栏，可以照常审阅采用",
+                            "重试一次（多半是连接或超时）",
+                            "或在流程图上手动改——手动路径不依赖 LLM",
+                        ],
+                    ).to_dict()
+                },
+            }
+            return
+        if not out:  # collaborate() 保证有 result；真没有就当作中断，绝不静默收尾
+            out = self._salvage(said, ops)
+            out["over_limit"] = True
+        turns = await self._persist(pid, out)
+        if out["over_limit"]:
+            yield {"event": "error", "data": {"error": self._over_limit(len(out["ops"])).to_dict()}}
+            return
+        yield {
+            "event": "done",
+            "data": {
+                "turns": turns,
+                "ops": out["ops"],
+                "degraded": out["degraded"],
+                "rounds": out["rounds"],
+            },
+        }
+
+    @staticmethod
+    def _salvage(said: list[str], ops: list[dict[str, Any]]) -> dict[str, Any]:
+        """半路中断时手里剩下的东西，拼成 `_persist()` 认的那个形状。"""
+        return {
+            "reply": "".join(said).strip(),
+            "ops": ops,
+            "rounds": 0,
+            "over_limit": False,
+            "degraded": False,
+        }
+
+    async def _persist(self, pid: str, out: dict[str, Any]) -> list[dict[str, Any]]:
+        """把一轮的结果落成记录：AI 说的那条 + 有提案时再一条。**只有这一份实现。**"""
         turns = [
             await self._add_turn(
                 pid,
@@ -107,19 +232,21 @@ class DirectorService:
                     {"ops": out["ops"], "note": "以上为提案，尚未写入数据库。"},
                 )
             )
-        if out["over_limit"]:
-            # 提案已经落好了才报错：转够了轮数不代表这几条不能用。
-            raise AppError(
-                ErrorCode.LLM_INVALID_OUTPUT,
-                "AI 转了太多轮还没收尾",
-                f"已经跑满 {agent.MAX_ROUNDS} 轮工具调用，这一轮就此停下。",
-                [
-                    f"已产出的 {len(out['ops'])} 条提案仍在右栏，可以照常审阅采用",
-                    "把要求说得更具体一点再试（比如指明是哪一幕）",
-                    "或直接在流程图上手动改——手动路径不依赖 LLM",
-                ],
-            )
-        return {"turns": turns, "ops": out["ops"], "degraded": out["degraded"]}
+        return turns
+
+    @staticmethod
+    def _over_limit(count: int) -> AppError:
+        """转满轮数：提案已经落好了才报这个错——转够了轮数不代表这几条不能用。"""
+        return AppError(
+            ErrorCode.LLM_INVALID_OUTPUT,
+            "AI 转了太多轮还没收尾",
+            f"已经跑满 {agent.MAX_ROUNDS} 轮工具调用，这一轮就此停下。",
+            [
+                f"已产出的 {count} 条提案仍在右栏，可以照常审阅采用",
+                "把要求说得更具体一点再试（比如指明是哪一幕）",
+                "或直接在流程图上手动改——手动路径不依赖 LLM",
+            ],
+        )
 
     async def _llm_history(self, pid: str) -> list[dict[str, Any]]:
         """只把人说的和 AI 说的回喂给模型。提案那几条不回喂——

@@ -11,6 +11,7 @@ gemini / ollama）。这一层只做三件事：判断「配没配」、按设�
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from typing import Any
 
 from app.ai.llm import protocols
@@ -35,6 +36,8 @@ def status() -> dict[str, Any]:
         "model": settings.llm_model or None,
         #: 不支持工具的端会退化成一次性产出提案，界面上要说清这件事。
         "supports_tools": bool(proto and proto.supports_tools),
+        #: 不支持流式的端会整段返回（基类替它冒充一块），协作栏据此不画那个光标。
+        "supports_stream": bool(proto and proto.supports_stream),
         "hint": (
             f"已配置 {proto.label} · {settings.llm_model}"
             if configured and proto
@@ -82,6 +85,29 @@ async def complete_tools(
     require_configured()
     proto = protocols.require()
     return await proto.complete_tools(protocols.config(), messages, tools)
+
+
+async def stream_tools(
+    messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+) -> AsyncIterator[dict[str, Any]]:
+    """function calling **一轮**，一边写一边吐。事件只有两种：
+
+      · `{"type": "delta", "text": …}`  文本增量（可以一个都没有）；
+      · `{"type": "final", "content", "tool_calls"}`  **必定收尾**，形状与
+        `complete_tools()` 的返回一模一样。
+
+    **不支持流式的端不是「用不了」**：这里退化成调一次 `complete_tools()`，整段文字算一块。
+    退化刻意走本模块的 `complete_tools`（而不是适配器上那个同名方法）——于是测试里
+    monkeypatch 它就同时盖住了流式那条路，两条路不会在测试里分叉。
+    """
+    require_configured()
+    proto = protocols.require()
+    if not proto.supports_stream:
+        for event in protocols.one_chunk(await complete_tools(messages, tools)):
+            yield event
+        return
+    async for event in proto.stream_tools(protocols.config(), messages, tools):
+        yield event
 
 
 async def complete_json(system: str, user: str) -> dict[str, Any]:

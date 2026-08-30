@@ -2,7 +2,7 @@
 
 它做的事只有一件：**把「加一幕雨夜追车」这种话，变成一份可逐条审阅的提案。**
 
-三条设计：
+四条设计：
 
   1. **读立刻执行、写只进缓冲区。** 边界在 `tools.py`。模型可以随便看这个工程里有谁、
      有哪些地点、现在几幕；但它想改什么，只会变成提案条目。数据库是用户的。
@@ -12,11 +12,15 @@
   3. **不支持 tools 的端也要能用。** Ollama 那类端退化成一次性 `complete_json()`：
      先把工程现状塞进提示里（模型没法自己去查了），让它一口气吐一个 ops 数组，
      再走同一个 `to_op()` 翻译。两条路产出的提案形状一模一样。
+  4. **流式与不流式共用同一个循环。** 只有 `collaborate()` 一份实现，它是个事件流；
+     `propose()` 只是把事件收干、把最后那条 `result` 拿出来。多轮工具调用的循环、
+     工具失败怎么回喂、提案怎么攒——这些绝不能有第二份，两份必然分叉。
 """
 
 from __future__ import annotations
 
 import json
+from collections.abc import AsyncIterator
 from typing import Any
 
 from app.ai import prompts
@@ -89,29 +93,71 @@ async def propose(
     history: list[dict[str, Any]],
     scope: str = "flow",
 ) -> dict[str, Any]:
-    """跑一轮协作。返回 `{reply, ops, rounds, over_limit, degraded}`，**不落库**。
+    """跑一轮协作，**不落库**。返回 `{reply, ops, rounds, over_limit, degraded}`。
+
+    非流式那条路（`POST /director/chat`）用它。实现只是把 `collaborate()` 的事件收干——
+    循环只有那一份。
+    """
+    result: dict[str, Any] = {}
+    async for event in collaborate(pid, message, history, scope=scope, live=False):
+        if event["kind"] == "result":
+            result = event["result"]
+    return result
+
+
+async def collaborate(
+    pid: str,
+    message: str,
+    history: list[dict[str, Any]],
+    scope: str = "flow",
+    *,
+    live: bool = True,
+) -> AsyncIterator[dict[str, Any]]:
+    """跑一轮协作，把过程当事件流吐出来。**一行库都不改。**
+
+    事件（`kind`）：
+
+      · `delta`   —— 模型正在写的文字增量（`live=False` 时一条都没有）；
+      · `tool`    —— 一次工具调用的 `start` / `done`（`done` 带 `ok` 与失败标题）；
+      · `op`      —— 新攒出的一条提案，**产出即可见**，不用等这一轮说完；
+      · `result`  —— **必定收尾**，`propose()` 的那份返回值。
 
     `scope` 只透传给 `prompts.director()`（那一句「用户现在在哪一页」），不影响别的。
+    `live=False` 走非流式的 `complete_tools()`：同一个循环、同一套工具执行，
+    只是没有 delta——于是「提案不落库」这条边界只有一处实现，测试盯住它就够。
     """
     llm.require_configured()
     if not llm.supports_tools():
-        return await _propose_without_tools(pid, message, scope)
+        async for event in _without_tools(pid, message, scope):
+            yield event
+        return
 
     messages: list[dict[str, Any]] = [{"role": "system", "content": prompts.director(scope)}]
     messages.extend(history)
     messages.append({"role": "user", "content": message})
     ops: list[dict[str, Any]] = []
-    reply = ""
+    #: 中途几轮的「我先看一下现状」也算它说过的话：用户在流里看见了，落库的记录里
+    #: 就不该只剩最后一句，不然刷新页面等于把看过的内容擦掉。
+    said: list[str] = []
     rounds = 0
     over_limit = True
     while rounds < MAX_ROUNDS:
         rounds += 1
-        out = await llm.complete_tools(messages, tool_specs())
+        out: dict[str, Any] = {"content": "", "tool_calls": []}
+        async for event in _one_round(messages, live):
+            if event["kind"] == "final":
+                out = event["out"]
+            else:
+                yield event
         calls = out["tool_calls"]
+        text = str(out.get("content") or "").strip()
         if not calls:
-            reply = str(out.get("content") or "").strip()
+            if text:
+                said.append(text)
             over_limit = False
             break
+        if text:
+            said.append(text)
         messages.append(
             {
                 "role": "assistant",
@@ -130,24 +176,51 @@ async def propose(
             }
         )
         for call in calls:
-            messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": call["id"],
-                    "content": await _run_one(pid, call, ops),
-                }
-            )
-    return {
-        "reply": reply,
-        "ops": ops,
-        "rounds": rounds,
-        "over_limit": over_limit,
-        "degraded": False,
+            yield {"kind": "tool", "name": call["name"], "phase": "start"}
+            done = await _run_one(pid, call, len(ops) + 1)
+            if done["op"] is not None:
+                ops.append(done["op"])
+                yield {"kind": "op", "op": done["op"]}
+            yield {
+                "kind": "tool",
+                "name": call["name"],
+                "phase": "done",
+                "ok": done["ok"],
+                "error": done["error"],
+            }
+            messages.append({"role": "tool", "tool_call_id": call["id"], "content": done["text"]})
+    yield {
+        "kind": "result",
+        "result": {
+            "reply": "\n\n".join(said),
+            "ops": ops,
+            "rounds": rounds,
+            "over_limit": over_limit,
+            "degraded": False,
+        },
     }
 
 
-async def _run_one(pid: str, call: dict[str, Any], ops: list[dict[str, Any]]) -> str:
-    """执行一次工具调用，返回给模型看的那段文本。
+async def _one_round(messages: list[dict[str, Any]], live: bool) -> AsyncIterator[dict[str, Any]]:
+    """问一次模型。yield 若干 `delta`，最后必定 yield 一条 `final`。"""
+    if not live:
+        out = await llm.complete_tools(messages, tool_specs())
+        yield {
+            "kind": "final",
+            "out": {"content": out.get("content"), "tool_calls": out.get("tool_calls") or []},
+        }
+        return
+    out = {"content": "", "tool_calls": []}
+    async for event in llm.stream_tools(messages, tool_specs()):
+        if event["type"] == "delta":
+            yield {"kind": "delta", "text": event["text"]}
+        elif event["type"] == "final":
+            out = {"content": event.get("content"), "tool_calls": event.get("tool_calls") or []}
+    yield {"kind": "final", "out": out}
+
+
+async def _run_one(pid: str, call: dict[str, Any], seq: int) -> dict[str, Any]:
+    """执行一次工具调用。返回 `{text, op, ok, error}`——`text` 是回给模型看的那段。
 
     工具报错**不中断整轮**：把错误原样回给模型，它常常能自己纠正（比如换个对的 id）。
     一路抛出去只会让用户看到一条「AI 失败了」，什么也没拿到。
@@ -155,22 +228,33 @@ async def _run_one(pid: str, call: dict[str, Any], ops: list[dict[str, Any]]) ->
     name = call["name"]
     try:
         if name in WRITE_TOOLS:
-            op = await to_op(pid, name, call["arguments"], len(ops) + 1)
-            ops.append(op)
+            op = await to_op(pid, name, call["arguments"], seq)
             note = "已记入提案，尚未写入数据库；用户会逐条审阅。"
             if op["warnings"]:
                 note += " 注意：" + "；".join(op["warnings"])
-            return note
-        return json.dumps(await run_read(pid, name, call["arguments"]), ensure_ascii=False)
+            return {"text": note, "op": op, "ok": True, "error": ""}
+        payload = json.dumps(await run_read(pid, name, call["arguments"]), ensure_ascii=False)
+        return {"text": payload, "op": None, "ok": True, "error": ""}
     except Exception as exc:  # noqa: BLE001 —— 工具的任何失败都只是这一步失败
         log.info("director tool %s failed: %s", name, exc)
-        title = getattr(exc, "title", type(exc).__name__)
-        detail = getattr(exc, "detail", str(exc))
-        return f"这个工具失败了：{title}。{detail} 请换一种做法或先用读工具确认 id。"
+        title = str(getattr(exc, "title", type(exc).__name__))
+        detail = str(getattr(exc, "detail", str(exc)))
+        return {
+            "text": f"这个工具失败了：{title}。{detail} 请换一种做法或先用读工具确认 id。",
+            "op": None,
+            "ok": False,
+            "error": title,
+        }
 
 
-async def _propose_without_tools(pid: str, message: str, scope: str = "flow") -> dict[str, Any]:
-    """不支持 function calling 的端：一次性产出 ops 数组，再走同一套翻译。"""
+async def _without_tools(
+    pid: str, message: str, scope: str = "flow"
+) -> AsyncIterator[dict[str, Any]]:
+    """不支持 function calling 的端：一次性产出 ops 数组，再走同一套翻译。
+
+    它没有中途的文字增量（一次调用就出全部），但 `op` 事件照旧一条条给——
+    协作栏那一侧于是不用为两条路各写一份渲染。
+    """
     data = await llm.complete_json(
         _fallback_system(scope),
         f"工程现状：\n{await _snapshot(pid)}\n\n用户的要求：{message}",
@@ -183,11 +267,25 @@ async def _propose_without_tools(pid: str, message: str, scope: str = "flow") ->
         name = str(raw.get("tool") or "")
         args = raw.get("args") if isinstance(raw.get("args"), dict) else {}
         try:
-            ops.append(await to_op(pid, name, args, len(ops) + 1))
+            op = await to_op(pid, name, args, len(ops) + 1)
         except Exception as exc:  # noqa: BLE001 —— 一条不成立不该毁掉其余几条
             notes.append(f"{name}：{getattr(exc, 'title', type(exc).__name__)}")
+            continue
+        ops.append(op)
+        yield {"kind": "op", "op": op}
     reply = str(data.get("reply") or "").strip()
     if notes:
         tail = f"有 {len(notes)} 条没能成立：" + "；".join(notes)
         reply = f"{reply} {tail}" if reply else tail
-    return {"reply": reply, "ops": ops, "rounds": 1, "over_limit": False, "degraded": True}
+    if reply:
+        yield {"kind": "delta", "text": reply}
+    yield {
+        "kind": "result",
+        "result": {
+            "reply": reply,
+            "ops": ops,
+            "rounds": 1,
+            "over_limit": False,
+            "degraded": True,
+        },
+    }

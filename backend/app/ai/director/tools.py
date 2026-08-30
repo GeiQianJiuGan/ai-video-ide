@@ -396,14 +396,23 @@ async def run_read(pid: str, name: str, args: dict[str, Any]) -> Any:
 
 async def _read_script(pid: str, args: dict[str, Any]) -> dict[str, Any]:
     """读剧本原文的一段。**分段读是「不再超时」的关键**，所以这里只回一段，
-    并且把「还剩多少」写清楚——模型靠 `next_offset` / `done` 自己决定要不要再读一段。"""
+    并且把「还剩多少」写清楚——模型靠 `next_offset` / `done` 自己决定要不要再读一段。
+
+    **多数工程根本没有原文**：剧本页已经没有贴原文那一栏了（后端留作兼容，见
+    `services/story.py` 的 `raw_text`）。所以「原文是空的」不是错误现场，只是
+    「这条路走不通，改成听用户说」——建议里第一句就得是这个。
+    """
     text = str((await story.get_story(pid)).get("raw_text") or "")
     if not text.strip():
         raise AppError(
             ErrorCode.VALIDATION_ERROR,
-            "剧本原文是空的",
-            "这个工程还没有存过剧本原文。",
-            ["在剧本页左栏把剧本贴进去并保存", "或者直接告诉我剧情，我按你说的提幕与镜头"],
+            "这个工程没有剧本原文",
+            "没存过原文，所以没有可读的段落——这不影响拆幕，只是要换个来源。",
+            [
+                "直接照用户说的剧情提幕与镜头，别再调 read_script",
+                "先 list_scenes / get_scene 看看现在已经有哪些幕",
+                "缺哪一段就问用户一句，别自己编设定",
+            ],
         )
     total = len(text)
     try:

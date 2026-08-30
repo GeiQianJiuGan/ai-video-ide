@@ -1,18 +1,26 @@
 """AI 导演接口（幕流程图右栏的后端）。
 
-三个端点，界线就是「提案」与「落库」的界线：
+四个端点，界线就是「提案」与「落库」的界线：
 
-  - `POST /director/chat`  说一句话 → 拿回一份提案，**数据库一行不动**；
-  - `POST /director/apply` 把审阅通过的条目落库，只落 `op != "reject"` 的；
-  - `GET  /director`       历史对话与提案（刷新页面不丢）+ LLM 状态
+  - `POST /director/chat`        说一句话 → 拿回一份提案，**数据库一行不动**；
+  - `POST /director/chat/stream` 同一件事，边跑边吐（SSE）。上面那条原样保留：
+    不支持 SSE 的调用方与后端自己的测试都还走它；
+  - `POST /director/apply`       把审阅通过的条目落库，只落 `op != "reject"` 的；
+  - `GET  /director`             历史对话与提案（刷新页面不丢）+ LLM 状态
     （未配置时前端据此显示去配置页的引导，而不是一个红叉）。
+
+这一层照旧极薄：SSE 那条也只是**把 service 给的事件按 `event:` / `data:` 写出去**，
+一个业务判断都不做。
 """
 
 from __future__ import annotations
 
+import json
+from collections.abc import AsyncIterator
 from typing import Any
 
 from fastapi import APIRouter
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from app.services.director import director
@@ -42,6 +50,35 @@ async def history(pid: str) -> dict[str, Any]:
 async def chat(pid: str, body: ChatBody) -> dict[str, Any]:
     """产出提案。落库的是「提案」这条记录，不是提案里的改动。"""
     return await director.chat(pid, body.message, body.scope)
+
+
+def _sse(event: str, data: Any) -> bytes:
+    """一条 SSE 帧。`data` 永远是一行 JSON——多行 data 的拼接规则不值得让前端去处理。"""
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n".encode()
+
+
+@router.post("/projects/{pid}/director/chat/stream")
+async def chat_stream(pid: str, body: ChatBody) -> StreamingResponse:
+    """产出提案，边跑边吐。**和不流式那条落的是同一份记录，业务数据照旧一行不动。**
+
+    先 `await stream_precheck()`：消息空的 / LLM 没配 / 工程没打开都在开流之前抛，
+    前端拿到的是正常的 JSON 四要素错误。开流之后的失败才走 `error` 事件——
+    `done` 与 `error` 互斥且必有其一。
+
+    两个头是给中间那层代理的：`no-cache` 不许缓存，`X-Accel-Buffering: no` 让 nginx
+    别攒着一起发（攒着就等于不流式了）。
+    """
+    await director.stream_precheck(pid, body.message)
+
+    async def frames() -> AsyncIterator[bytes]:
+        async for event in director.chat_stream(pid, body.message, body.scope):
+            yield _sse(event["event"], event["data"])
+
+    return StreamingResponse(
+        frames(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @router.post("/projects/{pid}/director/apply", status_code=201)
