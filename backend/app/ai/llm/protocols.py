@@ -26,6 +26,28 @@
 「模型自动获取」就是 `list_models()`：每个适配器知道自家列表长什么样，除了名字还给一个
 `label`（Anthropic 的 display_name、Gemini 的 displayName、Ollama 的体积），
 设置页直接列出来给人挑，不用手抄模型名。
+
+**流式（`stream_tools`）与非流式（`complete_tools`）是同一个动作的两种取回方式**：
+三家 SSE 方言（OpenAI 的 `choices[].delta`、Anthropic 的 `content_block_delta`、
+Gemini 的 `streamGenerateContent?alt=sse`）各自在自己的适配器里拼回内部规范形状，
+上层只认两种事件——`{"type": "delta", "text": …}` 与**必定收尾**的
+`{"type": "final", "content", "tool_calls"}`。**不支持流式不等于用不了**：基类默认调一次
+`complete_tools()` 再把整段文字当成一块 delta 吐出去（`one_chunk()`），
+于是 Ollama 与将来任何新协议都不必为「AI 回复要流式」改一行。
+
+**看图是第五个动作**（`describe_image()` + `supports_vision`）：素材没有描述时，模型引用它
+只看得到一个文件名，所以「照着这张图写一句描述」必须能真的把图片字节送进去。四种方言
+接图的形状完全不同，全部关在这一层：
+
+  · `openai_compatible` —— `content: [{type:"text"}, {type:"image_url", image_url:{url:"data:…"}}]`
+  · `anthropic` —— `content: [{type:"image", source:{type:"base64", media_type, data}}, {type:"text"}]`
+    （图排在文字前面，顺序反了它常常只答「我看到一张图片」）
+  · `gemini` —— `contents[].parts: [{inline_data:{mime_type, data}}, {text}]`
+  · `ollama` —— 图不在 content 里，而是 `messages[].images: ["<base64>"]`（**不带 `data:` 前缀**）
+
+`supports_vision=False` 的端走基类那个默认实现：报四要素错误，建议里必须有手动路径
+（照硬约束 2——看不了图不该让「给素材写描述」这件事走不通）。**密钥照旧只走请求头**，
+Gemini 这条路上也没有 `?key=`。
 """
 
 from __future__ import annotations
@@ -232,6 +254,13 @@ class LlmProtocol:
     models_path = ""
     #: 能不能走 function calling。不能的话上层退化成一次性 `complete_json()`。
     supports_tools = False
+    #: 能不能一个字一个字地回。不能的话基类替它冒充一块（见 `stream_tools`）。
+    supports_stream = False
+    #: 能不能**真的看图**（把图片字节内联进请求体）。协议级的事实，不是模型级的：
+    #: 一个端支不支持 `image_url` / `inline_data` 这种块由协议定，具体那个模型认不认图
+    #: 只有真发一次请求才知道（认不出时端会 400，照 `_http_error` 报出来）。
+    #: `False` 的端走基类那个默认实现，四要素错误里必须有手动路径。
+    supports_vision = False
     #: 没密钥能不能用（本机 Ollama 能，云端不能）。设置页用它决定要不要标必填。
     needs_key = True
 
@@ -256,6 +285,38 @@ class LlmProtocol:
             [
                 "换成 OpenAI 兼容 / Anthropic / Gemini 协议即可用多轮工具调用",
                 "或继续用它——不支持工具时会自动退化成一次性产出提案，形状完全一样",
+                MANUAL_WAY_OUT,
+            ],
+            {"provider": self.name},
+        )
+
+    async def stream_tools(
+        self, cfg: LlmConfig, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+    ) -> AsyncIterator[dict[str, Any]]:
+        """流式跑**一轮** function calling。事件只有两种，`final` 必定收尾。
+
+        默认实现是退化路径：调一次 `complete_tools()`，把整段文字当成一块 delta。
+        用户看到的是「等一下，然后整段出现」——比不给流式接口好，也不用为它加分支。
+        """
+        for event in one_chunk(await self.complete_tools(cfg, messages, tools)):
+            yield event
+
+    async def describe_image(
+        self, cfg: LlmConfig, system: str, user: str, images: list[ImagePart]
+    ) -> str:
+        """看着这几张图写一段文字。**回的是纯文本**，不是 JSON——素材描述就是一句话，
+        套一层 JSON 只会多一处能解析失败的地方。
+
+        默认实现直接报错：`supports_vision=False` 的端走它。照硬约束 2，
+        建议里必须有手动路径——「看不了图」不该让「给素材写一句描述」这件事走不通。
+        """
+        raise AppError(
+            ErrorCode.LLM_UNAVAILABLE,
+            "这个 LLM 端不能看图",
+            f"{self.label} 不接收图片，没法照着素材写描述。",
+            [
+                "在素材页的描述框里手填一句——描述是纯文本，手写与 AI 写的完全等价",
+                "或在设置页换一个能看图的端（OpenAI 兼容 / Anthropic / Gemini / Ollama 视觉模型）",
                 MANUAL_WAY_OUT,
             ],
             {"provider": self.name},
@@ -472,6 +533,8 @@ class OpenAiCompatible(LlmProtocol):
     default_base_url = "https://api.openai.com/v1"
     models_path = "/models"
     supports_tools = True
+    supports_stream = True
+    supports_vision = True
     needs_key = True
 
     def headers(self, cfg: LlmConfig) -> dict[str, str]:
@@ -697,6 +760,8 @@ class Anthropic(LlmProtocol):
     default_base_url = "https://api.anthropic.com/v1"
     models_path = "/models"
     supports_tools = True
+    supports_stream = True
+    supports_vision = True
     needs_key = True
     #: 这个头是必填的，缺了它 /messages 直接 400。
     version = "2023-06-01"
@@ -967,6 +1032,8 @@ class Gemini(LlmProtocol):
     default_base_url = "https://generativelanguage.googleapis.com/v1beta"
     models_path = "/models"
     supports_tools = True
+    supports_stream = True
+    supports_vision = True
     needs_key = True
 
     def headers(self, cfg: LlmConfig) -> dict[str, str]:
@@ -1199,6 +1266,8 @@ def listing() -> list[dict[str, Any]]:
             "label": NONE_LABEL,
             "default_base_url": "",
             "supports_tools": False,
+            "supports_stream": False,
+            "supports_vision": False,
             "needs_key": False,
             "models_hint": "",
         }
@@ -1209,6 +1278,8 @@ def listing() -> list[dict[str, Any]]:
             "label": p.label,
             "default_base_url": p.default_base_url,
             "supports_tools": p.supports_tools,
+            "supports_stream": p.supports_stream,
+            "supports_vision": p.supports_vision,
             "needs_key": p.needs_key,
             "models_hint": f"GET {p.default_base_url}{p.models_path}",
         }

@@ -1183,6 +1183,25 @@ function cancelDrop(): void {
                   <p class="text-fg-2 mt-0.5 truncate text-2xs" :title="item.label">
                     {{ item.label }}
                   </p>
+                  <!--
+                    这一条进 prompt 时那句「长什么样」。空着不是错误，但要说出来：
+                    没有它，模型引用这张素材时只看到一个文件名。判断由后端给
+                    （`desc_missing`），前端不再算第二遍。
+                  -->
+                  <p
+                    v-if="item.desc"
+                    class="text-fg-3 mt-0.5 line-clamp-2 text-2xs"
+                    :title="`模型看到的说明：${item.desc}`"
+                  >
+                    「{{ item.desc }}」
+                  </p>
+                  <p
+                    v-else-if="item.desc_missing"
+                    class="text-st-review mt-0.5 text-2xs"
+                    title="这张素材没有描述：去资产库或角色 / 地点 / 道具页给它写一句（也可以让 AI 看图补）"
+                  >
+                    没有描述 · 模型只看到一个文件名
+                  </p>
                   <p class="text-fg-4 truncate text-2xs" :title="item.reason">{{ item.reason }}</p>
                 </div>
               </li>

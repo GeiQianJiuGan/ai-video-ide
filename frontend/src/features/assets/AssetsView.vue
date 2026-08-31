@@ -14,7 +14,7 @@
  */
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { Image as ImageIcon, Library, RefreshCw, Search, Trash2 } from '@lucide/vue'
+import { Image as ImageIcon, FileText, Library, RefreshCw, Search, Trash2 } from '@lucide/vue'
 import AppPanel from '@/shared/ui/AppPanel.vue'
 import AppButton from '@/shared/ui/AppButton.vue'
 import AppBadge from '@/shared/ui/AppBadge.vue'
@@ -133,6 +133,31 @@ function goOwner(ownerKind: string, ownerId: string): void {
       >
         <Library :size="10" />从素材库采用
       </AppButton>
+      <!--
+        缺描述不是扫出来的：它跟着列表一起来，因为「引用它时模型只看到一个文件名」是
+        每次进来都该看见的事实。这颗按钮只切换「只看这一批」，不发起任何写动作。
+      -->
+      <AppButton
+        v-if="store.undescribed"
+        size="sm"
+        :variant="store.onlyUndescribed ? 'primary' : 'default'"
+        :disabled="store.undescribed.count === 0 && !store.onlyUndescribed"
+        :title="
+          store.undescribed.count === 0
+            ? '每个素材都写了描述——引用它们时 prompt 里都有「这张图长什么样」'
+            : store.undescribed.note
+        "
+        @click="store.onlyUndescribed = !store.onlyUndescribed"
+      >
+        <FileText :size="10" />
+        {{
+          store.undescribed.count === 0
+            ? '描述齐了'
+            : store.onlyUndescribed
+              ? `只看缺描述（${store.undescribed.count}）`
+              : `缺描述 ${store.undescribed.count}`
+        }}
+      </AppButton>
       <span class="text-fg-3 tnum text-2xs">
         {{ store.assets.length }} 个文件 · {{ humanBytes(store.totalBytes) }}
         <template v-if="store.orphanIds !== null">
@@ -198,24 +223,34 @@ function goOwner(ownerKind: string, ownerId: string): void {
         <template #actions>
           <span class="text-fg-4 text-2xs">
             {{
-              store.orphanIds === null
-                ? '点上面「扫描孤儿资产」把没人用的标出来'
-                : '标「孤儿」的没有任何引用，可以安全回收'
+              store.onlyUndescribed
+                ? '只列还没写描述的：写一句，引用它的 prompt 里才有「这张图长什么样」'
+                : store.orphanIds === null
+                  ? '点上面「扫描孤儿资产」把没人用的标出来'
+                  : '标「孤儿」的没有任何引用，可以安全回收'
             }}
           </span>
         </template>
         <EmptyState
-          v-if="store.assets.length === 0"
-          :title="store.kind ? '这个类型下还没有文件' : '工程里还没有落盘文件'"
+          v-if="store.visible.length === 0"
+          :title="
+            store.onlyUndescribed
+              ? '这一批都写了描述'
+              : store.kind
+                ? '这个类型下还没有文件'
+                : '工程里还没有落盘文件'
+          "
           :body="
-            store.kind
-              ? '换一个类型看看，或者点「全部」。'
-              : '上传角色表、场景参考图，或者跑一次生成——所有落盘文件都会登记到这里，包括导出的成片。'
+            store.onlyUndescribed
+              ? '当前筛选下每个素材都有描述了。再点一下上面那颗按钮回到全部。'
+              : store.kind
+                ? '换一个类型看看，或者点「全部」。'
+                : '上传角色表、场景参考图，或者跑一次生成——所有落盘文件都会登记到这里，包括导出的成片。'
           "
         />
         <div v-else class="grid grid-cols-[repeat(auto-fill,minmax(9rem,1fr))] gap-2 p-2">
           <article
-            v-for="a in store.assets"
+            v-for="a in store.visible"
             :key="a.id"
             class="border bg-base-2"
             :class="
@@ -244,6 +279,14 @@ function goOwner(ownerKind: string, ownerId: string): void {
                 <AppBadge v-if="a.missing" tone="fail">文件丢失</AppBadge>
                 <AppBadge v-else-if="isOrphan(a)" tone="warn">孤儿</AppBadge>
                 <AppBadge v-else-if="a.ref_count > 0" tone="ok">{{ a.ref_count }} 处引用</AppBadge>
+                <!-- 与上面那串状态独立：被引用得再多，没描述照样只是一个文件名 -->
+                <AppBadge
+                  v-if="store.undescribedIds.has(a.id)"
+                  tone="warn"
+                  title="还没有描述：模型引用它时只看到一个文件名"
+                >
+                  缺描述
+                </AppBadge>
                 <span class="text-fg-4 tnum text-2xs">{{ humanBytes(a.size_bytes) }}</span>
                 <span v-if="a.width && a.height" class="text-fg-4 tnum text-2xs">
                   {{ a.width }}×{{ a.height }}

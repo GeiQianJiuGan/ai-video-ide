@@ -21,6 +21,7 @@ import {
   type AssetKind,
   type AssetRef,
   type DeleteResult,
+  type UndescribedList,
 } from '@/shared/api/assets'
 
 export const useAssetsStore = defineStore('assets', () => {
@@ -30,6 +31,15 @@ export const useAssetsStore = defineStore('assets', () => {
   const refs = ref<AssetRef[]>([])
   /** 已扫描出的孤儿 id；`null` 表示还没扫过（与「扫过但一个都没有」不是一回事）。 */
   const orphanIds = ref<Set<string> | null>(null)
+  /**
+   * 缺描述的那一批（`GET /assets/undescribed`）。**跟着列表一起拉，不做成显式动作**：
+   * 孤儿扫描要遍历引用所以是按钮，这一条只是问一句「哪些还没写」，而没写描述是
+   * 每次进来都该看见的事实——模型引用它们时只看到一个文件名。
+   * 临时帧算不算、上限是多少都由后端说（`TRANSIENT_KINDS` / `desc_max`），前端不写第二份。
+   */
+  const undescribed = ref<UndescribedList | null>(null)
+  /** 只看缺描述的那些。与类型筛选叠加，是同一张表的一种读法。 */
+  const onlyUndescribed = ref(false)
   const lastDelete = ref<DeleteResult | null>(null)
 
   const busy = ref(false)
@@ -38,6 +48,15 @@ export const useAssetsStore = defineStore('assets', () => {
   const selected = computed(() => assets.value.find((a) => a.id === selectedId.value) ?? null)
   const missing = computed(() => assets.value.filter((a) => a.missing))
   const totalBytes = computed(() => assets.value.reduce((n, a) => n + a.size_bytes, 0))
+  const undescribedIds = computed(
+    () => new Set((undescribed.value?.items ?? []).map((item) => item.id)),
+  )
+  /** 网格真正渲染的那一批。 */
+  const visible = computed(() =>
+    onlyUndescribed.value
+      ? assets.value.filter((a) => undescribedIds.value.has(a.id))
+      : assets.value,
+  )
   const orphanBytes = computed(() =>
     orphanIds.value === null
       ? 0
@@ -68,6 +87,8 @@ export const useAssetsStore = defineStore('assets', () => {
     await guarded(async () => {
       assets.value = await assetsApi.list(pid, kind.value || undefined)
     })
+    // 缺描述那份清单拉不到不该把整页判成失败（它只是一层标记），所以吞掉这一次的错误。
+    undescribed.value = await assetsApi.undescribed(pid).catch(() => null)
     if (selectedId.value) await loadRefs(pid, selectedId.value).catch(() => {})
   }
 
@@ -111,12 +132,16 @@ export const useAssetsStore = defineStore('assets', () => {
     selectedId,
     refs,
     orphanIds,
+    undescribed,
+    onlyUndescribed,
     lastDelete,
     busy,
     lastError,
     selected,
     missing,
     totalBytes,
+    undescribedIds,
+    visible,
     orphanBytes,
     load,
     setKind,

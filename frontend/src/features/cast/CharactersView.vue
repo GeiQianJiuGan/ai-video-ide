@@ -36,6 +36,7 @@ import ErrorPanel from '@/shared/ui/ErrorPanel.vue'
 import FeatureHeader from '@/shared/ui/FeatureHeader.vue'
 import LibraryPickDialog from '@/features/library/LibraryPickDialog.vue'
 import GenerateImageDialog from '@/features/images/GenerateImageDialog.vue'
+import AssetDescription from '@/shared/ui/AssetDescription.vue'
 import { fileUrl } from '@/shared/api/files'
 import { assetsApi, type Asset } from '@/shared/api/assets'
 import {
@@ -114,6 +115,31 @@ const tree = computed<TreeNode[]>(() => {
 })
 
 const current = computed(() => cast.selectedAppearance)
+
+/**
+ * 描述框对着哪一版角色表。默认跟着当前版本走——那一版才是镜头真正引用的那张图。
+ *
+ * 刻意让**每一版都能选**（而不是只给当前版）：版本只增不改，用户回头把旧版换回当前
+ * 之前，通常先想看清「那一版长什么样」。切形象时清空，否则描述框会对着上一个形象的图。
+ */
+const sheetPick = ref('')
+watch(
+  () => [current.value?.id, cast.sheets.map((s) => s.id).join(',')] as const,
+  () => {
+    if (!cast.sheets.some((s) => s.id === sheetPick.value)) sheetPick.value = ''
+  },
+)
+const sheet = computed(
+  () =>
+    cast.sheets.find((s) => s.id === sheetPick.value) ??
+    cast.sheets.find((s) => s.is_current) ??
+    cast.sheets[0] ??
+    null,
+)
+/** 这一版挂的那个资产（可能已经不在磁盘上了，那时只有描述可改）。 */
+const sheetAsset = computed(() =>
+  sheet.value?.asset_id ? (assetById.value.get(sheet.value.asset_id) ?? null) : null,
+)
 
 function thumb(assetId: string | null | undefined): string {
   if (!assetId) return ''
@@ -375,7 +401,7 @@ async function saveCharacterField(key: string, value: string): Promise<void> {
           </ul>
         </AppPanel>
 
-        <AppPanel title="Character Sheet 版本" class="min-h-0 flex-1">
+        <AppPanel title="Character Sheet 版本" class="min-h-0 flex-1" :scroll="false">
           <template #actions>
             <span class="text-fg-4 text-2xs">新版本自动成为当前，旧版本永不覆盖</span>
             <AppButton
@@ -404,28 +430,65 @@ async function saveCharacterField(key: string, value: string): Promise<void> {
             title="这个形象还没有角色表"
             body="上传一张多视角参考图即可。没有角色表的形象在生成时上下文不完整，概览页的连续性检查会点出来。"
           />
-          <div v-else class="grid grid-cols-[repeat(auto-fill,minmax(9rem,1fr))] gap-2 p-2">
-            <figure
-              v-for="s in cast.sheets"
-              :key="s.id"
-              class="border bg-base-2 flex flex-col overflow-hidden"
-              :class="s.is_current ? 'border-accent/60' : 'border-line-1'"
+          <div v-else class="flex h-full min-h-0 flex-col">
+            <div
+              class="grid min-h-0 flex-1 grid-cols-[repeat(auto-fill,minmax(9rem,1fr))] content-start gap-2 overflow-auto p-2"
             >
-              <span class="bg-base-3 flex h-24 items-center justify-center overflow-hidden">
-                <img
-                  v-if="thumb(s.asset_id)"
-                  :src="thumb(s.asset_id)"
-                  alt=""
-                  class="h-full w-full object-cover"
-                />
-                <span v-else class="text-fg-4 text-2xs">占位版本（还没有图）</span>
-              </span>
-              <figcaption class="flex items-center gap-1 px-1.5 py-1">
-                <span class="text-fg-2 tnum text-2xs">v{{ s.version_no }}</span>
-                <AppBadge v-if="s.is_current" tone="ok">当前</AppBadge>
-                <span class="text-fg-4 ml-auto truncate text-2xs">{{ s.source }}</span>
-              </figcaption>
-            </figure>
+              <figure
+                v-for="s in cast.sheets"
+                :key="s.id"
+                class="border bg-base-2 flex cursor-pointer flex-col overflow-hidden"
+                :class="
+                  s.id === sheet?.id
+                    ? 'border-accent'
+                    : s.is_current
+                      ? 'border-accent/60'
+                      : 'border-line-1'
+                "
+                :title="'点一下：在下面给这一版写描述'"
+                @click="sheetPick = s.id"
+              >
+                <span class="bg-base-3 flex h-24 items-center justify-center overflow-hidden">
+                  <img
+                    v-if="thumb(s.asset_id)"
+                    :src="thumb(s.asset_id)"
+                    alt=""
+                    class="h-full w-full object-cover"
+                  />
+                  <span v-else class="text-fg-4 text-2xs">占位版本（还没有图）</span>
+                </span>
+                <figcaption class="flex items-center gap-1 px-1.5 py-1">
+                  <span class="text-fg-2 tnum text-2xs">v{{ s.version_no }}</span>
+                  <AppBadge v-if="s.is_current" tone="ok">当前</AppBadge>
+                  <!-- 描述空着 = 模型引用这张图时只看到一个文件名，所以标出来 -->
+                  <AppBadge
+                    v-if="s.asset_id && !assetById.get(s.asset_id)?.description"
+                    tone="warn"
+                    title="这一版还没有描述：模型引用它时只看到一个文件名"
+                  >
+                    缺描述
+                  </AppBadge>
+                  <span class="text-fg-4 ml-auto truncate text-2xs">{{ s.source }}</span>
+                </figcaption>
+              </figure>
+            </div>
+            <!-- 描述固定在底部：它属于「上面选中的那一版」，跟着网格滚走会看不见 -->
+            <div v-if="sheet" class="border-line-1 shrink-0 border-t p-2">
+              <p class="text-fg-3 mb-1 text-2xs tracking-wide uppercase">
+                v{{ sheet.version_no }} 这张图的描述
+              </p>
+              <AssetDescription
+                v-if="sheet.asset_id"
+                :key="sheet.asset_id"
+                :pid="pid"
+                :asset-id="sheet.asset_id"
+                :description="sheetAsset?.description ?? null"
+                @saved="loadAssets()"
+              />
+              <p v-else class="text-fg-4 text-2xs">
+                这一版没有挂图（占位版本），没有可写描述的对象。
+              </p>
+            </div>
           </div>
         </AppPanel>
       </div>

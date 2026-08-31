@@ -20,6 +20,7 @@ import ErrorPanel from '@/shared/ui/ErrorPanel.vue'
 import FeatureHeader from '@/shared/ui/FeatureHeader.vue'
 import LibraryPickDialog from '@/features/library/LibraryPickDialog.vue'
 import GenerateImageDialog from '@/features/images/GenerateImageDialog.vue'
+import AssetDescription from '@/shared/ui/AssetDescription.vue'
 import { fileUrl } from '@/shared/api/files'
 import { assetsApi, type Asset } from '@/shared/api/assets'
 import { ApiError } from '@/shared/api/client'
@@ -53,6 +54,28 @@ const imageAssets = computed(() =>
   ),
 )
 const prop = computed(() => world.selectedProp)
+/**
+ * 描述框对着哪一版参考图。默认跟着当前版本走——那一版才是镜头真正引用的那张图，
+ * 但旧版也能点开写（版本只增不改，用户回头换回来之前通常先想看清那一版）。
+ * 换道具时清空，否则描述框会对着上一个道具的图。
+ */
+const refPick = ref('')
+watch(
+  () => [prop.value?.id, world.propReferences.map((r) => r.id).join(',')] as const,
+  () => {
+    if (!world.propReferences.some((r) => r.id === refPick.value)) refPick.value = ''
+  },
+)
+const reference = computed(
+  () =>
+    world.propReferences.find((r) => r.id === refPick.value) ??
+    world.propReferences.find((r) => r.is_current) ??
+    world.propReferences[0] ??
+    null,
+)
+const referenceAsset = computed(() =>
+  reference.value?.asset_id ? (assetById.value.get(reference.value.asset_id) ?? null) : null,
+)
 /**
  * 两个面板都在说同一件事时只留一个。
  *
@@ -235,7 +258,7 @@ async function saveField(key: 'name' | 'description' | 'notes', value: string): 
       </AppPanel>
 
       <!-- 中：参考图版本 -->
-      <AppPanel title="参考图版本" class="min-h-0 flex-1">
+      <AppPanel title="参考图版本" class="min-h-0 flex-1" :scroll="false">
         <template #actions>
           <span class="text-fg-4 text-2xs">新版本自动成为当前，旧版本永不覆盖</span>
           <AppButton
@@ -258,28 +281,61 @@ async function saveField(key: 'name' | 'description' | 'notes', value: string): 
           title="这个道具还没有参考图"
           body="上传一张即可。没有参考图的道具在生成时上下文不完整，概览页的连续性检查会点出来。"
         />
-        <div v-else class="grid grid-cols-[repeat(auto-fill,minmax(9rem,1fr))] gap-2 p-2">
-          <figure
-            v-for="r in world.propReferences"
-            :key="r.id"
-            class="border bg-base-2 flex flex-col overflow-hidden"
-            :class="r.is_current ? 'border-accent/60' : 'border-line-1'"
+        <div v-else class="flex h-full min-h-0 flex-col">
+          <div
+            class="grid min-h-0 flex-1 grid-cols-[repeat(auto-fill,minmax(9rem,1fr))] content-start gap-2 overflow-auto p-2"
           >
-            <span class="bg-base-3 flex h-28 items-center justify-center overflow-hidden">
-              <img
-                v-if="thumb(r.asset_id)"
-                :src="thumb(r.asset_id)"
-                alt=""
-                class="h-full w-full object-cover"
-              />
-              <span v-else class="text-fg-4 text-2xs">文件不在了</span>
-            </span>
-            <figcaption class="flex items-center gap-1 px-1.5 py-1">
-              <span class="text-fg-2 tnum text-2xs">v{{ r.version_no }}</span>
-              <AppBadge v-if="r.is_current" tone="ok">当前</AppBadge>
-              <span v-if="r.note" class="text-fg-4 ml-auto truncate text-2xs">{{ r.note }}</span>
-            </figcaption>
-          </figure>
+            <figure
+              v-for="r in world.propReferences"
+              :key="r.id"
+              class="border bg-base-2 flex cursor-pointer flex-col overflow-hidden"
+              :class="
+                r.id === reference?.id
+                  ? 'border-accent'
+                  : r.is_current
+                    ? 'border-accent/60'
+                    : 'border-line-1'
+              "
+              title="点一下：在下面给这一版写描述"
+              @click="refPick = r.id"
+            >
+              <span class="bg-base-3 flex h-28 items-center justify-center overflow-hidden">
+                <img
+                  v-if="thumb(r.asset_id)"
+                  :src="thumb(r.asset_id)"
+                  alt=""
+                  class="h-full w-full object-cover"
+                />
+                <span v-else class="text-fg-4 text-2xs">文件不在了</span>
+              </span>
+              <figcaption class="flex items-center gap-1 px-1.5 py-1">
+                <span class="text-fg-2 tnum text-2xs">v{{ r.version_no }}</span>
+                <AppBadge v-if="r.is_current" tone="ok">当前</AppBadge>
+                <!-- 描述空着 = 模型引用这张图时只看到一个文件名 -->
+                <AppBadge
+                  v-if="!assetById.get(r.asset_id)?.description"
+                  tone="warn"
+                  title="这一版还没有描述：模型引用它时只看到一个文件名"
+                >
+                  缺描述
+                </AppBadge>
+                <span v-if="r.note" class="text-fg-4 ml-auto truncate text-2xs">{{ r.note }}</span>
+              </figcaption>
+            </figure>
+          </div>
+          <!-- 描述固定在底部：它属于「上面选中的那一版」，跟着网格滚走就看不见了 -->
+          <div v-if="reference" class="border-line-1 shrink-0 border-t p-2">
+            <p class="text-fg-3 mb-1 text-2xs tracking-wide uppercase">
+              v{{ reference.version_no }} 这张图的描述
+            </p>
+            <AssetDescription
+              :key="reference.asset_id"
+              :pid="pid"
+              :asset-id="reference.asset_id"
+              :description="referenceAsset?.description ?? null"
+              @saved="loadAssets()"
+            />
+          </div>
         </div>
       </AppPanel>
 

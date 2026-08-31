@@ -31,10 +31,11 @@ AI Video Studio（`aivs`）：桌面端优先的 AI 原生长视频制作工作�
 
 - **后端已全量落地**：docs/04 的 Step 1–9 都有实现，之后又落了「两级场景系统」这一轮
   （应用级设置 → provider 适配层 → 衔接与编排 → 场景工作台 → 幕流程图 → AI 协作栏）——
-  23 个 service（cast / world / assets / workflows / story / context / generation / timeline /
+  24 个 service（cast / world / assets / workflows / story / context / generation / timeline /
   overview / projects / library / adopt / fsbrowse / appsettings / frames / sequence / director /
-  packages / ingest / dub / refine / audio / **images**；`base` / `params` / `global_registry`
-  是公共件不算）+ 22 个 router（含 `/ws`），405 passed。
+  packages / ingest / dub / refine / audio / images / **describe**；`base` / `params` /
+  `global_registry` 是公共件不算）+ 24 个 router（含 `/ws`），449 passed（1 skipped：
+  没跑过 `fetch_ffmpeg.py` 的机器上跳过「用的是内置那份」那条正向断言）。
 - **前端也全部接上了后端**：`app/features.ts` 里 15 个功能都是 `ready: true`，
   `/p/:pid` 下不再有外壳页。`shared/ui/FeatureView.vue`（按注册表画工作区骨架与能力锁）
   暂时没人用，留给下一个「登记了但还没接后端」的功能——那种情况先挂它，绝不给假界面。
@@ -254,6 +255,49 @@ kind / priority / included / reason / **media**（`image` / `video` / `audio`，
 **时间线与导出**（`services/timeline.py`）：完全不依赖 AI。撤销栈是整轨快照（`UNDO_DEPTH=50`）；
 `GET /export/command` 只产出 ffmpeg 参数计划，`POST /export` 才真的起进程。
 
+**素材描述 = 模型引用一个素材时唯一看得到的那句话**（迁移 `0021_asset_description`：
+`asset.description` + `character.description`）。没有它，「引用这张图」在 prompt 里只剩一个
+文件名，视频 prompt 根本构建不起来。整条链五处，各处的口径都只有一份：
+
+- **能存 / 能改**：`services/assets.py::update()` 是 `Asset` 上**唯一的文本写路径**
+  （`assign` 的 `allowed` 只放 `description` 过去——`path` / `kind` / `sha1` 是落盘事实，
+  改了就和磁盘上那个文件对不上）；`PATCH /projects/{pid}/assets/{asset_id}`。
+  **清空传 `''`**，`null` 是「这次不改」（与 `ShotPatch` 同一条口径）。
+  `GET /assets/undescribed` 是「还缺哪些」那份清单，**临时资源不算**（`TRANSIENT_KINDS`：
+  抽出来的帧、拆出来的音频），每条带 `owners` 说清它挂在谁身上。
+- **进 prompt 只有三跳**：`services/context.py::_desc_of()`（唯一的取值口径：素材自己那句 →
+  退回实体设定文字 → 空）给账单每条加 `desc` / `desc_missing` 并冻结进
+  `GenerationVersion.context_json` → `services/generation.py::_images_of` 装进
+  `RefAsset(desc=…)`（同时冻结成 `params.refs[].desc`）→
+  `generation/providers/base.py::ref_hint()` 渲染成
+  `参考素材说明：参考图1=阿岚（默认形象）（褪色军绿夹克…）。`。
+  **截断只有 `clip_desc()` 这一处**（`DESC_MAX = 120`）：账单与冻结参数都留全文，界面才说得清
+  「当时到底喂了哪句话」。**没有描述时 `ref_hint()` 的输出与升级前逐字相同**——老工程的
+  prompt 不会因为加了这条链而变样（`tests/test_context_desc.py` 盯着）。
+  最后那一跳**按 provider 分岔**：ComfyUI 那类图只按顺序收素材、收不到标签，所以只能拼进
+  prompt；`http_api` 收得到结构化字段，描述就走 `refs[].desc`（合同里那一项），
+  **不重复塞进 prompt** ——描述属于素材本身，混进提示词只会让服务端再解析一遍。
+- **AI 能看图补**：`supports_vision` 是**协议级**事实，写在 `ai/llm/protocols.py::BY_NAME` 里
+  （四种方言各一份图片编码：OpenAI `image_url` / Anthropic `image` 块**在文字前** /
+  Gemini `inline_data` / Ollama `images[]` **纯 base64 不带 `data:` 前缀**），
+  `describe_image()` **回纯文本**（一句描述套一层 JSON 只多一处能解析失败的地方）。
+  `supports_vision=False` 的端走基类默认实现：四要素错误 + 手填那条出路（硬约束 2）。
+  看图模型可以和主模型不同，设置项 `llm.vision_model`（留空 = 用主模型）。
+- **建议只填输入框，落库只有「用户按保存」**：`services/describe.py` 的 `plan()`（只读、不出网）
+  与 `suggest()`（出建议，**一行库都不改**）；`POST /projects/{pid}/describe/plan` / `.../suggest`。
+  非图片素材在出网之前就跳过并说清原因，绝不把整段视频送出去。AI 协作栏那侧是
+  `list_undescribed()` / `look_at_image()` 两个读工具 + 写工具 `set_description`（六种
+  `target_kind`，`target()` 是唯一的目标解析：形象落 `traits`，其余落 `description`），
+  照老规矩只翻译成提案，`POST /director/apply` 才落。
+- **前端只有一个共用件** `shared/ui/AssetDescription.vue`，摆在五处：资产总账页、角色的定妆图、
+  地点变体的参考图、道具的参考图、素材库。字数上限只认后端给的 `desc_max`，前端不写死 120。
+  素材库那侧写的是**已有的 `note` 列**（库不走 alembic，加列会让已有的 `library.db` 打不开），
+  且没有工程上下文，所以 AI 看图那颗按钮在库里是 disabled + 写清去哪儿做。
+  采用时库里那句 `note` 会落进工程的 `asset.description`，**但已经有描述的不覆盖**——
+  采用是单向复制，库不该回头盖掉工程里改过的话。
+  账单上每条都显示这句话（`features/story/ShotView.vue` 与 `features/flow/SceneWorkbench.vue`），
+  空的标「没有描述 · 模型只看到一个文件名」——判断用后端的 `desc_missing`，前端不算第二遍。
+
 **生成层 = 两级场景系统 + provider 适配层**（不再是「Workflow 为中心」）：
 
 - **第一级：幕流程图**（`services/sequence.py` + `api/sequence.py`，前端 `features/flow/FlowView.vue`）。
@@ -451,10 +495,11 @@ kind / priority / included / reason / **media**（`image` / `video` / `audio`，
 - **新增表**：工程表必须在 `persistence/all_models.py` 里 import，否则 `Base.metadata` 漏表；
   素材库表相反——挂 `LibraryBase`，**不要**进 `all_models.py`（理由见上面的素材库段）。
 - **新增迁移**：`alembic/versions/` 加脚本 → 在 `persistence/migrate.py::REVISION_SCHEMA` 登记
-  它对应的 schema 版本 → 同步 `settings.schema_version`（当前 20，最新一条是
-  `0020_image_jobs`：图片任务不挂在镜头上，所以 `job.shot_id` 改可空，另加
-  `target_kind` / `target_id` 两列指向出图对象（`appearance` / `location_variant` / `prop` /
-  `shot_first_frame` / `shot_last_frame`）；`GenerationVersion` 一列不动——素材图的
+  它对应的 schema 版本 → 同步 `settings.schema_version`（当前 21，最新一条是
+  `0021_asset_description`：`asset.description` + `character.description` 两列，见下面的
+  「素材描述」段；上一条 `0020_image_jobs` 是图片任务——它不挂在镜头上，所以 `job.shot_id`
+  改可空，另加 `target_kind` / `target_id` 两列指向出图对象（`appearance` / `location_variant` /
+  `prop` / `shot_first_frame` / `shot_last_frame`）；`GenerationVersion` 一列不动——素材图的
   「永不覆盖」由 `SheetVersion` / `LocationReference` / `PropReference` 已有的
   `version_no` + `is_current` 保证）。漏登记会导致打开旧工程时无法告诉用户「schema X → Y」。
 - **落盘**：资产 `path` 相对工程目录存（整个目录拷走仍然有效）；类型→子目录映射在

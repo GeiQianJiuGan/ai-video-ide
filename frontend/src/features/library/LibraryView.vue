@@ -13,7 +13,16 @@
  */
 import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { FolderSearch, ImagePlus, Plus, RefreshCw, Tag, Trash2, Upload } from '@lucide/vue'
+import {
+  FileText,
+  FolderSearch,
+  ImagePlus,
+  Plus,
+  RefreshCw,
+  Tag,
+  Trash2,
+  Upload,
+} from '@lucide/vue'
 import AppPanel from '@/shared/ui/AppPanel.vue'
 import AppButton from '@/shared/ui/AppButton.vue'
 import AppBadge from '@/shared/ui/AppBadge.vue'
@@ -21,6 +30,7 @@ import AppDialog from '@/shared/ui/AppDialog.vue'
 import EmptyState from '@/shared/ui/EmptyState.vue'
 import ErrorPanel from '@/shared/ui/ErrorPanel.vue'
 import DirPicker from '@/shared/ui/DirPicker.vue'
+import AssetDescription from '@/shared/ui/AssetDescription.vue'
 import AdoptDialog from './AdoptDialog.vue'
 import { libraryFileUrl } from '@/shared/api/files'
 import {
@@ -87,13 +97,20 @@ const variantFor = ref<{ id: string; name: string } | null>(null)
 const variantName = ref('')
 const attaching = ref<{ target: AttachTarget; id: string; title: string } | null>(null)
 const attachPick = ref('')
+/**
+ * 正在给哪个素材写描述。**库里那一句写的是已有的 `note` 列**，不是工程的
+ * `asset.description`——库不走 alembic，加列会让已有的 library.db 打不开。
+ * 采用时它会跟着复制进工程，所以在库里写一次，之后每个工程都省一次。
+ */
+const describing = ref('')
 
 const dialogOpen = computed(
   () =>
     presetKind.value !== '' ||
     tagging.value ||
     variantFor.value !== null ||
-    attaching.value !== null,
+    attaching.value !== null ||
+    describing.value !== '',
 )
 /** 弹窗开着时错误显示在弹窗里（就地重试），否则显示在页面上。同一条只画一次。 */
 const pageError = computed(() => (dialogOpen.value ? null : lib.lastError))
@@ -111,6 +128,10 @@ const adoptHint = computed(() =>
     : '先回「项目」页打开一个工程。打开之后，工程内各页的「从素材库采用」也能直接取库里的东西，不必来这儿',
 )
 const assetById = computed(() => new Map(lib.assets.map((a) => [a.id, a])))
+
+const describingAsset = computed(() =>
+  describing.value ? (assetById.value.get(describing.value) ?? null) : null,
+)
 
 const visibleAssets = computed(() =>
   lib.assets.filter(
@@ -464,7 +485,18 @@ onMounted(() => void lib.refresh())
               <div class="flex flex-wrap items-center gap-1">
                 <AppBadge v-for="t in a.tags" :key="t.id" tone="accent">{{ t.name }}</AppBadge>
                 <AppBadge v-if="a.ref_count > 0" tone="ok">被 {{ a.ref_count }} 处使用</AppBadge>
+                <!-- 库里写一次，之后每个采用它的工程都省一次 -->
+                <AppBadge
+                  v-if="!a.note"
+                  tone="warn"
+                  title="还没有描述：采用进工程后，模型引用它时只看到一个文件名"
+                >
+                  缺描述
+                </AppBadge>
               </div>
+              <p v-if="a.note" class="text-fg-2 line-clamp-2 text-2xs" :title="a.note">
+                {{ a.note }}
+              </p>
               <div class="flex items-center gap-1">
                 <AppButton
                   size="sm"
@@ -473,6 +505,14 @@ onMounted(() => void lib.refresh())
                   @click="askAdopt('asset', a.id)"
                 >
                   采用
+                </AppButton>
+                <AppButton
+                  size="sm"
+                  variant="ghost"
+                  title="写一句描述：采用进工程后，这一句就是模型引用它时唯一看得到的说明"
+                  @click="describing = a.id"
+                >
+                  <FileText :size="10" />描述
                 </AppButton>
                 <select
                   v-if="lib.tags.length"
@@ -899,6 +939,48 @@ onMounted(() => void lib.refresh())
         <AppButton variant="primary" :disabled="lib.busy || attachPick === ''" @click="attach()">
           <ImagePlus :size="11" />挂上
         </AppButton>
+      </template>
+    </AppDialog>
+
+    <!--
+      素材描述：库这侧写的是已有的 `note` 列（库不走 alembic，不加列）。
+      这里**没有 AI 看图那条路**——看图补全要工程上下文（账单、设置、出网口子都在工程侧），
+      所以组件自己会把那颗按钮 disabled 并写清去哪儿做，界面上不假装能点。
+    -->
+    <AppDialog
+      :open="describing !== ''"
+      title="素材描述"
+      :subtitle="describingAsset?.title || describingAsset?.path || ''"
+      size="sm"
+      @update:open="describing = $event ? describing : ''"
+    >
+      <div v-if="describingAsset" class="space-y-2 p-3">
+        <div
+          v-if="!describingAsset.missing && describingAsset.kind !== 'audio'"
+          class="border-line-1 bg-base-2 flex h-40 items-center justify-center overflow-hidden border"
+        >
+          <img
+            :src="libraryFileUrl(describingAsset.path)"
+            alt=""
+            loading="lazy"
+            class="size-full object-contain"
+          />
+        </div>
+        <AssetDescription
+          :key="describingAsset.id"
+          target="library"
+          :asset-id="describingAsset.id"
+          :description="describingAsset.note"
+          @saved="lib.reload()"
+        />
+        <p class="text-fg-4 text-2xs">
+          采用进工程时这一句会跟着复制过去，所以在库里写一次，之后每个工程都省一次。
+        </p>
+      </div>
+
+      <template #footer>
+        <span class="flex-1" />
+        <AppButton variant="ghost" @click="describing = ''">关闭</AppButton>
       </template>
     </AppDialog>
   </div>

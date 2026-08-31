@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -526,6 +527,36 @@ async def test_http_api_full_round_trip(tmp_path: Path, monkeypatch: pytest.Monk
     assert (state.status, state.progress) == ("done", 1.0)
     name, data = await provider.fetch(task_id)
     assert (name, data) == ("out.mp4", b"MP4BYTES")
+
+
+async def test_http_api_carries_the_asset_description_in_the_refs_body(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """这一族收得到结构化字段，所以描述走 `refs[].desc`，不靠 prompt 里那句对号。
+
+    ComfyUI 那类图只能把描述拼进 prompt（`ref_hint`），而这条合同由我们定：描述是「这张素材
+    长什么样」，属于素材本身而不是提示词，混进 prompt 只会让服务端还得再解析一遍。
+    没写描述时是空串——键照旧在，服务端不用分「缺键」和「空」两种情况。
+    """
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/submit"):
+            seen.update(json.loads(request.content))
+            return httpx.Response(200, json={"task_id": "t-9"})
+        return httpx.Response(404, json={"error": "no"})
+
+    stub_transport(monkeypatch, handler)
+    monkeypatch.setattr(settings, "video_base_url", "http://127.0.0.1:9100")
+    described, plain = make_refs(tmp_path, "林小雨（常服）", "雨夜巷口")
+    described = replace(described, desc="褪色军绿夹克，\n短发")
+
+    await HttpApiProvider().submit(
+        VideoRequest(mode="i2v", prompt="雨夜", refs=[described, plain]), client_id="aivs-test"
+    )
+
+    assert [r["desc"] for r in seen["refs"]] == ["褪色军绿夹克， 短发", ""]  # 换行压成空格
+    assert [r["label"] for r in seen["refs"]] == ["林小雨（常服）", "雨夜巷口"]
 
 
 async def test_http_api_without_an_address_points_at_the_settings_page(

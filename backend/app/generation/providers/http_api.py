@@ -7,7 +7,8 @@
       body {mode, prompt, negative, duration, seed, extra, first_frame, last_frame, refs}
       —— 两个 frame 是 base64 的**图片**（图在我们这边，不能指望对方能读我们的磁盘）
       —— refs 是**首尾帧之外的参考素材**，按优先级排好的数组，每项
-         {data: base64, name, label, kind, media}：label 是「它是谁」（角色表 / 地点参考），
+         {data: base64, name, label, kind, media, desc}：label 是「它是谁」（角色表 / 地点参考），
+         desc 是「它长什么样」（`Asset.description`，没写就是空串），
          media 是 image | video | audio（**同一个数组里三种媒体混着来**，按 media 分流，
          别拿后缀猜），模型端用不上可以忽略，但顺序必须当成语义——同一媒体里第 1 个最重要
       resp {task_id}
@@ -35,7 +36,7 @@ from app.core.config import settings
 from app.core.errors import AppError, ErrorCode
 from app.core.logging import get_logger
 from app.generation.providers import base
-from app.generation.providers.base import STATUSES, TaskState, VideoRequest
+from app.generation.providers.base import STATUSES, TaskState, VideoRequest, clip_desc
 
 log = get_logger("provider.http_api")
 
@@ -154,6 +155,9 @@ class HttpApiProvider:
         # 参考素材整组带过去：这条合同由我们定，所以它天生支持多个，不存在槽位不够的问题。
         # `media` 必须带上——服务端按它分流（图进图生视频那条、音频进 S2V 那条），
         # 让对方拿后缀去猜的话，一个没有后缀的临时文件就能把整条链路带偏。
+        # `desc`（这张素材长什么样）也带上：这一族收得到结构化字段，所以**不靠 prompt 里那句
+        # 「参考素材说明」对号**（`ref_hint` 只服务于按顺序收素材的 ComfyUI 那类图）。
+        # 用户没写描述时是空串，服务端可以照旧忽略这个键。
         if req.refs:
             body["refs"] = [
                 {
@@ -162,6 +166,7 @@ class HttpApiProvider:
                     "label": ref.label,
                     "kind": ref.kind,
                     "media": ref.media,
+                    "desc": clip_desc(ref.desc),
                 }
                 for ref in req.refs
             ]

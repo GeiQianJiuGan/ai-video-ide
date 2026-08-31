@@ -189,6 +189,12 @@ class AdoptService:
                 "adopted_at": utc_now(),
             },
         )
+        # 库里那句备注就是这张图的描述——不带过来的话，「模型引用它时只看到一个文件名」
+        # 这件事在每个工程里都要重写一次。**已经有描述的不动**：采用是单向复制，
+        # 工程里改过的那一句是用户自己写的，库不该回头盖掉它（沿用 ONE_WAY 那条口径）。
+        note = (row.get("note") or "").strip()
+        if note and not (asset.get("description") or "").strip():
+            asset = await assets.update(pid, asset["id"], {"description": note})
         tally["asset_ids"].append(asset["id"])
         return asset
 

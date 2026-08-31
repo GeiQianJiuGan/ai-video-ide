@@ -81,6 +81,31 @@ def test_adopted_asset_lands_inside_the_project_with_its_provenance(
     assert meta["adopted_at"]
 
 
+def test_library_note_becomes_the_project_asset_description(
+    client: TestClient, pid: str, library: dict[str, Any]
+) -> None:
+    """库里那句备注跟着复制进工程，落在 `asset.description` 上。
+
+    没有它，「引用这张图时模型只看到一个文件名」这件事在每个工程里都要重写一次。
+    已经写过描述的那一份不动：采用是单向复制，库不该回头盖掉工程里改过的话。
+    """
+    lib_asset_id = lib_png(client, name="noted.png")
+    resp = client.patch(f"/api/v1/library/assets/{lib_asset_id}", json={"note": "褪色军绿夹克"})
+    assert resp.status_code == 200, resp.text
+
+    _adopt(client, pid, "asset", lib_asset_id)
+    rows = _assets(client, pid)
+    assert len(rows) == 1
+    assert rows[0]["description"] == "褪色军绿夹克"
+
+    # 工程里改过之后再采用一次（sha1 命中复用同一行）：库里那句不许盖掉用户写的
+    client.patch(
+        f"/api/v1/projects/{pid}/assets/{rows[0]['id']}", json={"description": "我自己改过的一句"}
+    )
+    _adopt(client, pid, "asset", lib_asset_id)
+    assert _assets(client, pid)[0]["description"] == "我自己改过的一句"
+
+
 def test_adopting_the_same_asset_twice_copies_one_file(
     client: TestClient, pid: str, project_dir: Path, library: dict[str, Any]
 ) -> None:

@@ -22,6 +22,7 @@ import ErrorPanel from '@/shared/ui/ErrorPanel.vue'
 import FeatureHeader from '@/shared/ui/FeatureHeader.vue'
 import LibraryPickDialog from '@/features/library/LibraryPickDialog.vue'
 import GenerateImageDialog from '@/features/images/GenerateImageDialog.vue'
+import AssetDescription from '@/shared/ui/AssetDescription.vue'
 import { fileUrl } from '@/shared/api/files'
 import { assetsApi, type Asset } from '@/shared/api/assets'
 import { VARIANT_TEXT_FIELDS, type VariantPatch } from '@/shared/api/world'
@@ -59,6 +60,24 @@ const imageAssets = computed(() =>
   ),
 )
 const variant = computed(() => world.selectedVariant)
+/**
+ * 描述框对着哪一张参考图。**这里刻意不用「当前版本」的概念**：一个变体的每张参考图
+ * 都是 `is_current`（它们是不同机位，不是彼此的新版本），所以「哪一张」只能由用户点。
+ * 换变体时清空，否则描述框会对着上一个变体的图。
+ */
+const refPick = ref('')
+watch(
+  () => [variant.value?.id, world.references.map((r) => r.id).join(',')] as const,
+  () => {
+    if (!world.references.some((r) => r.id === refPick.value)) refPick.value = ''
+  },
+)
+const reference = computed(
+  () => world.references.find((r) => r.id === refPick.value) ?? world.references[0] ?? null,
+)
+const referenceAsset = computed(() =>
+  reference.value?.asset_id ? (assetById.value.get(reference.value.asset_id) ?? null) : null,
+)
 /**
  * 两个面板都在说同一件事时只留一个。
  *
@@ -312,7 +331,7 @@ async function saveVariantField(key: keyof VariantPatch, value: string): Promise
           </ul>
         </AppPanel>
 
-        <AppPanel title="多机位参考图" class="min-h-0 flex-1">
+        <AppPanel title="多机位参考图" class="min-h-0 flex-1" :scroll="false">
           <template #actions>
             <input
               v-model="camera"
@@ -345,27 +364,61 @@ async function saveVariantField(key: keyof VariantPatch, value: string): Promise
             title="这个变体还没有参考图"
             body="上传一张即可。没有参考图的变体在生成时上下文不完整，概览页的连续性检查会点出来。"
           />
-          <div v-else class="grid grid-cols-[repeat(auto-fill,minmax(9rem,1fr))] gap-2 p-2">
-            <figure
-              v-for="r in world.references"
-              :key="r.id"
-              class="border bg-base-2 flex flex-col overflow-hidden"
-              :class="r.is_current ? 'border-accent/60' : 'border-line-1'"
+          <div v-else class="flex h-full min-h-0 flex-col">
+            <div
+              class="grid min-h-0 flex-1 grid-cols-[repeat(auto-fill,minmax(9rem,1fr))] content-start gap-2 overflow-auto p-2"
             >
-              <span class="bg-base-3 flex h-24 items-center justify-center overflow-hidden">
-                <img
-                  v-if="thumb(r.asset_id)"
-                  :src="thumb(r.asset_id)"
-                  alt=""
-                  class="h-full w-full object-cover"
-                />
-                <span v-else class="text-fg-4 text-2xs">文件不在了</span>
-              </span>
-              <figcaption class="flex items-center gap-1 px-1.5 py-1">
-                <span class="text-fg-2 truncate text-2xs">{{ r.camera || '未标机位' }}</span>
-                <AppBadge v-if="r.is_current" tone="ok" class="ml-auto">当前</AppBadge>
-              </figcaption>
-            </figure>
+              <figure
+                v-for="r in world.references"
+                :key="r.id"
+                class="border bg-base-2 flex cursor-pointer flex-col overflow-hidden"
+                :class="
+                  r.id === reference?.id
+                    ? 'border-accent'
+                    : r.is_current
+                      ? 'border-accent/60'
+                      : 'border-line-1'
+                "
+                title="点一下：在下面给这一张写描述"
+                @click="refPick = r.id"
+              >
+                <span class="bg-base-3 flex h-24 items-center justify-center overflow-hidden">
+                  <img
+                    v-if="thumb(r.asset_id)"
+                    :src="thumb(r.asset_id)"
+                    alt=""
+                    class="h-full w-full object-cover"
+                  />
+                  <span v-else class="text-fg-4 text-2xs">文件不在了</span>
+                </span>
+                <figcaption class="flex items-center gap-1 px-1.5 py-1">
+                  <span class="text-fg-2 truncate text-2xs">{{ r.camera || '未标机位' }}</span>
+                  <!-- 描述空着 = 模型引用这张图时只看到一个文件名 -->
+                  <AppBadge
+                    v-if="!assetById.get(r.asset_id)?.description"
+                    tone="warn"
+                    class="ml-auto"
+                    title="这一张还没有描述：模型引用它时只看到一个文件名"
+                  >
+                    缺描述
+                  </AppBadge>
+                  <AppBadge v-else-if="r.is_current" tone="ok" class="ml-auto">当前</AppBadge>
+                </figcaption>
+              </figure>
+            </div>
+            <!-- 描述固定在底部：它属于「上面选中的那一张」，跟着网格滚走就看不见了 -->
+            <div v-if="reference" class="border-line-1 shrink-0 border-t p-2">
+              <p class="text-fg-3 mb-1 text-2xs tracking-wide uppercase">
+                {{ reference.camera || '未标机位' }} 这张图的描述
+              </p>
+              <AssetDescription
+                :key="reference.asset_id"
+                :pid="pid"
+                :asset-id="reference.asset_id"
+                :description="referenceAsset?.description ?? null"
+                @saved="loadAssets()"
+              />
+            </div>
           </div>
         </AppPanel>
       </div>
