@@ -28,6 +28,7 @@ from app.ai.llm import protocols as llm_protocols
 from app.core.config import Settings, settings
 from app.core.errors import AppError, ErrorCode
 from app.core.logging import get_logger
+from app.generation.providers import image as image_protocols
 from app.persistence.models import utc_now
 
 log = get_logger("appsettings")
@@ -61,6 +62,7 @@ GROUPS: tuple[tuple[str, str], ...] = (
     ("prompt", "AI 提示词"),
     ("video", "视频生成 API"),
     ("audio", "音源生成（配音 / 环境音）"),
+    ("image", "图片生成 API（角色 / 场景 / 道具参考图）"),
     ("refine", "二次处理（超分 / 插帧）"),
     ("ingest", "长视频导入切段"),
     ("comfy", "ComfyUI"),
@@ -186,6 +188,57 @@ FIELDS: tuple[FieldSpec, ...] = (
         ),
     ),
     FieldSpec("audio.timeout", "audio_timeout", "audio", "单次超时（秒）", "int"),
+    # --- 图片：**第三条链**。角色四视图 / 地点参考图 / 道具图会被当参考素材喂进
+    # AIVS_REF_*，没有它们，只喂一张首帧的镜头在几秒里就把人物形象丢掉了。
+    # 与视频 / 音频同一个作风：另一份图、另一个地址、另一份密钥。`none` 是默认——
+    # 手动上传一张图那条路走完全流程（硬约束 2）。
+    FieldSpec(
+        "image.provider",
+        "image_provider",
+        "image",
+        "调用方式",
+        "enum",
+        # 协议表是唯一真源（app/generation/providers/image.py::BY_NAME）：
+        # 加一家出图 API 只改那一张表，这里与前端都一行不用动。
+        tuple(image_protocols.names()),
+        tuple(image_protocols.labels()),
+        "none 时「生成参考图」按钮不可用，但手动上传一张图照旧——参考素材照样喂得进去。",
+    ),
+    FieldSpec(
+        "image.base_url",
+        "image_base_url",
+        "image",
+        "服务地址",
+        impact="留空则用协议自己的默认地址（comfy_preset 退回下面的 ComfyUI 地址）。",
+    ),
+    FieldSpec(
+        "image.model",
+        "image_model",
+        "image",
+        "模型",
+        impact="云端端点用哪个模型（comfy_preset 不看它，它认的是下面那份预设）。",
+        fetch="image",
+    ),
+    FieldSpec("image.api_key", "image_api_key", "image", "API Key", "secret"),
+    FieldSpec(
+        "image.preset",
+        "image_preset",
+        "image",
+        "图片预设",
+        impact=(
+            "comfy_preset 时指哪一份 T2I 图（提示词 / 负向 / 种子 / 参考图槽位用的是同一批"
+            "AIVS_* 标题，另外可选 AIVS_WIDTH / AIVS_HEIGHT）。缺它无法出图——"
+            "出图用哪份图靠这里指名，不靠标题猜。"
+        ),
+    ),
+    FieldSpec(
+        "image.size",
+        "image_size",
+        "image",
+        "画幅",
+        impact="形如 1024x1024。ComfyUI 那条路只有在图里标了 AIVS_WIDTH / AIVS_HEIGHT 时才生效。",
+    ),
+    FieldSpec("image.timeout", "image_timeout", "image", "单次超时（秒）", "int"),
     # --- 二次处理：**刻意没有单独的地址 / 密钥**。超分与出画面跑在同一台 ComfyUI 上是常态，
     # 多一套地址只会多一处配错的地方；真要分开时换预设就够了。
     FieldSpec(
@@ -366,6 +419,9 @@ class AppSettingsService:
             #: 每个协议的默认地址 / 要不要密钥 / 支不支持工具——设置页照它给提示，
             #: 不在前端抄一份「Anthropic 的地址长这样」。
             "llm_protocols": llm_protocols.listing(),
+            #: 出图那条链的协议表（默认地址 / 要不要密钥 / 收不收参考图 / 要不要预设）。
+            #: **原样投影**：加一家出图 API 时设置页一行不用改。
+            "image_protocols": image_protocols.listing(),
         }
 
     async def patch(self, patch: dict[str, Any]) -> dict[str, Any]:
@@ -412,11 +468,18 @@ class AppSettingsService:
             from app.generation.providers import registry
 
             return await registry.audio_provider().probe()
+        if what == "image":
+            #: 出图是第三条链，同样独立探测：ComfyUI 通了不代表云端出图那个密钥是对的。
+            #: 没配时 `image_provider()` 抛的 `MISSING_CAPABILITY` 里已经写了手动上传
+            #: 那条出路，这里不再另写一份。
+            from app.generation.providers import registry
+
+            return await registry.image_provider().probe()
         raise AppError(
             ErrorCode.VALIDATION_ERROR,
             "不认识的探测对象",
             f"what={what}",
-            ["用 llm / video / audio"],
+            ["用 llm / video / audio / image"],
         )
 
     async def models(
@@ -426,17 +489,23 @@ class AppSettingsService:
         base_url: str | None = None,
         api_key: str | None = None,
     ) -> dict[str, Any]:
-        """自动获取某个字段的候选取值（当前只有 LLM 模型）。
+        """自动获取某个字段的候选取值（LLM 模型 / 出图模型）。
 
         协议 / 地址 / 密钥可以是**还没保存**的那份：让用户先看到模型列表再决定存什么，
         而不是先存一份可能是错的配置。这些覆盖不落盘。
         """
+        if what == "image":
+            #: 出图那条链另一套地址与密钥，所以列表也另列一次——LLM 那把密钥列不出
+            #: 出图端有哪些模型。返回形状与 LLM 那一支一致，设置页共用同一段渲染。
+            return await image_protocols.list_models(
+                protocol=provider, base_url=base_url, api_key=api_key
+            )
         if what != "llm":
             raise AppError(
                 ErrorCode.VALIDATION_ERROR,
                 "这一项没有可自动获取的取值",
                 f"what={what}",
-                ["当前只有 llm（模型列表）支持自动获取"],
+                ["当前只有 llm（模型列表）与 image（出图模型）支持自动获取"],
                 {"what": what},
             )
         return await llm.list_models(provider=provider, base_url=base_url, api_key=api_key)

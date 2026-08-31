@@ -17,6 +17,7 @@ import { computed, ref } from 'vue'
 import { ApiError } from '@/shared/api/client'
 import {
   settingsApi,
+  type ImageProtocolRow,
   type LlmProtocolRow,
   type ModelListing,
   type PresetListing,
@@ -62,9 +63,10 @@ export const useSettingsStore = defineStore('settings', () => {
   const busy = ref(false)
   const lastError = ref<ApiError | null>(null)
   const savedAt = ref('')
-  const probes = ref<Record<'llm' | 'video', ProbeState>>({
+  const probes = ref<Record<'llm' | 'video' | 'image', ProbeState>>({
     llm: emptyProbe(),
     video: emptyProbe(),
+    image: emptyProbe(),
   })
   const fetched = ref<FetchState>({ key: '', busy: false, listing: null, error: null })
 
@@ -73,12 +75,22 @@ export const useSettingsStore = defineStore('settings', () => {
   const providers = computed(() => snapshot.value?.providers ?? [])
   const llm = computed(() => snapshot.value?.llm ?? null)
   const llmProtocols = computed(() => snapshot.value?.llm_protocols ?? [])
+  const imageProtocols = computed(() => snapshot.value?.image_protocols ?? [])
   const path = computed(() => snapshot.value?.path ?? '')
 
   /** 草稿里选中的那个协议的能力说明（默认地址 / 要不要密钥 / 支不支持工具）。 */
   const draftProtocol = computed<LlmProtocolRow | null>(() => {
     const name = String(draft.value['llm.provider'] ?? '')
     return llmProtocols.value.find((p) => p.name === name) ?? null
+  })
+
+  /**
+   * 出图那一族的同一件事。协议表是后端的唯一真源，所以这里只是「按名字查一行」——
+   * 加一家出图 API 时这一段与设置页都不用改。
+   */
+  const draftImageProtocol = computed<ImageProtocolRow | null>(() => {
+    const name = String(draft.value['image.provider'] ?? '')
+    return imageProtocols.value.find((p) => p.name === name) ?? null
   })
 
   const byKey = computed<Record<string, SettingField>>(() =>
@@ -172,19 +184,23 @@ export const useSettingsStore = defineStore('settings', () => {
   }
 
   /**
-   * 自动获取某一项的候选取值（`field.fetch` 非空的那些，当前只有 LLM 模型）。
+   * 自动获取某一项的候选取值（`field.fetch` 非空的那些：LLM 模型 / 出图模型）。
    *
    * 用的是**草稿里**的协议与地址：用户常常是「改完地址就想看看有哪些模型」。
    * 密钥只在真敲了新的时候才带上——没敲就让后端沿用已保存的那把（它不回明文）。
+   *
+   * `field.fetch` 同时是设置里的键前缀（`llm` / `image`），所以这里不写
+   * 「哪一族要读哪几个键」的第二份表——后端加一族只多一个 `fetch` 值。
    */
   async function fetchOptions(field: SettingField): Promise<boolean> {
     if (!field.fetch) return false
     fetched.value = { key: field.key, busy: true, listing: null, error: null }
-    const typedKey = String(draft.value['llm.api_key'] ?? '')
+    const family = field.fetch
+    const typedKey = String(draft.value[`${family}.api_key`] ?? '')
     try {
-      const listing = await settingsApi.models(field.fetch as 'llm', {
-        provider: String(draft.value['llm.provider'] ?? ''),
-        base_url: String(draft.value['llm.base_url'] ?? ''),
+      const listing = await settingsApi.models(family as 'llm' | 'image', {
+        provider: String(draft.value[`${family}.provider`] ?? ''),
+        base_url: String(draft.value[`${family}.base_url`] ?? ''),
         ...(typedKey ? { api_key: typedKey } : {}),
       })
       fetched.value = { key: field.key, busy: false, listing, error: null }
@@ -209,7 +225,7 @@ export const useSettingsStore = defineStore('settings', () => {
     fetched.value = { key: '', busy: false, listing: null, error: null }
   }
 
-  async function probe(what: 'llm' | 'video'): Promise<boolean> {
+  async function probe(what: 'llm' | 'video' | 'image'): Promise<boolean> {
     probes.value[what] = { busy: true, result: null, error: null }
     try {
       probes.value[what] = { busy: false, result: await settingsApi.probe(what), error: null }
@@ -243,6 +259,8 @@ export const useSettingsStore = defineStore('settings', () => {
       await settingsApi.removePreset(name)
       await loadPresets()
       if (byKey.value['video.preset']?.value === name) await clear('video.preset')
+      // 出图那份预设指的是同一个目录里的图，删掉之后同样不能再留着一个悬空的名字。
+      if (byKey.value['image.preset']?.value === name) await clear('image.preset')
     })
   }
 
@@ -260,7 +278,9 @@ export const useSettingsStore = defineStore('settings', () => {
     providers,
     llm,
     llmProtocols,
+    imageProtocols,
     draftProtocol,
+    draftImageProtocol,
     path,
     byKey,
     dirty,

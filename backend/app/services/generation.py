@@ -25,10 +25,17 @@ from app.core.logging import get_logger
 from app.events.bus import Channel, bus
 from app.generation.comfy.client import comfy, outputs_of
 from app.generation.providers import registry
-from app.generation.providers.base import AudioRequest, RefAsset, TaskState, VideoRequest
+from app.generation.providers.base import (
+    AudioRequest,
+    ImageRequest,
+    RefAsset,
+    TaskState,
+    VideoRequest,
+)
 from app.persistence.models import Project, utc_now
 from app.persistence.models_gen import (
     AUDIO_KINDS,
+    IMAGE_KINDS,
     JOB_KINDS,
     REFINE_KINDS,
     GenerationVersion,
@@ -43,6 +50,7 @@ from app.services.base import as_dict, db_of, dump_json, fetch, fetch_all, load_
 from app.services.context import context
 from app.services.frames import frame_key, poster_at, start_frame_index
 from app.services.global_registry import global_registry
+from app.services.images import images
 from app.services.workflows import apply_bindings, parse_graph, workflows
 
 log = get_logger("queue")
@@ -430,16 +438,24 @@ class GenerationService:
         db = db_of(pid)
         rows = await fetch_all(db, Job, order_by=Job.created_at)
         shots = {s.id: s for s in await fetch_all(db, Shot)}
+        # 图片任务不属于任何镜头（`shot_id` 是空的），所以它在控制台里要有自己的那句话
+        # 「角色 · 阿岚 · 默认形象 四视图」——否则整行都是空白，看不出这是在生成什么。
+        # 口径只有一份（`services/images.py::target_label`），认不出来时回 None，不抛。
+        labels: dict[tuple[str, str], str | None] = {}
         out = []
         for row in rows:
             if status and row.status != status:
                 continue
             shot = shots.get(row.shot_id)
+            key = (row.target_kind or "", row.target_id or "")
+            if key != ("", "") and key not in labels:
+                labels[key] = await images.target_label(pid, row.target_kind, row.target_id)
             out.append(
                 {
                     **as_dict(row),
                     "shot_index_no": shot.index_no if shot else None,
                     "shot_title": shot.title if shot else None,
+                    "target_label": labels.get(key),
                     "params": load_json(row.params_json, {}),
                     "error": load_json(row.error_json, None),
                 }
@@ -878,6 +894,7 @@ class GenerationService:
         """跑一次生成。
 
         四条路，**按 `job.kind` 分**（`models_gen.JOB_KINDS` 是唯一那张表）：
+          · 出图（`IMAGE_KINDS`）——图片素材那条链，产出的是一张参考图而不是版本；
           · 出声音（`AUDIO_KINDS`）——音源那条链，产出 `kind="audio"` 的版本，画面不重跑；
           · 二次处理（`REFINE_KINDS`）——输入是已经出好的那一版，产出同一个镜头上的新版本
             并记下 `parent_version_id`；
@@ -886,6 +903,8 @@ class GenerationService:
 
         产物登记与 `add_version` 四条路完全共用。
         """
+        if job.kind in IMAGE_KINDS:
+            return await self._run_image(pid, job, params)
         if job.kind in AUDIO_KINDS:
             return await self._run_audio(pid, job, params)
         parent_version_id: str | None = None
@@ -1204,6 +1223,40 @@ class GenerationService:
             duration=req.duration,
             parent_version_id=str(params.get("source_version_id") or "") or None,
         )
+
+    # --- 图片素材（不属于任何镜头，产出的是一张参考图而不是版本）---
+
+    async def _run_image(self, pid: str, job: Job, params: dict[str, Any]) -> dict[str, Any]:
+        """出一张参考图（角色四视图 / 地点参考图 / 道具图 / 镜头首尾帧候选）。
+
+        与出画面、出声音**同构**（提交 → 轮询 → 取回），三处不同：另一个适配器
+        （`registry.image_provider()`）、另一条落地路径（`images.land()` 转调
+        `cast.add_sheet` / `world.add_*_reference`，都是 append-only）、
+        **不写 `GenerationVersion`**——素材图的「永不覆盖」由那几张表自己的
+        `version_no` + `is_current` 保证，再存一份版本只会多一个可能对不上的真相。
+
+        prompt 与负向 prompt 是**入队那一刻就拼好冻结**的（`services/images.py`），
+        这里一个字都不再拼：SKILL 之后改了，已经排在队列里的这一张也不该变样。
+        """
+        provider = registry.image_provider()
+        refs = await images.refs_of(pid, params)
+        req = ImageRequest(
+            prompt=str(params.get("prompt") or ""),
+            negative=str(params.get("negative_prompt") or ""),
+            size=str(params.get("size") or settings.image_size),
+            refs=refs,
+            seed=params.get("seed"),
+            extra={**(params.get("extra") or {}), "preset": params.get("preset")},
+        )
+        filename, data = await self._await_task(
+            pid, job, provider, await provider.submit(req, client_id=f"aivs-{pid}")
+        )
+        # 适配层的降级说明（参考图装不下、这个端收不了参考图）要留在任务上——
+        # 少喂了几张图这件事必须看得见（绝不静默失败）。
+        if req.notes:
+            params["ref_notes"] = list(req.notes)
+            await self._set(pid, job.id, params_json=dump_json(params))
+        return await images.land(pid, job, filename, data)
 
     async def _asset_path(self, pid: str, asset_id: Any) -> Path | None:
         if not asset_id:

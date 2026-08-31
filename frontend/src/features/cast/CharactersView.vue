@@ -10,8 +10,9 @@
  *   3. **出处不是同步关系**——`origin_library_id` 只说明「当初从素材库采用而来」，
  *      采用之后两边各改各的，标记上的 title 把这句话写出来。
  *
- * 生成类动作（出多视角角色表）要 ComfyUI + 生成队列，本轮没接，
- * 所以按钮 disabled 并在 title 里说清原因——不给假界面。
+ * 「生成角色表」走第三条生成链（`features/images/GenerateImageDialog.vue`）：结构由内置的
+ * 「角色四视图」SKILL 补，用户那段话只写「长什么样」。出图服务没配置时**不在这里判断**——
+ * 弹窗里那份只读账单会原样摆出四要素错误与去设置页的路，比一句 tooltip 说得清。
  */
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
@@ -34,6 +35,7 @@ import EmptyState from '@/shared/ui/EmptyState.vue'
 import ErrorPanel from '@/shared/ui/ErrorPanel.vue'
 import FeatureHeader from '@/shared/ui/FeatureHeader.vue'
 import LibraryPickDialog from '@/features/library/LibraryPickDialog.vue'
+import GenerateImageDialog from '@/features/images/GenerateImageDialog.vue'
 import { fileUrl } from '@/shared/api/files'
 import { assetsApi, type Asset } from '@/shared/api/assets'
 import {
@@ -45,14 +47,13 @@ import {
 } from '@/shared/api/cast'
 import { ApiError } from '@/shared/api/client'
 import { useCastStore } from '@/stores/cast'
-import { useSystemStore } from '@/stores/system'
 
 const route = useRoute()
 const cast = useCastStore()
-const sys = useSystemStore()
 
 const pid = computed(() => String(route.params.pid ?? ''))
-const comfyReady = computed(() => sys.deps.find((d) => d.name === 'comfyui')?.ok ?? false)
+
+const genOpen = ref(false)
 
 const newName = ref('')
 const createOpen = ref(false)
@@ -77,8 +78,7 @@ const imageAssets = computed(() =>
   assets.value.filter(
     (asset) =>
       !asset.missing &&
-      (asset.mime?.startsWith('image/') ||
-        /\.(png|jpe?g|webp|gif|bmp)$/i.test(asset.path)) &&
+      (asset.mime?.startsWith('image/') || /\.(png|jpe?g|webp|gif|bmp)$/i.test(asset.path)) &&
       asset.kind !== 'audio',
   ),
 )
@@ -236,14 +236,15 @@ async function saveCharacterField(key: string, value: string): Promise<void> {
         <Plus :size="10" />新建角色
       </AppButton>
       <AppButton size="sm" @click="picking = true"> <Library :size="10" />从素材库采用 </AppButton>
+      <!--
+        出图服务没配置时不在这里判断：弹窗里那份只读账单会原样摆出四要素错误与
+        「去设置页配一个」，比一句 tooltip 说得清。这里只拦「还没选形象」。
+      -->
       <AppButton
         size="sm"
-        :disabled="true"
-        :title="
-          comfyReady
-            ? '生成角色表要接生成队列（镜头编辑器同一批做），本轮只支持上传'
-            : 'ComfyUI 不在线，且生成队列尚未接上；本轮只支持上传角色表'
-        "
+        :disabled="!current"
+        :title="current ? '照内置的「角色四视图」结构出一张角色表' : '先选一个形象'"
+        @click="genOpen = true"
       >
         <Sparkles :size="10" />生成角色表
       </AppButton>
@@ -505,7 +506,27 @@ async function saveCharacterField(key: string, value: string): Promise<void> {
     </div>
 
     <LibraryPickDialog v-model:open="picking" :pid="pid" kind="character" @adopted="reload()" />
-    <input ref="createFileInput" type="file" accept="image/*" class="hidden" @change="onCreateFile" />
+    <!--
+      入队之后图要等队列跑完才落进来，所以这里只重拉一次列表（「多了一个任务」交给底部
+      控制台说），不假装角色表已经有了。
+    -->
+    <GenerateImageDialog
+      v-if="current"
+      v-model:open="genOpen"
+      :pid="pid"
+      target-kind="appearance"
+      :target-id="current.id"
+      :what="`角色形象 · ${current.name}`"
+      @queued="reload()"
+    />
+
+    <input
+      ref="createFileInput"
+      type="file"
+      accept="image/*"
+      class="hidden"
+      @change="onCreateFile"
+    />
     <AppDialog
       :open="createOpen"
       title="新建角色"
@@ -516,21 +537,49 @@ async function saveCharacterField(key: string, value: string): Promise<void> {
       <form id="create-character" class="space-y-3 p-3" @submit.prevent="createCharacter()">
         <label class="block">
           <span class="text-fg-3 text-2xs">角色名称</span>
-          <input v-model="newName" autofocus placeholder="林昭" class="border-line-1 bg-base-2 text-fg-1 mt-0.5 h-row w-full border px-2 text-xs outline-none" />
+          <input
+            v-model="newName"
+            autofocus
+            placeholder="林昭"
+            class="border-line-1 bg-base-2 text-fg-1 mt-0.5 h-row w-full border px-2 text-xs outline-none"
+          />
         </label>
         <section>
           <div class="flex items-center justify-between">
             <span class="text-fg-3 text-2xs">默认定妆图（必选）</span>
-            <AppButton size="sm" variant="ghost" :disabled="uploading" @click="createFileInput?.click()">
+            <AppButton
+              size="sm"
+              variant="ghost"
+              :disabled="uploading"
+              @click="createFileInput?.click()"
+            >
               <Upload :size="10" />{{ uploading ? '上传中' : '上传图片' }}
             </AppButton>
           </div>
-          <div v-if="createAssetId && thumb(createAssetId)" class="border-line-1 bg-base-2 mt-1.5 flex h-32 items-center justify-center overflow-hidden border">
+          <div
+            v-if="createAssetId && thumb(createAssetId)"
+            class="border-line-1 bg-base-2 mt-1.5 flex h-32 items-center justify-center overflow-hidden border"
+          >
             <img :src="thumb(createAssetId)" alt="默认定妆图" class="size-full object-contain" />
           </div>
           <p v-else class="text-fg-4 mt-1.5 text-2xs">请上传一张角色定妆图后再创建。</p>
-          <div v-if="imageAssets.length" class="mt-2 grid max-h-40 grid-cols-4 gap-1.5 overflow-auto">
-            <button v-for="asset in imageAssets" :key="asset.id" type="button" class="bg-base-2 aspect-square overflow-hidden border" :class="createAssetId === asset.id ? 'border-accent/70 ring-1 ring-accent/30' : 'border-line-1'" title="使用项目中的这张图片" @click="createAssetId = asset.id">
+          <div
+            v-if="imageAssets.length"
+            class="mt-2 grid max-h-40 grid-cols-4 gap-1.5 overflow-auto"
+          >
+            <button
+              v-for="asset in imageAssets"
+              :key="asset.id"
+              type="button"
+              class="bg-base-2 aspect-square overflow-hidden border"
+              :class="
+                createAssetId === asset.id
+                  ? 'border-accent/70 ring-1 ring-accent/30'
+                  : 'border-line-1'
+              "
+              title="使用项目中的这张图片"
+              @click="createAssetId = asset.id"
+            >
               <img :src="fileUrl(pid, asset.path)" alt="" class="size-full object-cover" />
             </button>
           </div>
@@ -539,7 +588,12 @@ async function saveCharacterField(key: string, value: string): Promise<void> {
       <template #footer>
         <span class="flex-1" />
         <AppButton variant="ghost" @click="createOpen = false">取消</AppButton>
-        <AppButton type="submit" form="create-character" variant="primary" :disabled="cast.busy || uploading || !newName.trim() || !createAssetId">
+        <AppButton
+          type="submit"
+          form="create-character"
+          variant="primary"
+          :disabled="cast.busy || uploading || !newName.trim() || !createAssetId"
+        >
           <Plus :size="11" />新建角色
         </AppButton>
       </template>

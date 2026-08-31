@@ -123,6 +123,27 @@ add_shot / update_shot（以及 add_scene 里的 shots[]）**不要自己拼那�
 固定写 none；正向 prompt 末尾的「声音设计：」与负向里的 background music, BGM, soundtrack,
 musical score 由系统自动补齐，你不用重复写。"""
 
+#: 素材图那条链的契约（角色 / 地点 / 道具 / 镜头首尾帧候选）。**同样由代码始终追加**：
+#: 这几句写反了用户看不出来——图照样出得来，只是它当参考素材时会把环境、光影、
+#: 甚至图里那个路人一起带进每一个引用它的镜头。清单只放摘要，全文靠 `read_skill` 取。
+DIRECTOR_IMAGE_CONTRACT_HEAD = """新增素材与出参考图（内置 SKILL，同一个 read_skill 取全文）：
+"""
+
+DIRECTOR_IMAGE_CONTRACT_TAIL = """
+add_character / add_location / add_prop 建素材，generate_reference 给已有素材补一张图。
+这几个工具收的是 image_prompt + skill 两个字段：
+
+  - skill：照的是上面哪一份（角色写 char_sheet、地点写 scene_simple、道具写 prop_ref）；
+  - image_prompt：**只写「长什么样」**——外形、年龄气质、服装配色、材质、时间与天气这类事实。
+
+四视图、纯背景、平光无投影、无文字、场景里无人物那些话由系统按 SKILL 固定补齐，
+**你不要自己写**：重复写只会互相打架（你写了「电影感光影」，而参考图恰恰要的是平光无投影），
+而这种打架从图上看不出来，要等它当参考素材喂进镜头、人物形象跑偏了才发现。
+负向提示词也由系统补，不用给。
+
+素材图会自动追加成一个新版本，旧版本一条都不删。**镜头的首帧 / 末帧只进素材库**，
+要不要用哪一张由用户自己在镜头上点——你不要声称已经设成首帧了。"""
+
 
 def _custom(raw: str) -> str:
     return str(raw or "").strip()
@@ -219,10 +240,16 @@ def director(scope: str = "flow") -> str:
 
     可改的那一段 + **代码始终追加**的 SKILL 与镜头字段契约（用户改不到，见开头 rule 1）
     + 一句「用户现在在哪一页」。SKILL 只进清单那几行，全文靠 `read_skill` 取——
-    四份全塞进来等于每一轮都多烧几千 token。
+    七份全塞进来等于每一轮都多烧几千 token。
     """
     from app.ai import skills  # 局部 import：让 skills 只依赖单向的 core，避免绕圈
 
     contract = f"{DIRECTOR_SKILL_CONTRACT_HEAD}{skills.catalog()}\n{DIRECTOR_SKILL_CONTRACT_TAIL}"
+    image_contract = (
+        f"{DIRECTOR_IMAGE_CONTRACT_HEAD}{skills.image_catalog()}\n{DIRECTOR_IMAGE_CONTRACT_TAIL}"
+    )
     hint = SCOPE_HINT.get(str(scope or "").strip(), SCOPE_HINT["flow"])
-    return f"{_custom(settings.prompt_director) or DIRECTOR_TASK}\n\n{contract}\n\n{hint}"
+    return (
+        f"{_custom(settings.prompt_director) or DIRECTOR_TASK}\n\n"
+        f"{contract}\n\n{image_contract}\n\n{hint}"
+    )

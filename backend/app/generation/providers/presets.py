@@ -90,6 +90,9 @@ TEXT_FIELDS = ("text", "prompt", "string", "value")
 #: 时长与种子的候选字段。音频那份图与视频那份图用的是同一批名字。
 DURATION_FIELDS = ("length", "duration", "frames", "seconds", "num_frames", "value")
 SEED_FIELDS = ("seed", "noise_seed", "value")
+#: 出图那份图的画幅入口。与时长共用一批候选字段名（EmptyLatentImage 是 `width` / `height`，
+#: 各家的原生节点常用 `value`），所以不另造一份候选表。
+SIZE_FIELDS = ("width", "height", "value", "size")
 
 MARKERS: dict[str, tuple[str, ...]] = {
     "AIVS_FIRST_FRAME": IMAGE_FIELDS,
@@ -109,6 +112,12 @@ MARKERS: dict[str, tuple[str, ...]] = {
     "AIVS_VOICE_REF": AUDIO_FIELDS,
     "AIVS_AUDIO_DURATION": DURATION_FIELDS,
     "AIVS_AUDIO_SEED": SEED_FIELDS,
+    #: 出图那份图的画幅入口（**另一条链**，见 `providers/image.py`）。刻意只有这两个：
+    #: 提示词 / 负向 / 种子 / 参考图那几族出图与出视频用的是同一批标题，T2I 图上本来就有。
+    #: **`inspect()` 不因为它们多一条 ready 判定**——从入口标题分不出「这是 T2I 还是 R2V」，
+    #: 出图用哪份图靠 `image.preset` 设置指名，硬猜只会猜错。
+    "AIVS_WIDTH": SIZE_FIELDS,
+    "AIVS_HEIGHT": SIZE_FIELDS,
     #: 参考素材：角色表 / 地点参考图 / 动作参考视频 / 对白音频从这里进去。
     #: 首帧只能是一张，参考素材想喂几个标几个。
     **dict.fromkeys(REF_MARKERS, IMAGE_FIELDS),
@@ -131,6 +140,8 @@ MARKER_LABEL: dict[str, str] = {
     "AIVS_VOICE_REF": "音色参考",
     "AIVS_AUDIO_DURATION": "音频时长",
     "AIVS_AUDIO_SEED": "音频随机种子",
+    "AIVS_WIDTH": "图片宽",
+    "AIVS_HEIGHT": "图片高",
     **{m: f"参考图 {i + 1}" for i, m in enumerate(REF_MARKERS)},
     **{m: f"参考视频 {i + 1}" for i, m in enumerate(REF_VIDEO_MARKERS)},
     **{m: f"参考音频 {i + 1}" for i, m in enumerate(REF_AUDIO_MARKERS)},
@@ -166,6 +177,7 @@ MARKER_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
             "AIVS_AUDIO_SEED",
         ),
     ),
+    ("image", "图片入口（出参考图那份图）", ("AIVS_WIDTH", "AIVS_HEIGHT")),
 )
 
 #: 少了这一个就没法生成（提示词填不进去）；其余入口缺了只是「那一项用图里原来的值」。
@@ -193,6 +205,9 @@ HOW_TO = [
     "音源那份图另存一份：台词标 AIVS_AUDIO_TEXT、声音描述标 AIVS_AUDIO_PROMPT"
     "（两者有其一即可）、音色参考标 AIVS_VOICE_REF、时长与种子标 AIVS_AUDIO_DURATION /"
     " AIVS_AUDIO_SEED——它不需要 AIVS_PROMPT",
+    "出参考图（角色四视图 / 地点图 / 道具图）那份 T2I 图也另存一份：提示词、负向、种子、"
+    "参考图槽位用的是同一批标题，只多两个可选的 AIVS_WIDTH / AIVS_HEIGHT"
+    "——它由设置页的「图片预设」指名，不靠标题猜",
     "再用「Save (API Format)」导出，重新上传这份预设",
 ]
 

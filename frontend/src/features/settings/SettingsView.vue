@@ -51,13 +51,19 @@ const GROUP_HINT: Record<string, string> = {
     '「AI 拆出来的场景不够好」多半是这段话不够好，所以它可改。留空 = 用内置默认；JSON 输出形状由系统始终追加，改不坏。',
   video:
     'comfy_preset 直接连 ComfyUI 并按节点标题注参数，模型端的图由模型端维护；http_api 走通用合同。',
+  image:
+    '角色四视图 / 地点参考图 / 道具图 / 镜头首末帧候选走这一族。不配也行——素材图照旧可以手动上传，只是 AI 那条「顺带出一张图」会跳过并说明原因。',
   comfy: 'comfy_preset 方式下的目标地址，同时也是节点探测与状态栏用的那一个。',
   scene: '一幕里挂多少个人物 / 地点小节点的上限。prompt 是必填的那一个，不受它限制。',
   runtime: '并发数与 FFmpeg。FFmpeg 留空或裸名字表示用应用自带的那份。',
 }
 
 /** 哪一组下面挂「测试连接」。 */
-const PROBE_OF: Record<string, 'llm' | 'video'> = { llm: 'llm', video: 'video' }
+const PROBE_OF: Record<string, 'llm' | 'video' | 'image'> = {
+  llm: 'llm',
+  video: 'video',
+  image: 'image',
+}
 
 const advanced = ref(false)
 const presetName = ref('')
@@ -72,14 +78,26 @@ function tone(field: SettingField): 'accent' | 'neutral' {
   return field.source === 'file' ? 'accent' : 'neutral'
 }
 
+/**
+ * 「自动获取」按的是哪一族的协议。
+ *
+ * `field.fetch` 同时就是设置里的键前缀（`llm` / `image`），所以这里不写第二张
+ * 「哪一项属于哪一族」的表——后端加一族只多一个 `fetch` 值，这一页一行不用改。
+ * 两族的协议行形状不一样（LLM 有 `supports_tools`，出图有 `supports_refs`），
+ * 只取这里真正要用的那三个字段。
+ */
+function protoOf(field: SettingField): { name: string; label: string; models_hint: string } | null {
+  return field.fetch === 'image' ? cfg.draftImageProtocol : cfg.draftProtocol
+}
+
 /** 没选协议时按不动这个按钮——理由写进 tooltip，不画一个点了没反应的按钮。 */
-function canFetch(): boolean {
-  const proto = cfg.draftProtocol
+function canFetch(field: SettingField): boolean {
+  const proto = protoOf(field)
   return Boolean(proto && proto.name !== 'none')
 }
 
-function fetchTitle(): string {
-  const proto = cfg.draftProtocol
+function fetchTitle(field: SettingField): string {
+  const proto = protoOf(field)
   if (!proto || proto.name === 'none') return '先在上面选一个协议，再来自动获取模型列表'
   return `列出 ${proto.label} 上可用的模型（${proto.models_hint}）`
 }
@@ -143,6 +161,32 @@ async function pastePreset(): Promise<void> {
           cfg.draftProtocol.supports_tools
             ? '支持多轮工具调用'
             : '不支持工具调用 —— AI 协作会退化成一次性产出提案，提案形状完全一样'
+        }}
+      </p>
+      <!--
+        出图那一族的同一句话，读的是同一张协议表的另一半。
+        `wants_preset` / `supports_refs` 是这一族才有的两件事：前者说「还得指一份 T2I 图」，
+        后者说「这个端收不了参考图，带了只会降级并写进账单的 warnings」。
+      -->
+      <p
+        v-if="
+          group.id === 'image' && cfg.draftImageProtocol && cfg.draftImageProtocol.name !== 'none'
+        "
+        class="text-fg-3 border-line-1 border-b px-3 py-1.5 text-2xs"
+      >
+        {{ cfg.draftImageProtocol.label }} ·
+        <span class="font-mono">
+          {{ cfg.draftImageProtocol.default_base_url || '无默认地址' }}
+        </span>
+        （地址留空即用它）·
+        {{ cfg.draftImageProtocol.needs_key ? '需要 API Key' : '不需要 API Key（本机端）' }} ·
+        {{
+          cfg.draftImageProtocol.supports_refs
+            ? '能收参考图'
+            : '收不了参考图 —— 带了也只会降级，账单里会把跳过哪几张写出来'
+        }}
+        {{
+          cfg.draftImageProtocol.wants_preset ? ' · 还要在下面的预设列表里给出图指一份 T2I 图' : ''
         }}
       </p>
 
@@ -236,8 +280,8 @@ async function pastePreset(): Promise<void> {
               <AppButton
                 v-if="field.fetch"
                 size="sm"
-                :disabled="!canFetch() || cfg.fetched.busy || cfg.busy"
-                :title="fetchTitle()"
+                :disabled="!canFetch(field) || cfg.fetched.busy || cfg.busy"
+                :title="fetchTitle(field)"
                 @click="cfg.fetchOptions(field)"
               >
                 <Download :size="10" />
@@ -365,6 +409,13 @@ async function pastePreset(): Promise<void> {
             <AppBadge v-if="cfg.byKey['video.preset']?.value === row.name" tone="accent">
               默认
             </AppBadge>
+            <!--
+              出图那份预设与视频那份是同一个目录里的两张不同的图（一张 T2I、一张 R2V），
+              所以两个「默认」各标一个，不共用一个徽标。
+            -->
+            <AppBadge v-if="cfg.byKey['image.preset']?.value === row.name" tone="accent">
+              出图默认
+            </AppBadge>
             <!-- 参考图槽位数：0 个也能生成，但角色表喂不进去，所以标出来而不是藏起来 -->
             <AppBadge v-if="row.ready" :tone="row.ref_slots ? 'neutral' : 'warn'">
               参考图 {{ row.ref_slots }} 槽
@@ -389,6 +440,20 @@ async function pastePreset(): Promise<void> {
               @click="cfg.setOne('video.preset', row.name)"
             >
               设为默认
+            </AppButton>
+            <!--
+              只有认预设的出图协议（本机 ComfyUI）才需要这个按钮：`wants_preset` 来自协议表，
+              云端 API 那几家指一份图毫无意义，所以那时这颗按钮根本不出现。
+            -->
+            <AppButton
+              v-if="cfg.draftImageProtocol?.wants_preset"
+              size="sm"
+              variant="ghost"
+              :disabled="cfg.busy"
+              title="把这份图当出图用的那一份（角色四视图 / 地点参考图 / 道具图走它）"
+              @click="cfg.setOne('image.preset', row.name)"
+            >
+              设为出图默认
             </AppButton>
             <AppButton
               size="sm"

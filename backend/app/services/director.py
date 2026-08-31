@@ -22,11 +22,15 @@ from app.ai.llm import client as llm
 from app.core.errors import AppError, ErrorCode
 from app.core.ids import new_id
 from app.core.logging import get_logger
+from app.generation.providers import registry
 from app.persistence.models import utc_now
 from app.persistence.models_flow import DirectorTurn
 from app.services.base import as_dict, db_of, dump_json, fetch_all, load_json
+from app.services.cast import cast
+from app.services.images import images
 from app.services.sequence import sequence
 from app.services.story import story
+from app.services.world import world
 
 log = get_logger("director")
 
@@ -292,6 +296,63 @@ class DirectorService:
             )
             return {"link_id": row["id"], "mode": row["mode"]}
 
+        if name == "add_character":
+            row = await cast.create_character(
+                pid, {k: after.get(k) for k in ("name", "description")}
+            )
+            # `create_character` 顺手建了「默认形象」——出图挂的是形象，不是角色。
+            apps = await cast.list_appearances(pid, row["id"])
+            appearance = next((a for a in apps if a.get("is_default")), apps[0] if apps else None)
+            out = {
+                "character_id": row["id"],
+                "name": row["name"],
+                "appearance_id": appearance["id"] if appearance else None,
+            }
+            if appearance is not None:
+                out.update(await self._maybe_image(pid, after, "appearance", appearance["id"]))
+            return out
+
+        if name == "add_location":
+            row = await world.create_location(
+                pid, {k: after.get(k) for k in ("name", "description")}
+            )
+            variant = await world.create_variant(
+                pid,
+                row["id"],
+                {
+                    "name": after.get("variant") or "默认场景",
+                    "time_of_day": after.get("time_of_day"),
+                },
+            )
+            return {
+                "location_id": row["id"],
+                "name": row["name"],
+                "variant_id": variant["id"],
+                "variant": variant["name"],
+                **await self._maybe_image(pid, after, "location_variant", variant["id"]),
+            }
+
+        if name == "add_prop":
+            row = await world.create_prop(pid, {k: after.get(k) for k in ("name", "description")})
+            return {
+                "prop_id": row["id"],
+                "name": row["name"],
+                **await self._maybe_image(pid, after, "prop", row["id"]),
+            }
+
+        if name == "generate_reference":
+            return {
+                "target_kind": str(after.get("target_kind") or ""),
+                "target_id": str(after.get("target_id") or ""),
+                "target_label": after.get("target_label"),
+                **await self._maybe_image(
+                    pid,
+                    after,
+                    str(after.get("target_kind") or ""),
+                    str(after.get("target_id") or ""),
+                ),
+            }
+
         # 剩下三条都是「整幕覆盖」：作用到这一幕的每个正片镜头上。
         # 转场镜头不算——它是衔接生成出来的，不是导演排的戏。
         shots = await self._real_shots(pid, sid)
@@ -316,6 +377,39 @@ class DirectorService:
             f"op = {name}。",
             ["丢弃这一条，让 AI 重新提", "或在流程图上手动做这一步"],
         )
+
+    async def _maybe_image(
+        self, pid: str, after: dict[str, Any], target_kind: str, target_id: str
+    ) -> dict[str, Any]:
+        """素材建好之后顺带排一张参考图。**素材已经落了，这一步失败绝不回滚它。**
+
+        三种结果，每一种都说出来（照硬约束 4）：没写 `image_prompt` → 什么都不做；
+        图片服务没配置 → `image_skipped` 写明原因，素材照旧建成了；入队失败 →
+        `image_skipped` 写那个四要素错误的标题，用户还能在素材页手点一次「生成参考图」。
+        """
+        text = str(after.get("image_prompt") or "").strip()
+        if not text:
+            return {}
+        if not registry.image_configured():
+            return {
+                "image_skipped": (
+                    "图片服务未配置（设置页的「图片生成 API」是 none）："
+                    "素材已经建好了，图没有生成。配一个服务后在素材页点「生成参考图」，"
+                    "或手动导入一张图。"
+                )
+            }
+        try:
+            job = await images.enqueue(
+                pid,
+                target_kind,
+                target_id,
+                prompt=text,
+                skill=str(after.get("skill") or "") or None,
+            )
+        except AppError as exc:
+            log.warning("director image enqueue failed: %s", exc.title)
+            return {"image_skipped": f"{exc.title}：{exc.detail}"}
+        return {"job_id": job["id"], "target_label": job.get("target_label")}
 
     async def _real_shots(self, pid: str, sid: str) -> list[str]:
         lane = next((la for la in await story.storyboard(pid) if la["id"] == sid), None)

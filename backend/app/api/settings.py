@@ -22,13 +22,13 @@ router = APIRouter(tags=["settings"])
 
 
 class ProbeIn(BaseModel):
-    what: str = Field("llm", description="llm | video | audio")
+    what: str = Field("llm", description="llm | video | audio | image")
 
 
 class ModelsIn(BaseModel):
     """自动获取取值。协议 / 地址 / 密钥可以带上「还没保存」的那份，先试再存。"""
 
-    what: str = Field("llm", description="llm")
+    what: str = Field("llm", description="llm | image")
     provider: str | None = None
     base_url: str | None = None
     api_key: str | None = None

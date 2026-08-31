@@ -28,8 +28,11 @@ from typing import Any
 
 from app.ai import prompts, skills
 from app.core.errors import AppError, ErrorCode
+from app.generation.providers import registry
 from app.persistence.models_flow import LINK_MODES, SHOT_LINK_MODES
+from app.persistence.models_gen import IMAGE_TARGETS
 from app.services.cast import cast
+from app.services.images import images
 from app.services.sequence import sequence
 from app.services.story import story
 from app.services.world import world
@@ -50,6 +53,24 @@ SHOT_PROMPT_PARAMS: dict[str, dict[str, Any]] = {
         "type": "string",
         "enum": list(skills.NAMES),
         "description": "照的是哪一份内置 SKILL（先用 read_skill 取全文）",
+    },
+}
+
+#: 素材图那两个字段。**只有这一处口径**：`add_character` / `add_location` / `add_prop` /
+#: `generate_reference` 收的都是这两个，正 / 负向 prompt 由
+#: `skills.render_image_prompt()` 在 `to_op()` 里拼一次。
+IMAGE_PROMPT_PARAMS: dict[str, dict[str, Any]] = {
+    "image_prompt": {
+        "type": "string",
+        "description": (
+            "**只写「长什么样」**：外形、年龄气质、服装配色、材质、时间与天气。"
+            "四视图、纯背景、无文字、场景里无人物那些话由系统补，不要自己写"
+        ),
+    },
+    "skill": {
+        "type": "string",
+        "enum": list(skills.IMAGE_NAMES),
+        "description": "照的是哪一份出图 SKILL（留空按素材类型自动选；全文用 read_skill 取）",
     },
 }
 
@@ -109,13 +130,16 @@ TOOLS: dict[str, dict[str, Any]] = {
     "read_skill": {
         "kind": "read",
         "desc": (
-            "取一份内置 SKILL 的全文（镜头 prompt 该怎么写）。写镜头 prompt 之前先读对应的"
-            "那一份：\n" + skills.catalog()
+            "取一份内置 SKILL 的全文。**两族共用这一个工具**——写镜头 prompt 之前读对应的"
+            "那一份，出素材参考图之前读出图那一份：\n"
+            + skills.catalog()
+            + "\n"
+            + skills.image_catalog()
         ),
         "params": {
             "name": {
                 "type": "string",
-                "enum": list(skills.NAMES),
+                "enum": list(skills.ALL_NAMES),
                 "description": "SKILL 名",
             }
         },
@@ -281,6 +305,68 @@ TOOLS: dict[str, dict[str, Any]] = {
             "why": {"type": "string"},
         },
         "required": ["from_shot_id", "to_shot_id", "mode"],
+    },
+    "add_character": {
+        "kind": "write",
+        "desc": (
+            "提议加一个角色（会顺手建一个「默认形象」）。给了 image_prompt 就顺带排一张"
+            "角色四视图参考图；图片服务没配置时只建角色，并把原因写进 warnings。"
+        ),
+        "params": {
+            "name": {"type": "string", "description": "角色名，用剧本里的原文"},
+            "description": {"type": "string", "description": "人物设定（给人看的那份）"},
+            **IMAGE_PROMPT_PARAMS,
+            "why": {"type": "string"},
+        },
+        "required": ["name"],
+    },
+    "add_location": {
+        "kind": "write",
+        "desc": (
+            "提议加一个地点（会顺手建一个变体，幕靠变体钉住地点）。给了 image_prompt 就顺带"
+            "排一张场景参考图。"
+        ),
+        "params": {
+            "name": {"type": "string", "description": "地点名，如「城南旧宅」"},
+            "variant": {"type": "string", "description": "变体名，如「雨夜」；留空叫「默认场景」"},
+            "time_of_day": {"type": "string", "description": "白天 / 黄昏 / 雨夜等"},
+            "description": {"type": "string", "description": "地点设定（给人看的那份）"},
+            **IMAGE_PROMPT_PARAMS,
+            "why": {"type": "string"},
+        },
+        "required": ["name"],
+    },
+    "add_prop": {
+        "kind": "write",
+        "desc": "提议加一个道具。给了 image_prompt 就顺带排一张道具参考图。",
+        "params": {
+            "name": {"type": "string", "description": "道具名，如「油纸伞」"},
+            "description": {"type": "string", "description": "道具设定（给人看的那份）"},
+            **IMAGE_PROMPT_PARAMS,
+            "why": {"type": "string"},
+        },
+        "required": ["name"],
+    },
+    "generate_reference": {
+        "kind": "write",
+        "desc": (
+            "提议给**已有**素材补一张参考图（形象 / 地点变体 / 道具），或给一个镜头出一张"
+            "首 / 末帧候选。镜头那两种**只进素材库**，设不设成首帧由用户自己点。"
+        ),
+        "params": {
+            "target_kind": {
+                "type": "string",
+                "enum": list(IMAGE_TARGETS),
+                "description": "给哪种素材出图",
+            },
+            "target_id": {
+                "type": "string",
+                "description": "那一行的 id：形象 id / 地点变体 id / 道具 id / 镜头 id",
+            },
+            **IMAGE_PROMPT_PARAMS,
+            "why": {"type": "string"},
+        },
+        "required": ["target_kind", "target_id"],
     },
 }
 
@@ -595,7 +681,46 @@ _TARGET = {
     "delete_shot": "shot",
     "reorder_shots": "shot",
     "set_shot_link": "shot_link",
+    "add_character": "material",
+    "add_location": "material",
+    "add_prop": "material",
+    "generate_reference": "material",
 }
+
+#: 图片服务没配置时那句话。**绝不静默跳过**：素材照样建得出来，图不会有，
+#: 所以这条 warning 必须跟着提案一起给用户看（照 CLAUDE.md 硬约束 4）。
+IMAGE_OFF_WARNING = "图片服务未配置：只会建素材，不会生成图。去设置页配一个，或手动导入图片"
+
+
+#: 出图那四个工具共用这一支。**正 / 负向 prompt 只在这里拼一次**
+#: （照 `_shot_after()` 的老规矩），落库那边只照 `after` 用，不再拼第二遍。
+def _image_after(
+    op: dict[str, Any],
+    args: dict[str, Any],
+    target_kind: str,
+) -> dict[str, Any]:
+    """把 `image_prompt` + `skill` 拼成提案里的那几个字段。
+
+    没给 `image_prompt` 就是「只建素材、不出图」——这不是错误，用户后面还能在素材页
+    点「生成参考图」。给了但图片服务没配置时照样把 prompt 拼好放进 `after`
+    （用户看得见 AI 想出什么图），只是多一条 warning 说明这一次不会真出图。
+    """
+    text = str(args.get("image_prompt") or "").strip()
+    declared = str(args.get("skill") or "").strip().lower()
+    if declared and declared not in skills.IMAGE_NAMES:
+        op["warnings"].append(f"skill「{declared}」不是内置的那三份出图 SKILL，已按素材类型自动选")
+        declared = ""
+    name = declared or skills.image_pick(target_kind)
+    out: dict[str, Any] = {"skill": name, "image_prompt": text, "generate_image": bool(text)}
+    if not text:
+        return out
+    positive, negative = skills.render_image_prompt(name, text)
+    out["prompt"] = positive
+    out["negative_prompt"] = negative
+    if not registry.image_configured():
+        out["generate_image"] = False
+        op["warnings"].append(IMAGE_OFF_WARNING)
+    return out
 
 
 async def to_op(pid: str, name: str, args: dict[str, Any], temp_no: int) -> dict[str, Any]:
@@ -823,6 +948,77 @@ async def to_op(pid: str, name: str, args: dict[str, Any], temp_no: int) -> dict
             "to_title": tail["title"],
             "mode": mode,
             **_clean(args, ("duration", "prompt")),
+        }
+        return op
+
+    if name == "add_character":
+        raw = str(args.get("name") or "").strip()
+        existing = [c for c in await cast.list_characters(pid) if c["name"] == raw]
+        if existing:
+            op["warnings"].append(f"工程里已经有一个叫「{raw}」的角色，采用后会多出一个同名角色")
+        op["after"] = {
+            **_clean(args, ("name", "description")),
+            **_image_after(op, args, "appearance"),
+        }
+        return op
+
+    if name == "add_location":
+        raw = str(args.get("name") or "").strip()
+        if any(loc["name"] == raw for loc in await world.list_locations(pid)):
+            op["warnings"].append(f"工程里已经有一个叫「{raw}」的地点，采用后会多出一个同名地点")
+        op["after"] = {
+            **_clean(args, ("name", "description")),
+            "variant": str(args.get("variant") or "").strip() or "默认场景",
+            **_clean(args, ("time_of_day",)),
+            **_image_after(op, args, "location_variant"),
+        }
+        return op
+
+    if name == "add_prop":
+        raw = str(args.get("name") or "").strip()
+        if any(p["name"] == raw for p in await world.list_props(pid)):
+            op["warnings"].append(f"工程里已经有一个叫「{raw}」的道具，采用后会多出一个同名道具")
+        op["after"] = {
+            **_clean(args, ("name", "description")),
+            **_image_after(op, args, "prop"),
+        }
+        return op
+
+    if name == "generate_reference":
+        kind = str(args.get("target_kind") or "").strip()
+        if kind not in IMAGE_TARGETS:
+            raise AppError(
+                ErrorCode.VALIDATION_ERROR,
+                "不认识这种素材类型",
+                f"target_kind = {kind or '（空）'}。",
+                [f"可用的是：{'、'.join(IMAGE_TARGETS)}"],
+                {"target_kind": args.get("target_kind")},
+            )
+        target_id = str(args.get("target_id") or "").strip()
+        label = await images.target_label(pid, kind, target_id)
+        if label is None:
+            raise AppError(
+                ErrorCode.NOT_FOUND,
+                "没有这个素材",
+                f"{kind} 里没有 id = {target_id or '（空）'} 这一行。",
+                [
+                    "先调 list_characters / list_locations / list_props 拿正确的 id",
+                    "形象出图给的是**形象 id**，不是角色 id；地点给的是**变体 id**",
+                ],
+                {"target_kind": kind, "target_id": target_id},
+            )
+        if not str(args.get("image_prompt") or "").strip():
+            raise AppError(
+                ErrorCode.VALIDATION_ERROR,
+                "没写这张图长什么样",
+                "generate_reference 的 image_prompt 是空的，那样只能出一张没有细节的图。",
+                ["写一句「长什么样」：外形、服装配色、材质、时间与天气"],
+            )
+        op["after"] = {
+            "target_kind": kind,
+            "target_id": target_id,
+            "target_label": label,
+            **_image_after(op, args, kind),
         }
         return op
 

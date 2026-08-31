@@ -209,6 +209,45 @@ class AudioRequest:
 
 
 @dataclass(slots=True)
+class ImageRequest:
+    """一次**出图**请求（角色四视图 / 地点参考图 / 道具图 / 镜头首尾帧候选）。
+
+    这是第三条生成链。它与 `VideoRequest` 分开的理由和音频一样：另一份图、另一个地址、
+    另一份密钥（`settings.image_*`），共用一个形状就得在业务层写 `if 这次是图片`。
+
+    `refs` **复用** `RefAsset`（不另造一套）：图生图与风格参考走它，顺序即优先级。
+    接不了参考图的端**只降级并留一条 note**，不失败——照 `AudioRequest` 那条规矩。
+
+    `size` 是 `"宽x高"` 的字符串（`"1024x1024"`）：各家 API 的字段名与取值全不一样，
+    在这里拆成两个 int 只会在适配器里再拼回去。拆分由适配器自己做（`size_wh()`）。
+    """
+
+    prompt: str = ""
+    negative: str = ""
+    size: str = "1024x1024"
+    #: 图生图 / 风格参考。空列表 = 纯文生图。
+    refs: list[RefAsset] = field(default_factory=list)
+    seed: int | None = None
+    extra: dict[str, Any] = field(default_factory=dict)
+    #: 降级说明，与 `VideoRequest.notes` / `AudioRequest.notes` 同一个作风：
+    #: 降级要说出来并留档，而不是抛错让整个任务失败。
+    notes: list[str] = field(default_factory=list)
+
+    def size_wh(self, fallback: tuple[int, int] = (1024, 1024)) -> tuple[int, int]:
+        """把 `size` 拆成 (宽, 高)。**认不出就回默认值，绝不抛**——出图这件事不该被
+        一句写歪的 `"1024*1024"` 卡死在提交之前。"""
+        raw = str(self.size or "").strip().lower().replace("*", "x").replace("×", "x")
+        parts = raw.split("x", 1)
+        if len(parts) != 2:
+            return fallback
+        try:
+            width, height = int(parts[0].strip()), int(parts[1].strip())
+        except ValueError:
+            return fallback
+        return (width, height) if width > 0 and height > 0 else fallback
+
+
+@dataclass(slots=True)
 class TaskState:
     """轮询结果。`detail` 是给人看的一句话，失败时它会进错误的 detail。"""
 
@@ -259,6 +298,33 @@ class AudioProvider(Protocol):
     async def probe(self) -> dict[str, Any]: ...
 
     async def submit(self, req: AudioRequest, *, client_id: str) -> str: ...
+
+    async def poll(self, task_id: str) -> TaskState: ...
+
+    async def fetch(self, task_id: str) -> tuple[str, bytes]: ...
+
+
+class ImageProvider(Protocol):
+    """一个**出图**服务要能做的四件事。
+
+    四个方法与 `VideoProvider` / `AudioProvider` **同名同形是刻意的**：
+    `GenerationService._await_task()` 那个轮询循环（取消检查、每 5 拍发 `job.progress`、
+    失败翻成 `WORKFLOW_ERROR`）于是一行不改就能给图片链用。
+
+    云端出图 API 绝大多数是**同步**的（一次 POST 就回图），所以适配器里有一层
+    「同步端 → 任务形状」的壳（`providers/image.py::ImageProtocol`）：`submit` 真的把图生出来
+    并把字节存在内存里，`poll` 立刻回 done，`fetch` 把它弹出来。这层壳只存在于适配器内部，
+    业务层看到的仍然只有这四个方法。
+
+    没有 `ref_capacity()`：出图这条路上「参考图喂不进去」是端的能力问题
+    （`supports_refs`），不是可数的槽位，降级说明直接写进 `req.notes`。
+    """
+
+    name: str
+
+    async def probe(self) -> dict[str, Any]: ...
+
+    async def submit(self, req: ImageRequest, *, client_id: str) -> str: ...
 
     async def poll(self, task_id: str) -> TaskState: ...
 

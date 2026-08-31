@@ -47,6 +47,7 @@ import EmptyState from '@/shared/ui/EmptyState.vue'
 import ErrorPanel from '@/shared/ui/ErrorPanel.vue'
 import ConfirmErrorDialog from '@/shared/ui/ConfirmErrorDialog.vue'
 import FeatureHeader from '@/shared/ui/FeatureHeader.vue'
+import GenerateImageDialog from '@/features/images/GenerateImageDialog.vue'
 import { ApiError, confirmFlagOf } from '@/shared/api/client'
 import { fileUrl } from '@/shared/api/files'
 import {
@@ -76,6 +77,18 @@ const refInput = ref<HTMLInputElement | null>(null)
 const versionInput = ref<HTMLInputElement | null>(null)
 /** 首帧 / 末帧共用一个 file input，记住正在填哪一个槽位。 */
 const pickingSlot = ref<FrameSlotKey>('first_frame_asset_id')
+
+/**
+ * 「生成一张」正在给哪一族出候选图。出来的图**只进素材库、不进槽位**（后端
+ * `images.land()` 那条规矩），所以生成完还要在槽位那个下拉里挑一次。
+ */
+const genOpen = ref(false)
+const genTarget = ref<'shot_first_frame' | 'shot_last_frame'>('shot_first_frame')
+
+function openGen(key: FrameSlotKey): void {
+  genTarget.value = key === 'first_frame_asset_id' ? 'shot_first_frame' : 'shot_last_frame'
+  genOpen.value = true
+}
 const newShotTitle = ref('')
 /** 整幕入队的结果：入队了几条、跳过了哪几条。null = 这次会话还没整幕入过。 */
 const sceneRun = ref<{ queued: string[]; skipped: unknown[] } | null>(null)
@@ -460,6 +473,19 @@ function cancelDrop(): void {
       @confirm="confirmDrop()"
       @cancel="cancelDrop()"
     />
+    <!--
+      首 / 末帧候选图。**只进素材库**——落进来之后还要在槽位那个下拉里挑一次，
+      槽位绝不由生成链代填。
+    -->
+    <GenerateImageDialog
+      v-if="shot"
+      v-model:open="genOpen"
+      :pid="pid"
+      :target-kind="genTarget"
+      :target-id="shot.id"
+      :what="`${shot.title || '镜头'} · ${genTarget === 'shot_first_frame' ? '首帧候选' : '末帧候选'}`"
+      @queued="reload()"
+    />
     <ErrorPanel
       v-if="showSideError"
       class="mx-2 mt-2"
@@ -605,7 +631,9 @@ function cancelDrop(): void {
                           : 'text-fg-2 hover:bg-base-2'
                       "
                       @click="workbench.select(pid, s.id)"
-                      @dblclick.stop="router.push({ name: 'shot', params: { pid: pid, sid: s.id } })"
+                      @dblclick.stop="
+                        router.push({ name: 'shot', params: { pid: pid, sid: s.id } })
+                      "
                     >
                       <Film :size="10" class="text-fg-4" />
                       <span class="min-w-0 flex-1 truncate text-2xs">{{ s.title }}</span>
@@ -755,6 +783,19 @@ function cancelDrop(): void {
                     >
                       <Upload :size="10" />上传
                     </AppButton>
+                    <!--
+                      生成出来的图**只进素材库**，还要在左边那个下拉里挑一次才算这一帧——
+                      哪一张是首帧只认用户按下去的那一下，生成链不代填槽位。
+                    -->
+                    <AppButton
+                      size="sm"
+                      variant="ghost"
+                      :disabled="!shot || busyFile || workbench.busy"
+                      title="出一张候选图。只进素材库，还要在左边挑一次才算这一帧"
+                      @click="openGen(slot.key)"
+                    >
+                      <Sparkles :size="10" />生成一张
+                    </AppButton>
                   </div>
                 </div>
               </div>
@@ -831,7 +872,8 @@ function cancelDrop(): void {
                 <div v-else class="border-line-1 bg-base-2 border p-1.5">
                   <p class="text-fg-1 text-2xs">4 · 转场上下游已固定</p>
                   <p class="text-fg-4 mt-0.5 text-2xs">
-                    负责「{{ transitionPeers?.before ?? '上游镜头' }} → {{ transitionPeers?.after ?? '下游镜头' }}」的转场；请回到这两个镜头修改衔接。
+                    负责「{{ transitionPeers?.before ?? '上游镜头' }} →
+                    {{ transitionPeers?.after ?? '下游镜头' }}」的转场；请回到这两个镜头修改衔接。
                   </p>
                 </div>
               </div>

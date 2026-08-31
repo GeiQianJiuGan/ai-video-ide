@@ -40,7 +40,7 @@ export const OP_FIELD_LABEL: Record<string, string> = {
   from_scene_id: '上一幕',
   to_scene_id: '下一幕',
   // 镜头级
-  description: '镜头描述',
+  description: '描述', // 镜头是「镜头描述」，素材是「设定」，两族共用一张表，取通用那个词
   camera: '景别',
   movement: '运镜',
   camera_motion: '机位与运镜',
@@ -51,6 +51,13 @@ export const OP_FIELD_LABEL: Record<string, string> = {
   scene_title: '所属幕',
   index_no: '第几镜',
   position: '插在第几个',
+  // 素材级（角色 / 地点 / 道具 + 顺带出一张参考图）
+  name: '名字',
+  variant: '地点变体',
+  image_prompt: '图片提示词',
+  target_kind: '素材类型',
+  target_label: '出图对象',
+  generate_image: '顺带出一张图',
 }
 
 /** 写工具名 = 提案的 op。用户丢弃一条时，前端把它改成 'reject'。 */
@@ -68,6 +75,10 @@ export const DIRECTOR_OPS = [
   'delete_shot',
   'reorder_shots',
   'set_shot_link',
+  'add_character',
+  'add_location',
+  'add_prop',
+  'generate_reference',
 ] as const
 export type DirectorOpName = (typeof DIRECTOR_OPS)[number]
 
@@ -86,12 +97,16 @@ export const OP_LABEL: Record<string, string> = {
   delete_shot: '删掉一个镜头',
   reorder_shots: '重排镜头顺序',
   set_shot_link: '改镜头之间的衔接',
+  add_character: '加一个角色',
+  add_location: '加一个地点',
+  add_prop: '加一个道具',
+  generate_reference: '生成参考图',
 }
 
 export interface DirectorOp {
   /** 写工具名；丢弃时被改成 'reject'。 */
   op: string
-  target: 'scene' | 'link' | 'shot' | 'shot_link' | string
+  target: 'scene' | 'link' | 'shot' | 'shot_link' | 'material' | string
   temp_id: string
   scene_id?: string
   shot_id?: string

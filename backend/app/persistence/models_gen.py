@@ -35,7 +35,22 @@ REQUIRED_SLOTS: dict[str, tuple[str, ...]] = {
 VIDEO_KINDS = ("image2video", "first_last_frame", "transition", "fl2va")
 REFINE_KINDS = ("upscale", "interpolate", "recut")
 AUDIO_KINDS = ("audio",)
-JOB_KINDS = (*VIDEO_KINDS, *REFINE_KINDS, *AUDIO_KINDS)
+#: 出图（第四族，**第三条生成链**）：`t2i` 从提示词出一张，`i2i` 带参考图出一张。
+#: 它们与前三族最大的不同是**不属于任何镜头**——落点写在 `job.target_kind` /
+#: `target_id` 上（角色形象 / 地点变体 / 道具 / 镜头的首尾帧候选），`shot_id` 是空的。
+IMAGE_KINDS = ("t2i", "i2i")
+JOB_KINDS = (*VIDEO_KINDS, *REFINE_KINDS, *AUDIO_KINDS, *IMAGE_KINDS)
+#: 出图任务的落点类型。**只有这一张表**：service 校验、AI 写工具、SKILL 默认表
+#: （`ai/skills/image_prompt.py::BY_TARGET`）都照它。
+#: 镜头那两项刻意只表示「这张图是给这个镜头出的候选」——**落地时绝不动首尾帧槽位**，
+#: 哪一张是首帧只认用户按下去的那一下。
+IMAGE_TARGETS = (
+    "appearance",
+    "location_variant",
+    "prop",
+    "shot_first_frame",
+    "shot_last_frame",
+)
 #: 这些 kind 要用上游镜头的末帧当首帧（严格首尾帧那条路）。判定只放这一份。
 NEEDS_LAST_FRAME = ("first_last_frame", "transition", "fl2va")
 #: 产物是音频的 kind。
@@ -107,9 +122,17 @@ class Job(Base):
     __tablename__ = "job"
 
     id: Mapped[str] = mapped_column(String(40), primary_key=True)
-    shot_id: Mapped[str] = mapped_column(
-        String(40), ForeignKey("shot.id", ondelete="CASCADE"), nullable=False, index=True
+    #: **可空**：出图任务不属于任何镜头（角色 / 地点 / 道具是素材，被很多镜头引用），
+    #: 它的落点写在 `target_kind` / `target_id` 上。外键与 CASCADE 原样保留——
+    #: 可空外键不影响它，镜头级任务照旧跟着镜头一起删。
+    shot_id: Mapped[str | None] = mapped_column(
+        String(40), ForeignKey("shot.id", ondelete="CASCADE"), nullable=True, index=True
     )
+    #: **这张图是给谁出的**（出图任务专用，其余 kind 一律是空）：`target_kind` 在
+    #: `IMAGE_TARGETS` 里，`target_id` 是那一行的 id。**刻意不加外键**——素材被删掉时
+    #: 按「这条任务的落点没了」如实报错，比让数据库连带删掉一条正在跑的任务好解释。
+    target_kind: Mapped[str | None] = mapped_column(String(30))
+    target_id: Mapped[str | None] = mapped_column(String(40))
     kind: Mapped[str] = mapped_column(String(30), nullable=False, default="image2video")
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="queued", index=True)
     priority: Mapped[int] = mapped_column(Integer, nullable=False, default=100)

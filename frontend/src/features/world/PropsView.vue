@@ -19,18 +19,18 @@ import EmptyState from '@/shared/ui/EmptyState.vue'
 import ErrorPanel from '@/shared/ui/ErrorPanel.vue'
 import FeatureHeader from '@/shared/ui/FeatureHeader.vue'
 import LibraryPickDialog from '@/features/library/LibraryPickDialog.vue'
+import GenerateImageDialog from '@/features/images/GenerateImageDialog.vue'
 import { fileUrl } from '@/shared/api/files'
 import { assetsApi, type Asset } from '@/shared/api/assets'
 import { ApiError } from '@/shared/api/client'
 import { useWorldStore } from '@/stores/world'
-import { useSystemStore } from '@/stores/system'
 
 const route = useRoute()
 const world = useWorldStore()
-const sys = useSystemStore()
 
 const pid = computed(() => String(route.params.pid ?? ''))
-const comfyReady = computed(() => sys.deps.find((d) => d.name === 'comfyui')?.ok ?? false)
+
+const genOpen = ref(false)
 
 const newName = ref('')
 const createOpen = ref(false)
@@ -48,8 +48,7 @@ const imageAssets = computed(() =>
   assets.value.filter(
     (asset) =>
       !asset.missing &&
-      (asset.mime?.startsWith('image/') ||
-        /\.(png|jpe?g|webp|gif|bmp)$/i.test(asset.path)) &&
+      (asset.mime?.startsWith('image/') || /\.(png|jpe?g|webp|gif|bmp)$/i.test(asset.path)) &&
       asset.kind !== 'audio',
   ),
 )
@@ -161,14 +160,15 @@ async function saveField(key: 'name' | 'description' | 'notes', value: string): 
         <Plus :size="10" />新建道具
       </AppButton>
       <AppButton size="sm" @click="picking = true"> <Library :size="10" />从素材库采用 </AppButton>
+      <!--
+        出图服务没配置时不在这里判断：弹窗里那份只读账单会原样摆出四要素错误与
+        「去设置页配一个」，比一句 tooltip 说得清。这里只拦「还没选道具」。
+      -->
       <AppButton
         size="sm"
-        :disabled="true"
-        :title="
-          comfyReady
-            ? '生成道具参考图要接生成队列，本轮只支持上传'
-            : 'ComfyUI 不在线，且生成队列尚未接上；本轮只支持上传参考图'
-        "
+        :disabled="!prop"
+        :title="prop ? '照内置的「道具参考图」结构出一张' : '先选一个道具'"
+        @click="genOpen = true"
       >
         <Sparkles :size="10" />生成参考图
       </AppButton>
@@ -341,7 +341,26 @@ async function saveField(key: 'name' | 'description' | 'notes', value: string): 
     </div>
 
     <LibraryPickDialog v-model:open="picking" :pid="pid" kind="prop" @adopted="reload()" />
-    <input ref="createFileInput" type="file" accept="image/*" class="hidden" @change="onCreateFile" />
+    <!--
+      入队之后图要等队列跑完才落进来，所以这里只重拉一次列表（把「多了一个任务」这件事
+      交给底部控制台），不假装参考图已经有了。
+    -->
+    <GenerateImageDialog
+      v-if="prop"
+      v-model:open="genOpen"
+      :pid="pid"
+      target-kind="prop"
+      :target-id="prop.id"
+      :what="`道具 · ${prop.name}`"
+      @queued="reload()"
+    />
+    <input
+      ref="createFileInput"
+      type="file"
+      accept="image/*"
+      class="hidden"
+      @change="onCreateFile"
+    />
     <AppDialog
       :open="createOpen"
       title="新建道具"
@@ -352,21 +371,53 @@ async function saveField(key: 'name' | 'description' | 'notes', value: string): 
       <form id="create-prop" class="space-y-3 p-3" @submit.prevent="createProp()">
         <label class="block">
           <span class="text-fg-3 text-2xs">道具名称</span>
-          <input v-model="newName" autofocus placeholder="铜制怀表" class="border-line-1 bg-base-2 text-fg-1 mt-0.5 h-row w-full border px-2 text-xs outline-none" />
+          <input
+            v-model="newName"
+            autofocus
+            placeholder="铜制怀表"
+            class="border-line-1 bg-base-2 text-fg-1 mt-0.5 h-row w-full border px-2 text-xs outline-none"
+          />
         </label>
         <section>
           <div class="flex items-center justify-between">
             <span class="text-fg-3 text-2xs">默认参考图（必选）</span>
-            <AppButton size="sm" variant="ghost" :disabled="uploading" @click="createFileInput?.click()">
+            <AppButton
+              size="sm"
+              variant="ghost"
+              :disabled="uploading"
+              @click="createFileInput?.click()"
+            >
               <Upload :size="10" />{{ uploading ? '上传中' : '上传图片' }}
             </AppButton>
           </div>
-          <div v-if="createAssetId && thumb(createAssetId)" class="border-line-1 bg-base-2 mt-1.5 flex h-32 items-center justify-center overflow-hidden border">
-            <img :src="thumb(createAssetId)" alt="默认道具参考图" class="size-full object-contain" />
+          <div
+            v-if="createAssetId && thumb(createAssetId)"
+            class="border-line-1 bg-base-2 mt-1.5 flex h-32 items-center justify-center overflow-hidden border"
+          >
+            <img
+              :src="thumb(createAssetId)"
+              alt="默认道具参考图"
+              class="size-full object-contain"
+            />
           </div>
           <p v-else class="text-fg-4 mt-1.5 text-2xs">请上传一张道具参考图后再创建。</p>
-          <div v-if="imageAssets.length" class="mt-2 grid max-h-40 grid-cols-4 gap-1.5 overflow-auto">
-            <button v-for="asset in imageAssets" :key="asset.id" type="button" class="bg-base-2 aspect-square overflow-hidden border" :class="createAssetId === asset.id ? 'border-accent/70 ring-1 ring-accent/30' : 'border-line-1'" title="使用项目中的这张图片" @click="createAssetId = asset.id">
+          <div
+            v-if="imageAssets.length"
+            class="mt-2 grid max-h-40 grid-cols-4 gap-1.5 overflow-auto"
+          >
+            <button
+              v-for="asset in imageAssets"
+              :key="asset.id"
+              type="button"
+              class="bg-base-2 aspect-square overflow-hidden border"
+              :class="
+                createAssetId === asset.id
+                  ? 'border-accent/70 ring-1 ring-accent/30'
+                  : 'border-line-1'
+              "
+              title="使用项目中的这张图片"
+              @click="createAssetId = asset.id"
+            >
               <img :src="fileUrl(pid, asset.path)" alt="" class="size-full object-cover" />
             </button>
           </div>
@@ -375,7 +426,12 @@ async function saveField(key: 'name' | 'description' | 'notes', value: string): 
       <template #footer>
         <span class="flex-1" />
         <AppButton variant="ghost" @click="createOpen = false">取消</AppButton>
-        <AppButton type="submit" form="create-prop" variant="primary" :disabled="world.busy || uploading || !newName.trim() || !createAssetId">
+        <AppButton
+          type="submit"
+          form="create-prop"
+          variant="primary"
+          :disabled="world.busy || uploading || !newName.trim() || !createAssetId"
+        >
           <Plus :size="11" />新建道具
         </AppButton>
       </template>

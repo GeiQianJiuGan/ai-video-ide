@@ -31,9 +31,10 @@ AI Video Studio（`aivs`）：桌面端优先的 AI 原生长视频制作工作�
 
 - **后端已全量落地**：docs/04 的 Step 1–9 都有实现，之后又落了「两级场景系统」这一轮
   （应用级设置 → provider 适配层 → 衔接与编排 → 场景工作台 → 幕流程图 → AI 协作栏）——
-  17 个 service（cast / world / assets / workflows / story / context / generation / timeline /
-  overview / projects / library / adopt / fsbrowse / appsettings / frames / sequence / director）
-  + 18 个 router（含 `/ws`），263 passed / 1 skipped。
+  23 个 service（cast / world / assets / workflows / story / context / generation / timeline /
+  overview / projects / library / adopt / fsbrowse / appsettings / frames / sequence / director /
+  packages / ingest / dub / refine / audio / **images**；`base` / `params` / `global_registry`
+  是公共件不算）+ 22 个 router（含 `/ws`），405 passed。
 - **前端也全部接上了后端**：`app/features.ts` 里 15 个功能都是 `ready: true`，
   `/p/:pid` 下不再有外壳页。`shared/ui/FeatureView.vue`（按注册表画工作区骨架与能力锁）
   暂时没人用，留给下一个「登记了但还没接后端」的功能——那种情况先挂它，绝不给假界面。
@@ -377,6 +378,30 @@ kind / priority / included / reason / **media**（`image` / `video` / `audio`，
   `参考图说明：参考图1=…`（`base.ref_hint`，ComfyUI 那类图收不到标签，只能靠这句对号），
   设置里 `video.ref_labels` 可关。**三族分开算槽位**：把 `.mp4` 接到 `AIVS_REF_1` 上会喂给
   LoadImage 一个视频文件名，既不报错也出不了片。
+- **第三条生成链：图片**（`app/generation/providers/image.py` + `services/images.py` +
+  `api/images.py` + `ai/skills/image_prompt.py`，前端只有一个共用弹窗
+  `features/images/GenerateImageDialog.vue`）。视频与音频之外的第三条，出的是**素材图**：
+  角色四视图 / 地点变体参考图 / 道具图 / 镜头首末帧候选。五条不许绕的：
+  - **协议表是唯一真源**，和 `ai/llm/protocols.py` 同一个形状：`none` / `comfy_preset` /
+    `openai_images` / `gemini` / `http_api` 五项写在一张 `BY_NAME` 里（默认地址、要不要密钥、
+    收不收参考图、模型列表从哪来），`GET /settings` 投影成 `image_protocols[]` 给前端画界面
+    ——加一家 API 只改那一个 dict，前端一行不动。**密钥只走请求头**（Gemini 刻意不用 `?key=`），
+    出网只有 `image._client()` 这一个口子，测试全靠 monkeypatch 它关在机器里跑。
+  - **结构由内置 SKILL 补，用户那段话只写「长什么样」**（`ai/skills/image_prompt.py` 三份：
+    `char_sheet` / `scene_simple` / `prop_ref`）。拼装口径只有一处
+    `render_image_prompt(name, user_text)`，AI 路径与手动按钮共用；四视图、纯背景、无文字
+    那几句是系统追加的，模型与用户都改不到。`read_skill` 一个工具同时查视频与图片两张表。
+  - **不新造队列**：图片任务就是一行 `Job`（`kind` ∈ `t2i` / `i2i`），靠 `0020_image_jobs`
+    的可空 `shot_id` + `target_kind` / `target_id` 挂到出图对象上，轮询 / 取消 / 重试 / 优先级
+    全部继承 `generation._await_task()`。底部控制台靠 `list_jobs()` 多回的 `target_label`
+    显示「角色 · 阿岚 四视图」，不是空白。
+  - **落地全部转调已有写方法**（`cast.add_sheet` / `world.add_variant_reference` /
+    `world.add_prop_reference`，都是 append-only，旧版本一条不删），`services/images.py` 自己
+    不碰 ORM。**镜头首末帧只进素材库、绝不写槽位**——「哪一张是首帧」只认用户按下去的那一下。
+  - **先账单再动手**：`POST /images/plan` 只读地给出用哪个协议、照哪份 SKILL、拼出来的
+    正 / 负向 prompt 全文、图会落到哪里、缺什么；弹窗上也照这个顺序，`can_generate=false`
+    时把四要素错误连 `suggestions` 一起摆出来。出图服务没配置时 AI 那条提案**照旧建素材**，
+    只把跳过的原因写进 `warnings` / `applied[].image_skipped`。
 - **真末帧抽取**（`services/frames.py`）：`tail_frame` 衔接靠它。FFmpeg `-sseof` 抽一张 PNG →
   登记 `Asset(kind="frame")` → 同 (asset, at) 幂等复用；`services/context.py` 的 `prev_frame`
   指的就是这张抽出来的帧，不是上游那整段视频。抽取失败报 `FFMPEG_ERROR`，建议里给出
@@ -391,7 +416,11 @@ kind / priority / included / reason / **media**（`image` / `video` / `audio`，
 - **应用级设置**（`services/appsettings.py` + `api/settings.py`）：落
   `settings.runtime_dir / "settings.json"`（与 `library.json` / `recent.json` 同级），生效顺序
   **settings.json → 环境变量 → 默认**，每个字段回一个 `source` 让 UI 标出「来自配置文件 /
-  环境变量」。`POST /settings/probe` 分别探 LLM 与视频服务。**API key 永不回明文**：只回
+  环境变量」。`POST /settings/probe` 分别探 LLM、视频与**图片**服务（`what` ∈
+  `llm` / `video` / `image`），`POST /settings/models` 也是这三族共用，靠 `field.fetch`
+  认「这一项属于哪一族」——它同时就是设置键前缀，所以前端不写第二张对照表。
+  出图那一族是 `image.*` 七项（`provider` / `base_url` / `model` / `api_key` / `preset` /
+  `size` / `timeout`），`provider` 的候选直接来自协议表。**API key 永不回明文**：只回
   `masked` + `has_value`，前端只在用户真的输入了才提交那个字段。
 - **LLM 协议适配层**（`app/ai/llm/protocols.py`，`client.py` 只按设置选一个协议再转调）：与
   provider 适配层同一个思路——**业务层只有 OpenAI 那套内部规范形状**（`messages` / `tools` /
@@ -422,10 +451,12 @@ kind / priority / included / reason / **media**（`image` / `video` / `audio`，
 - **新增表**：工程表必须在 `persistence/all_models.py` 里 import，否则 `Base.metadata` 漏表；
   素材库表相反——挂 `LibraryBase`，**不要**进 `all_models.py`（理由见上面的素材库段）。
 - **新增迁移**：`alembic/versions/` 加脚本 → 在 `persistence/migrate.py::REVISION_SCHEMA` 登记
-  它对应的 schema 版本 → 同步 `settings.schema_version`（当前 13，最新一条是
-  `0013_shot_frames`：镜头上显式的首帧 / 末帧槽位，`Shot.first_frame_asset_id` /
-  `last_frame_asset_id`，只能是图片、可空、不加外键，清空传 `''` 不传 `null`）。漏登记会导致
-  打开旧工程时无法告诉用户「schema X → Y」。
+  它对应的 schema 版本 → 同步 `settings.schema_version`（当前 20，最新一条是
+  `0020_image_jobs`：图片任务不挂在镜头上，所以 `job.shot_id` 改可空，另加
+  `target_kind` / `target_id` 两列指向出图对象（`appearance` / `location_variant` / `prop` /
+  `shot_first_frame` / `shot_last_frame`）；`GenerationVersion` 一列不动——素材图的
+  「永不覆盖」由 `SheetVersion` / `LocationReference` / `PropReference` 已有的
+  `version_no` + `is_current` 保证）。漏登记会导致打开旧工程时无法告诉用户「schema X → Y」。
 - **落盘**：资产 `path` 相对工程目录存（整个目录拷走仍然有效）；类型→子目录映射在
   `services/assets.py::KIND_DIR`，`generations/` 只放生成物，手动素材一律进 `assets/`，
   可再生的临时文件（抽出来的首尾帧）进 `cache/`。

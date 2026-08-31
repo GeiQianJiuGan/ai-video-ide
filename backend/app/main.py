@@ -23,6 +23,7 @@ from app.api import dub as dub_api
 from app.api import files as files_api
 from app.api import fs as fs_api
 from app.api import generation as generation_api
+from app.api import images as images_api
 from app.api import ingest as ingest_api
 from app.api import library as library_api
 from app.api import overview as overview_api
@@ -143,6 +144,7 @@ def create_app() -> FastAPI:
     app.include_router(context_api.router, prefix=API_PREFIX)
     app.include_router(generation_api.router, prefix=API_PREFIX)
     app.include_router(sequence_api.router, prefix=API_PREFIX)
+    app.include_router(images_api.router, prefix=API_PREFIX)
     app.include_router(refine_api.router, prefix=API_PREFIX)
     app.include_router(dub_api.router, prefix=API_PREFIX)
     app.include_router(ingest_api.router, prefix=API_PREFIX)

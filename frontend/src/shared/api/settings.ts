@@ -81,8 +81,25 @@ export interface LlmProtocolRow {
   models_hint: string
 }
 
-/** 一种调用方式。`legacy` 的是旧的 Workflow 绑定路径，只作兼容保留。 */
-export interface ProviderRow {
+/**
+ * 一个图片协议的能力说明。与 `LlmProtocolRow` 同一个思路——**协议表是后端的唯一真源**，
+ * 加一家出图 API 只改后端那一个 dict，这里与设置页一行都不用动。
+ *
+ * `wants_preset` 为真的（本机 ComfyUI）认的是模型端保存的那份 T2I 图，所以要另填
+ * `image.preset`；`supports_refs` 为假的端收不了参考图，带了也只会降级并说出来。
+ */
+export interface ImageProtocolRow {
+  name: string
+  label: string
+  default_base_url: string
+  needs_key: boolean
+  supports_refs: boolean
+  wants_preset: boolean
+  /** 模型列表从哪来，例如 `GET https://api.openai.com/v1/models`。 */
+  models_hint: string
+}
+
+/** 一种调用方式。`legacy` 的是旧的 Workflow 绑定路径，只作兼容保留。 */ export interface ProviderRow {
   name: string
   label: string
   legacy: boolean
@@ -94,6 +111,7 @@ export interface SettingsSnapshot {
   fields: SettingField[]
   llm: LlmStatus
   llm_protocols: LlmProtocolRow[]
+  image_protocols: ImageProtocolRow[]
   providers: ProviderRow[]
 }
 
@@ -167,16 +185,18 @@ export type SettingsPatch = Record<string, string | number | boolean | null>
 export const settingsApi = {
   get: () => api.get<SettingsSnapshot>('/settings'),
   patch: (patch: SettingsPatch) => api.patch<SettingsSnapshot>('/settings', patch),
-  probe: (what: 'llm' | 'video') => api.post<ProbeResult>('/settings/probe', { what }),
+  probe: (what: 'llm' | 'video' | 'image') => api.post<ProbeResult>('/settings/probe', { what }),
   /**
-   * 自动获取某一项的候选取值（当前只有 LLM 模型）。
+   * 自动获取某一项的候选取值（LLM 模型 / 出图模型）。
    *
    * 协议 / 地址 / 密钥可以带上**还没保存**的那份：让用户先看到模型列表再决定存什么，
    * 而不是先存一份可能是错的配置。后端不会把它们写进 settings.json。
    * `api_key` 留空表示「沿用已保存的那把」——密钥不回明文，所以没敲就别提交。
    */
-  models: (what: 'llm', over: { provider?: string; base_url?: string; api_key?: string } = {}) =>
-    api.post<ModelListing>('/settings/models', { what, ...over }),
+  models: (
+    what: 'llm' | 'image',
+    over: { provider?: string; base_url?: string; api_key?: string } = {},
+  ) => api.post<ModelListing>('/settings/models', { what, ...over }),
   presets: () => api.get<PresetListing>('/settings/presets'),
   savePreset: (name: string, graph: string) =>
     api.post<PresetRow>('/settings/presets', { name, graph }),

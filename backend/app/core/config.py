@@ -15,7 +15,7 @@ class Settings(BaseSettings):
 
     app_name: str = "AI Video Studio"
     version: str = "0.1.0"
-    schema_version: int = 19
+    schema_version: int = 20
 
     # --- 网络：只监听回环，绝不对外暴露工程数据 ---
     host: str = "127.0.0.1"
@@ -79,6 +79,20 @@ class Settings(BaseSettings):
     audio_api_key: str = ""
     audio_preset: str = ""  # 音源工作流：presets 目录里的另一份图
     audio_timeout: int = 600
+
+    # --- 图片生成：第三条链（角色四视图 / 地点参考图 / 道具图 / 镜头首尾帧候选） ---
+    # 这些参考图不是装饰：context 会把它们当参考素材喂进 AIVS_REF_*，没有它们，
+    # 只喂一张首帧的镜头在几秒里就把人物形象丢掉了。以前只能用户自己在别处生成再导入。
+    # 与视频 / 音频同一个作风：另一份图、另一个地址、另一份密钥，各是一条路。
+    # none 是默认（硬约束 2）：图片入口一律回 MISSING_CAPABILITY 并说清手动上传那条路
+    # 完全不受影响。可选值来自协议表（providers/image.py::BY_NAME），加一家 API 不改这里。
+    image_provider: str = "none"  # none|comfy_preset|openai_images|gemini|http_api
+    image_base_url: str = ""  # 留空时用协议自己的默认地址（comfy_preset 退回 comfy_base_url）
+    image_api_key: str = ""
+    image_model: str = ""  # 云端端点用哪个模型（comfy_preset 不看它）
+    image_preset: str = ""  # comfy_preset 用哪一份 T2I 图：presets 目录里的另一份
+    image_size: str = "1024x1024"
+    image_timeout: int = 300
 
     # --- 长视频导入与切段：全靠 FFmpeg，不需要 LLM ---
     # 画面切换的判定阈值（0~1，越大越只认剧烈的切换）。

@@ -11,7 +11,7 @@ from typing import Any
 
 from app.core.config import settings
 from app.core.errors import AppError, ErrorCode
-from app.generation.providers import audio, presets
+from app.generation.providers import audio, image, presets
 from app.generation.providers.base import AudioProvider, RefCapacity, VideoProvider
 from app.generation.providers.comfy_preset import ComfyPresetProvider
 from app.generation.providers.http_api import HttpApiProvider
@@ -105,6 +105,7 @@ def reset() -> None:
     """测试用：换掉 settings 之后丢掉缓存的实例。"""
     _cache.clear()
     _audio_cache.clear()
+    _image_cache.clear()
     presets.reset_cache()
 
 
@@ -155,3 +156,44 @@ def audio_provider(name: str | None = None) -> AudioProvider:
     if chosen not in _audio_cache:
         _audio_cache[chosen] = factory()
     return _audio_cache[chosen]
+
+
+# --- 图片：第三条链，协议表在 providers/image.py（那张表是唯一真源）---
+
+_image_cache: dict[str, Any] = {}
+
+
+def image_listing() -> list[dict[str, Any]]:
+    """设置页的图片协议表。**原样投影 `image.listing()`**，这里不加工、不筛选——
+    加一家 API 只改那一张 `BY_NAME`，这一层与前端都一行不动。
+    """
+    return image.listing()
+
+
+def image_configured(name: str | None = None) -> bool:
+    return (name or settings.image_provider) not in ("", image.NONE)
+
+
+def image_provider(name: str | None = None) -> Any:
+    """当前的出图服务。**没配就是 `MISSING_CAPABILITY`，不是崩溃**（硬约束 2）。
+
+    建议里必须写明手动那条路：在角色 / 地点 / 道具页直接上传一张图，参考素材照旧
+    喂进 `AIVS_REF_*`——图片服务只是省掉「自己去别处生成再导入」这一步。
+    """
+    chosen = str(name or settings.image_provider or "").strip()
+    if not image_configured(chosen):
+        raise AppError(
+            ErrorCode.MISSING_CAPABILITY,
+            "还没有配置图片生成服务",
+            "出图是独立的一条链（另一份图 / 另一个地址 / 另一份密钥），默认不开启。",
+            [
+                "在设置页的「图片生成 API」里选一种调用方式并填好地址",
+                image.MANUAL_WAY_OUT,
+            ],
+            {"image_provider": chosen},
+        )
+    if chosen not in _image_cache:
+        #: `require()` 负责「不认识这个名字」那句四要素错误，这里不再判一遍。
+        #: `provider()` 是协议自己回的实例：HTTP 那几支是它本身，ComfyUI 那支另有一个类。
+        _image_cache[chosen] = image.require(chosen).provider()
+    return _image_cache[chosen]

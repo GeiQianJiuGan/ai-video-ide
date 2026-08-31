@@ -1,0 +1,10 @@
+How the reference pictures align with the target video — Picture 1 (from Shot 1) aligns with the 0.00-second mark of the target video; Picture 2 (from Shot 1) aligns with the 10.00-second mark of the target video.
+
+integrated_multimodal_description:
+[Shot 1] Live-action, cinematic, the video begins in the composition established by Picture 1. A matte-red portable speaker remains geometrically consistent. Minimal dark studio, soft haze, precise reflections and generous negative space. The camera performs a Push In with small amplitude at slow speed. A rim light traces the silhouette, then the speaker settles into a clean hero frame. The motion develops through observable intermediate states, progressively narrows every visual difference, and settles into the exact composition established by Picture 2 at the end of the shot.
+
+overall_soundscape:
+One soft dial click, restrained room tone and a synchronized low-frequency pulse.
+
+non_diegetic_music:
+Minimal electronic percussion, moderate tempo, ending cleanly on the hero frame.

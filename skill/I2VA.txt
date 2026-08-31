@@ -1,0 +1,10 @@
+For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1]) is fully referenced.
+
+integrated_multimodal_description:
+[Shot 1] Live-action, cinematic, the composition, subject appearance and spatial relationships in <Picture 1> remain consistent. A matte-red portable speaker remains geometrically consistent. Minimal dark studio, soft haze, precise reflections and generous negative space. The camera performs a Push In with small amplitude at slow speed. A rim light traces the silhouette, then the speaker settles into a clean hero frame.
+
+overall_soundscape:
+One soft dial click, restrained room tone and a synchronized low-frequency pulse.
+
+non_diegetic_music:
+Minimal electronic percussion, moderate tempo, ending cleanly on the hero frame.

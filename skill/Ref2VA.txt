@@ -1,0 +1,18 @@
+subject_definitions:
+<Subject 1> is the visible subject shown in <Picture 1>: A matte-red portable speaker remains geometrically consistent. Preserve the exact product shape, material, color and logo.
+
+summary:
+[reference generation] Create a 10-second target video featuring <Subject 1>; <Picture 1> provides the subject's visible identity and product attributes.
+
+retention_analysis:
+<Subject 1> (appears in [Shot 1]): fully_preserved - preserve the exact product shape, material, color and logo throughout the target video.
+
+detailed_description:
+The target video uses a cinematic product-film style with coherent lighting and stable visual continuity.
+[Shot 1] <Subject 1> appears with the referenced characteristics clearly visible. Minimal dark studio, soft haze, precise reflections and generous negative space. The camera performs a Push In with small amplitude at slow speed. A rim light traces the silhouette, then the speaker settles into a clean hero frame.
+
+overall_soundscape:
+One soft dial click, restrained room tone and a synchronized low-frequency pulse.
+
+non_diegetic_music:
+Minimal electronic percussion, moderate tempo, ending cleanly on the hero frame.

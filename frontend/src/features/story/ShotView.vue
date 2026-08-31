@@ -41,6 +41,7 @@ import FeatureHeader from '@/shared/ui/FeatureHeader.vue'
 import SegmentPlayer from '@/shared/ui/SegmentPlayer.vue'
 import DubModal from './components/DubModal.vue'
 import RefineModal from './components/RefineModal.vue'
+import GenerateImageDialog from '@/features/images/GenerateImageDialog.vue'
 import { fileUrl } from '@/shared/api/files'
 import { ApiError, confirmFlagOf } from '@/shared/api/client'
 import { assetsApi, type Asset } from '@/shared/api/assets'
@@ -80,6 +81,20 @@ const contextInput = ref<HTMLInputElement | null>(null)
 const frameInput = ref<HTMLInputElement | null>(null)
 /** 首帧 / 末帧共用一个 file input，记住正在填哪一个槽位。 */
 const pickingSlot = ref<FrameSlotKey>('first_frame_asset_id')
+
+/**
+ * 「生成一张」正在给哪一族出图。
+ *
+ * 出来的图**只进素材库、不进槽位**（后端 `images.land()` 那条规矩：哪一张是首帧只认
+ * 用户按下去的那一下），所以这两个是候选而不是槽位内容——生成完还要在上面那个下拉里挑。
+ */
+const genOpen = ref(false)
+const genTarget = ref<'shot_first_frame' | 'shot_last_frame'>('shot_first_frame')
+
+function openGen(key: FrameSlotKey): void {
+  genTarget.value = key === 'first_frame_asset_id' ? 'shot_first_frame' : 'shot_last_frame'
+  genOpen.value = true
+}
 
 type FrameSlotKey = 'first_frame_asset_id' | 'last_frame_asset_id'
 /** 某一族的槽位账 + 它是哪一族——界面上每族一行，所以把 key 带进值里。 */
@@ -245,7 +260,11 @@ const allShots = computed(() =>
   story.lanes.flatMap((l) =>
     l.shots
       .filter((s) => s.kind !== 'transition')
-      .map((s) => ({ id: s.id, label: `${s.index_no}. ${s.title} · ${l.title}`, prev_shot_id: s.prev_shot_id })),
+      .map((s) => ({
+        id: s.id,
+        label: `${s.index_no}. ${s.title} · ${l.title}`,
+        prev_shot_id: s.prev_shot_id,
+      })),
   ),
 )
 
@@ -388,7 +407,10 @@ function fmt(n: number | null | undefined): string {
   return n === null || n === undefined ? '—' : `${Math.round(n * 10) / 10}s`
 }
 
-async function saveText(key: 'prompt' | 'negative_prompt' | 'description' | 'dialogue', value: string) {
+async function saveText(
+  key: 'prompt' | 'negative_prompt' | 'description' | 'dialogue',
+  value: string,
+) {
   await editor.save(pid.value, { [key]: value || null }).catch(() => {})
 }
 
@@ -765,11 +787,7 @@ function cancelDrop(): void {
                     @change="saveField('prev_shot_id', ($event.target as HTMLSelectElement).value)"
                   >
                     <option value="">不接上游</option>
-                    <option
-                      v-for="s in upstreamCandidates"
-                      :key="s.id"
-                      :value="s.id"
-                    >
+                    <option v-for="s in upstreamCandidates" :key="s.id" :value="s.id">
                       {{ s.label }}
                     </option>
                   </select>
@@ -777,7 +795,8 @@ function cancelDrop(): void {
                 <div v-if="shot.kind === 'transition'" class="border-line-1 bg-base-2 border p-1.5">
                   <p class="text-fg-2 text-2xs">转场上下游已固定</p>
                   <p class="text-fg-4 mt-0.5 text-2xs">
-                    负责「{{ transitionPeers?.before ?? '上游镜头' }} → {{ transitionPeers?.after ?? '下游镜头' }}」的转场；请回到这两个镜头修改衔接。
+                    负责「{{ transitionPeers?.before ?? '上游镜头' }} →
+                    {{ transitionPeers?.after ?? '下游镜头' }}」的转场；请回到这两个镜头修改衔接。
                   </p>
                 </div>
                 <p class="text-fg-4 text-2xs">
@@ -841,17 +860,36 @@ function cancelDrop(): void {
                       {{ a.path.split('/').pop() }}
                     </option>
                   </select>
-                  <AppButton
-                    v-if="src.key"
-                    size="sm"
-                    variant="ghost"
-                    class="mt-1 w-full"
-                    :disabled="src.disabled || uploading || editor.busy"
-                    :title="src.disabled ? src.hint : '上传一张图直接填进这个槽位'"
-                    @click="pickSlotFile(src.key!)"
-                  >
-                    <Upload :size="10" />上传
-                  </AppButton>
+                  <!--
+                    「上传」直接填进槽位，「生成一张」只把图放进素材库——出来的图要在上面
+                    那个下拉里挑一次才算首帧（哪一张是首帧只认用户按下去的那一下）。
+                  -->
+                  <div v-if="src.key" class="mt-1 flex gap-1">
+                    <AppButton
+                      size="sm"
+                      variant="ghost"
+                      class="flex-1"
+                      :disabled="src.disabled || uploading || editor.busy"
+                      :title="src.disabled ? src.hint : '上传一张图直接填进这个槽位'"
+                      @click="pickSlotFile(src.key!)"
+                    >
+                      <Upload :size="10" />上传
+                    </AppButton>
+                    <AppButton
+                      size="sm"
+                      variant="ghost"
+                      class="flex-1"
+                      :disabled="src.disabled || uploading || editor.busy"
+                      :title="
+                        src.disabled
+                          ? src.hint
+                          : '出一张候选图。只进素材库，还要在上面挑一次才算首帧'
+                      "
+                      @click="openGen(src.key!)"
+                    >
+                      <Sparkles :size="10" />生成一张
+                    </AppButton>
+                  </div>
                   <p v-if="src.type === 'upstream'" class="text-fg-4 mt-1 text-2xs">
                     {{ src.hint }}
                   </p>
@@ -894,23 +932,43 @@ function cancelDrop(): void {
                     :disabled="lastFrameSlot.disabled || uploading || editor.busy"
                     class="border-line-1 bg-base-2 text-fg-1 focus:border-accent/60 disabled:opacity-50 mt-1 h-5 w-full border px-1 text-2xs outline-none"
                     :title="lastFrameSlot.hint"
-                    @change="setSlot(lastFrameSlot.key!, ($event.target as HTMLSelectElement).value)"
+                    @change="
+                      setSlot(lastFrameSlot.key!, ($event.target as HTMLSelectElement).value)
+                    "
                   >
                     <option value="">不指定</option>
                     <option v-for="a in imageAssets" :key="a.id" :value="a.id">
                       {{ a.path.split('/').pop() }}
                     </option>
                   </select>
-                  <AppButton
-                    size="sm"
-                    variant="ghost"
-                    class="mt-1 w-full"
-                    :disabled="lastFrameSlot.disabled || uploading || editor.busy"
-                    :title="lastFrameSlot.disabled ? lastFrameSlot.hint : '上传一张图直接填进这个槽位'"
-                    @click="pickSlotFile(lastFrameSlot.key!)"
-                  >
-                    <Upload :size="10" />上传
-                  </AppButton>
+                  <div class="mt-1 flex gap-1">
+                    <AppButton
+                      size="sm"
+                      variant="ghost"
+                      class="flex-1"
+                      :disabled="lastFrameSlot.disabled || uploading || editor.busy"
+                      :title="
+                        lastFrameSlot.disabled ? lastFrameSlot.hint : '上传一张图直接填进这个槽位'
+                      "
+                      @click="pickSlotFile(lastFrameSlot.key!)"
+                    >
+                      <Upload :size="10" />上传
+                    </AppButton>
+                    <AppButton
+                      size="sm"
+                      variant="ghost"
+                      class="flex-1"
+                      :disabled="lastFrameSlot.disabled || uploading || editor.busy"
+                      :title="
+                        lastFrameSlot.disabled
+                          ? lastFrameSlot.hint
+                          : '出一张候选图。只进素材库，还要在上面挑一次才算末帧'
+                      "
+                      @click="openGen(lastFrameSlot.key!)"
+                    >
+                      <Sparkles :size="10" />生成一张
+                    </AppButton>
+                  </div>
                 </div>
               </div>
               <input
@@ -992,7 +1050,11 @@ function cancelDrop(): void {
               size="sm"
               variant="ghost"
               :disabled="shot?.kind === 'transition' || uploading || editor.busy"
-              :title="shot?.kind === 'transition' ? '转场镜头首尾帧固定，不接受参考素材' : '上传图 / 视频 / 音频直接挂进上下文，优先级最高（手动添加）'"
+              :title="
+                shot?.kind === 'transition'
+                  ? '转场镜头首尾帧固定，不接受参考素材'
+                  : '上传图 / 视频 / 音频直接挂进上下文，优先级最高（手动添加）'
+              "
               @click="contextInput?.click()"
             >
               <Upload :size="10" />加素材
@@ -1201,14 +1263,18 @@ function cancelDrop(): void {
           <div class="flex items-center border-line-1 border-b bg-base-2 text-2xs">
             <button
               class="flex-1 py-1.5 font-medium text-center transition-colors border-r border-line-1"
-              :class="versionTab === 'video' ? 'bg-base-1 text-accent' : 'text-fg-4 hover:text-fg-2'"
+              :class="
+                versionTab === 'video' ? 'bg-base-1 text-accent' : 'text-fg-4 hover:text-fg-2'
+              "
               @click="versionTab = 'video'"
             >
               画面版本 ({{ editor.versions.length }})
             </button>
             <button
               class="flex-1 py-1.5 font-medium text-center transition-colors"
-              :class="versionTab === 'audio' ? 'bg-base-1 text-accent' : 'text-fg-4 hover:text-fg-2'"
+              :class="
+                versionTab === 'audio' ? 'bg-base-1 text-accent' : 'text-fg-4 hover:text-fg-2'
+              "
               @click="versionTab = 'audio'"
             >
               独立音轨 ({{ editor.audioVersions.length }})
@@ -1237,7 +1303,17 @@ function cancelDrop(): void {
                   <div class="flex items-center gap-1">
                     <span class="text-fg-1 tnum text-2xs font-medium">v{{ v.version_no }}</span>
                     <AppBadge :tone="v.source === 'manual' ? 'neutral' : 'accent'">
-                      {{ v.source === 'manual' ? '手动' : v.source === 'imported' ? '导入' : v.source === 'upscaled' ? '超分' : v.source === 'interpolated' ? '插帧' : '生成' }}
+                      {{
+                        v.source === 'manual'
+                          ? '手动'
+                          : v.source === 'imported'
+                            ? '导入'
+                            : v.source === 'upscaled'
+                              ? '超分'
+                              : v.source === 'interpolated'
+                                ? '插帧'
+                                : '生成'
+                      }}
                     </AppBadge>
                     <AppBadge v-if="v.status !== 'done'" tone="warn">{{ v.status }}</AppBadge>
                     <div class="ml-auto flex items-center gap-1">
@@ -1271,7 +1347,10 @@ function cancelDrop(): void {
                   </div>
 
                   <!-- 切段区间标识 -->
-                  <div v-if="v.in_point != null || v.out_point != null" class="mt-1 text-2xs text-accent flex items-center gap-1 font-mono">
+                  <div
+                    v-if="v.in_point != null || v.out_point != null"
+                    class="mt-1 text-2xs text-accent flex items-center gap-1 font-mono"
+                  >
                     <Scissors :size="9" />
                     <span>区间: {{ v.in_point ?? 0 }}s ~ {{ v.out_point ?? v.duration }}s</span>
                   </div>
@@ -1307,9 +1386,13 @@ function cancelDrop(): void {
 
             <!-- 独立音轨 Tab -->
             <div v-else class="space-y-2">
-              <div class="border-line-1 bg-base-2 p-1.5 border text-2xs flex items-center justify-between">
+              <div
+                class="border-line-1 bg-base-2 p-1.5 border text-2xs flex items-center justify-between"
+              >
                 <span class="text-fg-3">
-                  {{ editor.currentAudioVersion ? '当前：使用独立配音轨' : '当前：使用画面原生声音' }}
+                  {{
+                    editor.currentAudioVersion ? '当前：使用独立配音轨' : '当前：使用画面原生声音'
+                  }}
                 </span>
                 <button
                   v-if="editor.currentAudioVersion"
@@ -1398,7 +1481,11 @@ function cancelDrop(): void {
             <textarea
               :value="shot.prompt ?? ''"
               rows="3"
-              :placeholder="currentLane?.prompt ? `（留空继承本幕共用 Prompt: ${currentLane.prompt}）` : '这条镜头要画什么。上下文里的参考素材（图 / 视频 / 音频）会和它一起喂给模型。'"
+              :placeholder="
+                currentLane?.prompt
+                  ? `（留空继承本幕共用 Prompt: ${currentLane.prompt}）`
+                  : '这条镜头要画什么。上下文里的参考素材（图 / 视频 / 音频）会和它一起喂给模型。'
+              "
               class="border-line-1 bg-base-2 text-fg-1 placeholder:text-fg-4 focus:border-accent/60 mt-px w-full resize-none border px-1.5 py-1 text-2xs outline-none font-mono"
               @change="saveText('prompt', ($event.target as HTMLTextAreaElement).value)"
             />
@@ -1462,6 +1549,19 @@ function cancelDrop(): void {
         @done="reload()"
       />
 
+      <!--
+        首 / 末帧候选图。**只进素材库**——图落进来之后还要在上面那个下拉里挑一次，
+        槽位绝不由生成链代填（哪一张是首帧只认用户按下去的那一下）。
+      -->
+      <GenerateImageDialog
+        v-model:open="genOpen"
+        :pid="pid"
+        :target-kind="genTarget"
+        :target-id="shot.id"
+        :what="`${shot.title || '镜头'} · ${genTarget === 'shot_first_frame' ? '首帧候选' : '末帧候选'}`"
+        @queued="loadSide()"
+      />
+
       <!-- 二次超分 / 插帧优化弹窗 -->
       <RefineModal
         v-model:open="refineModalOpen"
@@ -1500,7 +1600,9 @@ function cancelDrop(): void {
             </div>
             <div class="flex justify-between text-fg-2">
               <span>后半段 (作为新镜紧随其后):</span>
-              <strong class="text-fg-1">{{ ((shot?.duration || 0) - splitAtSeconds).toFixed(1) }}s</strong>
+              <strong class="text-fg-1"
+                >{{ ((shot?.duration || 0) - splitAtSeconds).toFixed(1) }}s</strong
+              >
             </div>
           </div>
           <p class="text-fg-4 text-2xs">
@@ -1513,7 +1615,9 @@ function cancelDrop(): void {
             <AppButton
               size="sm"
               variant="primary"
-              :disabled="editor.busy || splitAtSeconds <= 0 || splitAtSeconds >= (shot?.duration || 0)"
+              :disabled="
+                editor.busy || splitAtSeconds <= 0 || splitAtSeconds >= (shot?.duration || 0)
+              "
               @click="executeSplit"
             >
               <Scissors :size="10" />确认拆分
@@ -1547,7 +1651,10 @@ function cancelDrop(): void {
           <p v-if="lineageResult.children.length" class="text-fg-2 font-medium mt-2">
             下游衍生版本：
           </p>
-          <div v-if="lineageResult.children.length" class="space-y-1 border-line-1 bg-base-2 p-2 border">
+          <div
+            v-if="lineageResult.children.length"
+            class="space-y-1 border-line-1 bg-base-2 p-2 border"
+          >
             <div
               v-for="c in lineageResult.children"
               :key="c.id"
