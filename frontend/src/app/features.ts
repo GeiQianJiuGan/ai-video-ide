@@ -253,23 +253,26 @@ const PROJECT_DEFS: FeatureDef[] = [
   {
     id: 'story',
     route: 'story',
-    title: '剧本与 AI 导演',
-    purpose: '把一段文字剧本拆成 Scene 与 Shot，AI 可选、手动同样能走完',
+    title: '剧本与 AI 编剧',
+    purpose: '把剧情讲给 AI 编剧，逐条审阅它的提案；手动建 Scene / Shot 同样能走完',
     group: 'story',
     icon: ScrollText,
     milestone: 'M3',
     ready: true,
     requires: ['backend'],
     panels: {
-      left: { title: '剧本', body: '分段文本编辑，段落与 Scene 双向对应' },
       main: {
-        title: '拆解结果',
-        body: 'AI 拆出的 Scene / Shot 逐项 Diff：你逐条接受或改写，确认后才落库',
+        title: 'AI 编剧',
+        body: '一边说一边出字，提案产出即可审：每条给出 before → after，采用之前库里什么都不变',
       },
-      right: { title: '角色映射', body: '文本里的人名映射到已有角色，避免重复建人' },
+      right: { title: '幕与镜头', body: '已落库的 Scene / Shot 与这一场的属性、地点变体' },
     },
     actions: [
-      { label: 'AI 自动拆解', hint: '需要配置 LLM；产出结果仍需你审阅', primary: true },
+      {
+        label: '讲一段剧情',
+        hint: '需要配置 LLM；它提的每一条都要你按「采用」才落库',
+        primary: true,
+      },
       { label: '手动添加 Scene', hint: '不依赖 LLM，完整流程照样可用' },
       { label: '挂地点变体', hint: '把一场戏钉在「城南旧宅 · 雨夜」上，镜头顺着它取参考图' },
     ],
@@ -290,7 +293,10 @@ const PROJECT_DEFS: FeatureDef[] = [
         title: 'Shot 卡片',
         body: '按时间顺序展示 Shot；每张卡片直接列出已生成版本和采纳状态',
       },
-      right: { title: '预览与工作台', body: '单击预览视频，双击进入单 Shot 工作台配置角色、场景与上下文' },
+      right: {
+        title: '预览与工作台',
+        body: '单击预览视频，双击进入单 Shot 工作台配置角色、场景与上下文',
+      },
     },
     actions: [
       { label: '采纳版本', hint: '为每个 Shot 选择进入时间线和下游续接的版本', primary: true },

@@ -12,7 +12,7 @@
  *      而不是一个红叉。手动编排本来就能走完全程。
  */
 
-import { api } from './client'
+import { ApiError, api, type ErrorPayload } from './client'
 
 /** 用户现在开着哪一页。只影响后端拼系统提示词的那一句，不落库。 */
 export type DirectorScope = 'script' | 'flow'
@@ -132,9 +132,21 @@ export interface DirectorTurn {
   created_at: string
 }
 
+export interface DirectorLlm {
+  configured: boolean
+  provider: string
+  label: string
+  model: string | null
+  /** false = 这个端不支持工具调用，走一次性产出提案的退化路径（提案形状一样）。 */
+  supports_tools: boolean
+  /** false = 这个端整段返回，不会有 delta；协作栏据此不画那个光标。 */
+  supports_stream: boolean
+  hint: string
+}
+
 export interface DirectorHistory {
   turns: DirectorTurn[]
-  llm: { configured: boolean; provider: string; model: string | null; hint: string }
+  llm: DirectorLlm
   note: string
 }
 
@@ -158,6 +170,33 @@ export interface DirectorApply {
   count: number
 }
 
+/** 一次工具调用的开始 / 结束。`done` 那条带 `ok`，失败时 `error` 是一句话标题。 */
+export interface DirectorToolStep {
+  name: string
+  phase: 'start' | 'done'
+  ok?: boolean
+  error?: string
+}
+
+/** 流式正常收尾。`turns` 是刚落下的记录（assistant + 有提案时的 proposal）。 */
+export interface DirectorDone {
+  turns: DirectorTurn[]
+  ops: DirectorOp[]
+  degraded: boolean
+  /** 这一轮和模型往返了几次。转满 `MAX_ROUNDS` 会走 error 那条。 */
+  rounds: number
+}
+
+/**
+ * 流式事件。**`error` 不在这里**——它被 `chatStream()` 抛成 `ApiError`，
+ * 于是调用方对「开流前失败」和「半路挂了」只有一套错误处理。
+ */
+export type DirectorStreamEvent =
+  | { event: 'delta'; data: { text: string } }
+  | { event: 'tool'; data: DirectorToolStep }
+  | { event: 'op'; data: DirectorOp }
+  | { event: 'done'; data: DirectorDone }
+
 export const directorApi = {
   history: (pid: string) => api.get<DirectorHistory>(`/projects/${pid}/director`),
   /**
@@ -165,10 +204,44 @@ export const directorApi = {
    *
    * `scope` 是「用户现在开着哪一页」（`script` 剧本页 / `flow` 幕流程图页）。它只影响这一次
    * 请求拼出来的系统提示词，不落库——两页共用同一个会话，换页不该让历史对话变味。
+   *
+   * 这是不流式那条（兼容路径）。界面走的是下面的 `chatStream()`。
    */
   chat: (pid: string, message: string, scope: DirectorScope = 'flow') =>
     api.post<DirectorChat>(`/projects/${pid}/director/chat`, { message, scope }),
+  /**
+   * 同一件事，但一边说一边给。**照旧一行库都不动**（`done` 里的 `turns` 只是聊天记录）。
+   *
+   * 三条与不流式那条一致的规矩：
+   *   1. **`done` 与 `error` 互斥且必有其一**——`error` 在这里表现为抛 `ApiError`，
+   *      所以正常收尾一定是最后那条 `done`；
+   *   2. **半路挂了也不白干**：抛出来之前收到的 `op` 全部有效，后端已经把它们落成记录，
+   *      刷新页面还在；
+   *   3. **`signal` 用来「停」**：abort 之后迭代直接结束，不抛——已经收到的照旧有效。
+   */
+  chatStream: (
+    pid: string,
+    message: string,
+    scope: DirectorScope = 'flow',
+    signal?: AbortSignal,
+  ): AsyncGenerator<DirectorStreamEvent> => stream(pid, message, scope, signal),
   apply: (pid: string, ops: DirectorOp[]) =>
     api.post<DirectorApply>(`/projects/${pid}/director/apply`, { ops }),
   clear: (pid: string) => api.del<void>(`/projects/${pid}/director`),
+}
+
+async function* stream(
+  pid: string,
+  message: string,
+  scope: DirectorScope,
+  signal?: AbortSignal,
+): AsyncGenerator<DirectorStreamEvent> {
+  const path = `/projects/${pid}/director/chat/stream`
+  for await (const frame of api.stream(path, { message, scope }, signal)) {
+    if (frame.event === 'error') {
+      // 状态码是 200——错误是在流里来的。但对调用方来说它和开流前失败没有区别。
+      throw new ApiError((frame.data as { error: ErrorPayload }).error, 200)
+    }
+    yield frame as DirectorStreamEvent
+  }
 }

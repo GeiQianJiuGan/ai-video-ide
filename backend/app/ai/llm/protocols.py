@@ -3,7 +3,7 @@
 原来 `client.py` 里那两个函数各自 `if provider == "ollama"`，于是「支持一个新协议」
 等于在两处各加一支 if。照硬约束 1（业务层不绑定具体模型）与 `generation/providers/`
 的做法，这里把协议做成适配器：`require()` 按设置挑一个，上层（`ai/director/agent.py`、
-`services/*`）只认下面这四个动作——列模型 / 探活 / 出 JSON / 走一轮工具调用。
+`services/*`）只认下面这几个动作——列模型 / 探活 / 出 JSON / 走一轮工具调用（流式或不流式）。
 
 **内部规范形状就是 OpenAI 那一套**（`messages` / `tools` / `tool_calls`）：agent 已经
 按它写了，它也是这几家里表达力最全的一个。适配器负责双向翻译，上层永远只看到
@@ -26,26 +26,13 @@
 「模型自动获取」就是 `list_models()`：每个适配器知道自家列表长什么样，除了名字还给一个
 `label`（Anthropic 的 display_name、Gemini 的 displayName、Ollama 的体积），
 设置页直接列出来给人挑，不用手抄模型名。
-
-**看图是第五个动作**（`describe_image()` + `supports_vision`）：素材没有描述时，模型引用它
-只看得到一个文件名，所以「照着这张图写一句描述」必须能真的把图片字节送进去。四种方言
-接图的形状完全不同，全部关在这一层：
-
-  · `openai_compatible` —— `content: [{type:"text"}, {type:"image_url", image_url:{url:"data:…"}}]`
-  · `anthropic` —— `content: [{type:"image", source:{type:"base64", media_type, data}}, {type:"text"}]`
-    （图排在文字前面，顺序反了它常常只答「我看到一张图片」）
-  · `gemini` —— `contents[].parts: [{inline_data:{mime_type, data}}, {text}]`
-  · `ollama` —— 图不在 content 里，而是 `messages[].images: ["<base64>"]`（**不带 `data:` 前缀**）
-
-`supports_vision=False` 的端走基类那个默认实现：报四要素错误，建议里必须有手动路径
-（照硬约束 2——看不了图不该让「给素材写描述」这件事走不通）。**密钥照旧只走请求头**，
-Gemini 这条路上也没有 `?key=`。
 """
 
 from __future__ import annotations
 
 import base64
 import json
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
 
@@ -198,6 +185,38 @@ def _tool_args(name: Any, raw: Any) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
+def one_chunk(out: dict[str, Any]) -> list[dict[str, Any]]:
+    """一次非流式返回 → 流式事件序列（整段文字算一块）。
+
+    **只有这一个地方知道「不流式怎么冒充流式」**：基类的 `stream_tools` 与
+    `ai/llm/client.py` 的退化分支共用它，形状不可能分叉。
+    """
+    text = str(out.get("content") or "")
+    events: list[dict[str, Any]] = []
+    if text:
+        events.append({"type": "delta", "text": text})
+    events.append(
+        {"type": "final", "content": out.get("content"), "tool_calls": out.get("tool_calls") or []}
+    )
+    return events
+
+
+def _sse_payload(chunk: str) -> Any | None:
+    """一个 SSE 事件的 data 段 → JSON。
+
+    心跳注释、`[DONE]` 这种非 JSON 的收尾标记回 None——它们不是失败，只是没内容。
+    真正读不懂的一段也回 None：一条 delta 丢了不该毁掉整轮，而「一条都没读懂」
+    在 `sse()` 收尾时会报出来。
+    """
+    if not chunk or chunk == "[DONE]":
+        return None
+    try:
+        return json.loads(chunk)
+    except json.JSONDecodeError:
+        log.info("llm.sse 跳过一段读不懂的 data：%s", chunk[:120])
+        return None
+
+
 class LlmProtocol:
     """一个 LLM 端要能做的四件事。
 
@@ -213,11 +232,6 @@ class LlmProtocol:
     models_path = ""
     #: 能不能走 function calling。不能的话上层退化成一次性 `complete_json()`。
     supports_tools = False
-    #: 能不能**真的看图**（把图片字节内联进请求体）。协议级的事实，不是模型级的：
-    #: 一个端支不支持 `image_url` / `inline_data` 这种块由协议定，具体那个模型认不认图
-    #: 只有真发一次请求才知道（认不出时端会 400，照 `_http_error` 报出来）。
-    #: `False` 的端走基类那个默认实现，四要素错误里必须有手动路径。
-    supports_vision = False
     #: 没密钥能不能用（本机 Ollama 能，云端不能）。设置页用它决定要不要标必填。
     needs_key = True
 
@@ -242,27 +256,6 @@ class LlmProtocol:
             [
                 "换成 OpenAI 兼容 / Anthropic / Gemini 协议即可用多轮工具调用",
                 "或继续用它——不支持工具时会自动退化成一次性产出提案，形状完全一样",
-                MANUAL_WAY_OUT,
-            ],
-            {"provider": self.name},
-        )
-
-    async def describe_image(
-        self, cfg: LlmConfig, system: str, user: str, images: list[ImagePart]
-    ) -> str:
-        """看着这几张图写一段文字。**回的是纯文本**，不是 JSON——素材描述就是一句话，
-        套一层 JSON 只会多一处能解析失败的地方。
-
-        默认实现直接报错：`supports_vision=False` 的端走它。照硬约束 2，
-        建议里必须有手动路径——「看不了图」不该让「给素材写一句描述」这件事走不通。
-        """
-        raise AppError(
-            ErrorCode.LLM_UNAVAILABLE,
-            "这个 LLM 端不能看图",
-            f"{self.label} 不接收图片，没法照着素材写描述。",
-            [
-                "在素材页的描述框里手填一句——描述是纯文本，手写与 AI 写的完全等价",
-                "或在设置页换一个能看图的端（OpenAI 兼容 / Anthropic / Gemini / Ollama 视觉模型）",
                 MANUAL_WAY_OUT,
             ],
             {"provider": self.name},
@@ -334,31 +327,9 @@ class LlmProtocol:
                     params=params or None,
                 )
         except httpx.TimeoutException as exc:
-            # 超时和「连不上」不是一回事：地址是通的，模型只是写得比 TIMEOUT 还慢
-            # （剧本拆解 + 本地模型最容易撞上）。下一步动作完全不同，所以分开报。
-            raise AppError(
-                ErrorCode.LLM_UNAVAILABLE,
-                f"LLM 服务超时（等了 {limit.read or limit.connect or 0:.0f} 秒）",
-                f"{url}：{type(exc).__name__}: {exc}",
-                [
-                    "这个端 / 这个模型这次写得太慢：换一个更快的模型，或把要拆的剧本分段再来一次",
-                    "本地模型（Ollama / LM Studio）第一次加载权重很慢，等它加载完再重试通常就过了",
-                    MANUAL_WAY_OUT,
-                ],
-                {"url": url, "provider": self.name, "timeout": limit.read},
-            ) from exc
+            raise self._timeout_error(url, limit, exc) from exc
         except httpx.HTTPError as exc:
-            raise AppError(
-                ErrorCode.LLM_UNAVAILABLE,
-                "LLM 服务连不上",
-                f"{url}：{type(exc).__name__}: {exc}",
-                [
-                    "确认地址与端口正确（本机服务通常是 127.0.0.1）",
-                    f"{self.label} 的默认地址是 {self.default_base_url}——留空即用它",
-                    MANUAL_WAY_OUT,
-                ],
-                {"url": url, "provider": self.name},
-            ) from exc
+            raise self._connect_error(url, exc) from exc
         if resp.status_code >= 400:
             raise self._http_error(resp, url)
         try:
@@ -374,6 +345,96 @@ class LlmProtocol:
                 ],
                 {"url": url, "provider": self.name},
             ) from exc
+
+    async def sse(
+        self,
+        url: str,
+        cfg: LlmConfig,
+        json_body: Any,
+        *,
+        http_timeout: httpx.Timeout | None = None,
+    ) -> AsyncIterator[Any]:
+        """POST 一个 SSE 流，逐个事件 yield 出 data 段解析后的 JSON。
+
+        与 `request()` 共用同一套错误归一（超时 / 连不上 / HTTP 4xx-5xx），所以流式
+        路径上的失败照旧是四要素错误，而不是一句 `httpx.ReadError`。
+
+        `data:` 按 SSE 规范可以有多行，所以攒到空行才算一个事件。**一个都没读懂时要报错**：
+        那种「HTTP 200 但什么都没有」最容易被当成「模型没话说」，然后用户对着空气等。
+        """
+        limit = http_timeout or TIMEOUT
+        buf: list[str] = []
+        seen = 0
+        try:
+            async with _client(limit) as http:
+                async with http.stream(
+                    "POST", url, headers=self.headers(cfg), json=json_body
+                ) as resp:
+                    if resp.status_code >= 400:
+                        # 出错时服务端给的是一整个 JSON 错误体：读完才有 .text 可看。
+                        await resp.aread()
+                        raise self._http_error(resp, url)
+                    async for raw in resp.aiter_lines():
+                        line = raw.rstrip("\r")
+                        if line.startswith("data:"):
+                            buf.append(line[5:].lstrip())
+                            continue
+                        if line.strip():
+                            continue  # event: / id: / 注释——我们要的形状全在 data 里
+                        payload = _sse_payload("\n".join(buf).strip())
+                        buf.clear()
+                        if payload is not None:
+                            seen += 1
+                            yield payload
+        except httpx.TimeoutException as exc:
+            raise self._timeout_error(url, limit, exc) from exc
+        except httpx.HTTPError as exc:
+            raise self._connect_error(url, exc) from exc
+        # 末尾没有空行收尾的实现也不少，剩下那一段照样算一个事件。
+        tail = _sse_payload("\n".join(buf).strip())
+        if tail is not None:
+            seen += 1
+            yield tail
+        if not seen:
+            raise AppError(
+                ErrorCode.LLM_INVALID_OUTPUT,
+                "LLM 流式响应里一个事件都没有",
+                f"{url}：连上了、也没报错，但没有任何可读的 data 段。",
+                [
+                    f"确认这个地址是 {self.label} 的接口，反代或网关可能把 SSE 缓冲掉了",
+                    "重试一次；持续如此就在设置页换一个协议 / 换一个端",
+                    MANUAL_WAY_OUT,
+                ],
+                {"url": url, "provider": self.name},
+            )
+
+    def _timeout_error(self, url: str, limit: httpx.Timeout, exc: Exception) -> AppError:
+        # 超时和「连不上」不是一回事：地址是通的，模型只是写得比 TIMEOUT 还慢
+        # （剧本拆解 + 本地模型最容易撞上）。下一步动作完全不同，所以分开报。
+        return AppError(
+            ErrorCode.LLM_UNAVAILABLE,
+            f"LLM 服务超时（等了 {limit.read or limit.connect or 0:.0f} 秒）",
+            f"{url}：{type(exc).__name__}: {exc}",
+            [
+                "这个端 / 这个模型这次写得太慢：换一个更快的模型，或把要拆的剧本分段再来一次",
+                "本地模型（Ollama / LM Studio）第一次加载权重很慢，等它加载完再重试通常就过了",
+                MANUAL_WAY_OUT,
+            ],
+            {"url": url, "provider": self.name, "timeout": limit.read},
+        )
+
+    def _connect_error(self, url: str, exc: Exception) -> AppError:
+        return AppError(
+            ErrorCode.LLM_UNAVAILABLE,
+            "LLM 服务连不上",
+            f"{url}：{type(exc).__name__}: {exc}",
+            [
+                "确认地址与端口正确（本机服务通常是 127.0.0.1）",
+                f"{self.label} 的默认地址是 {self.default_base_url}——留空即用它",
+                MANUAL_WAY_OUT,
+            ],
+            {"url": url, "provider": self.name},
+        )
 
     def _http_error(self, resp: httpx.Response, url: str) -> AppError:
         """HTTP 4xx/5xx 的下一步动作按状态码分：401 是密钥，404 多半是协议或版本前缀选错了。"""
@@ -411,7 +472,6 @@ class OpenAiCompatible(LlmProtocol):
     default_base_url = "https://api.openai.com/v1"
     models_path = "/models"
     supports_tools = True
-    supports_vision = True
     needs_key = True
 
     def headers(self, cfg: LlmConfig) -> dict[str, str]:
@@ -436,11 +496,12 @@ class OpenAiCompatible(LlmProtocol):
     async def complete_tools(
         self, cfg: LlmConfig, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
     ) -> dict[str, Any]:
-        body: dict[str, Any] = {"model": cfg.model, "messages": messages}
-        if tools:
-            body["tools"] = tools
-            body["tool_choice"] = "auto"
-        data = await self.request("POST", f"{self.base(cfg)}/chat/completions", cfg, json_body=body)
+        data = await self.request(
+            "POST",
+            f"{self.base(cfg)}/chat/completions",
+            cfg,
+            json_body=self._chat_body(cfg, messages, tools),
+        )
         message = _dig(data, "choices", 0, "message")
         calls = []
         for raw in message.get("tool_calls") or []:
@@ -453,6 +514,66 @@ class OpenAiCompatible(LlmProtocol):
                 }
             )
         return {"content": message.get("content"), "tool_calls": calls}
+
+    def _chat_body(
+        self, cfg: LlmConfig, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"model": cfg.model, "messages": messages}
+        if tools:
+            body["tools"] = tools
+            body["tool_choice"] = "auto"
+        return body
+
+    async def stream_tools(
+        self, cfg: LlmConfig, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+    ) -> AsyncIterator[dict[str, Any]]:
+        """`stream: true` 下的 `choices[0].delta` 拼回内部规范形状。
+
+        工具调用是**一片片来的**：名字在第一片里，参数是一串 JSON 片段，得按 index 攒齐
+        才能解析——中途解析必然撞上「不是合法 JSON」。
+        """
+        body = {**self._chat_body(cfg, messages, tools), "stream": True}
+        texts: list[str] = []
+        slots: dict[Any, dict[str, str]] = {}
+        order: list[Any] = []
+        async for chunk in self.sse(f"{self.base(cfg)}/chat/completions", cfg, body):
+            if not isinstance(chunk, dict):
+                continue
+            for choice in chunk.get("choices") or []:
+                delta = (choice or {}).get("delta") or {}
+                piece = delta.get("content")
+                if isinstance(piece, str) and piece:
+                    texts.append(piece)
+                    yield {"type": "delta", "text": piece}
+                for raw in delta.get("tool_calls") or []:
+                    key = raw.get("index")
+                    if not isinstance(key, int):
+                        # 少数端不给 index：带 id 的算新一条，没带的接在上一条后面。
+                        key = len(order) if (raw.get("id") or not order) else order[-1]
+                    if key not in slots:
+                        slots[key] = {"id": "", "name": "", "args": ""}
+                        order.append(key)
+                    slot = slots[key]
+                    if raw.get("id"):
+                        slot["id"] = str(raw["id"])
+                    fn = raw.get("function") or {}
+                    if fn.get("name"):
+                        slot["name"] = str(fn["name"])
+                    if isinstance(fn.get("arguments"), str):
+                        slot["args"] += fn["arguments"]
+        yield {
+            "type": "final",
+            "content": "".join(texts),
+            "tool_calls": [
+                {
+                    "id": slots[k]["id"] or f"call_{i + 1}",
+                    "name": slots[k]["name"],
+                    "arguments": _tool_args(slots[k]["name"], slots[k]["args"]),
+                }
+                for i, k in enumerate(order)
+                if slots[k]["name"]
+            ],
+        }
 
     async def complete_json(self, cfg: LlmConfig, system: str, user: str) -> dict[str, Any]:
         data = await self.request(
@@ -576,7 +697,6 @@ class Anthropic(LlmProtocol):
     default_base_url = "https://api.anthropic.com/v1"
     models_path = "/models"
     supports_tools = True
-    supports_vision = True
     needs_key = True
     #: 这个头是必填的，缺了它 /messages 直接 400。
     version = "2023-06-01"
@@ -602,17 +722,12 @@ class Anthropic(LlmProtocol):
     async def complete_tools(
         self, cfg: LlmConfig, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
     ) -> dict[str, Any]:
-        system, turns = _anthropic_messages(messages)
-        body: dict[str, Any] = {
-            "model": cfg.model,
-            "max_tokens": MAX_TOKENS,
-            "messages": turns,
-        }
-        if system:
-            body["system"] = system
-        if tools:
-            body["tools"] = [_anthropic_tool(t) for t in tools]
-        data = await self.request("POST", f"{self.base(cfg)}/messages", cfg, json_body=body)
+        data = await self.request(
+            "POST",
+            f"{self.base(cfg)}/messages",
+            cfg,
+            json_body=self._messages_body(cfg, messages, tools),
+        )
         calls = []
         for block in _dig(data, "content") or []:
             if isinstance(block, dict) and block.get("type") == "tool_use":
@@ -625,6 +740,84 @@ class Anthropic(LlmProtocol):
                     }
                 )
         return {"content": _anthropic_text(data), "tool_calls": calls}
+
+    def _messages_body(
+        self, cfg: LlmConfig, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        system, turns = _anthropic_messages(messages)
+        body: dict[str, Any] = {
+            "model": cfg.model,
+            "max_tokens": MAX_TOKENS,
+            "messages": turns,
+        }
+        if system:
+            body["system"] = system
+        if tools:
+            body["tools"] = [_anthropic_tool(t) for t in tools]
+        return body
+
+    async def stream_tools(
+        self, cfg: LlmConfig, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+    ) -> AsyncIterator[dict[str, Any]]:
+        """按块流：`content_block_start` 开一块（文本或 tool_use），`content_block_delta`
+        往里面填（`text_delta` 是正文，`input_json_delta` 是工具参数的 JSON 片段）。
+
+        它的 `error` 事件是**在 HTTP 200 之后**来的（比如中途 overloaded），
+        所以这里必须认它——不然就成了「什么都没说就结束了」。
+        """
+        body = {**self._messages_body(cfg, messages, tools), "stream": True}
+        texts: list[str] = []
+        blocks: dict[int, dict[str, str]] = {}
+        order: list[int] = []
+        async for chunk in self.sse(f"{self.base(cfg)}/messages", cfg, body):
+            if not isinstance(chunk, dict):
+                continue
+            kind = str(chunk.get("type") or "")
+            if kind == "error":
+                info = chunk.get("error") or {}
+                raise AppError(
+                    ErrorCode.LLM_UNAVAILABLE,
+                    "Anthropic 在生成途中报错",
+                    f"{info.get('type') or '未给出类型'}：{info.get('message') or chunk}",
+                    ["重试一次（overloaded 多半是临时的）", "或换一个模型", MANUAL_WAY_OUT],
+                    {"provider": self.name},
+                )
+            index = chunk.get("index")
+            index = index if isinstance(index, int) else 0
+            if kind == "content_block_start":
+                start = chunk.get("content_block") or {}
+                if start.get("type") == "tool_use":
+                    blocks[index] = {
+                        "id": str(start.get("id") or ""),
+                        "name": str(start.get("name") or ""),
+                        "args": "",
+                    }
+                    order.append(index)
+                continue
+            if kind != "content_block_delta":
+                continue
+            delta = chunk.get("delta") or {}
+            if delta.get("type") == "text_delta":
+                piece = str(delta.get("text") or "")
+                if piece:
+                    texts.append(piece)
+                    yield {"type": "delta", "text": piece}
+            elif delta.get("type") == "input_json_delta" and index in blocks:
+                blocks[index]["args"] += str(delta.get("partial_json") or "")
+        yield {
+            "type": "final",
+            "content": "".join(texts).strip(),
+            "tool_calls": [
+                {
+                    "id": blocks[i]["id"],
+                    "name": blocks[i]["name"],
+                    # 无参工具那一块一个 delta 都没有，攒出来是空串。
+                    "arguments": _tool_args(blocks[i]["name"], blocks[i]["args"] or "{}"),
+                }
+                for i in order
+                if blocks[i]["name"]
+            ],
+        }
 
     async def complete_json(self, cfg: LlmConfig, system: str, user: str) -> dict[str, Any]:
         # 它没有 JSON 模式：把要求写进 system，剩下交给 parse_json_object 截花括号。
@@ -774,7 +967,6 @@ class Gemini(LlmProtocol):
     default_base_url = "https://generativelanguage.googleapis.com/v1beta"
     models_path = "/models"
     supports_tools = True
-    supports_vision = True
     needs_key = True
 
     def headers(self, cfg: LlmConfig) -> dict[str, str]:
@@ -804,13 +996,24 @@ class Gemini(LlmProtocol):
     def _generate_url(self, cfg: LlmConfig) -> str:
         return f"{self.base(cfg)}/models/{cfg.model}:generateContent"
 
-    async def complete_tools(
-        self, cfg: LlmConfig, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+    def _stream_url(self, cfg: LlmConfig) -> str:
+        # `alt=sse` 不加的话它回的是一个 JSON 数组流，不是 SSE。密钥照旧只在头里。
+        return f"{self.base(cfg)}/models/{cfg.model}:streamGenerateContent?alt=sse"
+
+    def _generate_body(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
     ) -> dict[str, Any]:
         body = _gemini_body(messages)
         if tools:
             body["tools"] = [{"functionDeclarations": [_gemini_tool(t) for t in tools]}]
-        data = await self.request("POST", self._generate_url(cfg), cfg, json_body=body)
+        return body
+
+    async def complete_tools(
+        self, cfg: LlmConfig, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        data = await self.request(
+            "POST", self._generate_url(cfg), cfg, json_body=self._generate_body(messages, tools)
+        )
         texts: list[str] = []
         calls: list[dict[str, Any]] = []
         for index, part in enumerate(_gemini_parts(data)):
@@ -828,6 +1031,43 @@ class Gemini(LlmProtocol):
                     }
                 )
         return {"content": "\n".join(t for t in texts if t).strip(), "tool_calls": calls}
+
+    async def stream_tools(
+        self, cfg: LlmConfig, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+    ) -> AsyncIterator[dict[str, Any]]:
+        """`streamGenerateContent?alt=sse`：每个事件都是一整个 GenerateContentResponse，
+        `parts` 是增量。函数调用不切片，一来就是完整的一个。
+
+        中途被安全过滤挡掉时它给的是**没有 candidates 的一片**——那不是「格式不认识」，
+        所以照 `_gemini_parts` 的老规矩说清 blockReason。
+        """
+        texts: list[str] = []
+        calls: list[dict[str, Any]] = []
+        async for chunk in self.sse(
+            self._stream_url(cfg), cfg, self._generate_body(messages, tools)
+        ):
+            if not isinstance(chunk, dict):
+                continue
+            for part in _gemini_parts(chunk):
+                piece = part.get("text")
+                if isinstance(piece, str) and piece:
+                    texts.append(piece)
+                    yield {"type": "delta", "text": piece}
+                fc = part.get("functionCall")
+                if isinstance(fc, dict):
+                    args = fc.get("args")
+                    calls.append(
+                        {
+                            "id": f"call_{len(calls) + 1}",
+                            "name": str(fc.get("name") or ""),
+                            "arguments": args if isinstance(args, dict) else {},
+                        }
+                    )
+        yield {
+            "type": "final",
+            "content": "".join(texts).strip(),
+            "tool_calls": [c for c in calls if c["name"]],
+        }
 
     async def complete_json(self, cfg: LlmConfig, system: str, user: str) -> dict[str, Any]:
         data = await self.request(
@@ -952,14 +1192,13 @@ def labels() -> list[str]:
 
 
 def listing() -> list[dict[str, Any]]:
-    """设置页要的协议清单：默认地址、支不支持工具、能不能看图、要不要密钥、模型从哪列。"""
+    """设置页要的协议清单：默认地址、支不支持工具、要不要密钥、模型从哪列。"""
     rows: list[dict[str, Any]] = [
         {
             "name": NONE,
             "label": NONE_LABEL,
             "default_base_url": "",
             "supports_tools": False,
-            "supports_vision": False,
             "needs_key": False,
             "models_hint": "",
         }
@@ -970,7 +1209,6 @@ def listing() -> list[dict[str, Any]]:
             "label": p.label,
             "default_base_url": p.default_base_url,
             "supports_tools": p.supports_tools,
-            "supports_vision": p.supports_vision,
             "needs_key": p.needs_key,
             "models_hint": f"GET {p.default_base_url}{p.models_path}",
         }

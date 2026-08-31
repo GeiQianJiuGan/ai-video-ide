@@ -182,4 +182,107 @@ export const api = {
     for (const [k, v] of Object.entries(fields)) if (v) form.append(k, v)
     return request<T>('POST', path, form)
   },
+  /** SSE（见下面的 stream）。 */
+  stream: streamRequest,
+}
+
+/** 一条 SSE 事件。`data` 后端保证是一行 JSON。 */
+export interface StreamEvent {
+  event: string
+  data: unknown
+}
+
+/**
+ * POST 一个 SSE 流，逐条 yield 事件。
+ *
+ * **刻意不用 `EventSource`**：它只会 GET，而且带不了 `X-AIVS-Token`（Tauri 里握手是
+ * 必须的）。所以走 `fetch` + ReadableStream，自己按空行切帧。
+ *
+ * 三条与 `request()` 一致的规矩：
+ *   1. **开流之前的失败仍是 `ApiError`**——后端把「消息是空的 / LLM 没配 / 工程没打开」
+ *      放在 200 之前抛，所以这里照 `request()` 那套把 `{error}` 解出来，调用方
+ *      只需要 catch 一种东西；
+ *   2. **连不上也是 `ApiError`**（`NETWORK_ERROR`），不是一个裸的 TypeError；
+ *   3. **`signal` 由调用方给**：用户点「停」就 abort，abort 不算错误——
+ *      迭代直接结束，已经收到的事件照旧有效。
+ */
+async function* streamRequest(
+  path: string,
+  body: unknown,
+  signal?: AbortSignal,
+): AsyncGenerator<StreamEvent> {
+  const headers: Record<string, string> = {
+    Accept: 'text/event-stream',
+    'Content-Type': 'application/json',
+  }
+  if (endpoint.token) headers['X-AIVS-Token'] = endpoint.token
+
+  let resp: Response
+  try {
+    resp = await fetch(`${endpoint.baseUrl}${path}`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body ?? {}),
+      signal,
+    })
+  } catch (cause) {
+    if (signal?.aborted) return
+    throw networkError(cause)
+  }
+
+  if (!resp.ok || !resp.body) {
+    const text = await resp.text().catch(() => '')
+    let wrapped: { error?: ErrorPayload } | null = null
+    try {
+      wrapped = text ? (JSON.parse(text) as { error?: ErrorPayload }) : null
+    } catch {
+      wrapped = null
+    }
+    if (!wrapped?.error) throw offContractError(resp.status, text)
+    throw new ApiError(wrapped.error, resp.status)
+  }
+
+  const reader = resp.body.getReader()
+  const decoder = new TextDecoder()
+  let buf = ''
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buf += decoder.decode(value, { stream: true })
+      // 一帧到空行为止；最后那段可能还没收完，留在 buf 里等下一片。
+      let cut = buf.indexOf('\n\n')
+      while (cut >= 0) {
+        const frame = buf.slice(0, cut)
+        buf = buf.slice(cut + 2)
+        const parsed = parseFrame(frame)
+        if (parsed) yield parsed
+        cut = buf.indexOf('\n\n')
+      }
+    }
+    const tail = parseFrame(buf)
+    if (tail) yield tail
+  } catch (cause) {
+    if (signal?.aborted) return
+    throw networkError(cause)
+  } finally {
+    reader.cancel().catch(() => undefined)
+  }
+}
+
+/** 一帧文本 → `{event, data}`。读不懂的帧丢掉（心跳注释、空帧都走这条）。 */
+function parseFrame(frame: string): StreamEvent | null {
+  let name = ''
+  const data: string[] = []
+  for (const raw of frame.split('\n')) {
+    const line = raw.replace(/\r$/, '')
+    if (line.startsWith('event:')) name = line.slice(6).trim()
+    else if (line.startsWith('data:')) data.push(line.slice(5).replace(/^ /, ''))
+  }
+  if (!name || !data.length) return null
+  try {
+    return { event: name, data: JSON.parse(data.join('\n')) }
+  } catch {
+    return null
+  }
 }

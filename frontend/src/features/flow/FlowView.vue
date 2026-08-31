@@ -384,8 +384,9 @@ function switchMode(value: string): void {
           </div>
         </AppPanel>
       </div>
-      <!-- 最右：AI 协作栏。提案落库后重拉整张图（幕数、镜头数、衔接都可能变了） -->
-      <DirectorPanel v-if="showDirector" :pid="pid" @applied="reload()" />
+      <!-- 最右：AI 协作栏。提案落库后重拉整张图（幕数、镜头数、衔接都可能变了）。
+           宽度由这里给——同一个组件在剧本页是宽的主栏 -->
+      <DirectorPanel v-if="showDirector" :pid="pid" class="w-80 shrink-0" @applied="reload()" />
     </div>
 
     <!-- 导进来的是一整幕，图上多了一个节点，所以照 DirectorPanel 的规矩重拉整张图 -->

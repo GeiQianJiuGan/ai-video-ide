@@ -460,3 +460,164 @@ def test_deps_is_honest_about_an_unknown_protocol(
     assert rows["llm"]["ok"] is False
     assert "openai" in rows["llm"]["detail"]
     assert "anthropic" in rows["llm"]["hint"], "得把可用的协议名列出来"
+
+
+# --- 流式（`stream_tools`）：三种方言各自的切片方式 ---
+#
+# 盯的是「拼回来的形状和不流式那条一模一样」：`delta` 一片片来，最后**必定**一条
+# `final`，`tool_calls` 的参数是攒齐之后才解析的（中途解析必然撞上「不是合法 JSON」）。
+
+
+def sse_stream(*frames: str) -> Callable[[httpx.Request], httpx.Response]:
+    """把若干 SSE 帧拼成一个响应体。帧之间用空行分隔——那才是「一个事件到此为止」。"""
+    body = "".join(f"{frame}\n\n" for frame in frames)
+    return lambda _request: httpx.Response(
+        200, content=body.encode(), headers={"content-type": "text/event-stream"}
+    )
+
+
+async def drain(events: Any) -> tuple[list[str], dict[str, Any]]:
+    """把一条事件流收干，返回 `(每一片文字, final)`。"""
+    deltas: list[str] = []
+    final: dict[str, Any] = {}
+    async for event in events:
+        if event["type"] == "delta":
+            deltas.append(event["text"])
+        else:
+            final = event
+    assert final, "流式必须以 final 收尾，不然上层不知道这一轮到底调了什么工具"
+    return deltas, final
+
+
+async def test_openai_stream_waits_for_the_whole_argument_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """工具参数是一串 JSON 片段：攒齐才解析，名字只在第一片里。"""
+    seen = fake_http(
+        monkeypatch,
+        sse_stream(
+            'data: {"choices":[{"delta":{"content":"我先"}}]}',
+            'data: {"choices":[{"delta":{"content":"看一下现状。"}}]}',
+            'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1",'
+            '"function":{"name":"add_scene","arguments":"{\\"title\\": \\"雨"}}]}}]}',
+            'data: {"choices":[{"delta":{"tool_calls":[{"index":0,'
+            '"function":{"arguments":"夜追车\\"}"}}]}}]}',
+            "data: [DONE]",
+        ),
+    )
+    proto = protocols.BY_NAME["openai_compatible"]
+    deltas, final = await drain(proto.stream_tools(cfg("openai_compatible"), CONVERSATION, TOOLS))
+    assert deltas == ["我先", "看一下现状。"], "文字要一片片吐，不能攒到最后一起给"
+    assert final["content"] == "我先看一下现状。"
+    assert final["tool_calls"] == [
+        {"id": "c1", "name": "add_scene", "arguments": {"title": "雨夜追车"}}
+    ]
+    assert json.loads(seen[0].content.decode())["stream"] is True
+    assert seen[0].url.path.endswith("/chat/completions")
+
+
+async def test_anthropic_stream_stitches_its_block_deltas(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """按块流：文字在 `text_delta` 里，工具参数在 `input_json_delta` 里，认的是 index。"""
+    fake_http(
+        monkeypatch,
+        sse_stream(
+            'event: message_start\ndata: {"type":"message_start"}',
+            'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,'
+            '"delta":{"type":"text_delta","text":"先加一镜。"}}',
+            'data: {"type":"content_block_start","index":1,'
+            '"content_block":{"type":"tool_use","id":"c9","name":"add_shot"}}',
+            'data: {"type":"content_block_delta","index":1,'
+            '"delta":{"type":"input_json_delta","partial_json":"{\\"scene_id\\":"}}',
+            'data: {"type":"content_block_delta","index":1,'
+            '"delta":{"type":"input_json_delta","partial_json":" \\"scn_1\\"}"}}',
+            'data: {"type":"message_stop"}',
+        ),
+    )
+    proto = protocols.BY_NAME["anthropic"]
+    deltas, final = await drain(proto.stream_tools(cfg("anthropic"), CONVERSATION, TOOLS))
+    assert deltas == ["先加一镜。"]
+    assert final["tool_calls"] == [
+        {"id": "c9", "name": "add_shot", "arguments": {"scene_id": "scn_1"}}
+    ]
+
+
+async def test_anthropic_error_after_the_200_is_not_silence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """它的 overloaded 是**在 200 之后**来的一个 error 事件。认不出来就成了「什么都没说」。"""
+    fake_http(
+        monkeypatch,
+        sse_stream(
+            'data: {"type":"content_block_delta","index":0,'
+            '"delta":{"type":"text_delta","text":"先"}}',
+            'data: {"type":"error","error":{"type":"overloaded_error","message":"太忙了"}}',
+        ),
+    )
+    proto = protocols.BY_NAME["anthropic"]
+    with pytest.raises(AppError) as caught:
+        await drain(proto.stream_tools(cfg("anthropic"), CONVERSATION, TOOLS))
+    err = caught.value
+    assert err.code is ErrorCode.LLM_UNAVAILABLE
+    assert "生成途中报错" in err.title and "overloaded_error" in err.detail
+    assert protocols.MANUAL_WAY_OUT in err.suggestions
+
+
+async def test_gemini_stream_asks_for_sse_and_keeps_the_key_in_the_header(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`?alt=sse` 是要的；`?key=` 一如既往不许出现。函数调用不切片，一来就是完整一个。"""
+    seen = fake_http(
+        monkeypatch,
+        sse_stream(
+            'data: {"candidates":[{"content":{"parts":[{"text":"先看现状。"}]}}]}',
+            'data: {"candidates":[{"content":{"parts":[{"functionCall":'
+            '{"name":"add_scene","args":{"title":"雨夜追车"}}}]}}]}',
+        ),
+    )
+    proto = protocols.BY_NAME["gemini"]
+    deltas, final = await drain(proto.stream_tools(cfg("gemini"), CONVERSATION, TOOLS))
+    assert deltas == ["先看现状。"]
+    assert final["tool_calls"] == [
+        {"id": "call_1", "name": "add_scene", "arguments": {"title": "雨夜追车"}}
+    ]
+    assert "alt=sse" in str(seen[0].url) and ":streamGenerateContent" in str(seen[0].url)
+    assert KEY not in str(seen[0].url) and KEY in seen[0].headers["x-goog-api-key"]
+
+
+async def test_a_stream_with_nothing_in_it_is_not_silence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """HTTP 200 但一个 data 段都没有：那不是「模型没话说」，别让用户对着空气等。"""
+    fake_http(monkeypatch, lambda _r: httpx.Response(200, content=": 只有一条注释\n\n".encode()))
+    proto = protocols.BY_NAME["openai_compatible"]
+    with pytest.raises(AppError) as caught:
+        await drain(proto.stream_tools(cfg("openai_compatible"), CONVERSATION, TOOLS))
+    assert caught.value.code is ErrorCode.LLM_INVALID_OUTPUT
+    assert "一个事件都没有" in caught.value.title
+
+
+async def test_a_stream_that_is_refused_reports_the_http_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """开流那一下就 401：报的是和不流式那条同一个四要素错误，不是一句 ReadError。"""
+    fake_http(monkeypatch, replies({"error": {"message": "invalid api key"}}, status=401))
+    proto = protocols.BY_NAME["openai_compatible"]
+    with pytest.raises(AppError) as caught:
+        await drain(proto.stream_tools(cfg("openai_compatible"), CONVERSATION, TOOLS))
+    assert caught.value.code is ErrorCode.LLM_UNAVAILABLE
+    assert KEY not in caught.value.detail, "报错里不许带上密钥"
+
+
+async def test_an_end_without_streaming_still_streams(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ollama 那类端不支持流式，基类替它冒充一块：上层照旧只认 delta + final。"""
+    proto = protocols.BY_NAME["ollama"]
+    assert proto.supports_stream is False
+
+    async def once(_cfg: Any, _messages: Any, _tools: Any) -> dict[str, Any]:
+        return {"content": "整段一起给", "tool_calls": []}
+
+    monkeypatch.setattr(proto, "complete_tools", once)
+    deltas, final = await drain(proto.stream_tools(cfg("ollama"), CONVERSATION, []))
+    assert deltas == ["整段一起给"] and final["content"] == "整段一起给"
