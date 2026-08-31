@@ -93,6 +93,18 @@ FIELDS: tuple[FieldSpec, ...] = (
     ),
     FieldSpec("llm.api_key", "llm_api_key", "llm", "API Key", "secret"),
     FieldSpec(
+        "llm.vision_model",
+        "llm_vision_model",
+        "llm",
+        "看图模型",
+        impact=(
+            "「照着这张素材写一句描述」用哪个模型。留空就用上面那个主模型；"
+            "本机端（Ollama / LM Studio）的主模型往往不认图，在这里单独指一个视觉模型。"
+            "地址与密钥沿用上面那一套。"
+        ),
+        fetch="llm",
+    ),
+    FieldSpec(
         "prompt.breakdown",
         "prompt_breakdown",
         "prompt",
@@ -115,6 +127,19 @@ FIELDS: tuple[FieldSpec, ...] = (
             "「写工具只出提案、不落库」这条边界在代码里，提示词改不动它。"
         ),
         builtin=prompts.DIRECTOR_TASK,
+    ),
+    FieldSpec(
+        "prompt.describe",
+        "prompt_describe",
+        "prompt",
+        "素材描述（照着图写一句）",
+        "text",
+        impact=(
+            "「AI 补全」照这段话给素材写描述——那句描述就是模型引用这个素材时唯一看得到的说明。"
+            "留空用内置默认；「一段中文、不超过 120 字、只写看得见的事实、不要 JSON」"
+            "由系统始终追加，改不坏。"
+        ),
+        builtin=prompts.DESCRIBE_TASK,
     ),
     FieldSpec(
         "video.provider",

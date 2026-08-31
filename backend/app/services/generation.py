@@ -988,8 +988,18 @@ class GenerationService:
         # params，所以这里改它就会跟着版本一起存下来——账单说要喂 5 个、图只收了 3 个，
         # 事后必须在版本里看得见这件事（绝不静默失败）。
         params["refs"] = [
-            {"label": r.label, "kind": r.kind, "media": r.media, "file": r.path.name} for r in refs
+            {
+                "label": r.label,
+                "kind": r.kind,
+                "media": r.media,
+                "file": r.path.name,
+                #: 当时喂进 prompt 的那句说明（全文，`ref_hint` 里才截断）。素材描述
+                #: 事后能改，所以「这一版到底带了哪句话」只有冻结下来才回答得了。
+                "desc": r.desc,
+            }
+            for r in refs
         ]
+
         if req.notes:
             params["ref_notes"] = list(req.notes)
         filename, data = await self._await_task(pid, job, provider, task_id)
@@ -1339,6 +1349,9 @@ class GenerationService:
                     label=str(item.get("label") or ""),
                     kind=str(item["kind"]),
                     media=media,
+                    #: 那句「长什么样」，来自账单（`context._desc_of`）。它最终由
+                    #: `providers/base.py::ref_hint()` 渲染进 prompt——空就只剩一个名字。
+                    desc=str(item.get("desc") or ""),
                 )
             )
         return await resolve(explicit_first), await resolve(explicit_last), refs

@@ -33,6 +33,18 @@ class LinkBody(BaseModel):
     role: str | None = None
 
 
+class AssetPatch(BaseModel):
+    """改资产的描述。**能改的只有这一个字段**（其余都是落盘事实）。
+
+    描述是模型引用这张素材时唯一看得到的那句说明。**清空传 `''`**——
+    `null` 是「这次不改」（与 `ShotPatch` 同一条口径）。
+    """
+
+    description: str | None = Field(
+        default=None, description="这张素材长什么样。清空传空字符串，null = 不改"
+    )
+
+
 @router.get("/projects/{pid}/assets")
 async def list_assets(pid: str, kind: str | None = None) -> list[dict[str, Any]]:
     return await assets.list_assets(pid, kind)
@@ -41,6 +53,12 @@ async def list_assets(pid: str, kind: str | None = None) -> list[dict[str, Any]]
 @router.get("/projects/{pid}/assets/orphans")
 async def orphans(pid: str) -> list[dict[str, Any]]:
     return await assets.orphans(pid)
+
+
+@router.get("/projects/{pid}/assets/undescribed")
+async def undescribed(pid: str) -> dict[str, Any]:
+    """还没有描述的资产。没有描述 = 引用它时模型只看到一个文件名。"""
+    return await assets.undescribed(pid)
 
 
 @router.post("/projects/{pid}/assets/upload", status_code=201)
@@ -67,6 +85,11 @@ async def refs_of(pid: str, asset_id: str) -> list[dict[str, Any]]:
 async def link_asset(pid: str, body: LinkBody) -> dict[str, Any]:
     await assets.link(pid, body.asset_id, body.owner_kind, body.owner_id, body.role)
     return {"ok": True}
+
+
+@router.patch("/projects/{pid}/assets/{asset_id}")
+async def update_asset(pid: str, asset_id: str, body: AssetPatch) -> dict[str, Any]:
+    return await assets.update(pid, asset_id, body.model_dump(exclude_none=True))
 
 
 @router.delete("/projects/{pid}/assets/{asset_id}")

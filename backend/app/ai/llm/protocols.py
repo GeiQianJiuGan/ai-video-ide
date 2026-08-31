@@ -26,10 +26,25 @@
 「模型自动获取」就是 `list_models()`：每个适配器知道自家列表长什么样，除了名字还给一个
 `label`（Anthropic 的 display_name、Gemini 的 displayName、Ollama 的体积），
 设置页直接列出来给人挑，不用手抄模型名。
+
+**看图是第五个动作**（`describe_image()` + `supports_vision`）：素材没有描述时，模型引用它
+只看得到一个文件名，所以「照着这张图写一句描述」必须能真的把图片字节送进去。四种方言
+接图的形状完全不同，全部关在这一层：
+
+  · `openai_compatible` —— `content: [{type:"text"}, {type:"image_url", image_url:{url:"data:…"}}]`
+  · `anthropic` —— `content: [{type:"image", source:{type:"base64", media_type, data}}, {type:"text"}]`
+    （图排在文字前面，顺序反了它常常只答「我看到一张图片」）
+  · `gemini` —— `contents[].parts: [{inline_data:{mime_type, data}}, {text}]`
+  · `ollama` —— 图不在 content 里，而是 `messages[].images: ["<base64>"]`（**不带 `data:` 前缀**）
+
+`supports_vision=False` 的端走基类那个默认实现：报四要素错误，建议里必须有手动路径
+（照硬约束 2——看不了图不该让「给素材写描述」这件事走不通）。**密钥照旧只走请求头**，
+Gemini 这条路上也没有 `?key=`。
 """
 
 from __future__ import annotations
 
+import base64
 import json
 from dataclasses import dataclass
 from typing import Any
@@ -69,6 +84,31 @@ class LlmConfig:
     base_url: str = ""
     model: str = ""
     api_key: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class ImagePart:
+    """一张要让模型**真的看见**的图：字节 + 它是什么类型。
+
+    与 `generation/providers/base.py::RefAsset` 不是一回事：那是给视频适配层的**路径**
+    （文件要交给 ComfyUI / 云端出图服务去读），这里是要塞进 LLM 请求体的**字节**
+    （四种方言都是 base64 内联，没有一家收本机路径）。
+
+    `mime` 由调用方从后缀判断（`services/describe.py`）——图片文件不带 mime 时
+    大多数端会直接 400，而这里猜不出比让它照实报错更糟。
+    """
+
+    mime: str
+    data: bytes
+
+    @property
+    def b64(self) -> str:
+        return base64.b64encode(self.data).decode("ascii")
+
+    @property
+    def data_url(self) -> str:
+        """OpenAI 那一族要的 `data:` URL。"""
+        return f"data:{self.mime};base64,{self.b64}"
 
 
 def config(
@@ -173,6 +213,11 @@ class LlmProtocol:
     models_path = ""
     #: 能不能走 function calling。不能的话上层退化成一次性 `complete_json()`。
     supports_tools = False
+    #: 能不能**真的看图**（把图片字节内联进请求体）。协议级的事实，不是模型级的：
+    #: 一个端支不支持 `image_url` / `inline_data` 这种块由协议定，具体那个模型认不认图
+    #: 只有真发一次请求才知道（认不出时端会 400，照 `_http_error` 报出来）。
+    #: `False` 的端走基类那个默认实现，四要素错误里必须有手动路径。
+    supports_vision = False
     #: 没密钥能不能用（本机 Ollama 能，云端不能）。设置页用它决定要不要标必填。
     needs_key = True
 
@@ -197,6 +242,27 @@ class LlmProtocol:
             [
                 "换成 OpenAI 兼容 / Anthropic / Gemini 协议即可用多轮工具调用",
                 "或继续用它——不支持工具时会自动退化成一次性产出提案，形状完全一样",
+                MANUAL_WAY_OUT,
+            ],
+            {"provider": self.name},
+        )
+
+    async def describe_image(
+        self, cfg: LlmConfig, system: str, user: str, images: list[ImagePart]
+    ) -> str:
+        """看着这几张图写一段文字。**回的是纯文本**，不是 JSON——素材描述就是一句话，
+        套一层 JSON 只会多一处能解析失败的地方。
+
+        默认实现直接报错：`supports_vision=False` 的端走它。照硬约束 2，
+        建议里必须有手动路径——「看不了图」不该让「给素材写一句描述」这件事走不通。
+        """
+        raise AppError(
+            ErrorCode.LLM_UNAVAILABLE,
+            "这个 LLM 端不能看图",
+            f"{self.label} 不接收图片，没法照着素材写描述。",
+            [
+                "在素材页的描述框里手填一句——描述是纯文本，手写与 AI 写的完全等价",
+                "或在设置页换一个能看图的端（OpenAI 兼容 / Anthropic / Gemini / Ollama 视觉模型）",
                 MANUAL_WAY_OUT,
             ],
             {"provider": self.name},
@@ -345,6 +411,7 @@ class OpenAiCompatible(LlmProtocol):
     default_base_url = "https://api.openai.com/v1"
     models_path = "/models"
     supports_tools = True
+    supports_vision = True
     needs_key = True
 
     def headers(self, cfg: LlmConfig) -> dict[str, str]:
@@ -402,6 +469,29 @@ class OpenAiCompatible(LlmProtocol):
             },
         )
         return parse_json_object(str(_dig(data, "choices", 0, "message", "content") or ""))
+
+    async def describe_image(
+        self, cfg: LlmConfig, system: str, user: str, images: list[ImagePart]
+    ) -> str:
+        # 图走 `image_url` 块里的 data URL：这一族没有「上传文件再引用」的必要，
+        # 一张素材图几百 KB，内联最省事也最不容易在别处留一份副本。
+        content: list[dict[str, Any]] = [{"type": "text", "text": user}]
+        content += [
+            {"type": "image_url", "image_url": {"url": img.data_url}} for img in images
+        ]
+        data = await self.request(
+            "POST",
+            f"{self.base(cfg)}/chat/completions",
+            cfg,
+            json_body={
+                "model": cfg.model,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": content},
+                ],
+            },
+        )
+        return str(_dig(data, "choices", 0, "message", "content") or "").strip()
 
 
 # --- Anthropic：system 独立、工具结果是 user 消息里的块、角色必须交替 ---
@@ -486,6 +576,7 @@ class Anthropic(LlmProtocol):
     default_base_url = "https://api.anthropic.com/v1"
     models_path = "/models"
     supports_tools = True
+    supports_vision = True
     needs_key = True
     #: 这个头是必填的，缺了它 /messages 直接 400。
     version = "2023-06-01"
@@ -549,6 +640,32 @@ class Anthropic(LlmProtocol):
             },
         )
         return parse_json_object(_anthropic_text(data))
+
+    async def describe_image(
+        self, cfg: LlmConfig, system: str, user: str, images: list[ImagePart]
+    ) -> str:
+        # 图**排在文字前面**：Anthropic 自己的建议就是先给图再给问题，
+        # 顺序反了它常常只答一句「我看到一张图片」。
+        blocks: list[dict[str, Any]] = [
+            {
+                "type": "image",
+                "source": {"type": "base64", "media_type": img.mime, "data": img.b64},
+            }
+            for img in images
+        ]
+        blocks.append({"type": "text", "text": user})
+        data = await self.request(
+            "POST",
+            f"{self.base(cfg)}/messages",
+            cfg,
+            json_body={
+                "model": cfg.model,
+                "max_tokens": MAX_TOKENS,
+                "system": system,
+                "messages": [{"role": "user", "content": blocks}],
+            },
+        )
+        return _anthropic_text(data)
 
 
 # --- Gemini：角色叫 user / model，工具调用没有 id，schema 只认 OpenAPI 子集 ---
@@ -657,6 +774,7 @@ class Gemini(LlmProtocol):
     default_base_url = "https://generativelanguage.googleapis.com/v1beta"
     models_path = "/models"
     supports_tools = True
+    supports_vision = True
     needs_key = True
 
     def headers(self, cfg: LlmConfig) -> dict[str, str]:
@@ -725,6 +843,28 @@ class Gemini(LlmProtocol):
         text = "\n".join(str(p.get("text") or "") for p in _gemini_parts(data) if "text" in p)
         return parse_json_object(text)
 
+    async def describe_image(
+        self, cfg: LlmConfig, system: str, user: str, images: list[ImagePart]
+    ) -> str:
+        # 图是 `inline_data`（驼峰的 `inlineData` 也认，这里用下划线那一种——
+        # v1beta 两种都收，下划线是文档里的写法）。**密钥照旧只在头里。**
+        parts: list[dict[str, Any]] = [
+            {"inline_data": {"mime_type": img.mime, "data": img.b64}} for img in images
+        ]
+        parts.append({"text": user})
+        data = await self.request(
+            "POST",
+            self._generate_url(cfg),
+            cfg,
+            json_body={
+                "systemInstruction": {"parts": [{"text": system}]},
+                "contents": [{"role": "user", "parts": parts}],
+            },
+        )
+        return "\n".join(
+            str(p.get("text") or "") for p in _gemini_parts(data) if "text" in p
+        ).strip()
+
 
 # --- Ollama：本机端，不要密钥；tools 支持随模型而异，统一按不支持处理 ---
 
@@ -735,6 +875,10 @@ class Ollama(LlmProtocol):
     default_base_url = "http://127.0.0.1:11434"
     models_path = "/api/tags"
     supports_tools = False
+    #: 本机有视觉模型（llava / qwen-vl / gemma3 之类），但**主模型往往不是**——
+    #: 所以设置里有一项 `llm.vision_model` 单独指一个，留空就用主模型。
+    #: 主模型不认图时端会回 400，照 `_http_error` 说出来，不静默出一段瞎猜的描述。
+    supports_vision = True
     needs_key = False
 
     def parse_models(self, data: Any) -> list[dict[str, str]]:
@@ -771,6 +915,26 @@ class Ollama(LlmProtocol):
         )
         return parse_json_object(str(_dig(data, "message", "content") or ""))
 
+    async def describe_image(
+        self, cfg: LlmConfig, system: str, user: str, images: list[ImagePart]
+    ) -> str:
+        # Ollama 的图不在 content 里，而是消息上一个 `images` 数组（纯 base64，
+        # **不带 `data:` 前缀**——带了它会连前缀一起当图片数据解，直接报错）。
+        data = await self.request(
+            "POST",
+            f"{self.base(cfg)}/api/chat",
+            cfg,
+            json_body={
+                "model": cfg.model,
+                "stream": False,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user, "images": [img.b64 for img in images]},
+                ],
+            },
+        )
+        return str(_dig(data, "message", "content") or "").strip()
+
 
 #: 名字 → 适配器。加一个协议只需要在这里多一行——上层与设置页都是按这张表画出来的。
 BY_NAME: dict[str, LlmProtocol] = {
@@ -788,13 +952,14 @@ def labels() -> list[str]:
 
 
 def listing() -> list[dict[str, Any]]:
-    """设置页要的协议清单：默认地址、支不支持工具、要不要密钥、模型从哪列。"""
+    """设置页要的协议清单：默认地址、支不支持工具、能不能看图、要不要密钥、模型从哪列。"""
     rows: list[dict[str, Any]] = [
         {
             "name": NONE,
             "label": NONE_LABEL,
             "default_base_url": "",
             "supports_tools": False,
+            "supports_vision": False,
             "needs_key": False,
             "models_hint": "",
         }
@@ -805,6 +970,7 @@ def listing() -> list[dict[str, Any]]:
             "label": p.label,
             "default_base_url": p.default_base_url,
             "supports_tools": p.supports_tools,
+            "supports_vision": p.supports_vision,
             "needs_key": p.needs_key,
             "models_hint": f"GET {p.default_base_url}{p.models_path}",
         }

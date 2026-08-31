@@ -39,6 +39,28 @@ export interface Asset {
   ref_count: number
   /** 文件被工程外的程序删掉了：登记还在，但显示不出来。 */
   missing: boolean
+  /**
+   * 这张素材「长什么样」的那一句——**模型引用它时唯一看得到的说明**。
+   * 空 / null = 没写，此时 prompt 里只有一个文件名（后端 `providers/base.py::ref_hint`）。
+   * 清空要传 `''`：`null` 在后端是「这次不改」。
+   */
+  description: string | null
+}
+
+/** 缺描述的那一批（`GET /assets/undescribed`）。挂在谁身上由后端说，前端不反查。 */
+export interface UndescribedAsset extends Asset {
+  /** 后缀认出来的媒体类型：只有 image 能让 AI 真的看图。 */
+  media: 'image' | 'video' | 'audio' | string
+  owners: { owner_kind: string; owner_id: string; role: string | null }[]
+}
+
+export interface UndescribedList {
+  items: UndescribedAsset[]
+  count: number
+  described: number
+  /** 描述进 prompt 时的截断上限。**字数提示只认这个数**，前端不写死第二份。 */
+  desc_max: number
+  note: string
 }
 
 /** 反向引用：谁在用这个文件。owner_kind + owner_id 就是「破坏点」的地址。 */
@@ -74,6 +96,15 @@ export const assetsApi = {
   /** multipart 上传。kind 走 Form 字段，决定文件落进哪个子目录。 */
   upload: (pid: string, file: File, kind: AssetKind) =>
     api.upload<Asset>(`/projects/${pid}/assets/upload`, file, { kind }),
+  /**
+   * 改那一句描述。**只有 description 一个字段能改**（path / kind 是落盘事实）。
+   * 清空传 `''`——`null` 是「这次不改」。
+   */
+  update: (pid: string, assetId: string, patch: { description: string }) =>
+    api.patch<Asset>(`/projects/${pid}/assets/${assetId}`, patch),
+  /** 还没有描述的素材。`desc_max` 也从这里来，前端不写死 120。 */
+  undescribed: (pid: string) =>
+    api.get<UndescribedList>(`/projects/${pid}/assets/undescribed`),
   /** 仍被引用时后端默认拒绝（CONFLICT 并列出是谁在用）；force 才强删。 */
   remove: (pid: string, assetId: string, force = false) =>
     api.del<DeleteResult>(`/projects/${pid}/assets/${assetId}?force=${force}`),

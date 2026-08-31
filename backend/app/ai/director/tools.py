@@ -29,9 +29,13 @@ from typing import Any
 from app.ai import prompts, skills
 from app.core.errors import AppError, ErrorCode
 from app.generation.providers import registry
+from app.generation.providers.base import DESC_MAX
 from app.persistence.models_flow import LINK_MODES, SHOT_LINK_MODES
 from app.persistence.models_gen import IMAGE_TARGETS
+from app.services.assets import assets
 from app.services.cast import cast
+from app.services.context import APPEARANCE_DESC_FIELDS
+from app.services.describe import DESC_TARGET_LABEL, DESC_TARGETS, describe
 from app.services.images import images
 from app.services.sequence import sequence
 from app.services.story import story
@@ -93,15 +97,39 @@ SHOT_PLAIN_PARAMS: dict[str, dict[str, Any]] = {
 TOOLS: dict[str, dict[str, Any]] = {
     "list_characters": {
         "kind": "read",
-        "desc": "列出工程里所有角色及其形象（形象 id 是给镜头挂人用的）。",
+        "desc": (
+            "列出工程里所有角色及其形象（形象 id 是给镜头挂人用的）。"
+            "每条带 description 与形象的 has_description——空的那些进 prompt 时只有一个名字。"
+        ),
         "params": {},
     },
     "list_locations": {
         "kind": "read",
-        "desc": "列出所有地点及其变体（白天 / 雨夜等），变体 id 用来钉住一幕的地点。",
+        "desc": (
+            "列出所有地点及其变体（白天 / 雨夜等），变体 id 用来钉住一幕的地点。"
+            "变体带 description（它会被拼进引用这个地点的镜头的 prompt）。"
+        ),
         "params": {},
     },
-    "list_props": {"kind": "read", "desc": "列出所有道具。", "params": {}},
+    "list_props": {"kind": "read", "desc": "列出所有道具（带 description）。", "params": {}},
+    "list_undescribed": {
+        "kind": "read",
+        "desc": (
+            "列出**还没有描述**的素材。素材被镜头引用时，模型看到的只有那一句描述——"
+            "空的等于只递过去一个文件名，人物形象在几秒里就丢了。"
+            "抽出来的首尾帧是临时文件，不在这张清单里。"
+        ),
+        "params": {},
+    },
+    "look_at_image": {
+        "kind": "read",
+        "desc": (
+            "看一张素材图，回一句「它长什么样」的建议文字。**只是建议，一行库都不改**——"
+            "要落库请再用 set_description 提一条案。非图片素材与看不了图的端会说明原因。"
+        ),
+        "params": {"asset_id": {"type": "string", "description": "资产 id"}},
+        "required": ["asset_id"],
+    },
     "list_scenes": {
         "kind": "read",
         "desc": "列出现有的幕（含顺序、地点、镜头数）与幕之间的衔接方式。",
@@ -368,6 +396,29 @@ TOOLS: dict[str, dict[str, Any]] = {
         },
         "required": ["target_kind", "target_id"],
     },
+    "set_description": {
+        "kind": "write",
+        "desc": (
+            "提议给一个东西补 / 改那一句描述。**这一句是模型引用它时唯一看得到的说明**，"
+            "所以只写画面里看得见的事实（外形、服装配色、材质、光线、环境），"
+            "不写心理活动与剧情，不超过 120 字（超出的部分在拼 prompt 时会被截断）。"
+            "先用 list_undescribed 看缺哪些、look_at_image 看一眼图，再提这条案。"
+        ),
+        "params": {
+            "target_kind": {
+                "type": "string",
+                "enum": list(DESC_TARGETS),
+                "description": "写到哪一种东西上（素材本身最要紧——那才是模型看的那张图）",
+            },
+            "target_id": {
+                "type": "string",
+                "description": "那一行的 id：资产 / 角色 / 形象 / 地点 / 变体 / 道具各取自己的",
+            },
+            "description": {"type": "string", "description": "那一句描述；给空字符串表示清掉"},
+            "why": {"type": "string"},
+        },
+        "required": ["target_kind", "target_id", "description"],
+    },
 }
 
 READ_TOOLS = tuple(name for name, spec in TOOLS.items() if spec["kind"] == "read")
@@ -396,6 +447,16 @@ def tool_specs() -> list[dict[str, Any]]:
 # --- 读工具：立刻执行，没有副作用 ---
 
 
+def _has_appearance_desc(row: dict[str, Any]) -> bool:
+    """这个形象有没有「长什么样」的文字。
+
+    看的是 `APPEARANCE_DESC_FIELDS`——**账单里真正拼进 prompt 的就是那几格**
+    （`services/context.py::_appearance_desc`）。这里另立一套判断的话，模型会看到
+    「已经有描述了」而实际喂给模型的那一条其实是空的。
+    """
+    return any(str(row.get(f) or "").strip() for f in APPEARANCE_DESC_FIELDS)
+
+
 async def run_read(pid: str, name: str, args: dict[str, Any]) -> Any:
     """执行一个读工具。返回值直接回给模型，所以只给它需要的字段——
     把整张表塞回去只会挤爆上下文，还让它更容易挑错 id。"""
@@ -407,12 +468,15 @@ async def run_read(pid: str, name: str, args: dict[str, Any]) -> Any:
                 {
                     "id": char["id"],
                     "name": char["name"],
+                    #: 那一句设定。空的时候引用这个角色只剩一个名字，所以照实回给模型看。
+                    "description": str(char.get("description") or "").strip(),
                     "appearances": [
                         {
                             "id": a["id"],
                             "name": a["name"],
                             "is_default": bool(a.get("is_default")),
                             "has_sheet": bool(a.get("current_sheet")),
+                            "has_description": _has_appearance_desc(a),
                         }
                         for a in apps
                     ],
@@ -424,12 +488,46 @@ async def run_read(pid: str, name: str, args: dict[str, Any]) -> Any:
             {
                 "id": loc["id"],
                 "name": loc["name"],
-                "variants": [{"id": v["id"], "name": v["name"]} for v in loc["variants"]],
+                "description": str(loc.get("description") or "").strip(),
+                "variants": [
+                    {
+                        "id": v["id"],
+                        "name": v["name"],
+                        "description": str(v.get("description") or "").strip(),
+                    }
+                    for v in loc["variants"]
+                ],
             }
             for loc in await world.list_locations(pid)
         ]
     if name == "list_props":
-        return [{"id": p["id"], "name": p["name"]} for p in await world.list_props(pid)]
+        return [
+            {
+                "id": p["id"],
+                "name": p["name"],
+                "description": str(p.get("description") or "").strip(),
+            }
+            for p in await world.list_props(pid)
+        ]
+    if name == "list_undescribed":
+        #: 只读清单，转调已有服务（`assets.undescribed`），这里不另算一遍「什么算缺描述」。
+        return await assets.undescribed(pid)
+    if name == "look_at_image":
+        #: 看图是**读**：`describe.suggest` 一行库都不改，回的是建议文字。
+        #: 落库仍然只有 `set_description` 提案 + 用户点采用那一条路。
+        out = await describe.suggest(pid, [str(args.get("asset_id") or "")])
+        row = (out.get("items") or [{}])[0]
+        return {
+            "asset_id": row.get("asset_id"),
+            "label": row.get("label"),
+            "suggestion": row.get("suggestion") or "",
+            #: `vision` = 真看了图；`text` = 没送字节，只按名字与已有设定写；
+            #: `skipped` = 非图片素材，没看。模型该知道这一句可信到什么程度。
+            "source": row.get("source"),
+            "current_description": row.get("description") or "",
+            "warnings": row.get("warnings") or [],
+            "error": row.get("error"),
+        }
     if name == "list_scenes":
         scenes = await story.list_scenes(pid)
         links = await sequence.list_links(pid)
@@ -685,6 +783,7 @@ _TARGET = {
     "add_location": "material",
     "add_prop": "material",
     "generate_reference": "material",
+    "set_description": "material",
 }
 
 #: 图片服务没配置时那句话。**绝不静默跳过**：素材照样建得出来，图不会有，
@@ -1020,6 +1119,58 @@ async def to_op(pid: str, name: str, args: dict[str, Any], temp_no: int) -> dict
             "target_label": label,
             **_image_after(op, args, kind),
         }
+        return op
+
+    if name == "set_description":
+        kind = str(args.get("target_kind") or "").strip()
+        target_id = str(args.get("target_id") or "").strip()
+        if kind not in DESC_TARGETS:
+            raise AppError(
+                ErrorCode.VALIDATION_ERROR,
+                "不认识这种目标",
+                f"target_kind = {kind or '（空）'}。",
+                [f"可用的是：{'、'.join(DESC_TARGETS)}"],
+                {"target_kind": args.get("target_kind")},
+            )
+        row = await describe.target(pid, kind, target_id)
+        if row is None:
+            raise AppError(
+                ErrorCode.NOT_FOUND,
+                f"没有这个{DESC_TARGET_LABEL[kind]}",
+                f"{kind} 里没有 id = {target_id or '（空）'} 这一行。",
+                [
+                    "先调 list_undescribed / list_characters / list_locations / list_props "
+                    "拿正确的 id",
+                    "形象给的是**形象 id**，不是角色 id；地点变体给的是**变体 id**",
+                ],
+                {"target_kind": kind, "target_id": target_id},
+            )
+        text = " ".join(str(args.get("description") or "").split())
+        if len(text) > DESC_MAX:
+            op["warnings"].append(
+                f"这一句有 {len(text)} 字，拼进 prompt 时只会带前 {DESC_MAX} 字，超出的部分白写"
+            )
+        op["before"] = {
+            "target_label": row["label"],
+            "field": row["field"],
+            "description": row["description"],
+        }
+        op["after"] = {
+            "target_kind": kind,
+            "target_id": row["id"],
+            "target_label": row["label"],
+            #: 写哪一列由 `describe.target` 说（形象上没有 description 列）。
+            #: 落库那边照这个字段 patch，绝不在 `services/director.py` 里再认一遍 kind。
+            "field": row["field"],
+            "description": text,
+        }
+        if kind == "appearance":
+            op["warnings"].append(
+                "形象上没有「描述」这一列，这一句会写进「显著特征」（traits）——"
+                "那正是账单拼进 prompt 时读的那几格"
+            )
+        if not text and row["description"]:
+            op["warnings"].append("description 是空的：采用后会把现在那一句清掉")
         return op
 
     row = await _scene(pid, args.get("scene_id", ""))  # delete_scene

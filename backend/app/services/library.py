@@ -81,6 +81,12 @@ from app.services.world import LOCATION_FIELDS, PROP_FIELDS, VARIANT_FIELDS
 
 log = get_logger("library")
 
+#: 库里的角色预设比工程侧少一列：`LibCharacter` 上**没有** `description`。
+#: 库表刻意不动——库不走 alembic，`open()` 那次 `create_all` 只增表不加列，给它加一列会让
+#: 已有的 `library.db` 直接打不开。所以「这个角色长什么样」那一句只存在工程侧
+#: （`Character.description`），采用进工程之后再写；预设照旧只带能对上的那几列。
+LIB_CHARACTER_FIELDS = tuple(f for f in CHARACTER_FIELDS if f != "description")
+
 MANIFEST_NAME = "library.aivs.json"
 DB_NAME = "library.db"
 MANIFEST_KIND = "aivs-library"
@@ -816,7 +822,7 @@ class LibraryService:
         now = utc_now()
         row = LibCharacter(
             id=new_id("library_character"),
-            **{k: patch.get(k) for k in CHARACTER_FIELDS if k != "name"},
+            **{k: patch.get(k) for k in LIB_CHARACTER_FIELDS if k != "name"},
             name=name,
             created_at=now,
             updated_at=now,
@@ -852,7 +858,7 @@ class LibraryService:
         async with lib.db.write() as session:
             row = await session.get(LibCharacter, cid)
             assert row is not None
-            for key in CHARACTER_FIELDS:
+            for key in LIB_CHARACTER_FIELDS:
                 if key in patch:
                     setattr(row, key, patch[key])
             row.updated_at = utc_now()

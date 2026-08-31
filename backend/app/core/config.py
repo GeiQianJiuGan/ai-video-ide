@@ -15,7 +15,7 @@ class Settings(BaseSettings):
 
     app_name: str = "AI Video Studio"
     version: str = "0.1.0"
-    schema_version: int = 20
+    schema_version: int = 21
 
     # --- 网络：只监听回环，绝不对外暴露工程数据 ---
     host: str = "127.0.0.1"
@@ -108,6 +108,9 @@ class Settings(BaseSettings):
     llm_provider: str = "none"  # none|openai_compatible|anthropic|ollama
     llm_base_url: str = ""
     llm_model: str = ""
+    #: 看图用哪个模型（`describe_image`）。留空 = 用主模型。单独一项是因为本机端
+    #: （Ollama / LM Studio）的主模型往往不认图，而地址与密钥是同一套。
+    llm_vision_model: str = ""
     llm_api_key: str = ""
 
     # --- 系统提示词：空字符串表示「用内置默认」（内置文本在 app/ai/prompts.py）---
@@ -115,6 +118,9 @@ class Settings(BaseSettings):
     # 但 JSON 输出形状由代码始终追加，不受这两个字段影响。
     prompt_breakdown: str = ""
     prompt_director: str = ""
+    #: 「照着这张素材写一句描述」用的那段话（`ai/prompts.py::describe`）。
+    #: 形状契约（一段中文、只写看得见的事实、不要 JSON）由代码始终追加。
+    prompt_describe: str = ""
 
     log_level: str = "INFO"
     dev_cors: bool = True  # 开发期允许 Vite dev server 跨源

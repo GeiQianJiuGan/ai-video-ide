@@ -57,6 +57,9 @@ export const OP_FIELD_LABEL: Record<string, string> = {
   image_prompt: '图片提示词',
   target_kind: '素材类型',
   target_label: '出图对象',
+  target_id: '素材',
+  /** 这一句落在哪一列（形象上是 traits，其余是 description）。 */
+  field: '写进哪一列',
   generate_image: '顺带出一张图',
 }
 
@@ -79,6 +82,7 @@ export const DIRECTOR_OPS = [
   'add_location',
   'add_prop',
   'generate_reference',
+  'set_description',
 ] as const
 export type DirectorOpName = (typeof DIRECTOR_OPS)[number]
 
@@ -101,6 +105,7 @@ export const OP_LABEL: Record<string, string> = {
   add_location: '加一个地点',
   add_prop: '加一个道具',
   generate_reference: '生成参考图',
+  set_description: '补一句描述',
 }
 
 export interface DirectorOp {

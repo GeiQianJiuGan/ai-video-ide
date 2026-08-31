@@ -35,6 +35,11 @@ def status() -> dict[str, Any]:
         "model": settings.llm_model or None,
         #: 不支持工具的端会退化成一次性产出提案，界面上要说清这件事。
         "supports_tools": bool(proto and proto.supports_tools),
+        #: 能不能**真的看图**。素材页那个「AI 补全」按钮照它决定是不是 disabled——
+        #: 不能看图时不画假界面，tooltip 里写原因并指向手填那条路。
+        "supports_vision": bool(proto and proto.supports_vision),
+        #: 看图用哪个模型（留空 = 主模型）。本机端主模型常常不认图，所以单独一项。
+        "vision_model": settings.llm_vision_model or None,
         "hint": (
             f"已配置 {proto.label} · {settings.llm_model}"
             if configured and proto
@@ -89,6 +94,34 @@ async def complete_json(system: str, user: str) -> dict[str, Any]:
     require_configured()
     proto = protocols.require()
     return await proto.complete_json(protocols.config(), system, user)
+
+
+def supports_vision() -> bool:
+    """这个端能不能**真的看图**。协议级的事实，见 `protocols.LlmProtocol.supports_vision`。"""
+    proto = protocols.get()
+    return bool(proto and proto.supports_vision)
+
+
+def vision_config() -> protocols.LlmConfig:
+    """看图那一次调用用的配置：只有模型可能不一样（`llm.vision_model`，留空 = 主模型）。
+
+    地址与密钥一律沿用主配置——「换一个视觉模型」在所有端上都是同一个服务里的另一个模型名，
+    再给它一套地址 / 密钥只会多两个能配错的地方。
+    """
+    return protocols.config(model=settings.llm_vision_model or None)
+
+
+async def describe_image(
+    system: str, user: str, images: list[protocols.ImagePart]
+) -> str:
+    """看着这几张图写一段文字（纯文本）。
+
+    端不认图时由 `protocols` 那边的默认实现报四要素错误，建议里带手动路径——
+    这一层不判断、不兜底，否则「能不能看图」就有两处口径了。
+    """
+    require_configured()
+    proto = protocols.require()
+    return await proto.describe_image(vision_config(), system, user, images)
 
 
 async def list_models(

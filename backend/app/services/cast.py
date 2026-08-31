@@ -20,6 +20,9 @@ from app.services.base import as_dict, db_of, fetch, fetch_all, require_name
 
 CHARACTER_FIELDS = (
     "name",
+    #: 一句话设定（`0021_asset_description` 才加的列）。以前这张表里没有它，
+    #: 于是 AI 协作栏 `add_character` 提案里的 `description` 被这里静默丢掉。
+    "description",
     "alias",
     "gender",
     "age_range",

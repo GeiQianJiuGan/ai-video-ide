@@ -64,6 +64,13 @@ export interface LlmStatus {
   model?: string | null
   /** false 表示这个端不支持 function calling，AI 协作会退化成一次性产出提案。 */
   supports_tools: boolean
+  /**
+   * 这个端能不能**真的看图**。false 时「AI 补全描述」按钮保持 `disabled`，
+   * tooltip 里写原因并指向手填那条路——不画假界面。
+   */
+  supports_vision: boolean
+  /** 看图用哪个模型（null = 用主模型）。本机端主模型常常不认图，所以单独一项。 */
+  vision_model?: string | null
   hint: string
 }
 
@@ -76,6 +83,8 @@ export interface LlmProtocolRow {
   label: string
   default_base_url: string
   supports_tools: boolean
+  /** 能不能看图。素材描述那条链靠它决定「AI 补全」是不是可用（后端协议表投影过来）。 */
+  supports_vision: boolean
   needs_key: boolean
   /** 模型列表从哪来，例如 `GET https://api.openai.com/v1/models`。 */
   models_hint: string

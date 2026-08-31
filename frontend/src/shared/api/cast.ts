@@ -87,6 +87,11 @@ export interface Character {
   id: string
   name: string
   alias: string | null
+  /**
+   * 这个角色「长什么样」的那一句。素材自己没写描述时，上下文账单退回读它
+   * （后端 `services/context.py`），最后渲染进 prompt 里那句参考素材说明。
+   */
+  description: string | null
   gender: string | null
   age_range: string | null
   personality: string | null
@@ -105,6 +110,7 @@ export type CharacterPatch = Partial<
     Character,
     | 'name'
     | 'alias'
+    | 'description'
     | 'gender'
     | 'age_range'
     | 'personality'
@@ -125,6 +131,7 @@ export type AppearancePatch = Partial<Record<InheritableField, string | null>> &
 export const CHARACTER_TEXT_FIELDS: { key: keyof CharacterPatch; label: string }[] = [
   { key: 'name', label: '名字' },
   { key: 'alias', label: '别名' },
+  { key: 'description', label: '设定（进 prompt）' },
   { key: 'gender', label: '性别' },
   { key: 'age_range', label: '年龄段' },
   { key: 'personality', label: '性格' },

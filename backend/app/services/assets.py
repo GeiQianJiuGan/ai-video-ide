@@ -18,10 +18,12 @@ from sqlalchemy import select
 from app.core.errors import AppError, ErrorCode
 from app.core.ids import new_id
 from app.events.bus import Channel, bus
+from app.generation.providers.base import DESC_MAX
 from app.persistence.models import utc_now
 from app.persistence.models_world import Asset, AssetRef
 from app.services.base import (
     as_dict,
+    assign,
     db_of,
     dump_json,
     fetch,
@@ -290,6 +292,78 @@ class AssetService:
             meta.update(patch)
             row.meta_json = dump_json(meta)
             return as_dict(row)
+
+    async def update(self, pid: str, asset_id: str, patch: dict[str, Any]) -> dict[str, Any]:
+        """改这个资产的描述。**能改的只有 `description` 一个字段。**
+
+        `path` / `kind` / `sha1` / `size_bytes` 是落盘事实，改了就与磁盘上那个文件对不上，
+        所以这里刻意只放一个字段过去（`assign` 的 `allowed` 就是那道门）。
+
+        描述是**模型唯一看得到的素材说明**：上下文账单把它当 `desc` 冻结进版本，最后由
+        `providers/base.py::ref_hint()` 渲染成「参考图1=<名字>（<这一句>）」。所以它不是
+        备注栏——写不写直接决定引用这张图时 prompt 里有没有内容。
+
+        **清空传 `''`**：`None` 在 `assign` 里是「这次不改」（与 `ShotPatch` 同一条口径）。
+        """
+        db = db_of(pid)
+        await fetch(db, Asset, asset_id, "资产")
+        async with db.write() as session:
+            row = await session.get(Asset, asset_id)
+            assert row is not None
+            changed = assign(row, patch, ("description",))
+            out = as_dict(row)
+        if changed:
+            bus.emit(
+                Channel.ASSET,
+                "asset.updated",
+                {"id": asset_id, "changed": changed},
+                project_id=pid,
+            )
+        return out
+
+    async def undescribed(self, pid: str) -> dict[str, Any]:
+        """还没有描述的资产。「扫一遍缺描述的素材」与 AI 那条读工具共用这一份。
+
+        **临时资源不算**（`TRANSIENT_KINDS`：抽出来的帧、拆出来的音频）：它们是派生物，
+        给它们写描述既没人看得到，也会把这张清单刷满真正需要补的素材之外的东西。
+        每条带 `owners`（靠已有的 `AssetRef`）说清「它挂在谁身上」——不然用户看到一串
+        文件名也不知道该写什么。
+        """
+        db = db_of(pid)
+        proj = project_of(pid)
+        rows = await fetch_all(db, Asset, order_by=Asset.created_at.desc())
+        refs = await fetch_all(db, AssetRef)
+        owners: dict[str, list[dict[str, Any]]] = {}
+        for ref in refs:
+            owners.setdefault(ref.asset_id, []).append(
+                {"owner_kind": ref.owner_kind, "owner_id": ref.owner_id, "role": ref.role}
+            )
+        items = [
+            {
+                **as_dict(row),
+                "media": kind_of_suffix(Path(row.path).suffix),
+                "owners": owners.get(row.id, []),
+                "missing": not (proj.dir / row.path).exists(),
+            }
+            for row in rows
+            if row.kind not in TRANSIENT_KINDS and not str(row.description or "").strip()
+        ]
+        described = sum(
+            1
+            for row in rows
+            if row.kind not in TRANSIENT_KINDS and str(row.description or "").strip()
+        )
+        return {
+            "items": items,
+            "count": len(items),
+            "described": described,
+            #: 描述进 prompt 时的截断上限。前端照它显示字数提示，不写死第二份。
+            "desc_max": DESC_MAX,
+            "note": (
+                "没有描述的素材，模型引用它时只会看到一个文件名——"
+                "生成视频的 prompt 里就没有「这张图长什么样」这句话。"
+            ),
+        }
 
     # --- 引用关系 ---
 

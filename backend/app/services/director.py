@@ -25,8 +25,10 @@ from app.core.logging import get_logger
 from app.generation.providers import registry
 from app.persistence.models import utc_now
 from app.persistence.models_flow import DirectorTurn
+from app.services.assets import assets
 from app.services.base import as_dict, db_of, dump_json, fetch_all, load_json
 from app.services.cast import cast
+from app.services.describe import DESC_TARGETS
 from app.services.images import images
 from app.services.sequence import sequence
 from app.services.story import story
@@ -353,6 +355,9 @@ class DirectorService:
                 ),
             }
 
+        if name == "set_description":
+            return await self._set_description(pid, after)
+
         # 剩下三条都是「整幕覆盖」：作用到这一幕的每个正片镜头上。
         # 转场镜头不算——它是衔接生成出来的，不是导演排的戏。
         shots = await self._real_shots(pid, sid)
@@ -377,6 +382,47 @@ class DirectorService:
             f"op = {name}。",
             ["丢弃这一条，让 AI 重新提", "或在流程图上手动做这一步"],
         )
+
+    async def _set_description(self, pid: str, after: dict[str, Any]) -> dict[str, Any]:
+        """把提案里那一句描述落到对应的行上。**全部转调已有写方法，这里不碰 ORM。**
+
+        写哪个字段由提案里的 `field` 说（它来自 `describe.target`，是唯一那份口径）——
+        形象上没有 `description` 列，那一句要落在账单真正会读的 `traits` 上。
+        """
+        kind = str(after.get("target_kind") or "").strip()
+        target_id = str(after.get("target_id") or "").strip()
+        if kind not in DESC_TARGETS:
+            raise AppError(
+                ErrorCode.VALIDATION_ERROR,
+                "不认识这种目标",
+                f"target_kind = {kind or '（空）'}。",
+                [f"可用的是：{'、'.join(DESC_TARGETS)}", "丢弃这一条，让 AI 重新提"],
+                {"target_kind": after.get("target_kind")},
+            )
+        fallback = "traits" if kind == "appearance" else "description"
+        field = str(after.get("field") or "") or fallback
+        #: 空字符串 = 清掉那一句（不是「这次不改」）。`assign()` 会跳过 `None`，
+        #: 所以这里一律给字符串，别让「清空」变成静默的无操作。
+        patch = {field: str(after.get("description") or "")}
+        if kind == "asset":
+            await assets.update(pid, target_id, patch)
+        elif kind == "character":
+            await cast.update_character(pid, target_id, patch)
+        elif kind == "appearance":
+            await cast.update_appearance(pid, target_id, patch)
+        elif kind == "location":
+            await world.update_location(pid, target_id, patch)
+        elif kind == "location_variant":
+            await world.update_variant(pid, target_id, patch)
+        else:
+            await world.update_prop(pid, target_id, patch)
+        return {
+            "target_kind": kind,
+            "target_id": target_id,
+            "target_label": after.get("target_label"),
+            "field": field,
+            "description": patch[field],
+        }
 
     async def _maybe_image(
         self, pid: str, after: dict[str, Any], target_kind: str, target_id: str

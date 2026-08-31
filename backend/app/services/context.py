@@ -80,6 +80,41 @@ def _asset_label(row: Asset | None, asset_id: str) -> str:
     return str(name or Path(row.path).name)
 
 
+def _desc_of(row: Asset | None, fallback: str = "") -> str:
+    """这一条素材「长什么样」——**模型唯一看得到的那句说明**。
+
+    取值顺序只有这一份（各处再取一遍必然分叉）：先认资产自己那句描述
+    （`Asset.description`，用户手填或 AI 看图补的），没有就退回这个实体的设定文字
+    （角色的外形、地点变体的描述、道具的描述），都没有就是空。
+
+    空不是错误，只是「这一条进 prompt 时只有一个名字」——`desc_missing` 会把它标出来。
+    截断不在这里做：那是 `providers/base.py::clip_desc` 的事，账单要留全文给界面看。
+    """
+    own = str((row.description if row is not None else "") or "").strip()
+    return own or " ".join(str(fallback or "").split())
+
+
+#: 形象的哪几格算「外形描述」。**只有这一处口径**——AI 协作栏的 `list_characters` 靠它
+#: 回答「这个形象有没有描述」（`ai/director/tools.py`），判断的必须和真正拼进 prompt 的
+#: 是同一批字段，否则模型看到「有描述」而账单里那一条其实是空的。
+APPEARANCE_DESC_FIELDS = ("age", "face", "hair", "body", "costume", "traits", "state")
+
+
+def _appearance_desc(app: Appearance | None, char: Character | None) -> str:
+    """形象的外形文字，按 `APPEARANCE_DESC_FIELDS` 的顺序拼一句。
+
+    **只认这个形象自己填的那几格**：继承链的解析在 `services/cast.py::resolve_fields`，
+    账单这条只读路径不该为一句 fallback 再走一遍那棵树（真正要紧的形象描述应该写在
+    定妆图那张资产的 `description` 上，那才是模型看的那张图）。
+    """
+    if app is None:
+        return str((char.description if char else "") or "").strip()
+    parts = [str(getattr(app, f, "") or "").strip() for f in APPEARANCE_DESC_FIELDS]
+    joined = "，".join(p for p in parts if p)
+    return joined or str((char.description if char else "") or "").strip()
+
+
+
 def ref_capacity(capacity: RefCapacity | None = None) -> RefCapacity:
     """模型端这一次能收几张参考图。**不是设置项**——问的是适配层。
 
@@ -331,6 +366,7 @@ class ContextService:
                         "priority": PRIORITY["character_sheet"] if not duplicate else 30,
                         "asset_id": current.asset_id if current else None,
                         "source_id": app.id,
+                        "desc_fallback": _appearance_desc(app, char),
                         "eligible": bool(current and current.asset_id) and not duplicate,
                         "reason": (
                             "同一角色已有更高优先级形象"
@@ -389,6 +425,9 @@ class ContextService:
                         ),
                         "asset_id": ref.asset_id,
                         "source_id": ref.id,
+                        "desc_fallback": str(
+                            variant.description or (location.description if location else "") or ""
+                        ),
                         "eligible": same or extra,
                         "reason": (
                             "本 Scene 选定的地点变体"
@@ -432,6 +471,9 @@ class ContextService:
                         "priority": PRIORITY["prev_frame"],
                         "asset_id": frame or source_asset,
                         "source_id": shot.prev_shot_id,
+                        #: 它不是素材，是上一段画面的最后一格——「长什么样」由那段视频自己
+                        #: 决定，没有可写的描述，所以给一句固定说明而不是留空报缺。
+                        "desc_fallback": "上游镜头的真末帧，画面从这一格接着走",
                         "eligible": ready,
                         "pending_extract": bool(ready and frame is None),
                         "from_asset_id": source_asset,
@@ -467,6 +509,7 @@ class ContextService:
                         "priority": PRIORITY["prop_reference"] if present else 10,
                         "asset_id": current.asset_id if current else None,
                         "source_id": row.prop_id,
+                        "desc_fallback": str((prop.description if prop else "") or ""),
                         "eligible": bool(current) and present,
                         "reason": ("本镜头出场道具" if present else "该道具在本镜头标为已丢弃")
                         if current
@@ -500,6 +543,13 @@ class ContextService:
             #: 「媒体未知」不等于「这种媒体喂不进去」。
             media = kind_of_suffix(Path(asset.path).suffix) if asset is not None else "image"
             item["media"] = media
+            #: 这一条进 prompt 时那句「长什么样」。**只在这一处取一次**（`_desc_of`）：
+            #: 先认资产自己的描述，没有就退回构造时留下的实体设定（`desc_fallback`）。
+            #: 账单里存全文，截断由 `providers/base.py::clip_desc` 在提交那一刻做。
+            item["desc"] = _desc_of(asset, str(item.pop("desc_fallback", "") or ""))
+            #: 空描述不是错误，但要显眼：没有它，模型引用这张素材时只看到一个文件名。
+            #: 这句判断由后端给，不让两个前端渲染处各算一遍。
+            item["desc_missing"] = not item["desc"]
             item["manual"] = item["kind"] == "manual" or item["key"] in removed
             if item["key"] in removed:
                 item["included"] = False
@@ -675,6 +725,9 @@ class ContextService:
                     #: 是图 / 是视频 / 是音频。槽位按媒体分开算，所以这个也得冻结——
                     #: 不然事后看不出「那段音频到底有没有送出去」。
                     "media": i.get("media") or "image",
+                    #: 那句「长什么样」——**模型唯一看得到的素材说明**。冻结它，事后才说得清
+                    #: 「当时到底喂了哪句话」（描述后来被改过，版本里这一份不变）。
+                    "desc": i.get("desc") or "",
                     #: 采用了、但这份图收不下（会在提交时按顺序被挤掉）。
                     "over_capacity": bool(i.get("over_capacity")),
                 }

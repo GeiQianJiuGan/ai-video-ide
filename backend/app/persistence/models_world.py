@@ -106,6 +106,10 @@ class Asset(Base):
     sha1: Mapped[str | None] = mapped_column(String(40), index=True)
     #: manual（手动上传）/ generated（本系统生成）/ imported（外部导入）
     source: Mapped[str] = mapped_column(String(20), nullable=False, default="manual")
+    #: 这张素材「长什么样」（`0021_asset_description`）。**它是模型唯一看得到的素材说明**——
+    #: 上下文账单把它当 `desc` 冻结，最后由 `providers/base.py::ref_hint()` 渲染成
+    #: 「参考图1=<名字>（<这一句>）」。空 = 用户没写，那模型就只看到一个文件名。
+    description: Mapped[str | None] = mapped_column(Text)
     meta_json: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[str] = mapped_column(String(40), nullable=False, default=utc_now)
 

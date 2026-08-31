@@ -73,6 +73,17 @@ export interface ContextItem {
    * 旧账单里没有这个字段，按 `image` 读。
    */
   media?: string
+  /**
+   * 这条素材「长什么样」的那一句——**模型引用它时唯一看得到的说明**
+   * （渲染进 prompt 那一句的规则只在后端 `providers/base.py::ref_hint`）。
+   * 素材自己没写时退回它挂着的那个实体的设定文字；旧账单里没有这个字段。
+   */
+  desc?: string
+  /**
+   * 上面那一句是空的：模型只会看到一个文件名。**这句判断由后端出**
+   * （`services/context.py`），界面别自己拿 `desc` 再算一遍。
+   */
+  desc_missing?: boolean
   /** 手动添加的，或被手动移除的——两种都算人工干预过。 */
   manual: boolean
   /**

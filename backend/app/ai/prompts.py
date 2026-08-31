@@ -144,9 +144,54 @@ add_character / add_location / add_prop 建素材，generate_reference 给已有
 素材图会自动追加成一个新版本，旧版本一条都不删。**镜头的首帧 / 末帧只进素材库**，
 要不要用哪一张由用户自己在镜头上点——你不要声称已经设成首帧了。"""
 
+#: 素材描述那条链的契约。**同样由代码始终追加**（rule 1）：这件事的后果是静默的——
+#: 一个没有描述的素材照样能被引用、照样出片，只是模型看到的是一个文件名，
+#: 于是人物形象在几秒里就丢了。用户看不出这是「缺一句话」造成的。
+DIRECTOR_DESCRIBE_CONTRACT = """素材的那一句描述（引用它时模型唯一看得到的说明）：
+
+引用一个素材，最终只变成 prompt 末尾的一句「参考图1=阿岚（褪色军绿夹克，短发，左颊一道旧疤）」。
+括号里那一段就是这个素材的描述——**空的话模型只拿到一个文件名**，画面里的人是谁全靠它猜。
+所以：
+
+  1. `list_undescribed` 先看缺哪些（抽出来的首尾帧是临时文件，不在清单里）；
+  2. `look_at_image(asset_id)` 看一眼那张图，它回一句建议——**那只是建议，一行库都没改**；
+  3. 觉得对就用 `set_description(target_kind, target_id, description, why)` 提一条案，
+     用户点采用才落库。
+
+描述只写**画面里看得见的事实**：外形、年龄气质、服装与配色、材质、发型、显著特征、光线、
+环境与天气。不写心理活动、不写剧情、不写「这张图展示了」这类转述，不超过 120 字
+（超出的部分在拼 prompt 时会被截断，白写）。写在素材本身上最要紧——那才是模型看的那张图；
+角色 / 地点 / 道具上那一句只是素材没有描述时的退路。"""
+
+
 
 def _custom(raw: str) -> str:
     return str(raw or "").strip()
+
+
+#: 「照着这张素材写一句描述」的可改部分。
+#: 这句话的用处很具体：素材没有描述时，模型引用它只看到一个文件名
+#: （`providers/base.py::ref_hint`），于是「参考图1=阿岚」后面那个括号是空的。
+DESCRIBE_TASK = """你在给一个视频工程里的素材写「它长什么样」。
+
+这句描述唯一的用途是：这张素材被某个镜头引用时，把它拼进喂给视频生成模型的提示词里。
+所以只写**画面里看得见的事实**——外形、年龄气质、服装与配色、材质、发型、显著特征、
+光线、镜头角度、环境与天气。"""
+
+#: 形状契约。**由代码始终追加，用户改不到**（照本文件开头 rule 1）：
+#: 这几句写坏了后果是静默的——描述照样存下来，只是它会把剧情、心理活动、
+#: 甚至一整段设定塞进每一个引用这张素材的镜头的 prompt 里。
+DESCRIBE_SHAPE = """输出要求：
+
+  - 只输出那一句描述本身，不要前后缀、不要引号、不要 JSON、不要代码块、不要分点；
+  - 一段中文，不超过 120 字（超出的部分会被截断，白写）；
+  - 不写心理活动、不写剧情、不写「这张图展示了」这类转述；
+  - 看不清的东西不要猜——写不出来就只写看得清的那几样。"""
+
+
+def describe() -> str:
+    """给素材写描述用的系统提示词：可改的那一段 + 始终追加的形状契约。"""
+    return f"{_custom(settings.prompt_describe) or DESCRIBE_TASK}\n\n{DESCRIBE_SHAPE}"
 
 
 def with_shot_audio_policy(prompt: str, negative_prompt: str) -> tuple[str, str]:
@@ -251,5 +296,5 @@ def director(scope: str = "flow") -> str:
     hint = SCOPE_HINT.get(str(scope or "").strip(), SCOPE_HINT["flow"])
     return (
         f"{_custom(settings.prompt_director) or DIRECTOR_TASK}\n\n"
-        f"{contract}\n\n{image_contract}\n\n{hint}"
+        f"{contract}\n\n{image_contract}\n\n{DIRECTOR_DESCRIBE_CONTRACT}\n\n{hint}"
     )

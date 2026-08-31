@@ -46,6 +46,22 @@ MEDIA = ("image", "video", "audio")
 #: `base` 不该反向依赖某一个适配器的模块。
 MEDIA_LABEL = {"image": "参考图", "video": "参考视频", "audio": "参考音频"}
 
+#: 一条素材说明最多带多少字进 prompt。**截断规则只有这一处**（`ref_hint` 用它）：
+#: 素材描述是自由文本，用户可以写一整段设定，几条加起来就能把正向 prompt 顶掉；
+#: 而截断在两处各写一遍的话，界面上提示的字数与真正送出去的必然分叉。
+#: 前端从 `GET /projects/{pid}/assets/undescribed` 的账单里读这个数，不写死第二份。
+DESC_MAX = 120
+
+
+def clip_desc(text: str, limit: int = DESC_MAX) -> str:
+    """素材说明进 prompt 之前的唯一处理：去空白 + 压掉换行 + 超长截断。
+
+    压换行是因为这句话会被拼进一行提示词里，用户在文本框里敲的回车不该变成 prompt 的结构。
+    """
+    one = " ".join(str(text or "").split())
+    return one if len(one) <= limit else f"{one[:limit]}…"
+
+
 
 @dataclass(frozen=True, slots=True)
 class RefAsset:
@@ -56,12 +72,18 @@ class RefAsset:
 
     `media` 决定它进哪一组槽位，来源是文件后缀（`assets.kind_of_suffix`），不是用户手填：
     真正决定「这个文件能不能填进 LoadImage」的是它到底是什么文件。
+
+    `desc` 是这张素材**长什么样**（`Asset.description`，用户手填或 AI 看图补的那一句），
+    与 `label` 分开是刻意的：`label` 要短，它还要显示在上下文检查器、`dropped_labels`
+    与底部控制台里；`desc` 只服务于提示词，由 `ref_hint()` 截断后单独渲染。
+    空 = 用户没写，此时那句说明与升级前逐字相同。
     """
 
     path: Path
     label: str = ""
     kind: str = ""
     media: str = "image"
+    desc: str = ""
 
     @property
     def media_label(self) -> str:
@@ -168,11 +190,17 @@ def ref_hint(refs: Sequence[RefAsset]) -> str:
 
     序号**按媒体各自从 1 数**，因为槽位就是按媒体分开的：图片进 `AIVS_REF_1`、
     视频进 `AIVS_REF_VIDEO_1`，混在一起连续编号的话这句说明会和真正填进去的槽位错位。
+
+    有描述的素材多一个括号：`参考图1=阿岚（默认形象）（褪色军绿夹克，短发）`。
+    **没有描述时输出与升级前逐字相同**——老工程的 prompt 不该因为多了一列而变样。
     """
     parts: list[str] = []
     for media, group in refs_by_media(refs).items():
         label = MEDIA_LABEL.get(media, "参考素材")
-        parts += [f"{label}{i}={r.label or r.path.name}" for i, r in enumerate(group, 1)]
+        for i, r in enumerate(group, 1):
+            desc = clip_desc(r.desc)
+            who = r.label or r.path.name
+            parts.append(f"{label}{i}={who}（{desc}）" if desc else f"{label}{i}={who}")
     if not parts:
         return ""
     return f"参考素材说明：{'；'.join(parts)}。"

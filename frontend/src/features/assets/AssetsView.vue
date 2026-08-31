@@ -21,6 +21,7 @@ import AppBadge from '@/shared/ui/AppBadge.vue'
 import EmptyState from '@/shared/ui/EmptyState.vue'
 import ErrorPanel from '@/shared/ui/ErrorPanel.vue'
 import FeatureHeader from '@/shared/ui/FeatureHeader.vue'
+import AssetDescription from '@/shared/ui/AssetDescription.vue'
 import LibraryPickDialog from '@/features/library/LibraryPickDialog.vue'
 import { fileUrl } from '@/shared/api/files'
 import {
@@ -279,6 +280,15 @@ function goOwner(ownerKind: string, ownerId: string): void {
             <p v-if="store.selected.missing" class="text-st-review mt-1 text-2xs">
               登记还在，但文件已经不在磁盘上了：可能被工程外的程序删掉或移走了。
             </p>
+          </section>
+
+          <section class="border-line-1 border-t pt-2">
+            <AssetDescription
+              :pid="pid"
+              :asset-id="store.selected.id"
+              :description="store.selected.description"
+              @saved="store.load(pid)"
+            />
           </section>
 
           <section class="border-line-1 border-t pt-2">

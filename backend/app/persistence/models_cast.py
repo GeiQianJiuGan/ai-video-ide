@@ -26,6 +26,9 @@ class Character(Base):
 
     id: Mapped[str] = mapped_column(String(40), primary_key=True)
     name: Mapped[str] = mapped_column(String(200), nullable=False)
+    #: 一句话设定（`0021_asset_description`）。`Location` / `Prop` 早就有这一列，只有角色缺，
+    #: 于是 AI 协作栏 `add_character` 写的那句「设定」一直掉在地上。补齐才是一处口径。
+    description: Mapped[str | None] = mapped_column(Text)
     alias: Mapped[str | None] = mapped_column(String(200))
     gender: Mapped[str | None] = mapped_column(String(20))
     age_range: Mapped[str | None] = mapped_column(String(50))

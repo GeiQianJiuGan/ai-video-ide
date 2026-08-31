@@ -18,6 +18,7 @@ from fastapi.responses import JSONResponse
 from app.api import assets as assets_api
 from app.api import cast as cast_api
 from app.api import context as context_api
+from app.api import describe as describe_api
 from app.api import director as director_api
 from app.api import dub as dub_api
 from app.api import files as files_api
@@ -145,6 +146,7 @@ def create_app() -> FastAPI:
     app.include_router(generation_api.router, prefix=API_PREFIX)
     app.include_router(sequence_api.router, prefix=API_PREFIX)
     app.include_router(images_api.router, prefix=API_PREFIX)
+    app.include_router(describe_api.router, prefix=API_PREFIX)
     app.include_router(refine_api.router, prefix=API_PREFIX)
     app.include_router(dub_api.router, prefix=API_PREFIX)
     app.include_router(ingest_api.router, prefix=API_PREFIX)
