@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import sqlite3
+import sys
 from pathlib import Path
 
 from alembic.config import Config
@@ -21,7 +22,22 @@ from app.core.logging import get_logger
 
 log = get_logger("migrate")
 
-BACKEND_ROOT = Path(__file__).resolve().parents[2]
+
+def _backend_root() -> Path:
+    """`alembic.ini` 与 `alembic/` 所在的目录。
+
+    源码树里就是 `backend/`。打包成 sidecar 之后迁移脚本是**数据文件**
+    （运行期才 exec 的 .py，静态分析看不见），`backend/aivs-backend.spec` 把它们
+    摆在 bundle 根，也就是 PyInstaller 的解包目录 `sys._MEIPASS`——
+    改这里的算法就必须同步改那份 spec 里 datas 的落点。
+    """
+    if getattr(sys, "frozen", False):
+        bundled = getattr(sys, "_MEIPASS", None)
+        return Path(bundled) if bundled else Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parents[2]
+
+
+BACKEND_ROOT = _backend_root()
 ALEMBIC_INI = BACKEND_ROOT / "alembic.ini"
 ALEMBIC_DIR = BACKEND_ROOT / "alembic"
 

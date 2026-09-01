@@ -36,6 +36,8 @@ bin/ffmpeg*
 bin/ffprobe*
 tauri/bin/aivs-backend*
 backend/dist/
+# PyInstaller 的中间目录（analysis 缓存），每次打包重建
+backend/build/
 
 # ---- IDE / OS ----
 .idea/

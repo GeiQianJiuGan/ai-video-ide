@@ -26,10 +26,26 @@
 运行时目录：debug 构建用仓库根 `.runtime/`（与手动跑 backend 时一致）；release 构建用
 应用本地数据目录下的 `runtime/`，绝不往安装目录写文件。
 
+## 退出时要按树杀，不能只 kill 一个
+
+打包后的 sidecar 是 PyInstaller onefile，**一个文件跑起来是两个进程**：外层 bootloader
+解包，内层才是真正的 Python。Windows 的 `TerminateProcess` 不牵连子进程，所以
+`Supervisor::shutdown` 先 `taskkill /T /F` 按树杀、再 `child.kill()` 兜底；Unix 上先
+`kill -TERM`（bootloader 会转发，让 uvicorn 走完 lifespan、把 SQLite 的 WAL 合并回主库），
+等一下再兜底。只杀外层的话内层会变成孤儿，继续占着 `project.db` 与那个回环端口，
+而任务管理器里看不到我们的程序——下一次启动就报「端口被占」或「数据库被锁」。
+
+sidecar 是 **console 构建**（`sys.stderr` 被 windowed 构建掐掉的话，Python 堆栈就进不了
+`runtime/backend.stderr.log`，等于静默失败）。黑框由两处按住：这里的
+`CREATE_NO_WINDOW`，加上 spec 里的 `hide_console`。
+
+`START_TIMEOUT` 是 90s 而不是 40s：解包几十 MB 再装配 FastAPI，在冷盘 + 杀软实时扫描的
+机器上比源码树那条路慢得多。
+
 ## 本机状态：未验证
 
-这台机器上 **没有 Rust 工具链**（`cargo: command not found`），所以以下文件通过审查编写，
-但 **没有编译、没有运行过**。补齐工具链后再验证：
+这台机器上 **没有 Rust 工具链**（`cargo: command not found`），所以 `src/*.rs` 与
+`tauri.conf.json` 通过审查编写，但 **没有编译、没有运行过**。补齐工具链后再验证：
 
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
@@ -47,9 +63,23 @@ cargo install tauri-cli --version "^2"
 cd tauri && cargo tauri dev
 ```
 
-打包前还差两件事：
+## 打包
 
-- **图标**：`npx @tauri-apps/cli icon <源图 1024px>` 生成 `tauri/icons/*`，否则 `tauri build` 会失败。
-- **sidecar**：把后端打成单文件可执行程序，放到 `tauri/bin/aivs-backend-<target-triple>`
-  （例如 `aivs-backend-x86_64-pc-windows-msvc.exe`）。M0 阶段尚未接入 PyInstaller，
-  因此现在只能走开发期的 Python 回退路径。
+打包所需的两样东西（图标、sidecar）都已经有脚本了，整条流水线是一条命令，详见
+[docs/06-打包与分发.md](../docs/06-打包与分发.md)：
+
+```bash
+python scripts/build_desktop.py
+```
+
+先体检、缺什么说什么（不构建）：
+
+```bash
+python scripts/build_desktop.py --check
+```
+
+它按顺序跑图标（`scripts/make_icons.py`，纯 Python 画，产物已进版本库）→ 内置 FFmpeg
+（`scripts/fetch_ffmpeg.py --for-tauri`）→ sidecar（`scripts/build_sidecar.py`，PyInstaller
+onefile，打完会真的启动一次并建一个空工程自检）→ `cargo tauri build`。
+`externalBin` 要的 `<name>-<target-triple>` 命名由脚本摆好，不用手动改名。
+

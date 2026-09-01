@@ -2,12 +2,30 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
+
+def _repo_root() -> Path:
+    """「仓库根」在源码树里和在安装包里不是同一个东西。
+
+    源码树：`backend/app/core/config.py` 往上四级就是仓库根。
+
+    冻结成 sidecar 之后 `__file__` 落在 PyInstaller 的临时解包目录里
+    （`<_MEIPASS>/app/core/config.py`），往上数四级会指到系统临时目录——那里没有
+    `bin/`、也不该往里写 `.runtime/`，而且每次启动路径都变。所以冻结后改用
+    **可执行文件所在目录**：Tauri 的 externalBin 把 sidecar 与 ffmpeg 装在同一层，
+    正好是 `app/core/ffmpeg.py` 要找的那个位置。
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parents[3]
+
+
+REPO_ROOT = _repo_root()
 
 
 class Settings(BaseSettings):

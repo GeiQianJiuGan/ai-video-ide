@@ -27,6 +27,7 @@ from app.api import generation as generation_api
 from app.api import images as images_api
 from app.api import ingest as ingest_api
 from app.api import library as library_api
+from app.api import onboarding as onboarding_api
 from app.api import overview as overview_api
 from app.api import packages as packages_api
 from app.api import projects as projects_api
@@ -134,6 +135,7 @@ def create_app() -> FastAPI:
     app.include_router(system.router, prefix=API_PREFIX)
     app.include_router(settings_api.router, prefix=API_PREFIX)
     app.include_router(fs_api.router, prefix=API_PREFIX)
+    app.include_router(onboarding_api.router, prefix=API_PREFIX)
     app.include_router(projects_api.router, prefix=API_PREFIX)
     app.include_router(cast_api.router, prefix=API_PREFIX)
     app.include_router(world_api.router, prefix=API_PREFIX)

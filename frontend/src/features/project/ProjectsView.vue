@@ -18,6 +18,7 @@ import {
   FolderOpen,
   FolderPlus,
   FolderSearch,
+  GraduationCap,
   PackageOpen,
   PackagePlus,
   RefreshCw,
@@ -34,10 +35,12 @@ import ExportPackageDialog from '@/features/packages/ExportPackageDialog.vue'
 import ImportProjectDialog from '@/features/packages/ImportProjectDialog.vue'
 import type { DurationUnit } from '@/shared/api/projects'
 import { useProjectStore } from '@/stores/project'
+import { useOnboardingStore } from '@/stores/onboarding'
 import { useSystemStore } from '@/stores/system'
 
 const sys = useSystemStore()
 const proj = useProjectStore()
+const wiz = useOnboardingStore()
 const router = useRouter()
 const connected = computed(() => sys.health !== null)
 
@@ -223,10 +226,13 @@ onMounted(() => void proj.refreshRecent())
       <EmptyState
         v-if="proj.recent.length === 0"
         title="还没有任何项目"
-        body="用右上角的「新建项目」建一个工程目录，之后它会出现在这里，下次一键打开。"
+        body="用右上角的「新建项目」建一个工程目录，之后它会出现在这里，下次一键打开。想先看看系统是怎么组织一部片子的，就打开演示项目。"
       >
         <AppButton size="sm" variant="primary" :disabled="!connected" @click="startCreate()">
           <FolderPlus :size="10" />新建项目
+        </AppButton>
+        <AppButton size="sm" :disabled="!connected" @click="wiz.reopen('demo')">
+          <GraduationCap :size="10" />打开演示项目
         </AppButton>
       </EmptyState>
       <ul v-else class="divide-line-1 divide-y">

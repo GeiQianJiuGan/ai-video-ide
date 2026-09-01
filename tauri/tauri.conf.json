@@ -25,15 +25,23 @@
     "active": true,
     "licenseFile": "../LICENSE",
     "license": "MIT",
+    "publisher": "AI Video Studio",
+    "copyright": "Copyright © AI Video Studio contributors",
+    "category": "Video",
+    "shortDescription": "AI 原生长视频制作工作台",
+    "longDescription": "AI = 素材生产器 · System = 视频工程与编排器 · Human = 导演。内置 FFmpeg，不要求预装 Python 或视频模型；未配置 ComfyUI / LLM 时手动流程完全可用。",
     "targets": [
       "nsis",
       "dmg",
-      "appimage"
+      "appimage",
+      "deb",
+      "rpm"
     ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
+      "icons/icon.png",
       "icons/icon.icns",
       "icons/icon.ico"
     ],
@@ -45,7 +53,20 @@
     "resources": [],
     "windows": {
       "nsis": {
-        "installMode": "currentUser"
+        "installMode": "currentUser",
+        "languages": [
+          "SimpChinese",
+          "English"
+        ],
+        "displayLanguageSelector": true
+      }
+    },
+    "linux": {
+      "deb": {
+        "section": "video"
+      },
+      "appimage": {
+        "bundleMediaFramework": true
       }
     }
   }

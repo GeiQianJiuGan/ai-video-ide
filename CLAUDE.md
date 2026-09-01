@@ -31,10 +31,10 @@ AI Video Studio（`aivs`）：桌面端优先的 AI 原生长视频制作工作�
 
 - **后端已全量落地**：docs/04 的 Step 1–9 都有实现，之后又落了「两级场景系统」这一轮
   （应用级设置 → provider 适配层 → 衔接与编排 → 场景工作台 → 幕流程图 → AI 协作栏）——
-  24 个 service（cast / world / assets / workflows / story / context / generation / timeline /
+  25 个 service（cast / world / assets / workflows / story / context / generation / timeline /
   overview / projects / library / adopt / fsbrowse / appsettings / frames / sequence / director /
-  packages / ingest / dub / refine / audio / images / **describe**；`base` / `params` /
-  `global_registry` 是公共件不算）+ 24 个 router（含 `/ws`），449 passed（1 skipped：
+  packages / ingest / dub / refine / audio / images / describe / **onboarding**；`base` /
+  `params` / `global_registry` 是公共件不算）+ 25 个 router（含 `/ws`），464 passed（1 skipped：
   没跑过 `fetch_ffmpeg.py` 的机器上跳过「用的是内置那份」那条正向断言）。
 - **前端也全部接上了后端**：`app/features.ts` 里 15 个功能都是 `ready: true`，
   `/p/:pid` 下不再有外壳页。`shared/ui/FeatureView.vue`（按注册表画工作区骨架与能力锁）
@@ -47,6 +47,9 @@ AI Video Studio（`aivs`）：桌面端优先的 AI 原生长视频制作工作�
 - 本机装了 `frontend/node_modules` 与 `backend/.venv`（后端命令用 `.venv/Scripts/python`），
   没有 Rust 工具链，`cd tauri && cargo tauri dev` 从未编译过；`tauri/src/backend.rs` 与
   `tauri.conf.json` 的改动无法在本机验证。
+- **打包流水线已经接上了**（`scripts/build_desktop.py`，见下面的「打包与分发」段与
+  docs/06）：图标与 PyInstaller sidecar 不再是缺口，sidecar 在本机打过、启动过、建过工程；
+  只有最后一步 `cargo tauri build` 因为没有 Rust 工具链没跑过。
 - **FFmpeg 随应用分发**，不再要求用户自己装（见下面的「内置 FFmpeg」段）。测试不依赖
   「这台机器上恰好装了/没装」：缺失路径用 `conftest.py::no_ffmpeg` fixture 造。
 
@@ -117,6 +120,24 @@ python scripts/fetch_ffmpeg.py --for-tauri
 
 ```bash
 cd tauri && cargo tauri dev
+```
+
+出安装包（一条命令跑完图标 → FFmpeg → sidecar → `cargo tauri build`，详见 docs/06）：
+
+```bash
+python scripts/build_desktop.py
+```
+
+只体检、缺什么说什么（不构建）：
+
+```bash
+python scripts/build_desktop.py --check
+```
+
+单独打后端 sidecar（PyInstaller onefile，打完会真的启动一次并建一个空工程自检）：
+
+```bash
+python scripts/build_sidecar.py
 ```
 
 迁移是**按工程库**跑的，没有全局数据库：
@@ -220,6 +241,32 @@ token}` 写进 `.runtime/endpoint.json` → 壳校验后用 `window.__AIVS_ENDPO
 刻意不做缓存：用户可能在应用开着的时候才去下载。打包时 `tauri.conf.json` 的 `externalBin` 列了
 `bin/ffmpeg` / `bin/ffprobe`，构建前必须先 `python scripts/fetch_ffmpeg.py --for-tauri`，
 否则 bundle 会失败。
+
+**打包与分发**（`scripts/build_desktop.py` 是唯一入口，详见 docs/06）：目标是**装完就能用**
+——Python 解释器、后端依赖、FFmpeg 全在包里。五步顺序不能换：图标（`scripts/make_icons.py`）
+→ 内置 FFmpeg（`fetch_ffmpeg.py --for-tauri`）→ sidecar（`build_sidecar.py`）→ 前端
+（`beforeBuildCommand`）→ `cargo tauri build`；`cargo tauri build` 会在编译完十分钟之后才因为
+「少一张图标」失败，所以体检与前置产物都在脚本里前置。**没法交叉编译**：Windows 包只能在
+Windows 上出、Linux 包只能在 Linux 上出，两个平台的产物靠 `.github/workflows/release.yml`
+的双机 matrix。四条不许绕的：
+
+- **冻结后有两套路径算法，方向相反**，`tests/test_packaging_paths.py` 两边都盯着：
+  `config._repo_root()` → **可执行文件所在目录**（externalBin 把 ffmpeg 装在那一层）；
+  `migrate._backend_root()` → **解包目录 `sys._MEIPASS`**（迁移脚本作为数据文件摆在那儿）。
+  照 `__file__` 往上数几级会指到系统临时目录，而且每次启动都变。
+- **alembic 是数据不是代码**：迁移脚本是运行期 exec 的 `.py`，静态分析看不见，必须显式进
+  spec 的 `datas`，落点与 `_backend_root()` 对得上。漏了这条后端能启动、`/health` 正常，
+  **一建工程就炸**——所以 `build_sidecar.py` 打完会真的启动一次并建一个空工程。
+- **sidecar 必须是 `console=True`**：windowed 构建里 PyInstaller 会掐掉 `sys.stderr`，
+  Python 堆栈就进不了 `runtime/backend.stderr.log`，壳只剩一个退出码可报——那是静默失败
+  （硬约束 4）。黑框由壳的 `CREATE_NO_WINDOW` 与 spec 的 `hide_console` 两处按住。
+- **onefile 一个文件是两个进程**（bootloader + 真正的 Python），退出时必须**按树杀**
+  （`Supervisor::shutdown` 与 `build_sidecar._kill_tree` 各一份）。只杀外层的话里层变孤儿，
+  继续占着 `project.db` 与那个回环端口，任务管理器里却看不到我们的程序。
+  同一个原因 `START_TIMEOUT` 是 90s：解包几十 MB 比源码树那条路慢得多。
+
+图标**提交进版本库**（纯 Python 画的，打包机不必装 Pillow 或跑 `npx`）；有设计稿就放
+`tauri/icons/source.png` 再 `make_icons.py --force`。
 
 **事件**：进程内 `EventBus`（`events/bus.py`）→ 单个 `/ws` 端点按 `project_id` + `channels`
 过滤（job / queue / shot / version / asset / system / error）。事件幂等、可丢失（队列满丢最旧），
@@ -485,6 +532,36 @@ kind / priority / included / reason / **media**（`image` / `video` / `audio`，
   `advanced: true`、不进 `PROJECT_NAV`），`GenerationService._execute` 默认走 provider，
   只有 `job.workflow_id` 非空时才走 `apply_bindings` 那一支。
 
+**新手引导与演示工程**（`services/onboarding.py` + `api/onboarding.py` + `core/pngdraw.py`，
+前端 `features/onboarding/`）：第一次打开应用的人面前不该只有「新建 / 打开」两个按钮，
+所以有一份能立刻点开看的演示工程 + 一个五步向导（这是什么 → 演示工程 → 连上生成服务 →
+绑定预设或 API → 功能巡览）。六条不许绕的：
+
+- **状态是应用级的**：落 `settings.runtime_dir / "onboarding.json"`（与 `recent.json` /
+  `library.json` / `settings.json` 同级），坏 JSON 照 `appsettings._read()` 退回默认并留日志。
+  `first_run` 就是「这个文件还不存在」；**关掉 ≠ 走完**，`completed` 只有点「完成」才写。
+- **演示工程由后端代码播种，不往仓库塞二进制**（schema 永远是当前最新），落用户文档目录下的
+  `AI Video Studio/演示项目`（安装目录在 Windows 上常常只读），重名加 `-2`。
+  **播种全部转调已有写方法**（`cast` / `world` / `assets` / `story` / `sequence`），
+  `_seed()` 自己一行 ORM 都不碰——所以**不新增表、不新增迁移、`schema_version` 不动**。
+- **先账单再动手**（照 `services/adopt.py` / `services/packages.py`）：`POST /onboarding/demo/plan`
+  一个字节都不写；目录里已经有工程时 `action="open"`，点下去只打开、不重建、不覆盖。
+  陌生 `project.db` 由 `projects.create()` 现成的 `CONFLICT` 挡住，这里不另写一份。
+- **演示工程里刻意没有任何 `GenerationVersion`**：版本轨与时间线是空的，`warnings` 与界面都
+  写明「配好生成服务后从这里做出第一段画面」。一个看着能播其实是假的演示比空版本轨更糟。
+  `tests/test_onboarding.py` 盯着每张分镜卡 `version_count == 0`。
+- **占位图纯 Python 画**（`core/pngdraw.py`：`struct` + `zlib` 手写 PNG，理由同
+  `scripts/make_icons.py`——打包机不必装 Pillow），**不画文字**（字形超出范围）：
+  「这是谁」由那句 `description` 说清楚，而描述才是模型真正看得到的东西，所以每张占位图都
+  写了描述，播完 `GET /assets/undescribed` 必须是空的。
+- **向导不进 `app/features.ts`**：它是覆盖层不是页面，登记进注册表会让它出现在导航与它自己的
+  巡览列表里（自我指涉）。它挂在 `WorkbenchLayout` 里与 `CommandPalette` 同级常驻，重开入口
+  三处：设置页顶部、命令面板、起始页最近列表为空时（后者直接落在演示工程那一步）。
+  巡览那一步的文案**一个字都不在前端写**，全部来自 `features.ts` 的
+  `purpose` / `outcome` / `requires`，所以以后加功能会自动出现在巡览里。
+  **启动时不播种**：启动不该悄悄往用户文档目录写东西，播种是向导里那一下点击。
+
+
 ## 代码约定
 
 - **id**：`new_id("shot")` → `sht_<ULID>`。新实体必须先在 `app/core/ids.py` 的 `PREFIX` 里登记，
@@ -542,6 +619,7 @@ kind / priority / included / reason / **media**（`image` / `video` / `audio`，
 
 `docs/01` 架构与选型 · `docs/02` 模块规格与 M0–M6 里程碑 · `docs/03` 全量表结构 + REST/WS 契约
 + 落盘规范 + 测试清单 · `docs/04` Step 1–9 与完成标准 · `docs/05` 三种调用方式与模型端要
-准备什么（`AIVS_*` 节点标题约定、http_api 合同、最小验收清单）。service / api 的 docstring
+准备什么（`AIVS_*` 节点标题约定、http_api 合同、最小验收清单）· `docs/06` 打包与分发
+（五步流水线、各平台前置、冻结后的路径规则、sidecar 那三个坑）。service / api 的 docstring
 里写的「Step N」对应 `docs/04`；改接口或表结构时同步 `docs/03`，改生成层的入口约定或适配器
-时同步 `docs/05`。
+时同步 `docs/05`，改打包脚本 / spec / `tauri.conf.json` 时同步 `docs/06`。

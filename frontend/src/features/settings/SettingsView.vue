@@ -20,6 +20,7 @@ import {
   ChevronRight,
   Download,
   FileText,
+  GraduationCap,
   PlugZap,
   RefreshCw,
   RotateCcw,
@@ -34,9 +35,11 @@ import ErrorPanel from '@/shared/ui/ErrorPanel.vue'
 import StatusDot from '@/shared/ui/StatusDot.vue'
 import { SOURCE_LABEL, type SettingField } from '@/shared/api/settings'
 import { useSettingsStore } from '@/stores/settings'
+import { useOnboardingStore } from '@/stores/onboarding'
 import { useSystemStore } from '@/stores/system'
 
 const cfg = useSettingsStore()
+const wiz = useOnboardingStore()
 const sys = useSystemStore()
 
 const DEP_TITLE: Record<string, string> = {
@@ -131,6 +134,17 @@ async function pastePreset(): Promise<void> {
 <template>
   <div class="min-h-0 flex-1 overflow-auto p-2">
     <ErrorPanel :error="cfg.lastError" class="mb-2" @dismiss="cfg.clearError()" />
+
+    <!-- 引导的第二个入口（第一个是命令面板）：这一页就是它第三步教人填的地方 -->
+    <div class="border-line-1 bg-base-1 mb-2 flex items-center gap-2 border px-3 py-2">
+      <span class="text-fg-3 min-w-0 flex-1 text-2xs leading-relaxed">
+        不确定这些字段该怎么填？新手引导会带你走一遍：演示工程 → 连上生成服务 → 绑定预设或 API →
+        每个功能干什么。
+      </span>
+      <AppButton size="sm" @click="wiz.reopen()">
+        <GraduationCap :size="10" />重新打开新手引导
+      </AppButton>
+    </div>
 
     <!-- 可写配置：一组一块 -->
     <AppPanel v-for="group in cfg.groups" :key="group.id" :title="group.title" class="mb-2">

@@ -12,11 +12,13 @@ import { DialogContent, DialogOverlay, DialogPortal, DialogRoot, DialogTitle } f
 import { Search } from '@lucide/vue'
 import AppBadge from './AppBadge.vue'
 import { APP_NAV_FEATURES, PROJECT_ADVANCED_FEATURES, PROJECT_NAV_FEATURES } from '@/app/features'
+import { useOnboardingStore } from '@/stores/onboarding'
 
 const props = defineProps<{ open: boolean; projectId: string | null }>()
 const emit = defineEmits<{ 'update:open': [boolean] }>()
 
 const router = useRouter()
+const wiz = useOnboardingStore()
 const query = ref('')
 const cursor = ref(0)
 
@@ -73,6 +75,13 @@ const entries = computed<Entry[]>(() => {
       desc: 'FFmpeg / ComfyUI / LLM 状态与修复建议',
       badge: '可用',
       go: () => void router.push('/settings'),
+    },
+    {
+      key: 'onboarding',
+      title: '新手引导 · 重新走一遍',
+      desc: '演示工程、怎么配 ComfyUI 或 REST API、怎么绑定、每个功能干什么',
+      badge: '可用',
+      go: () => void wiz.reopen(),
     },
   )
   const q = query.value.trim().toLowerCase()

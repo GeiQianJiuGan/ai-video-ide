@@ -15,13 +15,16 @@ import ConsolePanel from './ConsolePanel.vue'
 import StatusBar from './StatusBar.vue'
 import TitleBar from './TitleBar.vue'
 import CommandPalette from '@/shared/ui/CommandPalette.vue'
+import OnboardingWizard from '@/features/onboarding/OnboardingWizard.vue'
 import { useConsoleStore } from '@/stores/console'
+import { useOnboardingStore } from '@/stores/onboarding'
 import { useProjectStore } from '@/stores/project'
 import { useSystemStore } from '@/stores/system'
 
 const sys = useSystemStore()
 const proj = useProjectStore()
 const consolePanel = useConsoleStore()
+const wiz = useOnboardingStore()
 const route = useRoute()
 const paletteOpen = ref(false)
 
@@ -47,6 +50,11 @@ let poll: number | undefined
 onMounted(() => {
   void sys.refresh()
   sys.connect()
+  // 第一次跑这台机器时自动弹新手引导：状态在后端（onboarding.json），
+  // 所以「关掉过 / 走完过 / 跳过过」刷新页面也不会重新弹一次
+  void wiz.load().then(() => {
+    if (wiz.shouldAutoOpen) wiz.open = true
+  })
   // 依赖状态可能在应用运行期间变化（用户启动了 ComfyUI），低频复查
   poll = window.setInterval(() => void sys.refresh(), 15_000)
   window.addEventListener('keydown', onKeydown)
@@ -71,5 +79,6 @@ onUnmounted(() => {
     <ConsolePanel :project-id="pid" />
     <StatusBar />
     <CommandPalette v-model:open="paletteOpen" :project-id="pid" />
+    <OnboardingWizard />
   </div>
 </template>

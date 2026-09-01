@@ -9,15 +9,25 @@
 use std::env::consts::EXE_SUFFIX;
 use std::fs;
 use std::net::{SocketAddr, TcpStream};
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-/// 后端从冷启动到可接受连接的最长等待。首次启动要建库 + 装配 FastAPI，留足余量。
-const START_TIMEOUT: Duration = Duration::from_secs(40);
+/// 后端从冷启动到可接受连接的最长等待。
+///
+/// 打包后的 sidecar 是 PyInstaller 单文件产物：每次启动都要先把几十 MB 解包到临时
+/// 目录，再装配 FastAPI，比源码树里那条路慢得多（冷盘 + 杀软实时扫描的机器上尤甚），
+/// 所以这个预算按打包后的最坏情况给。
+const START_TIMEOUT: Duration = Duration::from_secs(90);
 const POLL_INTERVAL: Duration = Duration::from_millis(150);
+
+/// `CREATE_NO_WINDOW`——不给 console 子系统的子进程分配控制台窗口。
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 #[derive(Debug, Deserialize)]
 struct EndpointFile {
@@ -68,9 +78,42 @@ pub struct Supervisor {
 impl Supervisor {
     pub fn shutdown(&mut self) {
         if let Some(mut child) = self.child.take() {
+            kill_tree(&child);
             let _ = child.kill();
             let _ = child.wait();
         }
+    }
+}
+
+/// 把 sidecar **整棵进程树**收掉。
+///
+/// PyInstaller 的单文件产物是**两个进程**：外层 bootloader 把自己解包到临时目录，
+/// 真正的 Python 是它的子进程。所以只 `child.kill()` 会留下一个孤儿——它继续占着
+/// project.db 与那个回环端口，用户关掉窗口之后下一次启动就会撞上「端口被占」或
+/// 「数据库被锁」，而任务管理器里看不到我们的程序。
+///
+/// Windows：`TerminateProcess` 不会牵连子进程，只能靠 `taskkill /T` 按树杀。
+/// Unix：bootloader 会把 `SIGTERM` 转发给里层，所以先温和地要求退出（顺带让
+/// uvicorn 走完 lifespan、把 SQLite 的 WAL 合并回主库），之后再由 `child.kill()` 兜底。
+fn kill_tree(child: &Child) {
+    let pid = child.id();
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        // 给 uvicorn 一点收尾时间；到点了就交给外面的 child.kill()。
+        std::thread::sleep(Duration::from_millis(1200));
     }
 }
 
@@ -190,6 +233,10 @@ pub fn launch(runtime_dir: &Path) -> Result<(Supervisor, Endpoint), BootError> {
     if let Some(dir) = bundle_dir() {
         cmd.env("AIVS_BUNDLE_DIR", dir);
     }
+    // sidecar 是 console 子系统的程序（必须如此，否则 Python 的堆栈进不了 stderr 日志），
+    // 而壳是 windows 子系统——不加这个标志，每次启动都会在屏幕上闪一个黑框。
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
 
     let mut child = cmd.spawn().map_err(|e| {
         BootError::new(
@@ -227,6 +274,7 @@ pub fn launch(runtime_dir: &Path) -> Result<(Supervisor, Endpoint), BootError> {
         }
 
         if Instant::now() >= deadline {
+            kill_tree(&child);
             let _ = child.kill();
             let _ = child.wait();
             return Err(BootError::new(
