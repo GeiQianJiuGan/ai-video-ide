@@ -144,23 +144,41 @@ async function reload(): Promise<void> {
 onMounted(reload)
 watch(pid, reload)
 
-function extractNodesFromGraph(graph: Record<string, any>): ExtractedNode[] {
+/**
+ * ComfyUI 导出的「API 格式」图：整份都是用户拖进来的外部 JSON，
+ * 任何一层都可能缺、可能是别的类型，所以按 `unknown` 收进来再逐字段收窄——
+ * 标成 `any` 的话下面那些 `node.inputs` 就没人替我们检查了。
+ */
+type RawGraph = Record<string, unknown>
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null
+}
+
+function extractNodesFromGraph(graph: RawGraph): ExtractedNode[] {
   const out: ExtractedNode[] = []
-  for (const [nodeId, node] of Object.entries(graph)) {
-    if (!node || typeof node !== 'object') continue
-    const inputs = (node.inputs && typeof node.inputs === 'object') ? node.inputs : {}
+  for (const [nodeId, raw] of Object.entries(graph)) {
+    const node = asRecord(raw)
+    if (!node) continue
+    const inputs = asRecord(node.inputs) ?? {}
     const fields = Object.keys(inputs).filter((k) => !Array.isArray(inputs[k]))
+    const meta = asRecord(node._meta)
     out.push({
       id: nodeId,
       class_type: String(node.class_type || ''),
-      title: (node._meta && typeof node._meta === 'object' && node._meta.title) ? String(node._meta.title) : null,
+      title: meta?.title ? String(meta.title) : null,
       fields: fields.sort(),
     })
   }
   return out.sort((a, b) => Number(a.id) - Number(b.id) || a.id.localeCompare(b.id))
 }
 
-function detectAutoBindings(nodes: ExtractedNode[], capability: Capability): { bindings: Record<string, string>; detected: Set<string> } {
+function detectAutoBindings(
+  nodes: ExtractedNode[],
+  capability: Capability,
+): { bindings: Record<string, string>; detected: Set<string> } {
   const bindings: Record<string, string> = {}
   const detected = new Set<string>()
   const titled: Record<string, string> = {}
@@ -214,10 +232,13 @@ function detectAutoBindings(nodes: ExtractedNode[], capability: Capability): { b
   }
 
   // 启发式探测回退
-  const promptNodes = nodes.filter((n) =>
-    ['CLIPTextEncode', 'CLIPTextEncodeSDXL', 'ShowText', 'PrimitiveNode', 'Text'].includes(n.class_type) ||
-    n.fields.includes('text') ||
-    n.fields.includes('prompt'),
+  const promptNodes = nodes.filter(
+    (n) =>
+      ['CLIPTextEncode', 'CLIPTextEncodeSDXL', 'ShowText', 'PrimitiveNode', 'Text'].includes(
+        n.class_type,
+      ) ||
+      n.fields.includes('text') ||
+      n.fields.includes('prompt'),
   )
   const posPrompts = promptNodes.filter((n) => !/(neg|负|反向)/i.test(n.title || ''))
   const negPrompts = promptNodes.filter((n) => /(neg|负|反向)/i.test(n.title || ''))
@@ -249,10 +270,15 @@ function detectAutoBindings(nodes: ExtractedNode[], capability: Capability): { b
     }
   }
 
-  const loadImgNodes = nodes.filter((n) => n.class_type.includes('LoadImage') || n.fields.includes('image'))
+  const loadImgNodes = nodes.filter(
+    (n) => n.class_type.includes('LoadImage') || n.fields.includes('image'),
+  )
   if (loadImgNodes.length && loadImgNodes[0]) {
-    const firstImg = loadImgNodes.find((n) => /(first|首|start|起始)/i.test(n.title || '')) || loadImgNodes[0]
-    const lastImg = loadImgNodes.find((n) => /(last|末|尾|end|结束)/i.test(n.title || '')) || (loadImgNodes.length > 1 ? loadImgNodes[1] : null)
+    const firstImg =
+      loadImgNodes.find((n) => /(first|首|start|起始)/i.test(n.title || '')) || loadImgNodes[0]
+    const lastImg =
+      loadImgNodes.find((n) => /(last|末|尾|end|结束)/i.test(n.title || '')) ||
+      (loadImgNodes.length > 1 ? loadImgNodes[1] : null)
     const firstImgField = firstImg.fields.find((x) => x === 'image') || firstImg.fields[0]
     const fImgTarget = firstImgField ? `${firstImg.id}.${firstImgField}` : ''
 
@@ -333,7 +359,9 @@ function detectAutoBindings(nodes: ExtractedNode[], capability: Capability): { b
       }
     }
     if (!bindings.duration) {
-      const df = firstLatent.fields.find((x) => ['length', 'num_frames', 'frames', 'duration'].includes(x))
+      const df = firstLatent.fields.find((x) =>
+        ['length', 'num_frames', 'frames', 'duration'].includes(x),
+      )
       if (df) {
         bindings.duration = `${firstLatent.id}.${df}`
         detected.add('duration')
@@ -365,11 +393,9 @@ async function onPickFile(event: Event): Promise<void> {
   importName.value = file.name.replace(/\.json$/i, '')
   importNotes.value = ''
   try {
-    const graph = JSON.parse(text) as Record<string, any>
+    const graph = JSON.parse(text) as RawGraph
     const count =
-      graph && typeof graph === 'object' && !Array.isArray(graph)
-        ? Object.keys(graph).length
-        : 0
+      graph && typeof graph === 'object' && !Array.isArray(graph) ? Object.keys(graph).length : 0
     if (count === 0) {
       importProblem.value = '这份 JSON 里没有节点。要的是 ComfyUI 的「API 格式」导出。'
       importNodes.value = []
@@ -423,7 +449,10 @@ async function runValidate(probe: boolean): Promise<void> {
   await wf.validate(pid.value, wid, probe)
 }
 
-async function saveField(key: 'name' | 'notes' | 'capability' | 'status', value: string): Promise<void> {
+async function saveField(
+  key: 'name' | 'notes' | 'capability' | 'status',
+  value: string,
+): Promise<void> {
   const wid = detail.value?.id
   if (!wid) return
   await wf.update(pid.value, wid, { [key]: value }).catch(() => {})
@@ -431,18 +460,22 @@ async function saveField(key: 'name' | 'notes' | 'capability' | 'status', value:
 
 async function saveProjectBinding(capability: Capability, value: string): Promise<void> {
   if (!pid.value) return
-  await wf.setProjectBindings(pid.value, {
-    ...projectBindings.value,
-    [capability]: value || null,
-  }).catch(() => {})
+  await wf
+    .setProjectBindings(pid.value, {
+      ...projectBindings.value,
+      [capability]: value || null,
+    })
+    .catch(() => {})
 }
 
 async function saveGenerationMode(value: GenerationMode): Promise<void> {
   if (!pid.value) return
-  await wf.setProjectBindings(pid.value, {
-    ...projectBindings.value,
-    generation_mode: value,
-  }).catch(() => {})
+  await wf
+    .setProjectBindings(pid.value, {
+      ...projectBindings.value,
+      generation_mode: value,
+    })
+    .catch(() => {})
 }
 </script>
 
@@ -516,7 +549,11 @@ async function saveGenerationMode(value: GenerationMode): Promise<void> {
               <li v-for="w in byCapability(cap)" :key="w.id">
                 <button
                   class="hover:bg-base-2 flex w-full items-center gap-1.5 rounded-xs px-1.5 py-1 text-left"
-                  :class="w.id === wf.selectedId ? 'bg-accent-dim/40 border border-accent/40' : 'border border-transparent'"
+                  :class="
+                    w.id === wf.selectedId
+                      ? 'bg-accent-dim/40 border border-accent/40'
+                      : 'border border-transparent'
+                  "
                   @click="wf.select(pid, w.id)"
                 >
                   <span class="min-w-0 flex-1">
@@ -565,9 +602,18 @@ async function saveGenerationMode(value: GenerationMode): Promise<void> {
           body="只有节点上的标量输入能被绑定——连线进来的输入由上游节点决定，覆盖不了。确认导出的是 API 格式。"
         />
         <div v-else class="p-2 space-y-2">
-          <div class="border-line-1 bg-base-2 border p-1.5 text-2xs text-fg-3 flex items-center justify-between">
-            <span>当前正在配置 <strong>{{ detail.name }}</strong>（{{ CAPABILITY_LABEL[detail.capability as Capability] ?? detail.capability }}）</span>
-            <span class="text-fg-4">{{ detail.nodes.length }} 个节点 · {{ fieldOptions.length }} 个可绑定输入项</span>
+          <div
+            class="border-line-1 bg-base-2 border p-1.5 text-2xs text-fg-3 flex items-center justify-between"
+          >
+            <span
+              >当前正在配置 <strong>{{ detail.name }}</strong
+              >（{{
+                CAPABILITY_LABEL[detail.capability as Capability] ?? detail.capability
+              }}）</span
+            >
+            <span class="text-fg-4"
+              >{{ detail.nodes.length }} 个节点 · {{ fieldOptions.length }} 个可绑定输入项</span
+            >
           </div>
 
           <table class="w-full text-2xs">
@@ -580,7 +626,9 @@ async function saveGenerationMode(value: GenerationMode): Promise<void> {
             <tbody class="divide-line-1 divide-y">
               <tr v-for="slot in SLOTS" :key="slot" class="hover:bg-base-2/50">
                 <td class="py-1.5 align-middle">
-                  <span :class="requiredSlots.includes(slot) ? 'text-fg-1 font-medium' : 'text-fg-3'">
+                  <span
+                    :class="requiredSlots.includes(slot) ? 'text-fg-1 font-medium' : 'text-fg-3'"
+                  >
                     {{ slot
                     }}<span v-if="requiredSlots.includes(slot)" class="text-st-review">*</span>
                   </span>
@@ -605,7 +653,8 @@ async function saveGenerationMode(value: GenerationMode): Promise<void> {
             </tbody>
           </table>
           <p class="text-fg-4 mt-2 text-2xs">
-            没绑的槽位在生成时就是「这套图不接这个参数」——例如超分只需要 source_image，绑上 prompt 也不会被用到。修改后请点击右上角「保存绑定」。
+            没绑的槽位在生成时就是「这套图不接这个参数」——例如超分只需要 source_image，绑上 prompt
+            也不会被用到。修改后请点击右上角「保存绑定」。
           </p>
         </div>
       </AppPanel>
@@ -616,7 +665,9 @@ async function saveGenerationMode(value: GenerationMode): Promise<void> {
           <!-- 属性编辑 -->
           <section v-if="detail" class="space-y-2">
             <div class="flex items-center justify-between">
-              <p class="text-fg-3 text-2xs font-medium tracking-wide uppercase">Workflow 信息编辑</p>
+              <p class="text-fg-3 text-2xs font-medium tracking-wide uppercase">
+                Workflow 信息编辑
+              </p>
             </div>
             <div class="space-y-1.5 border-line-1 bg-base-2 border p-2">
               <label class="block">
@@ -708,9 +759,7 @@ async function saveGenerationMode(value: GenerationMode): Promise<void> {
 
           <!-- 项目级生成绑定 -->
           <section v-if="pid" class="border-line-1 border-t pt-2">
-            <p class="text-fg-3 text-2xs tracking-wide uppercase">
-              当前项目生成方式绑定
-            </p>
+            <p class="text-fg-3 text-2xs tracking-wide uppercase">当前项目生成方式绑定</p>
             <div class="mt-1 space-y-1">
               <label class="block">
                 <span class="text-fg-4 text-2xs">项目生成引擎</span>
@@ -718,7 +767,9 @@ async function saveGenerationMode(value: GenerationMode): Promise<void> {
                   :value="projectBindings.generation_mode"
                   class="border-line-1 bg-base-2 text-fg-1 focus:border-accent/60 mt-px h-5 w-full border px-1 text-2xs outline-none"
                   :disabled="wf.busy"
-                  @change="saveGenerationMode(($event.target as HTMLSelectElement).value as GenerationMode)"
+                  @change="
+                    saveGenerationMode(($event.target as HTMLSelectElement).value as GenerationMode)
+                  "
                 >
                   <option value="comfy_preset">ComfyUI 预设</option>
                   <option value="http_api">通用 REST API</option>
@@ -810,7 +861,9 @@ async function saveGenerationMode(value: GenerationMode): Promise<void> {
               v-model="importCapability"
               class="border-line-1 bg-base-2 text-fg-1 focus:border-accent/60 mt-px h-6 w-full border px-1 text-2xs outline-none"
             >
-              <option v-for="c in CAPABILITIES" :key="c" :value="c">{{ CAPABILITY_LABEL[c] }}</option>
+              <option v-for="c in CAPABILITIES" :key="c" :value="c">
+                {{ CAPABILITY_LABEL[c] }}
+              </option>
             </select>
           </label>
         </div>
@@ -827,7 +880,9 @@ async function saveGenerationMode(value: GenerationMode): Promise<void> {
         <!-- 节点识别与手动映射区 -->
         <div v-if="importNodes.length" class="border-line-1 bg-base-2/60 border p-2 space-y-2">
           <div class="flex items-center justify-between">
-            <span class="text-fg-2 text-2xs font-medium">节点识别与绑定映射（已自动识别，可手动调整）</span>
+            <span class="text-fg-2 text-2xs font-medium"
+              >节点识别与绑定映射（已自动识别，可手动调整）</span
+            >
             <span class="text-fg-4 text-2xs">解析出 {{ importNodes.length }} 个节点</span>
           </div>
 
@@ -842,8 +897,15 @@ async function saveGenerationMode(value: GenerationMode): Promise<void> {
             <tbody class="divide-line-1 divide-y">
               <tr v-for="slot in SLOTS" :key="slot" class="hover:bg-base-2">
                 <td class="py-1">
-                  <span :class="importRequiredSlots.includes(slot) ? 'text-fg-1 font-medium' : 'text-fg-3'">
-                    {{ slot }}<span v-if="importRequiredSlots.includes(slot)" class="text-st-review">*</span>
+                  <span
+                    :class="
+                      importRequiredSlots.includes(slot) ? 'text-fg-1 font-medium' : 'text-fg-3'
+                    "
+                  >
+                    {{ slot
+                    }}<span v-if="importRequiredSlots.includes(slot)" class="text-st-review"
+                      >*</span
+                    >
                   </span>
                 </td>
                 <td class="py-1">
@@ -861,7 +923,10 @@ async function saveGenerationMode(value: GenerationMode): Promise<void> {
                   <AppBadge v-if="autoDetectedSlots.has(slot) && importBindings[slot]" tone="ok">
                     已识别
                   </AppBadge>
-                  <AppBadge v-else-if="importRequiredSlots.includes(slot) && !importBindings[slot]" tone="warn">
+                  <AppBadge
+                    v-else-if="importRequiredSlots.includes(slot) && !importBindings[slot]"
+                    tone="warn"
+                  >
                     必填未绑
                   </AppBadge>
                   <span v-else-if="importBindings[slot]" class="text-fg-4 text-3xs">手动选择</span>
