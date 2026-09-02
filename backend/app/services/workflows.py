@@ -11,7 +11,6 @@
 
 from __future__ import annotations
 
-import json
 import re
 from typing import Any
 
@@ -20,78 +19,20 @@ from sqlalchemy import select
 from app.core.errors import AppError, ErrorCode
 from app.core.ids import new_id
 from app.generation.comfy.client import comfy
+
+# 这三个是**纯函数**，落在 provider 层能 import 到的地方（`app.generation.*`），
+# 因为工作流绑定那条路的适配器要用它们；这里重新导出，老调用点与测试一行不用改。
+from app.generation.comfy.graph import SLOTS, apply_bindings, parse_graph
 from app.persistence.models import Project, utc_now
 from app.persistence.models_gen import CAPABILITIES, REQUIRED_SLOTS, Workflow
 from app.persistence.models_global import GlobalWorkflow
 from app.services.base import as_dict, db_of, dump_json, fetch, fetch_all, load_json
 from app.services.global_registry import global_registry
 
-#: 可绑定的输入槽。前四个是素材/文本，后面是采样参数。
-SLOTS = (
-    "prompt",
-    "negative_prompt",
-    "reference_image",
-    "first_frame",
-    "last_frame",
-    "source_image",
-    "seed",
-    "steps",
-    "width",
-    "height",
-    "duration",
-)
+__all__ = ["SLOTS", "apply_bindings", "parse_graph", "workflows"]
+
 #: ComfyUI 官方节点前缀之外的一律视为自定义节点（探测缺失用）。
 BUILTIN_HINT = ("CLIPTextEncode", "KSampler", "CheckpointLoaderSimple", "VAEDecode", "SaveImage")
-
-
-def parse_graph(raw: str) -> dict[str, Any]:
-    """解析 workflow_api.json。必须是 {节点id: {class_type, inputs}} 形状。"""
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise AppError(
-            ErrorCode.INVALID_WORKFLOW,
-            "不是合法的 JSON",
-            f"第 {exc.lineno} 行第 {exc.colno} 列：{exc.msg}",
-            [
-                "确认导出的是 ComfyUI 的「API 格式」而不是界面工作流",
-                "用文本编辑器确认文件没有被截断",
-            ],
-        ) from exc
-    if not isinstance(data, dict) or not data:
-        raise AppError(
-            ErrorCode.INVALID_WORKFLOW,
-            "不是 ComfyUI 的 API 格式",
-            "顶层应是「节点 id → 节点」的对象，实际拿到的是空对象或数组。",
-            ["在 ComfyUI 里用「Save (API Format)」重新导出", "确认没有把界面工作流当成 API 格式"],
-        )
-    # 界面工作流的顶层是 {id, revision, last_node_id, last_link_id, nodes: [...], links: [...]}。
-    # 它和 API 格式差得远，但下面那条「缺少 class_type」的报错会把这几个顶层键当成节点名列出来
-    # ——用户看到的是一串不认识的字段，而真正的原因是导出格式选错了。所以先认出这一种。
-    if isinstance(data.get("nodes"), list):
-        raise AppError(
-            ErrorCode.INVALID_WORKFLOW,
-            "这是界面工作流，不是 API 格式",
-            f"顶层键是 {'、'.join(list(data)[:6])}，{len(data['nodes'])} 个节点在 nodes 数组里。"
-            "API 格式的顶层直接是「节点 id → {class_type, inputs}」，没有 nodes / links。",
-            [
-                "在 ComfyUI 里打开这份工作流 → 菜单「工作流 / Workflow」→「导出 (API)」",
-                "旧版前端：设置里打开「Enable Dev mode Options」后会出现「Save (API Format)」按钮",
-                "user/default/workflows/ 里存的都是界面格式，不能直接上传",
-                "节点标题（AIVS_*）不用重设，导出格式换对就行",
-            ],
-            {"node_count": len(data["nodes"])},
-        )
-    bad = [k for k, v in data.items() if not isinstance(v, dict) or "class_type" not in v]
-    if bad:
-        raise AppError(
-            ErrorCode.INVALID_WORKFLOW,
-            "节点结构不完整",
-            f"以下节点缺少 class_type：{'、'.join(bad[:5])}。",
-            ["重新用「Save (API Format)」导出", "确认文件没有被手工改坏"],
-            {"nodes": bad[:20]},
-        )
-    return data
 
 
 def node_summary(graph: dict[str, Any]) -> list[dict[str, Any]]:
@@ -288,21 +229,6 @@ def _check_binding(graph: dict[str, Any], slot: str, target: str) -> str | None:
     return None
 
 
-def apply_bindings(
-    graph: dict[str, Any], bindings: dict[str, str], values: dict[str, Any]
-) -> dict[str, Any]:
-    """把参数值写进 api graph 的副本。Adapter 的核心，也是唯一知道节点细节的地方。"""
-    out = json.loads(json.dumps(graph))
-    for slot, target in bindings.items():
-        if slot not in values or values[slot] is None:
-            continue
-        node_id, field = target.split(".", 1)
-        node = out.get(node_id)
-        if isinstance(node, dict):
-            node.setdefault("inputs", {})[field] = values[slot]
-    return out
-
-
 class WorkflowService:
     async def _global_db(self):
         return await global_registry.start()
@@ -347,6 +273,8 @@ class WorkflowService:
         return await fetch(await self._global_db(), GlobalWorkflow, wid, "工作流")
 
     async def project_bindings(self, pid: str) -> dict[str, str | None]:
+        from app.services import route  # 延迟导入：route 在模块级 import 了这个模块
+
         project = (await fetch_all(db_of(pid), Project))[0]
         global_db = await self._global_db()
         async with global_db.read() as session:
@@ -356,7 +284,12 @@ class WorkflowService:
                 return wid if (await session.get(GlobalWorkflow, wid)) is not None else None
 
             return {
-                "generation_mode": project.generation_mode,
+                #: **读出来先归一**：老库里这一列写的是 `workflow_api`，registry 与设置页叫
+                #: `comfy_workflow`——同一条路两个名字、中间从来没有映射，前端于是拿它和
+                #: registry 给的候选比对不上。空串 = 跟随设置页（`route.INHERIT`）。
+                #: 坏值原样回（`_safe_normalize` 不抛）：说清哪里不对是 `GET /route` 的事，
+                #: 这份绑定表不该因为一个坏字符串整个读不出来。
+                "generation_mode": route._safe_normalize(project.generation_mode),
                 "text2image": await valid_id(project.default_image_workflow_id),
                 "image2video": await valid_id(project.default_video_workflow_id),
                 "first_last_frame": await valid_id(project.default_first_last_workflow_id),
@@ -366,8 +299,20 @@ class WorkflowService:
     async def set_project_bindings(
         self, pid: str, bindings: dict[str, str | None]
     ) -> dict[str, str | None]:
+        from app.services import route  # 延迟导入：route 在模块级 import 了这个模块
+
         db = db_of(pid)
         global_db = await self._global_db()
+        #: **写之前先归一，未知值直接抛。** 以前这里是一张写死的白名单
+        #: `{"comfy_preset", "http_api", "workflow_api"}`，不在里面的值**静默丢弃**——
+        #: 用户选了一条路、请求成功返回、库里那一列没变，界面上还显示着他选的那个。
+        #: `route.normalize()` 收别名（`workflow_api` → `comfy_workflow`）、把未知值报成
+        #: 四要素 `VALIDATION_ERROR`（写入侧该挡就挡），空串 = 跟随设置页。
+        mode = (
+            route.normalize(bindings["generation_mode"])
+            if "generation_mode" in bindings
+            else None
+        )
         valid_bindings: dict[str, str | None] = {}
         for capability, wid in bindings.items():
             if capability == "generation_mode":
@@ -398,8 +343,8 @@ class WorkflowService:
         async with db.write() as session:
             project = (await session.execute(select(Project))).scalars().first()
             assert project is not None
-            if bindings.get("generation_mode") in {"comfy_preset", "http_api", "workflow_api"}:
-                project.generation_mode = str(bindings["generation_mode"])
+            if mode is not None:
+                project.generation_mode = mode
             if "text2image" in bindings:
                 project.default_image_workflow_id = valid_bindings.get("text2image")
             if "image2video" in bindings:
@@ -660,7 +605,13 @@ class WorkflowService:
         return await self.validate_global(wid, probe=probe)
 
     async def capability_matrix(self, pid: str) -> dict[str, Any]:
-        """四行能力矩阵。没有任何镜头时就能回答「以后哪种镜头做不出来」。"""
+        """四行能力矩阵。没有任何镜头时就能回答「以后哪种镜头做不出来」。
+
+        多回一个 `route` 块（打开了工程才有）：**这张矩阵说的是绑定表齐不齐，而绑定表只在
+        「ComfyUI 工作流绑定」那条路上有意义**。走预设或 REST 的工程看着一屏红色的
+        「未绑定」会去修一件根本不影响自己出片的事——`route.binds_workflow` 就是界面上
+        那句「当前这条路不需要这些绑定」的来源。`comfy` 键保留给现有界面。
+        """
         rows = await fetch_all(await self._global_db(), GlobalWorkflow)
         matrix = []
         for cap in CAPABILITIES:
@@ -679,7 +630,28 @@ class WorkflowService:
                     "impact": None if ready else _impact(cap),
                 }
             )
-        return {"capabilities": matrix, "comfy": await comfy.ping()}
+        return {
+            "capabilities": matrix,
+            "comfy": await comfy.ping(),
+            #: 没有工程（应用级那张矩阵）时是 `None`：那时「这个工程走哪条路」还没有答案，
+            #: 编一个默认值出来只会让界面说错。
+            "route": await self._route_block(pid) if pid else None,
+        }
+
+    async def _route_block(self, pid: str) -> dict[str, Any] | None:
+        """这个工程当前走哪条路（矩阵上那一句提示）。**绝不抛**——矩阵是只读界面。"""
+        from app.services import route  # 延迟导入：route 在模块级 import 了这个模块
+
+        try:
+            resolved = await route.resolve(pid, "image2video")
+        except AppError:  # pragma: no cover - 工程没打开时（`db_of` 抛）
+            return None
+        return {
+            "provider": resolved.provider,
+            "label": resolved.label,
+            "source": resolved.source,
+            "binds_workflow": resolved.binds_workflow,
+        }
 
     async def global_capability_matrix(self) -> dict[str, Any]:
         return await self.capability_matrix("")

@@ -9,15 +9,16 @@ from __future__ import annotations
 from typing import Any
 
 from app.core import ffmpeg as ffmpeg_tool
+from app.core.errors import AppError
 from app.generation.comfy.client import comfy
-from app.generation.providers import presets
-from app.persistence.models import Project
+from app.generation.providers import registry
 from app.persistence.models_cast import Appearance, Character, SheetVersion
 from app.persistence.models_edit import ExportRecord, TimelineClip
 from app.persistence.models_gen import GenerationVersion, Job
 from app.persistence.models_global import GlobalWorkflow
 from app.persistence.models_story import Scene, Shot, ShotCast, ShotProp
 from app.persistence.models_world import Location, LocationVariant, Prop, PropReference
+from app.services import route
 from app.services.base import db_of, fetch_all, load_json, project_of
 from app.services.global_registry import global_registry
 from app.services.workflows import workflows
@@ -31,6 +32,29 @@ STATUS_LABEL = {
     "failed": "失败",
     "review": "待审",
 }
+
+
+def _bound_of(row: dict[str, Any]) -> str:
+    """这条路上到底绑了什么：预设名 / 那份图的名字 / 那个地址。没绑上是空串。
+
+    **按事实读，不按名字分岔**（硬约束 1）：哪一个字段有值就说它，所以以后加一条路
+    （比如另一个云服务）只要 `route.Route` 上有它绑的东西，这里一行都不用改。
+    """
+    return str(row.get("preset") or row.get("workflow_name") or row.get("base_url") or "")
+
+
+def _route_detail(label: str, r2v: dict[str, Any], flf: dict[str, Any]) -> str:
+    """环境栏里那一行话：走哪条路、两种镜头各绑了什么。
+
+    以前这句是 `R2V：x；FL2VA：y`，只在预设那条路上说得通——走 REST 的工程读到的是
+    「项目尚未绑定预设 Workflow」，而那条路根本没有预设这回事。
+    """
+    parts = [
+        f"普通镜头：{_bound_of(r2v) or '未绑定'}",
+        f"衔接与转场：{_bound_of(flf) or '未绑定'}",
+    ]
+    return f"{label} · " + "；".join(parts)
+
 
 
 class OverviewService:
@@ -342,7 +366,22 @@ class OverviewService:
     # --- 环境与能力 ---
 
     async def environment(self, pid: str | None = None) -> dict[str, Any]:
-        """状态条要的东西：ComfyUI、FFmpeg、GPU/显存、LLM。缺什么都要说清影响。"""
+        """状态条要的东西：这个工程走哪条路出片、ComfyUI、FFmpeg、GPU/显存。缺什么都要说清影响。
+
+        **三条路各自诚实**：以前这一栏里 `generation.mode` 是写死的 `"comfy_preset"`、预设名
+        一律去数 `r2v_preset_name`、ComfyUI 无条件 ping——于是走「通用 REST API」的工程在这儿
+        看到的是一屏与自己无关的状态（「ComfyUI 离线」+「未绑定预设」），而真正的问题
+        （REST 地址没配）一个字都没提，用户永远查不到原因。
+
+        现在这一块整个来自 `services/route.py::summary()`——与 `GET /projects/{pid}/route`
+        **同一份口径同一次解析**，两边不会说出不一样的话；服务在不在改由
+        `registry.provider(...).probe()` 回答，业务层照旧一个 `if provider ==` 都不写
+        （硬约束 1）。
+
+        `comfy` 与 `capabilities` 两个键原样保留：状态条与能力矩阵还在读它们，而且显存那一栏
+        只有 ComfyUI 答得出来——ComfyUI 在不在线对预设与工作流绑定两条路都成立，
+        走 REST 的工程则由 `generation.mode_label` 说清「这一栏与这条路无关」。
+        """
         ping = await comfy.ping()
         found = ffmpeg_tool.locate("ffmpeg")
         gpu: dict[str, Any] = {"available": False, "detail": "未能读取（需要 ComfyUI 在线）"}
@@ -363,42 +402,7 @@ class OverviewService:
                     "detail": f"{device.get('name')} · 空闲 {round((free or 0) / 1024**3, 1)}G",
                 }
         capabilities = await workflows.capability_matrix(pid) if pid else None
-        generation: dict[str, Any] | None = None
-        if pid:
-            project = (await fetch_all(db_of(pid), Project))[0]
-            listing = presets.listing()
-            selected = project.r2v_preset_name or project.preset_name or ""
-            flf_selected = project.flf_preset_name or project.preset_name or ""
-            item = next((x for x in listing if x["name"] == selected), None) if selected else None
-            flf_item = (
-                next((x for x in listing if x["name"] == flf_selected), None)
-                if flf_selected
-                else None
-            )
-            r2v_name = selected if item else None
-            flf_name = flf_selected if flf_item else None
-            generation = {
-                "mode": "comfy_preset",
-                "preset_name": r2v_name,
-                "preset_ready": bool(item and item.get("ready")),
-                "ref_slots": item.get("ref_slots") if item else None,
-                # 参考视频 / 参考音频的槽位数单独给。混进 `ref_slots` 会让状态条显示
-                # 「能收 5 个参考素材」而其中 2 个只吃音频——用户照着塞图必然白跑一趟。
-                "ref_video_slots": item.get("ref_video_slots") if item else None,
-                "ref_audio_slots": item.get("ref_audio_slots") if item else None,
-                "r2v_name": r2v_name,
-                "r2v_ready": bool(item and item.get("r2v_ready")),
-                "r2v_ref_slots": item.get("ref_slots") if item else None,
-                "r2v_ref_video_slots": item.get("ref_video_slots") if item else None,
-                "r2v_ref_audio_slots": item.get("ref_audio_slots") if item else None,
-                "flf_name": flf_name,
-                "flf_ready": bool(flf_item and flf_item.get("flf_ready")),
-                "detail": (
-                    f"R2V：{r2v_name or '未绑定'}；FL2VA：{flf_name or '未绑定'}"
-                    if (r2v_name or flf_name)
-                    else "项目尚未绑定预设 Workflow"
-                ),
-            }
+        generation = await self._generation_of(pid) if pid else None
         return {
             "comfy": ping,
             "ffmpeg": {
@@ -422,6 +426,79 @@ class OverviewService:
             "gpu": gpu,
             "capabilities": capabilities,
             "generation": generation,
+        }
+
+    async def _generation_of(self, pid: str) -> dict[str, Any]:
+        """「这个工程怎么出片」摆在环境栏里的那一小块。
+
+        整块来自 `route.summary(pid)`——**与 `GET /projects/{pid}/route` 同一次解析**，
+        所以概览页那一大块与状态条这一小块永远说同一句话。这里只做两件事：把两条能力挑成
+        平铺的字段（状态条没地方画一张表），再补一次「服务在不在」的探测。
+        """
+        summary = await route.summary(pid)
+        rows = {row["capability"]: row for row in summary["capabilities"]}
+        r2v = rows.get("image2video") or {}
+        flf = rows.get("first_last_frame") or {}
+        r2v_slots = r2v.get("slots") or {}
+        return {
+            # --- 走哪条路：`mode` 不再是写死的字符串，`mode_source` 说清是谁给的答案 ---
+            "mode": summary["provider"],
+            "mode_label": summary["label"],
+            #: `project`（工程显式选了）/ `settings`（跟随设置页）/ `default`（谁都没选过）。
+            "mode_source": summary["source"],
+            #: 界面上那句「这条路不需要工作流绑定」只看这一个布尔。
+            "binds_workflow": summary["binds_workflow"],
+            "workflow_name": r2v.get("workflow_name"),
+            "service": await self._probe_of(summary["provider"]),
+            #: 两条能力（普通镜头 / 衔接与转场）各自 ready 才算这个工程能出片。
+            "ready": bool(r2v.get("ready")) and bool(flf.get("ready")),
+            #: 缺什么。四要素形状，前端原样显示 suggestions（硬约束 4）。
+            "issues": [*(r2v.get("issues") or []), *(flf.get("issues") or [])],
+            # --- 下面这些键名沿用旧形状，但值全部来自解析结果 ---
+            #: 预设那条路才有值：走 REST / 工作流绑定时是 `None`，**不再谎报「未绑定预设」**。
+            "preset_name": r2v.get("preset"),
+            #: 「就绪」说的是**这条路**能不能出片，不是「有没有选预设」——走 REST 的工程
+            #: 配好地址就是就绪，它本来就没有预设这回事。
+            "preset_ready": bool(r2v.get("ready")),
+            #: 参考素材槽位按**真正会提交的那条路**数（预设那份图 / 绑定表里的参考图槽位 /
+            #: REST 合同的不限量）。参考视频 / 参考音频单独给：混进 `ref_slots` 会让状态条显示
+            #: 「能收 5 个参考素材」而其中 2 个只吃音频——用户照着塞图必然白跑一趟。
+            "ref_slots": r2v_slots.get("image"),
+            "ref_video_slots": r2v_slots.get("video"),
+            "ref_audio_slots": r2v_slots.get("audio"),
+            "ref_detail": r2v_slots.get("detail"),
+            "r2v_name": r2v.get("preset"),
+            "r2v_ready": bool(r2v.get("ready")),
+            "r2v_ref_slots": r2v_slots.get("image"),
+            "r2v_ref_video_slots": r2v_slots.get("video"),
+            "r2v_ref_audio_slots": r2v_slots.get("audio"),
+            "flf_name": flf.get("preset"),
+            "flf_ready": bool(flf.get("ready")),
+            "detail": _route_detail(summary["label"], r2v, flf),
+        }
+
+    async def _probe_of(self, provider_name: str) -> dict[str, Any]:
+        """这条路的服务在不在——「测试连接」那一下。**绝不抛。**
+
+        分岔交给 `registry.provider()`：这里既不知道也不需要知道被探的是 ComfyUI 还是某个
+        REST 地址（硬约束 1）。探测失败本身就是这一栏要显示的内容，所以四要素原样放进
+        `error`，界面照旧能显示 suggestions。
+
+        **它只回答「服务在不在」，不回答「绑没绑上」**：一份图绑给哪个能力是按工程存的，
+        适配器不认识工程（provider 层不 import service 层）。后半句在 `issues` 里，
+        两处各判一遍必然分叉成「这儿说就绪、一按生成说没绑图」。
+        """
+        try:
+            result = await registry.provider(provider_name).probe()
+        except AppError as exc:
+            return {"ok": False, "target": "", "detail": exc.detail, "error": exc.to_dict()}
+        except Exception as exc:  # noqa: BLE001 - 探测失败不该让概览页崩
+            return {"ok": False, "target": "", "detail": str(exc), "error": None}
+        return {
+            "ok": bool(result.get("ok")),
+            "target": str(result.get("target") or ""),
+            "detail": str(result.get("detail") or ""),
+            "error": None,
         }
 
     async def workflow_health(self, pid: str) -> list[dict[str, Any]]:

@@ -23,7 +23,6 @@ from app.core.errors import AppError, ErrorCode
 from app.core.ids import new_id
 from app.core.logging import get_logger
 from app.events.bus import Channel, bus
-from app.generation.comfy.client import comfy, outputs_of
 from app.generation.providers import registry
 from app.generation.providers.base import (
     AudioRequest,
@@ -31,6 +30,7 @@ from app.generation.providers.base import (
     RefAsset,
     TaskState,
     VideoRequest,
+    WorkflowSpec,
 )
 from app.persistence.models import Project, utc_now
 from app.persistence.models_gen import (
@@ -44,14 +44,13 @@ from app.persistence.models_gen import (
 from app.persistence.models_global import GlobalWorkflow
 from app.persistence.models_story import Scene, Shot
 from app.persistence.models_world import Asset
-from app.services import params
+from app.services import params, route
 from app.services.assets import assets, kind_of_suffix
 from app.services.base import as_dict, db_of, dump_json, fetch, fetch_all, load_json, project_of
 from app.services.context import context
 from app.services.frames import frame_key, poster_at, start_frame_index
 from app.services.global_registry import global_registry
 from app.services.images import images
-from app.services.workflows import apply_bindings, parse_graph, workflows
 
 log = get_logger("queue")
 
@@ -175,6 +174,34 @@ def _batch_fields(batch: dict[str, Any] | None) -> dict[str, Any]:
     }
 
 
+def _provider_of(params: dict[str, Any]) -> str:
+    """这个任务当时要走哪条路。**只读入队时冻结的那一份，绝不重新解析。**
+
+    以前这里是写死的 `registry.provider("comfy_preset")`：工程选了「通用 REST API」
+    也照旧提交给 ComfyUI，报出来的还是「ComfyUI 未连接」——选了等于没选，
+    而冻结进版本的参数里写着用户选的那条路（破硬约束 3、4）。
+
+    三级回退，各有各的理由：
+
+      1. `params["route"]["provider"]`——`route.require()` 在入队那一刻解析并冻结的那一份，
+         新任务都走这里。**重试不重新解析**：中途在设置页改了调用方式，「重试」就该重跑
+         同一条路，而不是换个后端跑一遍（版本参数上写的还是旧那条，硬约束 3）。
+      2. `params["generation_mode"]`——这一轮之前入队的老 job / 老版本。那时这一列的值是
+         写死的 `comfy_preset`，但它至少是**当时真的会走的那条**，重试照旧能跑。
+      3. `settings.video_provider`——参数里两个键都没有（更老的 job）。这是最后一层兜底，
+         不是正常路径。
+
+    未知名字不在这里挡：`registry.provider()` 会抛「不认识的视频调用方式」四要素错误，
+    比在这儿静默换成默认那条要诚实得多。
+    """
+    frozen = params.get("route")
+    if isinstance(frozen, dict):
+        chosen = str(frozen.get("provider") or "").strip()
+        if chosen:
+            return chosen
+    return str(params.get("generation_mode") or "").strip() or str(settings.video_provider or "")
+
+
 class GenerationService:
     def __init__(self) -> None:
         self._pumps: dict[str, asyncio.Task[None]] = {}
@@ -209,24 +236,23 @@ class GenerationService:
         prompt = params.prompt_of(shot, scene_of_shot)
         # 直接调用旧接口时保留 prev_shot_id 的续接语义；新的批量编排会显式传
         # image2video，让所有普通 SHOT 先独立生成，再单独创建 FL2VA 衔接任务。
-        capability = kind or ("first_last_frame" if shot.prev_shot_id else "image2video")
-        # 走适配层时不需要工作流：模型端那份图由模型端维护（预设 / 通用 REST 合同）。
-        # 只有旧的 comfy_workflow 兼容路径才必须先解析出一份已校验的工作流。
+        # 判定只有一份实现（`route.capability_of`）——参考素材账单那侧读的是同一个函数，
+        # 两处各写一遍的时候，首尾帧镜头的账单数的是 R2V 预设、提交的却是 FLF 那份图。
+        capability = route.capability_of(shot, kind)
         project = (await fetch_all(db, Project))[0]
-        generation_mode = "comfy_preset"
-        legacy_preset = project.preset_name or settings.video_preset
-        preset_name = (
-            project.flf_preset_name or legacy_preset
-            if capability in {"first_last_frame", "transition", "fl2va"}
-            else project.r2v_preset_name or legacy_preset
+        # **入队那道门槛。** 这个工程这个能力走哪条路、这条路要绑什么、绑没绑上，只有
+        # `services/route.py` 一份口径：缺地址 / 缺预设 / 没绑图在这里就是四要素错误，
+        # 而不是排进队列再由 pump 一条条失败（那时用户看到的只剩「ComfyUI 未连接」这种
+        # 与真正原因差一层的话）。解析出来的这一份下面会整个冻结进 `params["route"]`。
+        chosen = await route.require(
+            pid, capability, project=project, workflow_id=workflow_id or shot.workflow_id
         )
-        # 保留旧设置的明确错误提示；正常项目生成始终走项目选择的预设。
-        if registry.is_legacy():
-            await workflows.resolve(pid, capability, workflow_id or shot.workflow_id)
-        use_prev_frame = capability in {"first_last_frame", "transition", "fl2va"}
+        use_prev_frame = capability in route.FLF_CAPABILITIES
         if check_context:
             await context.require_complete(pid, shot_id, include_prev=use_prev_frame)
-        snapshot = await context.snapshot(pid, shot_id, include_prev=use_prev_frame)
+        snapshot = await context.snapshot(
+            pid, shot_id, include_prev=use_prev_frame, capability=capability
+        )
         # 参考图比模型端那份图能收的多时先问一句。**不是失败**：确认（allow_ref_drop）后
         # 照旧生成，只是按槽位顺序喂前几张。悄悄少喂两张图，事后没人查得出形象为什么跑偏。
         if not allow_ref_drop:
@@ -235,7 +261,7 @@ class GenerationService:
                 raise over_capacity_error([over])
 
         depends_on, wait_reason = None, None
-        if shot.prev_shot_id and capability in {"first_last_frame", "transition", "fl2va"}:
+        if shot.prev_shot_id and capability in route.FLF_CAPABILITIES:
             prev = await fetch(db, Shot, shot.prev_shot_id, "上游镜头")
             if wait_for_job_id:
                 # 单线程续接等待的是本次编排中的上一条任务，而不是旧的当前版本。
@@ -260,7 +286,9 @@ class GenerationService:
             priority=priority,
             depends_on=depends_on,
             wait_reason=wait_reason,
-            workflow_id=None,
+            #: 绑定那条路才有值（那份图的 id）。**执行时的装配条件是「这个任务有绑定的图」**，
+            #: 不是「这条路叫什么名字」——硬约束 1 不许业务层认路。
+            workflow_id=chosen.workflow_id,
             params_json=dump_json(
                 {
                     "prompt": prompt,
@@ -273,8 +301,13 @@ class GenerationService:
                     "last_frame_asset_id": last_frame_asset_id,
                     "wait_for_job_id": wait_for_job_id,
                     "extra": extra or {},
-                    "generation_mode": generation_mode,
-                    "preset": preset_name,
+                    #: 兼容旧读法（老 job / 老版本参数里就这一个键）。值第一次是真的：
+                    #: 以前这里恒等于 `comfy_preset`，用户在界面上选的那条根本没被读过。
+                    "generation_mode": chosen.provider,
+                    "preset": chosen.preset,
+                    #: **冻结的那一份路由**（硬约束 3）：重试只读它，绝不重新解析——否则中途
+                    #: 改了设置会让「重试」变成「换个后端跑一遍」，而版本上写的还是旧那条。
+                    "route": chosen.frozen(),
                     #: 「这个镜头的画面素材是哪一段」。长视频切段的镜头才有值。
                     "source_version_id": segment_version_id,
                 }
@@ -898,8 +931,13 @@ class GenerationService:
           · 出声音（`AUDIO_KINDS`）——音源那条链，产出 `kind="audio"` 的版本，画面不重跑；
           · 二次处理（`REFINE_KINDS`）——输入是已经出好的那一版，产出同一个镜头上的新版本
             并记下 `parent_version_id`；
-          · 出画面（默认）——走生成适配层（`app/generation/providers/*`）；
-          · 旧的节点绑定路径——只在「这个任务确实绑了工作流」时才走，是兼容选项不是主路。
+          · 出画面（默认）——走生成适配层（`app/generation/providers/*`）。
+
+        **出画面只有一支了。** 以前这里多一支 `elif job.workflow_id: _run_legacy`：工作流
+        绑定那条路长在 service 层里，靠那一列非空来触发——而它从来没被写过值，于是整支是
+        死代码（界面上选了「ComfyUI 工作流绑定」等于什么都没选）。那条路现在是
+        `providers/comfy_workflow.py`，与另外两条一样由 `registry.provider()` 挑出来，
+        业务层不再认识它（硬约束 1）。
 
         产物登记与 `add_version` 四条路完全共用。
         """
@@ -913,8 +951,6 @@ class GenerationService:
             filename, data, workflow_id = await self._run_refine(pid, job, params)
             parent_version_id = str(params.get("source_version_id") or "") or None
             source = "refined"
-        elif job.workflow_id:
-            filename, data, workflow_id = await self._run_legacy(pid, job, params)
         else:
             filename, data, workflow_id = await self._run_provider(pid, job, params)
         kind = (
@@ -938,8 +974,13 @@ class GenerationService:
     async def _run_provider(
         self, pid: str, job: Job, params: dict[str, Any]
     ) -> tuple[str, bytes, str | None]:
-        """默认路径：把请求交给适配器，轮询到出片。service 层不认识任何具体模型。"""
-        provider = registry.provider("comfy_preset")
+        """默认路径：把请求交给适配器，轮询到出片。service 层不认识任何具体模型。
+
+        **走哪条路只读入队时冻结的那一份**（`_provider_of`），不重新解析（硬约束 3）：
+        中途在设置页改了调用方式，「重试」就不该变成「换个后端跑一遍」。
+        """
+        provider = registry.provider(_provider_of(params))
+        spec = await self._workflow_spec_of(job, params)
         first, last, refs = await self._images_of(pid, job, params)
         source_video, version = await self._source_video_of(pid, params, shot_id=job.shot_id)
         if source_video is not None and not any(r.media == "video" for r in refs):
@@ -981,6 +1022,7 @@ class GenerationService:
                 params.get("duration") or (version.duration if version else None) or 4.0
             ),
             seed=params.get("seed"),
+            workflow=spec,
             extra={**(params.get("extra") or {}), "preset": params.get("preset")},
         )
         task_id = await provider.submit(req, client_id=f"aivs-{pid}")
@@ -1003,7 +1045,29 @@ class GenerationService:
         if req.notes:
             params["ref_notes"] = list(req.notes)
         filename, data = await self._await_task(pid, job, provider, task_id)
-        return filename, data, None
+        return filename, data, spec.id if spec is not None else None
+
+    async def _workflow_spec_of(self, job: Job, params: dict[str, Any]) -> WorkflowSpec | None:
+        """这个任务绑了哪份图（绑了才取）。**装配条件是事实而不是名字**（硬约束 1）。
+
+        判的是「`job.workflow_id` 非空」而不是「`if provider == "comfy_workflow"`」：不吃这个
+        字段的适配器忽略它就行，业务层从此不认识哪条路要绑图。id 是入队时解析并冻结的
+        （`route.require()` → `Route.workflow_id`），所以这里只按 id 取一次，
+        **不重新解析绑定**——中途改了绑定表不该让「重试」换一份图。
+
+        图与绑定表刻意**不进 `params_json`**（`WorkflowSpec` 那段注释说的就是这件事）：
+        一份 api_json 动辄几十 KB，每个版本存一份会把工程库撑起来。冻结的是 id。
+        """
+        wid = str(job.workflow_id or (params.get("route") or {}).get("workflow_id") or "")
+        if not wid:
+            return None
+        row = await fetch(await global_registry.start(), GlobalWorkflow, wid, "工作流")
+        return WorkflowSpec(
+            id=row.id,
+            name=row.name,
+            api_json=row.api_json,
+            bindings=load_json(row.bindings_json, {}),
+        )
 
     async def _await_task(
         self, pid: str, job: Job, provider: Any, task_id: str
@@ -1161,8 +1225,12 @@ class GenerationService:
         输入是 `source_version_id` 那一版的文件，填进预设的 `AIVS_SOURCE_VIDEO`
         （与参考视频严格分开，见 `providers/presets.py`）。产出仍然是同一个镜头上的一个新版本，
         于是「只增不改」「随时回退到未处理那一版」「采用入口只有一个」全都一行不用改。
+
+        走哪条路同样只读冻结的那一份：REST 那条路上二次处理是合同里的 `source_video`
+        （`providers/http_api.py`），预设那条路上是 `AIVS_SOURCE_VIDEO` 那个入口——
+        service 层两条都不认识。
         """
-        provider = registry.provider("comfy_preset")
+        provider = registry.provider(_provider_of(params))
         source, version = await self._source_video_of(
             pid, params, shot_id=job.shot_id, fallback_current=True
         )
@@ -1364,104 +1432,6 @@ class GenerationService:
                 "在等待生成结果时被取消。",
                 ["需要的话重新入队"],
             )
-
-    async def _run_legacy(
-        self, pid: str, job: Job, params: dict[str, Any]
-    ) -> tuple[str, bytes, str | None]:
-        """Workflow API 路径：上传输入图片，再按 AIVS_* 标题写入图。
-
-        **这条兼容路径只认图片**：旧的绑定表里只有 `reference_image_slots`，
-        没有任何地方能接一段参考视频 / 音频。所以非图片的参考素材在这里被跳过，
-        并把跳过了哪几条记进 `params.ref_notes`——静默丢掉的话，事后没人查得出
-        「我挂的那段对白音频到底送没送出去」。要喂视频 / 音频请走预设适配层。
-        """
-        workflow = await fetch(
-            await global_registry.start(), GlobalWorkflow, job.workflow_id or "", "工作流"
-        )
-        graph = parse_graph(workflow.api_json)
-        raw_bindings: dict[str, Any] = load_json(workflow.bindings_json, {})
-        bindings = {
-            key: str(value)
-            for key, value in raw_bindings.items()
-            if key != "reference_image_slots" and isinstance(value, str) and "." in value
-        }
-        first, last, all_refs = await self._images_of(pid, job, params)
-        refs = [r for r in all_refs if r.media == "image"]
-        notes = [
-            f"旧的 Workflow 绑定路径只能喂图片，{r.media_label}「{r.label or r.path.name}」"
-            "没有送出去（要喂它请改用预设适配层）。"
-            for r in all_refs
-            if r.media != "image"
-        ]
-
-        async def upload(path: Path | None) -> str | None:
-            if path is None:
-                return None
-            data = await asyncio.to_thread(path.read_bytes)
-            return await comfy.upload_input(path.name, data)
-
-        first_name = await upload(first)
-        last_name = await upload(last)
-        ref_names = [name for name in [await upload(ref.path) for ref in refs] if name]
-        values = {
-            "prompt": params.get("prompt"),
-            "negative_prompt": params.get("negative_prompt"),
-            "seed": params.get("seed"),
-            "steps": params.get("steps"),
-            "duration": params.get("duration"),
-            "first_frame": first_name,
-            "last_frame": last_name,
-            "source_image": first_name or (ref_names[0] if ref_names else None),
-            "reference_image": ref_names[0] if ref_names else first_name,
-        }
-        ref_slots = raw_bindings.get("reference_image_slots")
-        if isinstance(ref_slots, list):
-            for index, target in enumerate(ref_slots):
-                if index >= len(ref_names) or not isinstance(target, str) or "." not in target:
-                    continue
-                values[f"__ref_{index}"] = ref_names[index]
-                bindings[f"__ref_{index}"] = target
-            if len(ref_names) > len(ref_slots):
-                notes.append(
-                    f"Workflow 只有 {len(ref_slots)} 个 AIVS_REF_* 槽位，"
-                    f"已省略 {len(ref_names) - len(ref_slots)} 张参考图。"
-                )
-        if notes:
-            params["ref_notes"] = notes
-        graph = apply_bindings(graph, bindings, values)
-        prompt_id = await comfy.submit(graph, client_id=f"aivs-{pid}")
-
-        history: dict[str, Any] = {}
-        tick = 0
-        while True:
-            self._require_not_cancelled(job.id)
-            history = await comfy.history(prompt_id)
-            if history:
-                break
-            if tick % 5 == 0:
-                bus.emit(
-                    Channel.JOB,
-                    "job.progress",
-                    {"id": job.id, "progress": min(0.95, tick / 120)},
-                    project_id=pid,
-                )
-            await asyncio.sleep(POLL_INTERVAL)
-            tick += 1
-        files = outputs_of(history)
-        if not files:
-            raise AppError(
-                ErrorCode.WORKFLOW_ERROR,
-                "ComfyUI 没有产出任何文件",
-                f"prompt_id={prompt_id}，history 里没有 images / videos 输出。",
-                [
-                    "确认工作流末端有 SaveImage / VHS 之类的保存节点",
-                    "在 ComfyUI 界面里手动跑一次同一份工作流确认能出图",
-                ],
-                {"raw": str(history)[:2000]},
-            )
-        chosen = files[-1]
-        data = await comfy.download(chosen["filename"], chosen["subfolder"], chosen["type"])
-        return chosen["filename"], data, workflow.id
 
     # --- 版本（只增不改） ---
 

@@ -123,6 +123,22 @@ async def get_project_preset(pid: str) -> dict[str, Any]:
     }
 
 
+@router.get("/projects/{pid}/route")
+async def get_project_route(pid: str) -> dict[str, Any]:
+    """这个工程怎么出片：走哪条路、这条路要绑什么、绑没绑上、缺什么。
+
+    **一个请求画完概览页那一块**，照 `GET /preset` 一次回 r2v + flf 的作风：两条能力
+    （普通镜头 / 衔接与转场）各自一份，每份带参考素材槽位与 `issues`（四要素形状，
+    前端原样显示 suggestions）。调用方式的候选也在里面（`options`，第一项是「跟随设置页」），
+    所以**前端一个调用方式的名字都不写死**。
+
+    只读、绝不抛：缺地址 / 缺预设 / 没绑图都在 `issues` 里——用户正是来这儿看哪里不对的。
+    """
+    from app.services import route
+
+    return await route.summary(pid)
+
+
 @router.put("/projects/{pid}/preset")
 async def set_project_preset(pid: str, payload: dict[str, str | None]) -> dict[str, Any]:
     listing = presets.listing()
@@ -205,7 +221,10 @@ async def set_project_preset(pid: str, payload: dict[str, str | None]) -> dict[s
 
         # 旧字段继续镜像 R2V，供旧版本应用打开工程时使用。
         row.preset_name = row.r2v_preset_name
-        row.generation_mode = "comfy_preset"
+        # **改预设不许改路。** 这里以前无条件写 `row.generation_mode = "comfy_preset"`：
+        # 在 Workflow 页选好「ComfyUI 工作流绑定」或「通用 REST API」，回概览页改一下预设
+        # 就被悄悄改回预设那条路，而界面上那个下拉还显示着用户选的。调用方式只有
+        # `PUT /projects/{pid}/workflow-bindings` 那一个写入口（过 `route.normalize()`）。
         row.updated_at = utc_now()
     return await get_project_preset(pid)
 

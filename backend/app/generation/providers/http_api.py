@@ -4,8 +4,12 @@
 只要满足下面三个端点就能当视频生成后端，本工具不需要认识它内部长什么样。
 
     POST {base}/submit
-      body {mode, prompt, negative, duration, seed, extra, first_frame, last_frame, refs}
+      body {mode, prompt, negative, duration, seed, extra, first_frame, last_frame,
+            source_video, refs}
       —— 两个 frame 是 base64 的**图片**（图在我们这边，不能指望对方能读我们的磁盘）
+      —— source_video 是**二次处理的输入**（`mode="refine"`）：就处理这一段。它与
+         refs 里 media=video 的那些**不是一回事**——那些是「动作长这样」的参考，
+         这一条是「把它再过一遍」。混用的话超分出来的东西跟这个镜头无关
       —— refs 是**首尾帧之外的参考素材**，按优先级排好的数组，每项
          {data: base64, name, label, kind, media, desc}：label 是「它是谁」（角色表 / 地点参考），
          desc 是「它长什么样」（`Asset.description`，没写就是空串），
@@ -44,7 +48,26 @@ CONTRACT = [
     "POST {base}/submit → {task_id}",
     "GET {base}/tasks/{task_id} → {status, progress, output_url, error}",
     "GET {base}/health → 2xx",
+    "二次处理（mode=refine）另收一个 source_video：base64 的那一段视频",
 ]
+
+
+def missing_base_error() -> AppError:
+    """「还没有配置视频生成服务地址」——**这句话只有一份**。
+
+    `_require_base()`（真要出网那一刻）与 `services/route.py`（入队前那道门槛、概览页那份
+    账单）都用它。两处各写一遍的话，用户在概览页看到的建议和真按下生成时报的会是两句话。
+    """
+    return AppError(
+        ErrorCode.MISSING_CAPABILITY,
+        "还没有配置视频生成服务地址",
+        "http_api 方式需要一个实现了本工具合同的服务地址。",
+        [
+            "在设置页的「视频生成 API」里填写地址",
+            "或把调用方式改回 comfy_preset（默认，直接连 ComfyUI）",
+            *(f"服务端需要实现：{line}" for line in CONTRACT),
+        ],
+    )
 
 
 class HttpApiProvider:
@@ -68,16 +91,7 @@ class HttpApiProvider:
     def _require_base(self) -> str:
         base = self.base_url
         if not base:
-            raise AppError(
-                ErrorCode.MISSING_CAPABILITY,
-                "还没有配置视频生成服务地址",
-                "http_api 方式需要一个实现了本工具合同的服务地址。",
-                [
-                    "在设置页的「视频生成 API」里填写地址",
-                    "或把调用方式改回 comfy_preset（默认，直接连 ComfyUI）",
-                    *(f"服务端需要实现：{line}" for line in CONTRACT),
-                ],
-            )
+            raise missing_base_error()
         return base
 
     def _offline(self, exc: Exception) -> AppError:
@@ -147,7 +161,15 @@ class HttpApiProvider:
             "client_id": client_id,
             "extra": req.extra,
         }
-        for key, path in (("first_frame", req.first_frame), ("last_frame", req.last_frame)):
+        # 首帧 / 末帧 / **二次处理的源视频**都是「文件在我们这边」，一律 base64 带过去。
+        # `source_video` 与 `refs` 里 media=video 的那些严格分开：那些是参考，这一条是
+        # 「就处理这一段」。合同里少这一项的话，REST 路上的超分会变成「凭提示词重出一段」，
+        # 而版本轨上写着「从 v1 超分而来」——血缘就是假的了。
+        for key, path in (
+            ("first_frame", req.first_frame),
+            ("last_frame", req.last_frame),
+            ("source_video", req.source_video),
+        ):
             if path is None:
                 continue
             body[key] = _encode(path)

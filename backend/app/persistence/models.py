@@ -41,8 +41,13 @@ class Project(Base):
     default_image_workflow_id: Mapped[str | None] = mapped_column(String(40))
     default_first_last_workflow_id: Mapped[str | None] = mapped_column(String(40))
     default_upscale_workflow_id: Mapped[str | None] = mapped_column(String(40))
-    #: 项目级生成方式：工作流资源在应用层维护，项目只选择采用哪条调用路径。
-    generation_mode: Mapped[str] = mapped_column(String(20), nullable=False, default="comfy_preset")
+    #: **这个工程走哪条路出片**（`comfy_preset` / `http_api` / `comfy_workflow`）。
+    #: **空串 = 跟随设置页**（应用级 `video.provider`），不是「没配置」——一个工程走 REST、
+    #: 另一个走预设是常态，而绝大多数工程根本不需要单独指定。解析口径只有一份：
+    #: `services/route.py::resolve()`，它同时回一个 `source`（project / settings / default）。
+    #: 历史上这一列写死成 `comfy_preset` 且**从来没有被读过**（生成时是硬编码的），
+    #: `0022_project_route` 把等于默认值的老行清成空串——那些不是用户的选择。
+    generation_mode: Mapped[str | None] = mapped_column(String(20), default="")
     #: 项目唯一生成预设；预设由应用级管理，项目只选择其中一份。
     preset_name: Mapped[str | None] = mapped_column(String(100))
     #: 普通 Shot 的 R2V 预设；为空时回退到旧的 preset_name。

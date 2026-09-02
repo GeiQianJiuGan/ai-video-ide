@@ -33,9 +33,8 @@ from pathlib import Path
 from typing import Any
 
 from app.core.errors import AppError, ErrorCode
-from app.generation.providers import presets
 from app.generation.providers.base import MEDIA, MEDIA_LABEL, RefCapacity
-from app.persistence.models import Project, utc_now
+from app.persistence.models import utc_now
 from app.persistence.models_cast import Appearance, Character, SheetVersion
 from app.persistence.models_gen import GenerationVersion
 from app.persistence.models_story import Scene, SceneCast, SceneLocation, Shot, ShotCast, ShotProp
@@ -132,26 +131,26 @@ def ref_capacity(capacity: RefCapacity | None = None) -> RefCapacity:
     return registry.ref_capacity()
 
 
-async def project_ref_capacity(pid: str) -> RefCapacity | None:
-    """工程选的那份预设是这个工程唯一的参考素材容量来源。
+async def project_ref_capacity(pid: str, capability: str | None = None) -> RefCapacity | None:
+    """这个工程这个能力一次能喂几个参考素材。**按真正会提交的那条路数。**
 
-    三种媒体各数一遍（`presets.slot_counts`）：图片槽位是 `AIVS_REF_*`，视频是
-    `AIVS_REF_VIDEO_*`，音频是 `AIVS_REF_AUDIO_*`。视频 / 音频 0 槽是常态
-    （大多数图只收图），所以只在 detail 里附一句，不当成异常。
+    以前这里只会数「工程选的那份 R2V 预设」（`r2v_preset_name` → `preset_name`），于是三种
+    情况全是错的：首尾帧镜头数的是一份**不会被提交**的图（该数 `flf_preset_name`）、
+    走通用 REST API 的工程被硬算成某份预设的槽位（那条路根本没有槽位这回事）、走工作流
+    绑定的工程数出来的数字与它绑的那份图上真正的槽位毫无关系。账单上那句「超出会丢几个」
+    于是也是假的。
+
+    现在整件事只有一份口径（`services/route.py::capacity()`）：它先把「走哪条路、这条路
+    绑了什么」解析出来，再按解析出的**事实**数槽位（预设那份图 / 绑定表里的参考图槽位 /
+    REST 合同的不限量）。这里只负责把 `capability` 传下去。
+
+    `capability` 为空 = 调用方没说这次要走哪种能力（只读界面按普通镜头看）：这时按
+    `image2video` 算。**绝不抛**（`route.capacity()` 那条同样的约定）：账单是只读路径，
+    在那里因为没配地址就 500，用户连缺什么都看不到。
     """
-    project = (await fetch_all(db_of(pid), Project))[0]
-    name = project.r2v_preset_name or project.preset_name
-    if not name:
-        return None
-    counts = presets.slot_counts(name)
-    if counts is None:
-        return None
-    # 列出所有媒体类型的槽位情况
-    parts = [f"参考图 {counts['image']} 个"]
-    for media in ("video", "audio"):
-        parts.append(f"{presets.MEDIA_LABEL[media]} {counts[media]} 个")
-    detail = f"当前预设 {name} 支持：{' / '.join(parts)}。"
-    return RefCapacity(counts["image"], name, detail, video=counts["video"], audio=counts["audio"])
+    from app.services import route  # 延迟导入：route 在模块级 import 了 workflows，会绕回来
+
+    return await route.capacity(pid, capability or "image2video")
 
 
 def _assign_roles(items: list[dict[str, Any]], has_prev: bool) -> None:
@@ -275,7 +274,14 @@ class ContextService:
         *,
         capacity_override: RefCapacity | None = None,
         include_prev: bool = True,
+        capability: str | None = None,
     ) -> dict[str, Any]:
+        """这一次到底会喂什么给模型——那份账单。
+
+        `capability` 是「这次按哪种能力算槽位」：不给就按这个镜头自己的形态判
+        （`route.capability_of`，与入队侧同一个算法）。给了的场合是调用方比镜头更清楚
+        （补转场、编排里那条链），此时账单与真正提交的那份图必须是同一份。
+        """
         db = db_of(pid)
         shot = await fetch(db, Shot, shot_id, "镜头")
         scene = await fetch(db, Scene, shot.scene_id, "场景")
@@ -574,7 +580,13 @@ class ContextService:
             item["missing_file"] = bool(item["asset_id"]) and asset is None
             item.pop("eligible", None)
         _assign_roles(items, bool(include_prev and shot.prev_shot_id))
-        selected_capacity = capacity_override or await project_ref_capacity(pid)
+        # **数哪一份槽位，跟着真正会提交的那条路走**（`route.capability_of` 与入队侧同一个
+        # 算法）：首尾帧镜头数 FLF 那份图、普通镜头数 R2V 那份、REST 那条路不限量。
+        from app.services import route  # 延迟导入：route 在模块级 import 了 workflows
+
+        selected_capacity = capacity_override or await project_ref_capacity(
+            pid, capability or route.capability_of(shot)
+        )
         capacity = _capacity_of(items, ref_capacity(selected_capacity))
 
         problems = []
@@ -704,10 +716,17 @@ class ContextService:
         return await self.resolve(pid, shot_id)
 
     async def snapshot(
-        self, pid: str, shot_id: str, *, include_prev: bool = True
+        self, pid: str, shot_id: str, *, include_prev: bool = True, capability: str | None = None
     ) -> dict[str, Any]:
-        """冻结进 GenerationVersion.context_json 的那份账单。"""
-        ctx = await self.resolve(pid, shot_id, include_prev=include_prev)
+        """冻结进 GenerationVersion.context_json 的那份账单。
+
+        `capability` 由入队侧传下来（`route.capability_of(shot, kind)`），于是**冻结的这份
+        账单数的是真正会提交的那份图上的槽位**——两边各判一次的时候，首尾帧镜头的账单数的是
+        R2V 预设、提交的却是 FLF 那份，事后翻版本参数会看到两个对不上的数字。
+        """
+        ctx = await self.resolve(
+            pid, shot_id, include_prev=include_prev, capability=capability
+        )
         return {
             "resolved_at": ctx["resolved_at"],
             #: 当时模型端能收几张、这次算出要丢几张。冻结它，事后才说得清

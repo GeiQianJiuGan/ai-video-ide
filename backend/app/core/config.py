@@ -33,7 +33,7 @@ class Settings(BaseSettings):
 
     app_name: str = "AI Video Studio"
     version: str = "0.1.0"
-    schema_version: int = 21
+    schema_version: int = 22
 
     # --- 网络：只监听回环，绝不对外暴露工程数据 ---
     host: str = "127.0.0.1"
@@ -68,7 +68,9 @@ class Settings(BaseSettings):
     # --- 视频生成：本工具不维护模型端的图，只按约定调它 ---
     # comfy_preset  模型端保存好工作流，我们按节点 title 约定注入入口参数（默认，核心路径）
     # http_api      通用 REST 合同（提交 / 轮询 / 下载），模型端按 docs 实现
-    # comfy_workflow 旧的节点绑定路径，降级为兼容选项
+    # comfy_workflow 按用户自己那份图 + 绑定表填参数（`services/workflows.py` 那套）
+    # **这是「跟随设置页」时用的那条路**：工程可以显式选另一条
+    # （`project.generation_mode`，空 = 跟随这里），解析口径只有 `services/route.py`。
     video_provider: str = "comfy_preset"
     video_base_url: str = ""  # 留空时 comfy_preset 用 comfy_base_url
     video_api_key: str = ""

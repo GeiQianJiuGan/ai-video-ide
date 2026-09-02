@@ -144,6 +144,24 @@ class RefCapacity:
         return max(0, count - limit)
 
 
+@dataclass(frozen=True)
+class WorkflowSpec:
+    """用户自己那份 ComfyUI 图 + 绑定表（工作流绑定那条路专用）。
+
+    **刻意不塞进 `extra`**：`extra` 会被 service 层原样冻结进 `params_json`，一份 api_json
+    动辄几十 KB，每个版本存一遍会把工程库撑起来。这里只在提交那一刻传给适配器，
+    冻结进版本参数的是 `workflow_id`（哪一份图），需要复现时按 id 取。
+
+    适配器**不认识**图里的 lora 与加速节点：`bindings` 说「哪个节点的哪个字段收首帧」，
+    其余一律原样提交（硬约束 1）。
+    """
+
+    id: str
+    name: str
+    api_json: str
+    bindings: dict[str, Any] = field(default_factory=dict)
+
+
 @dataclass(slots=True)
 class VideoRequest:
     """一次生成请求。`extra` 原样透传给模型端，本工具不解释里面的东西。"""
@@ -163,6 +181,9 @@ class VideoRequest:
     #: 严格分开——源视频是「就处理这一段」，参考视频是「动作长这样」。混用的话超分图会把
     #: 一段参考视频当成待处理画面，出来的东西跟这个镜头无关，而界面上会显示「已生成」。
     source_video: Path | None = None
+    #: 工作流绑定那条路要提交的那份图（其余适配器忽略它）。装配条件是「这个任务绑了图」，
+    #: 不是「`if provider == ...`」——业务层不许认路（硬约束 1）。
+    workflow: WorkflowSpec | None = None
     extra: dict[str, Any] = field(default_factory=dict)
     #: 适配器提交时写下的降级说明，例如「这份图只有 3 个参考图槽位，账单里第 4 张没喂进去」。
     #: service 层原样冻结进版本，不解释内容——「绝不静默失败」在这里的样子是

@@ -62,6 +62,7 @@ from app.persistence.models_world import (
     Prop,
     PropReference,
 )
+from app.services import route
 from app.services.assets import TRANSIENT_KINDS, assets
 from app.services.base import db_of, fetch, fetch_all, load_json, project_of
 from app.services.cast import CHARACTER_FIELDS, cast
@@ -423,7 +424,10 @@ async def _env_of(pid: str) -> dict[str, Any]:
     return {
         "video_provider": settings.video_provider,
         "audio_provider": settings.audio_provider,
-        "generation_mode": row.generation_mode,
+        #: 这个工程显式选的调用方式（空 = 跟随目标机器的设置页）。**先归一**：老库里写的是
+        #: `workflow_api`，导进新机器后要能和 registry 认的那个名字对上，否则清单上那一行
+        #: 说的路在目标机器上根本不存在。
+        "generation_mode": route._safe_normalize(row.generation_mode),
         "presets": items,
         "needs_ffmpeg": True,
         # 手动路径能走完整流程（硬约束 2），所以包永远不「要求」LLM。

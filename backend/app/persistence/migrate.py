@@ -65,6 +65,7 @@ REVISION_SCHEMA: dict[str, int] = {
     "0019_job_batch": 19,
     "0020_image_jobs": 20,
     "0021_asset_description": 21,
+    "0022_project_route": 22,
 }
 
 

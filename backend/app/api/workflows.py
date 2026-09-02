@@ -31,8 +31,16 @@ class BindBody(BaseModel):
 
 
 class ProjectBindingsBody(BaseModel):
-    generation_mode: Literal["comfy_preset", "http_api", "workflow_api"] = Field(
-        default="comfy_preset", description="comfy_preset / http_api / workflow_api"
+    #: **空串 = 跟随设置页**（`route.INHERIT`），也是默认值——绝大多数工程是这一种，
+    #: 以前默认写死 `comfy_preset` 等于替用户在这里选了一次「就走预设」。
+    #: `workflow_api` 是老客户端的别名，收下来由 `route.normalize()` 归一成
+    #: `comfy_workflow`（`GET` 读出来就是归一后的名字）。
+    generation_mode: Literal["", "comfy_preset", "http_api", "comfy_workflow", "workflow_api"] = (
+        Field(
+            default="",
+            description="留空 = 跟随设置页；comfy_preset / http_api / comfy_workflow"
+            "（workflow_api 是它的老名字）",
+        )
     )
     text2image: str | None = None
     image2video: str | None = None

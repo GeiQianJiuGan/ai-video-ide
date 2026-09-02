@@ -19,68 +19,34 @@
 from __future__ import annotations
 
 import copy
-from pathlib import Path
 from typing import Any
 
 from app.core.config import settings
 from app.core.errors import AppError, ErrorCode
 from app.core.logging import get_logger
-from app.generation.comfy.client import ComfyClient, comfy, outputs_of
 from app.generation.providers import base, presets
-from app.generation.providers.base import TaskState, VideoRequest
+from app.generation.providers.base import VideoRequest
+from app.generation.providers.comfy_base import ComfyTasks
 
 log = get_logger("provider.comfy_preset")
 
 
-class ComfyPresetProvider:
-    name = "comfy_preset"
+class ComfyPresetProvider(ComfyTasks):
+    """按 `AIVS_*` 标题填参数。上传 / 轮询 / 取回那半条链在 `ComfyTasks` 里。"""
 
-    def __init__(self, client: ComfyClient | None = None) -> None:
-        self._client = client or comfy
-        #: prompt_id → 提交时选的预设名，只为报错时能说清「哪一份图没出片」。
-        self._used: dict[str, str] = {}
+    name = "comfy_preset"
 
     # --- 探测 ---
 
     def ref_capacity(self) -> base.RefCapacity:
         """能收几个参考素材 = 默认预设里标了几个 `AIVS_REF_*` / `_VIDEO_` / `_AUDIO_`。
 
-        看的是**设置里的默认预设**：问这句话的时机（算账单、给警告）都在入队之前，
-        那时还没有任务、也就没有 `extra["preset"]`。某个任务临时换了预设时，真正喂了
-        几个仍然由 `_refs` 如实写进 `params.ref_notes`——账单说的是「按当前设置会怎样」。
-
-        三种媒体各回一个数：一份图标了 3 张图片槽 + 1 段音频槽是常见的事，
-        折成一个数字的话账单只能说「还能再喂 1 个」，而用户塞进去的那一个大概是图。
+        看的是**设置里的默认预设**，也就是「按当前应用级设置会怎样」这一问的答案。
+        **工程 + 能力**那一问（这个工程的首尾帧镜头到底数哪一份预设）由
+        `services/route.py::capacity()` 回答：它先把路由与预设解析出来，再拿解析后的那个
+        名字问 `presets.capacity_of()`——也就是下面这同一段话，两处不各写一遍。
         """
-        name = str(settings.video_preset or "")
-        counts = presets.slot_counts(name)
-        if counts is None:
-            return base.RefCapacity(
-                None,
-                name,
-                (
-                    f"读不到预设 {name}（文件不在或填不进去），这里先不限数量；"
-                    "真正生成时会先报出这份图的问题。"
-                    if name
-                    else "还没有选默认预设，这里先不限数量；真正生成时会报「还没有选生成预设」。"
-                ),
-            )
-        image, video, audio = counts["image"], counts["video"], counts["audio"]
-        extra = "、".join(
-            f"{presets.MEDIA_LABEL[media]} {n} 个"
-            for media, n in (("video", video), ("audio", audio))
-            if n
-        )
-        if image == 0:
-            detail = (
-                f"预设 {name} 里一个 AIVS_REF_* 都没标——角色图 / 场景图全都喂不进去，"
-                "人物形象只能靠首帧带。"
-            )
-        else:
-            detail = f"预设 {name} 标了 {image} 个 AIVS_REF_* 槽位，一次最多喂 {image} 张参考图。"
-        if extra:
-            detail += f"另外还能收 {extra}。"
-        return base.RefCapacity(image, name, detail, video=video, audio=audio)
+        return presets.capacity_of(str(settings.video_preset or ""))
 
     async def probe(self) -> dict[str, Any]:
         ping = await self._client.ping()
@@ -276,67 +242,3 @@ class ComfyPresetProvider:
             values["AIVS_PROMPT"] = f"{req.prompt}\n{hint}".strip()
             req.notes.append(f"已把参考素材对应关系写进 prompt：{hint}")
         return values
-
-    async def _upload(self, path: Path) -> str:
-        if not path.is_file():  # noqa: ASYNC240 - 本地文件检查，开销可忽略
-            raise AppError(
-                ErrorCode.MISSING_ASSET,
-                "参考素材不在磁盘上",
-                f"{path} 找不到。",
-                ["确认该资产文件还在工程目录里", "或重新挑一个参考素材"],
-                {"path": path.as_posix()},
-            )
-        # 参考素材是本地文件，读它不值得再包一层线程（大段视频也就是一次同步读）
-        return await self._client.upload_input(path.name, path.read_bytes(), subfolder="")  # noqa: ASYNC240
-
-    async def poll(self, task_id: str) -> TaskState:
-        history = await self._client.history(task_id)
-        if not history:
-            return TaskState("running", 0.0, "ComfyUI 正在跑")
-        status = ((history.get("status") or {}) if isinstance(history, dict) else {}) or {}
-        if str(status.get("status_str") or "") == "error":
-            return TaskState("failed", 1.0, _error_detail(status), raw=history)
-        if not outputs_of(history):
-            if str(status.get("status_str") or "").lower() not in {
-                "success",
-                "completed",
-                "complete",
-            }:
-                return TaskState("running", 0.0, "ComfyUI 正在跑", raw=history)
-            return TaskState(
-                "failed",
-                1.0,
-                "跑完了但没有任何产物——图的末端可能没有保存节点。",
-                raw=history,
-            )
-        return TaskState("done", 1.0, "已出片", raw=history)
-
-    async def fetch(self, task_id: str) -> tuple[str, bytes]:
-        history = await self._client.history(task_id)
-        files = outputs_of(history)
-        if not files:
-            raise AppError(
-                ErrorCode.WORKFLOW_ERROR,
-                "ComfyUI 没有产出任何文件",
-                f"prompt_id={task_id}，预设={self._used.get(task_id, '?')}。",
-                [
-                    "确认图的末端有 SaveImage / VHS 之类的保存节点",
-                    "在 ComfyUI 界面里手动跑一次同一份图确认能出片",
-                ],
-                {"raw": str(history)[:2000]},
-            )
-        chosen = files[-1]
-        data = await self._client.download(chosen["filename"], chosen["subfolder"], chosen["type"])
-        return chosen["filename"], data
-
-
-def _error_detail(status: dict[str, Any]) -> str:
-    """把 ComfyUI 的 messages 里那条 execution_error 摘出来，别让人去翻原始 JSON。"""
-    for entry in status.get("messages") or []:
-        if isinstance(entry, list) and len(entry) == 2 and entry[0] == "execution_error":
-            info = entry[1] if isinstance(entry[1], dict) else {}
-            return (
-                f"{info.get('node_type') or '节点'} 执行失败："
-                f"{info.get('exception_message') or '（ComfyUI 没有给原因）'}"
-            )
-    return "ComfyUI 报告任务失败，但没有给出原因。"

@@ -33,6 +33,8 @@ from app.persistence.models_world import Asset
 from app.services.assets import kind_of_suffix
 from app.services.base import as_dict, db_of, fetch, fetch_all
 from app.services.generation import generation
+from app.services.route import Route
+from app.services.route import resolve as resolve_route
 
 #: 二次处理的种类 → 人话。种类本身在 `models_gen.REFINE_KINDS` 里，这里只管文案。
 LABELS = {
@@ -45,6 +47,15 @@ HOW_TO = (
     "在设置页的「二次处理」里选一份标了 AIVS_SOURCE_VIDEO 的预设",
     "那份图里接视频的节点（VHS_LoadVideoPath / LoadVideo）标题要改成 AIVS_SOURCE_VIDEO，"
     "它和 AIVS_REF_VIDEO_n 不是一回事：源视频是「就处理这一段」",
+)
+
+#: 工作流绑定那条路上，二次处理**结构上无处可接**时的出路（`comfy/graph.py::SLOTS` 里
+#: 根本没有「源视频」这个槽位）。硬约束 4：说不了「做不到」就得说清怎么才能做到。
+WAY_OUT_WORKFLOW = (
+    "把这个工程的调用方式改成「ComfyUI 预设」，再在设置页的「二次处理」里选一份标了"
+    " AIVS_SOURCE_VIDEO 的图——二次处理只有这条路能做",
+    "或改成「通用 REST API」：那份合同里本来就有 source_video 这一项",
+    "也可以先把这个镜头重新生成一次（贵，而且出来的一定是另一段画面）",
 )
 
 
@@ -84,6 +95,58 @@ def preset_ready(name: str) -> tuple[bool, str]:
     return True, f"预设 {name} 可以做二次处理。"
 
 
+def _route_bill(r: Route, kind: str, override: str | None) -> dict[str, Any]:
+    """这条路能不能做二次处理、用什么做、不行的话怎么办。
+
+    **按「这条路绑什么」分岔（`Route.binds`），不按调用方式的名字**——硬约束 1 禁的是后者
+    （`if provider == "comfy"`），而「有没有地方接『要处理的这一段』」是前者的事实：
+
+      · 预设那条路（`preset`）——看那份图有没有 `AIVS_SOURCE_VIDEO` 这个入口。判断一字不改，
+        还是 `preset_of()` + `preset_ready()`：二次处理有**自己那一份**预设
+        （`settings.refine_preset`），和出画面用的那一份不是同一个，所以这里刻意不看
+        `r.ready`（那说的是「这个工程出得了画面吗」）；
+      · 通用 REST API（`base_url`）——**没有预设这回事**，要处理的那一段按合同里的
+        `source_video` 整个发过去，所以地址配好了就能做。以前这条路上账单显示的是
+        「还没有选预设」，用户去设置页翻遍了也找不到那个不存在的东西；
+      · ComfyUI 工作流绑定（`workflow`）——**这条路做不了**：绑定表里没有「源视频」这个槽位
+        （`generation/comfy/graph.py::SLOTS`），接不了要处理的那一段画面。在账单里就说清并
+        给出路，而不是让它排进队列再失败。
+    """
+    if r.binds == "preset":
+        chosen = preset_of(kind, override)
+        ok, why = preset_ready(chosen)
+        return {"preset": chosen or None, "ready": ok, "detail": why, "how_to": HOW_TO}
+    if r.binds == "workflow":
+        return {
+            "preset": None,
+            "ready": False,
+            "detail": (
+                f"当前调用方式是「{r.label}」，这条路做不了二次处理：工作流绑定表里没有"
+                "「源视频」这个入口，接不了要处理的那一段画面。"
+            ),
+            "how_to": WAY_OUT_WORKFLOW,
+        }
+    if not r.ready:
+        #: 这条路自己就没配好（REST 上唯一会缺的就是地址）。四要素已经由 `route` 说全了，
+        #: 这里原样转述——两处各写一份必然分叉成「账单说缺地址、一按处理说缺预设」。
+        issue = r.issues[0] if r.issues else None
+        return {
+            "preset": None,
+            "ready": False,
+            "detail": (issue["detail"] if issue else f"「{r.label}」还没有配置好。"),
+            "how_to": tuple(issue["suggestions"]) if issue else (),
+        }
+    return {
+        "preset": None,
+        "ready": True,
+        "detail": (
+            f"当前调用方式是「{r.label}」，这条路不需要预设："
+            "要处理的那一段按合同里的 source_video 整个发过去。"
+        ),
+        "how_to": (),
+    }
+
+
 class RefineService:
     async def plan(
         self,
@@ -107,8 +170,14 @@ class RefineService:
         """
         _require_kind(kind)
         db = db_of(pid)
-        chosen = preset_of(kind, preset)
-        ok, why = preset_ready(chosen)
+        #: **先解析这个工程走哪条路**，再决定「用什么处理」这句话怎么说。以前这里一律去数
+        #: 预设（`preset_of` → `settings.refine_preset` → `settings.video_preset`），于是走
+        #: 「通用 REST API」的工程被拦在「还没有选预设」上——那条路根本没有预设这回事。
+        #: 与出画面那条链同一份口径（`services/route.py`），也同一个 `source`。
+        resolved = await resolve_route(pid, kind)
+        route_bill = _route_bill(resolved, kind, preset)
+        chosen: str | None = route_bill["preset"]
+        ok, why = bool(route_bill["ready"]), str(route_bill["detail"])
         items: list[dict[str, Any]] = []
         skipped: list[dict[str, Any]] = []
         for version_id, shot in await self._targets(pid, version_ids, shot_ids, scene_id, skipped):
@@ -162,12 +231,20 @@ class RefineService:
             "preset": chosen or None,
             "preset_ready": ok,
             "preset_detail": why,
+            #: 走哪条路。**界面照 `binds` 决定要不要显示「处理预设」那一行**——REST 那条路上
+            #: 显示「默认视频预设」是在说一个不存在的东西，前端也不该写死调用方式的名字。
+            "route": {
+                "provider": resolved.provider,
+                "label": resolved.label,
+                "source": resolved.source,
+                "binds": resolved.binds,
+            },
             "items": items,
             "skipped": skipped,
             "total": len(items),
-            #: 图不行时**账单照出**（用户得先看见要处理哪些），只是 `run` 会拒绝。
+            #: 这条路做不了时**账单照出**（用户得先看见要处理哪些），只是 `run` 会拒绝。
             "blocked": not ok,
-            "how_to": list(HOW_TO) if not ok else [],
+            "how_to": list(route_bill["how_to"]) if not ok else [],
         }
 
     async def run(
@@ -195,10 +272,10 @@ class RefineService:
         if bill["blocked"]:
             raise AppError(
                 ErrorCode.INVALID_WORKFLOW,
-                "这份预设不能做二次处理",
+                "这条路做不了二次处理",
                 bill["preset_detail"],
-                [*HOW_TO, "或先把画面重新生成一次（贵，但不需要另一份图）"],
-                {"preset": bill["preset"]},
+                [*bill["how_to"], "或先把画面重新生成一次（贵，但不需要另一份图）"],
+                {"preset": bill["preset"], "provider": bill["route"]["provider"]},
             )
         if not bill["items"]:
             raise AppError(
@@ -212,6 +289,16 @@ class RefineService:
         # 一次批量二次处理也是「一次编排」：队列里合并成一条可展开的任务（只有一条时不建批次）。
         batch_id = new_id("job_batch") if len(bill["items"]) > 1 else None
         label = f"{LABELS.get(kind, kind)} · {len(bill['items'])} 段"
+        #: **冻结走的是哪条路**：执行时只读这一份（`generation._provider_of`），重试不重新解析
+        #: ——中途改了设置不该让「重试」变成「换个后端跑一遍」。这里只冻结路由那几项，
+        #: 「用哪份图」照旧在 `params["preset"]` 里（二次处理有自己那一份，两处各写一个
+        #: 预设名会让半年后翻参数的人看到两个不一样的答案）。
+        route_frozen = {
+            "provider": bill["route"]["provider"],
+            "label": bill["route"]["label"],
+            "source": bill["route"]["source"],
+            "capability": kind,
+        }
         for i, item in enumerate(bill["items"]):
             job = await generation.enqueue_task(
                 pid,
@@ -224,6 +311,8 @@ class RefineService:
                     "prompt": prompt or "",
                     "duration": item["duration"],
                     "refine_kind": kind,
+                    "generation_mode": route_frozen["provider"],
+                    "route": route_frozen,
                     "extra": extra or {},
                 },
                 batch=(

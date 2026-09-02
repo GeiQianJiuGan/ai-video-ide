@@ -43,6 +43,7 @@ from typing import Any
 
 from app.core.config import settings
 from app.core.errors import AppError, ErrorCode
+from app.generation.providers.base import RefCapacity
 
 #: 入口标题 → 该往节点的哪个输入里填。按顺序取第一个命中的键，
 #: 这样 LoadImage / CLIPTextEncode / 各家的原生节点都能覆盖，而不必认识它们的 class_type。
@@ -326,6 +327,49 @@ def slot_count(name: str, media: str = "image") -> int | None:
     """这份预设标了几个某一媒体的槽位。默认问的是参考图（最常问的那一种）。"""
     counts = slot_counts(name)
     return None if counts is None else counts.get(media, 0)
+
+
+def capacity_of(name: str) -> RefCapacity:
+    """这份预设一次能收几个参考素材，**连那句人话一起给**。
+
+    以前这段文案长在 `comfy_preset.ref_capacity()` 里，只会数**设置里那份默认预设**。
+    但真正该数的是「这个工程这个能力最终会提交的那一份」——首尾帧镜头走 `flf_preset_name`、
+    普通镜头走 `r2v_preset_name`，两份图标的槽位数完全可以不一样。所以把它下沉到这里：
+    `services/route.py::capacity()` 解析出是哪一份之后拿名字来问，
+    `comfy_preset.ref_capacity()` 则是「按当前设置会怎样」那一问，转调同一段话。
+
+    三种媒体各回一个数：一份图标了 3 张图片槽 + 1 段音频槽是常见的事，折成一个数字的话
+    账单只能说「还能再喂 1 个」，而用户塞进去的那一个大概是图。
+
+    **绝不抛**（`slot_counts()` 那条同样的理由）：数不出来一律「不限制」，凭空造一个数字
+    只会白丢用户的角色图 / 场景图，而这份图真正的问题会在提交那一刻说清楚。
+    """
+    counts = slot_counts(name)
+    if counts is None:
+        return RefCapacity(
+            None,
+            name,
+            (
+                f"读不到预设 {name}（文件不在或填不进去），这里先不限数量；"
+                "真正生成时会先报出这份图的问题。"
+                if name
+                else "还没有选生成预设，这里先不限数量；真正生成时会报「还没有选生成预设」。"
+            ),
+        )
+    image, video, audio = counts["image"], counts["video"], counts["audio"]
+    if image == 0:
+        detail = (
+            f"预设 {name} 里一个 AIVS_REF_* 都没标——角色图 / 场景图全都喂不进去，"
+            "人物形象只能靠首帧带。"
+        )
+    else:
+        detail = f"预设 {name} 标了 {image} 个 AIVS_REF_* 槽位，一次最多喂 {image} 张参考图。"
+    extra = "、".join(
+        f"{MEDIA_LABEL[media]} {n} 个" for media, n in (("video", video), ("audio", audio)) if n
+    )
+    if extra:
+        detail += f"另外还能收 {extra}。"
+    return RefCapacity(image, name, detail, video=video, audio=audio)
 
 
 def _media_tail(by_media: dict[str, list[str]]) -> str:
