@@ -92,3 +92,31 @@ def _error_detail(status: dict[str, Any]) -> str:
                 f"{info.get('exception_message') or '（ComfyUI 没有给原因）'}"
             )
     return "ComfyUI 报告任务失败，但没有给出原因。"
+
+
+def detached_submit_error(exc: AppError, source: str, removed: list[dict[str, str]]) -> AppError:
+    """提交被 ComfyUI 拒绝、而这一次又摘过节点时，多给一条指向那件事的建议。**两条路共用。**
+
+    摘掉一个这次用不上的媒体入口（`comfy/graph.py::detach`）有一种会咬人的情形：图里那一格是
+    **必填**的（例如 `ImageBatch.image1`）。这时 ComfyUI 回的是「Required input is missing」，
+    而那个输入正是我们刚切掉的——不点出来的话，用户只会看着一份自己明明存好的图发愣。
+
+    **只有真摘过、且真是「ComfyUI 拒绝了这份图」时才加**：离线或超时那类失败与摘节点无关，
+    多这两句只会把真正的原因埋掉（硬约束 4 要的是说清，不是多说）。
+    """
+    if not removed or exc.code != ErrorCode.WORKFLOW_ERROR:
+        return exc
+    which = "、".join(f"{r['title'] or r['class_type']}#{r['node_id']}" for r in removed[:6])
+    return AppError(
+        exc.code,
+        exc.title,
+        exc.detail,
+        [
+            *exc.suggestions,
+            f"这一次从{source}里摘掉了 {len(removed)} 个这一版用不上的节点（{which}）："
+            "它们是登记为入口、但这个镜头没有值的媒体格子，以及只为它们服务的中间节点",
+            "如果上面的报错说某个输入缺失，说明图里那一格是必填的——把这个入口从图里删掉，"
+            "或者改成不依赖它的接法（例如末帧那一支单独存一份图）",
+        ],
+        exc.related_ids,
+    )

@@ -181,7 +181,11 @@ def test_node_limit_is_configurable_at_runtime(client: TestClient, pid: str) -> 
 # --- 1. prompt 兜底：三处口径必须一致 ---
 
 
-def test_scene_prompt_falls_back_for_shots(client: TestClient, pid: str) -> None:
+def test_scene_prompt_falls_back_for_shots(
+    client: TestClient, pid: str, video_preset: str
+) -> None:
+    """最后那一步要真入队，所以 `video_preset` 把默认那条路的预设摆好（入队门槛在
+    `services/route.py::require()`）——这里测的是 prompt 兜底，不是那道门槛。"""
     variant = make_variant(client, pid, "城南旧宅", "雨夜")
     app_id = make_appearance(client, pid, "林昭")
     sid = make_scene(client, pid, "雨夜追车", location_variant_id=variant)

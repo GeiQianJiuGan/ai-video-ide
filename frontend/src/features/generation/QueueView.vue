@@ -27,6 +27,7 @@ import EmptyState from '@/shared/ui/EmptyState.vue'
 import ErrorPanel from '@/shared/ui/ErrorPanel.vue'
 import FeatureHeader from '@/shared/ui/FeatureHeader.vue'
 import { JOB_STATUS, JOB_STATUS_LABEL, type Job } from '@/shared/api/generation'
+import { frozenRoute, ROUTE_SOURCE_LABEL } from '@/shared/api/projects'
 import { useQueueStore } from '@/stores/queue'
 
 const route = useRoute()
@@ -43,6 +44,12 @@ const rows = computed(() =>
 const selected = computed<Job | null>(
   () => queue.jobs.find((j) => j.id === selectedId.value) ?? null,
 )
+
+/**
+ * 这条任务入队时冻结的那条路。**执行与重试读的就是它**（后端 `_provider_of`），
+ * 所以排查「为什么这一条走的不是我以为的后端」只能看这一份，而不是现在的设置。
+ */
+const frozen = computed(() => frozenRoute(selected.value?.params))
 
 /** 状态点的颜色：跑/等/失败三种要一眼能分开。 */
 const TONE: Record<string, 'neutral' | 'accent' | 'ok' | 'warn' | 'fail'> = {
@@ -330,17 +337,30 @@ async function bump(job: Job): Promise<void> {
 
             <div class="border-line-1 border-t pt-2">
               <p class="text-fg-3 text-2xs tracking-wide uppercase">入队时冻结的参数</p>
+              <!-- 走的是哪条路先单独摆一行：排查失败时它是第一个要看的东西，埋在
+                   下面那坨 JSON 里等于没有。老任务没有这一项，如实说「没记录」。 -->
+              <p v-if="frozen" class="text-fg-2 mt-1 text-2xs">
+                走的是「{{ frozen.label }}」· {{ ROUTE_SOURCE_LABEL[frozen.source] }} ·
+                能力 {{ frozen.capability }}
+                <span v-if="frozen.preset"><br />预设：{{ frozen.preset }}</span>
+                <span v-if="frozen.workflow_name"><br />绑的图：{{ frozen.workflow_name }}</span>
+                <span v-if="frozen.base_url"><br />地址：{{ frozen.base_url }}</span>
+              </p>
+              <p v-else class="text-fg-4 mt-1 text-2xs">
+                这条任务入队时还没有记录走哪条路（改造之前的老任务）。
+              </p>
               <pre
                 class="text-fg-3 bg-base-2 border-line-1 mt-1 overflow-auto border p-1 text-2xs"
                 >{{ JSON.stringify(selected.params, null, 2) }}</pre>
               <p class="text-fg-4 mt-1 text-2xs">
-                这些值是入队那一刻定下的，之后改镜头也不影响这条任务。
+                这些值是入队那一刻定下的，之后改镜头也不影响这条任务；重试也不重新解析，
+                走的还是上面那条路。
               </p>
             </div>
 
             <div class="border-line-1 border-t pt-2">
               <p class="text-fg-4 text-2xs">
-                Workflow：{{ selected.workflow_id ?? '按能力取默认' }}<br />
+                Workflow：{{ selected.workflow_id ?? '这条路不绑图' }}<br />
                 版本：{{ selected.version_id ?? '还没产出' }}<br />
                 入队 {{ selected.created_at.slice(0, 16) }}
               </p>

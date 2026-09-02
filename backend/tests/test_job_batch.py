@@ -16,12 +16,22 @@
 
 from __future__ import annotations
 
+import pytest
 from fastapi.testclient import TestClient
 
 from tests.conftest import error_of
 from tests.test_sequence import two_scenes
 
 API = "/api/v1"
+
+
+@pytest.fixture(autouse=True)
+def _preset(video_preset: str) -> None:
+    """这个文件里每一条都要真入队，所以默认那条路必须有一份能用的图。
+
+    入队门槛在 `services/route.py::require()`（缺预设 = 四要素错误，不进队列），
+    而这里测的是批次身份与整批重跑，不是那道门槛。
+    """
 
 
 def test_sequential_run_merges_into_one_batch(client: TestClient, pid: str) -> None:

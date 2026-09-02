@@ -12,7 +12,8 @@
  *   5. **系统提示词（`kind === 'text'`）的内置文案只有后端一份**：灰字占位与「填入内置默认」
  *      都读 `field.builtin`，这一页绝不抄第二份文案。
  *
- * 旧的 Workflow 绑定页降级成了高级/兼容路径，入口收在最后的折叠区里。
+ * Workflow 绑定页是高级路径（工程的调用方式选了「ComfyUI 工作流绑定」才需要它），
+ * 入口收在最后的折叠区里。
  */
 import { onMounted, ref } from 'vue'
 import {
@@ -541,19 +542,20 @@ async function pastePreset(): Promise<void> {
       </ul>
     </AppPanel>
 
-    <!-- 高级 / 兼容：旧的 Workflow 绑定路径 -->
+    <!-- 高级：ComfyUI 工作流绑定那条路 -->
     <div class="border-line-1 bg-base-1 mt-2 border">
       <button
         class="text-fg-2 hover:text-fg-1 flex w-full items-center gap-1.5 px-3 py-1.5 text-xs"
         @click="advanced = !advanced"
       >
-        <ChevronRight :size="11" :class="advanced ? 'rotate-90' : ''" />高级 / 兼容路径
+        <ChevronRight :size="11" :class="advanced ? 'rotate-90' : ''" />高级路径
       </button>
       <div v-if="advanced" class="border-line-1 border-t px-3 py-2">
         <p class="text-fg-3 text-2xs">
-          旧的「Workflow 管理」把 prompt / 参考图 / 时长逐个绑到 ComfyUI 节点字段上。现在默认路径
-          改成了按节点标题注参数——模型端的图由模型端维护，本工具不再跟着改。已经配好的工作流仍然
-          可用：把上面的「调用方式」改成 <span class="font-mono">comfy_workflow</span> 就会走它。
+          「Workflow 管理」把 prompt / 参考图 / 时长逐个绑到 ComfyUI 节点字段上。默认路径改成了按
+          节点标题注参数——模型端的图由模型端维护，本工具不再跟着改。绑定那条路仍然是一条正经路：
+          把这里的「调用方式」改成 <span class="font-mono">comfy_workflow</span> 就会走它，
+          <strong class="text-fg-2">单个工程也能在概览页自己选</strong>（那一处优先于这里）。
         </p>
         <p class="text-fg-4 mt-1 text-2xs">
           绑定页在工程里：打开一个工程后按 Ctrl+K，搜「Workflow」就能进去。它不在左栏导航里——

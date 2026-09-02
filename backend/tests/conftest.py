@@ -16,6 +16,7 @@ from fastapi.testclient import TestClient
 
 from app.core import ffmpeg as ffmpeg_tool
 from app.core.config import settings
+from app.generation.providers import presets
 from app.generation.providers import registry as provider_registry
 from app.main import create_app
 from app.persistence.db import Database
@@ -175,6 +176,75 @@ def ready_workflow(client: TestClient, pid: str, capability: str = "image2video"
     assert resp.status_code == 200, resp.text
     assert resp.json()["ok"] is True
     return dict(client.get(f"/api/v1/projects/{pid}/workflows/{row['id']}").json())
+
+
+#: 一份最小可用的 ComfyUI 预设图（`AIVS_*` 标题约定，见 `providers/presets.py`）。
+#: 提示词 + 首末帧都标了，于是出正片（`r2v_ready`）与补转场（`flf_ready`）两条都就绪。
+PRESET_GRAPH: dict[str, Any] = {
+    "1": {
+        "class_type": "CLIPTextEncode",
+        "inputs": {"text": ""},
+        "_meta": {"title": "AIVS_PROMPT"},
+    },
+    "2": {
+        "class_type": "LoadImage",
+        "inputs": {"image": "first.png"},
+        "_meta": {"title": "AIVS_FIRST_FRAME"},
+    },
+    "3": {
+        "class_type": "LoadImage",
+        "inputs": {"image": "last.png"},
+        "_meta": {"title": "AIVS_LAST_FRAME"},
+    },
+    "4": {
+        "class_type": "KSampler",
+        "inputs": {"seed": 0, "steps": 20},
+        "_meta": {"title": "AIVS_SEED"},
+    },
+    #: 九个参考图槽位（`AIVS_REF_1…9`）。账单里采用的条目除首帧那张之外全部当参考素材送
+    #: 过去，槽位不够会变成生成前的一次确认（`REF_OVER_CAPACITY`）——那是另一批测试的题目，
+    #: 所以默认这份图把槽位给满，别让容量挡住「队列 / 编排 / 批次」这些用例。
+    **{
+        str(10 + i): {
+            "class_type": "LoadImage",
+            "inputs": {"image": f"ref{i}.png"},
+            "_meta": {"title": f"AIVS_REF_{i}"},
+        }
+        for i in range(1, 10)
+    },
+}
+
+
+def write_preset(name: str, graph: dict[str, Any] | None = None) -> str:
+    """往运行目录的预设目录里摆一份图，返回它的名字。
+
+    直接落文件而不走 `presets.save()`：这里要摆的图有时刻意缺入口（测「缺什么」那一路），
+    体检会把它拦在门外。
+    """
+    presets.presets_dir().joinpath(f"{name}.json").write_text(
+        json.dumps(graph if graph is not None else PRESET_GRAPH, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    presets.reset_cache()
+    return name
+
+
+@pytest.fixture
+async def video_preset() -> str:
+    """让默认那条路真的能出片：摆一份图，并让设置页指向它。
+
+    **凡是要真入队的测试都需要它。** 入队门槛在 `services/route.py::require()`——
+    「这个工程这个能力走哪条路、这条路绑没绑上」缺一样，按下生成立刻是四要素错误，
+    不再排进队列等 pump 一条条失败。队列机制、编排、批次那些测试测的不是这道门槛，
+    所以在这里一次把前提摆齐（相当于用户在设置页选了一份默认预设）。
+
+    刻意走 `app_settings.patch()`（真落 settings.json）而不是 monkeypatch `settings`
+    单例：`TestClient` 起 lifespan 时会再 `app_settings.apply()` 一遍，没写进文件的
+    覆盖会被擦回默认值——那正是「fixture 明明跑了却不生效」的原因。
+    """
+    name = write_preset("测试预设")
+    await app_settings.patch({"video.preset": name})
+    return name
 
 
 def upload_png(client: TestClient, pid: str, kind: str = "upload", name: str = "ref.png") -> str:

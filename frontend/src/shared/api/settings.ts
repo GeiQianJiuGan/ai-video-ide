@@ -108,7 +108,7 @@ export interface ImageProtocolRow {
   models_hint: string
 }
 
-/** 一种调用方式。`legacy` 的是旧的 Workflow 绑定路径，只作兼容保留。 */ export interface ProviderRow {
+/** 一种调用方式。`legacy` 已经恒为 `false`（三条路一视同仁），键留着只为不给一个恒假的布尔改型。 */ export interface ProviderRow {
   name: string
   label: string
   legacy: boolean

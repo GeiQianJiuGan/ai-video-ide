@@ -10,6 +10,7 @@
 
 import { api } from './client'
 import type { GenerationVersion, Job } from './generation'
+import type { RouteBinds, RouteSource } from './projects'
 
 export interface RefineKind {
   kind: 'upscale' | 'interpolate' | 'recut'
@@ -43,10 +44,24 @@ export interface RefinePlanResult {
   preset: string | null
   preset_ready: boolean
   preset_detail: string
+  /**
+   * 走哪条路。**界面照 `binds` 决定要不要显示「处理预设」那一行**：走 REST 时这个工程
+   * 根本没有预设这回事，写「默认视频预设」是在说一个不存在的东西；绑定那条路做不了
+   * 二次处理，那句话由 `preset_detail` + `how_to` 说清（硬约束 1、4）。
+   */
+  route: {
+    provider: string
+    label: string
+    /** `project` 工程显式选了 / `settings` 跟随设置页 / `default` 谁都没选过。 */
+    source: RouteSource
+    /** `preset` / `base_url` / `workflow`，未知调用方式是空串。 */
+    binds: RouteBinds
+  }
   items: RefinePlanItem[]
   skipped: RefinePlanSkipped[]
   total: number
   blocked: boolean
+  /** 这条路做不了时的出路（四要素里那几条建议）。**必须原样显示**（硬约束 4）。 */
   how_to: string[]
 }
 

@@ -396,7 +396,8 @@ const PROJECT_DEFS: FeatureDef[] = [
     id: 'workflows',
     route: 'workflows',
     title: 'Workflow 管理（高级）',
-    purpose: '高级 / 兼容路径：手工把 ComfyUI 工作流的节点字段绑成能力，只有主路满足不了时才用',
+    purpose:
+      '高级路径：手工把 ComfyUI 工作流的节点字段绑成能力，工程的调用方式选「ComfyUI 工作流绑定」时在这里绑图',
     group: 'generate',
     icon: Workflow,
     milestone: 'M2',
@@ -569,7 +570,8 @@ export const APP_NAV = ['projects', 'library', 'presets'] as const
  *
  * 生成层的入口是 `flow`（幕流程图）——从整片结构进到某一幕，再进那一幕的工作台。
  * `scene` 不在这里：它只从流程图点节点进去（URL 必须带 sid）。
- * `workflows` 也不在这里：它是 `advanced: true` 的兼容路径，从命令面板或设置页进。
+ * `workflows` 也不在这里：它是 `advanced: true` 的高级页面（工程选了「ComfyUI 工作流绑定」
+ * 那条路才需要它），从命令面板或设置页进。
  * `queue` 同样不在这里：队列是**一直在跑的东西**而不是一个要走过去看的页面，
  * 它的常驻界面是底部控制台的任务框（状态条上那个任务标识点一下就升起来）；
  * 队列页只留给「点开细看」——失败现场、冻结参数、优先级细调。
@@ -594,8 +596,8 @@ function pick(ids: readonly string[]): Feature[] {
 export const APP_NAV_FEATURES: Feature[] = pick(APP_NAV)
 export const PROJECT_NAV_FEATURES: Feature[] = pick(PROJECT_NAV)
 /**
- * 高级 / 兼容路径的项目内功能：不进左栏导航，但命令面板里要能搜到。
- * 「不推荐」不等于「藏起来找不到」——已经配好的东西必须还能进去。
+ * 高级路径的项目内功能：不进左栏导航，但命令面板里要能搜到。
+ * 「不是默认做法」不等于「藏起来找不到」——已经配好的东西必须还能进去。
  */
 export const PROJECT_ADVANCED_FEATURES: Feature[] = FEATURES.filter(
   (f) => f.scope === 'project' && f.advanced === true,

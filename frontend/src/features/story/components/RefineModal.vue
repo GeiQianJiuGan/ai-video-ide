@@ -13,6 +13,7 @@ import AppButton from '@/shared/ui/AppButton.vue'
 import AppBadge from '@/shared/ui/AppBadge.vue'
 import ErrorPanel from '@/shared/ui/ErrorPanel.vue'
 import { ApiError } from '@/shared/api/client'
+import { ROUTE_SOURCE_LABEL } from '@/shared/api/projects'
 import { refineApi, type RefineKind, type RefinePlanResult } from '@/shared/api/refine'
 
 const props = defineProps<{
@@ -129,15 +130,28 @@ async function handleRun() {
         </div>
       </div>
 
-      <!-- 预设与状态说明 -->
+      <!-- 走哪条路 + 缺什么。**照 binds 分岔，不照调用方式的名字**（硬约束 1） -->
       <div v-if="planResult" class="border-line-1 bg-base-2 border p-2 text-2xs space-y-1">
         <div class="flex items-center justify-between">
+          <span class="text-fg-3">走哪条路:</span>
+          <strong class="text-fg-1">
+            {{ planResult.route.label }}
+            <span class="text-fg-4 font-normal">· {{ ROUTE_SOURCE_LABEL[planResult.route.source] }}</span>
+          </strong>
+        </div>
+        <!-- 「处理预设」只有预设那条路才有这回事：走 REST 时显示「默认视频预设」是在说一个
+             不存在的东西，走工作流绑定时这条路根本做不了二次处理（下面那句话会说清）。 -->
+        <div v-if="planResult.route.binds === 'preset'" class="flex items-center justify-between">
           <span class="text-fg-3">处理预设:</span>
-          <strong class="text-fg-1">{{ planResult.preset || '默认视频预设' }}</strong>
+          <strong class="text-fg-1">{{ planResult.preset || '还没有选' }}</strong>
         </div>
         <div v-if="!planResult.preset_ready" class="text-st-failed">
           {{ planResult.preset_detail }}
         </div>
+        <!-- 缺什么就得说出怎么补：四要素里那几条出路原样列出（硬约束 4） -->
+        <ul v-if="planResult.how_to.length" class="text-fg-3 list-disc space-y-0.5 pl-4">
+          <li v-for="(way, i) in planResult.how_to" :key="i">{{ way }}</li>
+        </ul>
       </div>
 
       <!-- 拟处理片段账单 -->
@@ -170,7 +184,7 @@ async function handleRun() {
         <AppButton
           size="sm"
           variant="primary"
-          :disabled="busy || !planResult?.preset_ready || !planResult?.items.length"
+          :disabled="busy || !planResult || planResult.blocked || !planResult.items.length"
           @click="handleRun"
         >
           <Sparkles :size="12" />入队二次处理 ({{ planResult?.items.length || 0 }} 段)

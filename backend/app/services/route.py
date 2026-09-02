@@ -75,6 +75,7 @@ REF_SLOTS_KEY = "reference_image_slots"
 #: 它**：那边要先 `apply()` 把 `_baseline` 装起来，只读路径不该依赖这个时序。
 _DEFAULT_PROVIDER: str = str(Settings.model_fields["video_provider"].default or "")
 
+
 @dataclass(frozen=True)
 class Route:
     """一条解析完的出片路：**解析那一刻的只读快照**，入队时整个冻结进版本参数。"""
@@ -546,8 +547,14 @@ async def summary(pid: str) -> dict[str, Any]:
         #: 控件（两个预设下拉 / 一行地址说明 / 四个能力下拉），**不写死调用方式的名字**。
         "binds": first["binds"],
         "options": [
-            {"name": INHERIT, "label": "跟随设置页", "inherit": True},
-            *({**row, "inherit": False} for row in registry.listing()),
+            {"name": INHERIT, "label": "跟随设置页", "inherit": True, "binds": ""},
+            #: 每条候选带上**它要绑什么**（`BINDS`）：界面上「这四个下拉要改成哪一条才生效」
+            #: 只能由这份答案回答。前端自己按名字猜的话，`comfy_workflow` 这个字符串就又
+            #: 写死进前端了（硬约束 1）。
+            *(
+                {**row, "inherit": False, "binds": BINDS.get(row["name"], "")}
+                for row in registry.listing()
+            ),
         ],
         #: 设置页那条（也就是「留空会走哪条」），让界面把继承来的那条也写出来。
         "settings_provider": _safe_normalize(settings.video_provider or _DEFAULT_PROVIDER),

@@ -12,7 +12,7 @@
  *   3. 校验绑定与节点探测，并可设为默认或删除。
  */
 import { computed, onMounted, ref, watch } from 'vue'
-import { useRoute } from 'vue-router'
+import { RouterLink, useRoute } from 'vue-router'
 import {
   CheckCircle2,
   CircleSlash,
@@ -39,12 +39,47 @@ import {
   type GenerationMode,
   type Workflow,
 } from '@/shared/api/workflows'
+import { projectsApi, ROUTE_SOURCE_LABEL, type ProjectRoute } from '@/shared/api/projects'
 import { useWorkflowStore } from '@/stores/workflows'
 
 const route = useRoute()
 const wf = useWorkflowStore()
 
 const pid = computed(() => String(route.params.pid ?? ''))
+
+/**
+ * 这个工程走哪条路（`GET /projects/{pid}/route`）。这一页只是**绑定那条路**的操作面，
+ * 所以第一件事得说清「你现在走的是哪条」——以前这里只有一个下拉，选了 ComfyUI 预设的人
+ * 在这儿配了半天四个能力绑定，而那些绑定一个都不会被用到（H9 就是这句话缺失）。
+ */
+const routeInfo = ref<ProjectRoute | null>(null)
+
+/** 这条路要不要绑图。**四个能力下拉的 `:disabled` 只看这一个布尔**，不看调用方式的名字。 */
+const bindsWorkflow = computed(() => routeInfo.value?.binds_workflow ?? false)
+
+/** 为什么禁用 —— 禁了不说原因就是静默失败（硬约束 4）。 */
+const bindsHint = computed(() => {
+  const info = routeInfo.value
+  if (!info) return ''
+  if (info.binds_workflow) return '这条路按下面四个能力各自绑的那份图提交。'
+  if (info.binds === 'preset')
+    return `「${info.label}」不需要工作流绑定：它按预设图里的 AIVS_* 节点标题填参数，要换图请去概览页选预设。`
+  if (info.binds === 'base_url')
+    return `「${info.label}」不需要工作流绑定：首末帧与参考素材整组按 REST 合同发过去，地址在设置页配。`
+  return `「${info.label}」不需要工作流绑定。`
+})
+
+/** 「跟随设置页」跟的是哪一条。标签从候选里查，前端不写第二份对照表。 */
+const settingsLabel = computed(() => {
+  const info = routeInfo.value
+  if (!info) return ''
+  return info.options.find((o) => !o.inherit && o.name === info.settings_provider)?.label ?? ''
+})
+
+/** 绑图的那条调用方式叫什么。**按后端给的 `binds` 找**，不按名字猜（硬约束 1）。 */
+const workflowOptionLabel = computed(
+  () => routeInfo.value?.options.find((o) => o.binds === 'workflow')?.label ?? '绑图的那一条',
+)
 
 const importing = ref(false)
 const importName = ref('')
@@ -138,7 +173,16 @@ function byCapability(cap: string): Workflow[] {
 }
 
 async function reload(): Promise<void> {
-  await wf.load(pid.value).catch(() => {})
+  await Promise.all([wf.load(pid.value).catch(() => {}), loadRoute()])
+}
+
+/** 只读、绝不抛：缺什么在 `issues` 里，拉不到就整块不画，不该把这一页拖崩。 */
+async function loadRoute(): Promise<void> {
+  if (!pid.value) {
+    routeInfo.value = null
+    return
+  }
+  routeInfo.value = await projectsApi.route(pid.value).catch(() => null)
 }
 
 onMounted(reload)
@@ -466,8 +510,16 @@ async function saveProjectBinding(capability: Capability, value: string): Promis
       [capability]: value || null,
     })
     .catch(() => {})
+  // 绑上一份图之后「缺什么」就少一条，横幅那句话要跟着变。
+  await loadRoute()
 }
 
+/**
+ * 换调用方式。**整份绑定表一起提交**：`PUT /workflow-bindings` 收的是完整对象，
+ * 只发 `generation_mode` 会把四个能力绑定一起清空。
+ *
+ * 换完要重新解析一次路由——「绑没绑上」的答案跟着换（同一份图在另一条路上根本不会被读）。
+ */
 async function saveGenerationMode(value: GenerationMode): Promise<void> {
   if (!pid.value) return
   await wf
@@ -476,6 +528,7 @@ async function saveGenerationMode(value: GenerationMode): Promise<void> {
       generation_mode: value,
     })
     .catch(() => {})
+  await loadRoute()
 }
 </script>
 
@@ -519,6 +572,33 @@ async function saveGenerationMode(value: GenerationMode): Promise<void> {
       <AppButton size="sm" variant="ghost" class="ml-auto" :disabled="wf.busy" @click="reload()">
         <RefreshCw :size="10" />刷新
       </AppButton>
+    </div>
+
+    <!--
+      顶部横幅：**这一页配的东西只在「ComfyUI 工作流绑定」那条路上生效**，所以先把当前
+      走的是哪条、这个答案是谁给的说清楚。走别的路时下面四个能力下拉是禁用的，
+      禁了不说原因就是静默失败（硬约束 4）。
+    -->
+    <div
+      v-if="routeInfo"
+      class="border-line-1 bg-base-2 flex shrink-0 flex-wrap items-center gap-1.5 border-b px-2 py-1"
+    >
+      <AppBadge :tone="bindsWorkflow ? 'accent' : 'neutral'">
+        {{ bindsWorkflow ? '这条路绑图' : '这条路不绑图' }}
+      </AppBadge>
+      <span class="text-fg-1 text-2xs">
+        当前走「{{ routeInfo.label }}」·
+        <span class="text-fg-4">{{ ROUTE_SOURCE_LABEL[routeInfo.source] }}</span>
+      </span>
+      <span class="text-fg-4 min-w-0 flex-1 truncate text-2xs">{{ bindsHint }}</span>
+      <RouterLink
+        v-if="pid"
+        :to="{ name: 'dashboard', params: { pid } }"
+        class="text-accent shrink-0 text-2xs hover:underline"
+        title="调用方式与预设都在概览页的「这个工程怎么出片」里改"
+      >
+        去概览页改这条路
+      </RouterLink>
     </div>
 
     <ErrorPanel
@@ -761,8 +841,10 @@ async function saveGenerationMode(value: GenerationMode): Promise<void> {
           <section v-if="pid" class="border-line-1 border-t pt-2">
             <p class="text-fg-3 text-2xs tracking-wide uppercase">当前项目生成方式绑定</p>
             <div class="mt-1 space-y-1">
-              <label class="block">
-                <span class="text-fg-4 text-2xs">项目生成引擎</span>
+              <label v-if="routeInfo" class="block">
+                <span class="text-fg-4 text-2xs">项目调用方式</span>
+                <!-- 候选全部来自后端（`route.options`，第一项是「跟随选设置页」那条空串）：
+                     前端一个调用方式的名字都不写死，后端加一条路这里不用改。 -->
                 <select
                   :value="projectBindings.generation_mode"
                   class="border-line-1 bg-base-2 text-fg-1 focus:border-accent/60 mt-px h-5 w-full border px-1 text-2xs outline-none"
@@ -771,17 +853,31 @@ async function saveGenerationMode(value: GenerationMode): Promise<void> {
                     saveGenerationMode(($event.target as HTMLSelectElement).value as GenerationMode)
                   "
                 >
-                  <option value="comfy_preset">ComfyUI 预设</option>
-                  <option value="http_api">通用 REST API</option>
-                  <option value="workflow_api">Workflow API 图</option>
+                  <option v-for="opt in routeInfo.options" :key="opt.name" :value="opt.name">
+                    {{ opt.label }}
+                  </option>
                 </select>
               </label>
+              <p v-else class="text-st-review text-2xs">
+                读不到这个工程走哪条路，先点右上角「刷新」；期间下面的绑定改了也可能不生效。
+              </p>
+              <!-- 「跟随设置页」得说清跟的是哪一条，否则这个下拉等于什么都没说。 -->
+              <p v-if="routeInfo?.mode === '' && settingsLabel" class="text-fg-4 text-2xs">
+                跟着设置页走，现在是「{{ settingsLabel }}」。
+              </p>
+              <!-- 禁用的原因摆在被禁的控件旁边，而不是只在页顶那条横幅里（硬约束 4）。 -->
+              <p v-if="routeInfo && !bindsWorkflow" class="text-st-review text-2xs">
+                {{ bindsHint }}下面四个下拉这条路不读，所以先禁着——改成「{{
+                  workflowOptionLabel
+                }}」才会生效。
+              </p>
               <label v-for="cap in CAPABILITIES" :key="cap" class="block">
                 <span class="text-fg-4 text-2xs">{{ CAPABILITY_LABEL[cap] }}</span>
                 <select
                   :value="projectBindings[cap] ?? ''"
                   class="border-line-1 bg-base-2 text-fg-1 focus:border-accent/60 mt-px h-5 w-full border px-1 text-2xs outline-none"
-                  :disabled="wf.busy || projectBindings.generation_mode !== 'workflow_api'"
+                  :disabled="wf.busy || !bindsWorkflow"
+                  :title="bindsWorkflow ? '这条能力提交时用的就是这份图' : bindsHint"
                   @change="saveProjectBinding(cap, ($event.target as HTMLSelectElement).value)"
                 >
                   <option value="">未绑定</option>

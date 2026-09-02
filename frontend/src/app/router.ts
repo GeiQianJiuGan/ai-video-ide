@@ -52,10 +52,13 @@ const projectRoutes: RouteRecordRaw[] = [
     name: 'scene',
     component: () => import('@/features/flow/SceneWorkbench.vue'),
   },
+  // 兼容 / 细看路径：不在 `PROJECT_NAV` 里，只从命令面板、设置页或概览页那条链接进。
+  // 曾经这里是一条 `redirect: dashboard`——于是命令面板里那一项点下去回到概览页，
+  // 「Workflow 管理」这一页谁都打不开，而 `features.ts` 里它写着 `ready: true`。
   {
     path: 'workflows',
     name: 'workflows',
-    redirect: { name: 'dashboard' },
+    component: () => import('@/features/workflow/WorkflowsView.vue'),
   },
   {
     path: 'queue',

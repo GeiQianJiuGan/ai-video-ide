@@ -88,7 +88,6 @@ def ref_capacity(name: str | None = None) -> RefCapacity:
         return RefCapacity(None, chosen, "读不到这条调用方式的参考素材槽位，先不限数量。")
 
 
-
 def reset() -> None:
     """测试用：换掉 settings 之后丢掉缓存的实例。"""
     _cache.clear()

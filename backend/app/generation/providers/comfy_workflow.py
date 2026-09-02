@@ -16,6 +16,11 @@
     静默丢掉的话，事后没人查得出「我挂的那段对白音频到底送没送出去」。
   · **槽位不够只截断，不失败**。图是用户自己维护的，我们没资格因为它只绑了 3 个槽位
     就拒绝生成——少喂的那几张同样写进 `req.notes`。
+
+反过来，**这一版没有素材可填的媒体槽位不是「保持原样」而是要连节点一起摘掉**
+（`_detach_idle`，理由整段写在 `comfy/graph.py::detach()`）：绑了末帧却没有末帧、绑了 9 个
+参考图槽位而这个镜头只有 2 张时，那些格子里留着的是用户存图时挂着的示例文件——留着就等于
+把不相干的图真喂进模型，而队列里一条错误都没有。摘了什么照旧写进 `req.notes`。
 """
 
 from __future__ import annotations
@@ -24,16 +29,80 @@ from typing import Any
 
 from app.core.errors import AppError, ErrorCode
 from app.core.logging import get_logger
-from app.generation.comfy.graph import apply_bindings, parse_graph
+from app.generation.comfy.graph import MEDIA_SLOTS, apply_bindings, detach, parse_graph
 from app.generation.providers import base
 from app.generation.providers.base import VideoRequest
-from app.generation.providers.comfy_base import ComfyTasks
+from app.generation.providers.comfy_base import ComfyTasks, detached_submit_error
 
 log = get_logger("provider.comfy_workflow")
 
 #: 绑定表里那个「参考图槽位」的键名。它是一个数组（`["12.image", "13.image"]`），
 #: 与其余「一个槽位一行字符串」的键形状不同，所以到处都要把它单独摘出来。
 REF_SLOTS_KEY = "reference_image_slots"
+
+#: `MEDIA_SLOTS` 里那几个槽位给人看的说法。note 里得说人话，用途同预设那条路的
+#: `presets.MARKER_LABEL`——两份表分别对着两套入口，但话都只写一遍。
+SLOT_LABEL: dict[str, str] = {
+    "first_frame": "首帧",
+    "last_frame": "末帧",
+    "source_image": "输入图",
+    "reference_image": "参考图（单槽）",
+}
+
+
+def _detach_idle(
+    payload: dict[str, Any],
+    name: str,
+    bindings: dict[str, str],
+    values: dict[str, Any],
+    unused_refs: list[str],
+    req: VideoRequest,
+) -> list[dict[str, str]]:
+    """把这一版没有素材可填的**媒体**槽位连节点一起从提交的副本里摘掉。
+
+    与 `comfy_preset._detach_idle` 是同一件事、同一个理由（整段写在
+    `comfy/graph.py::detach()`），只是这条路的入口来自绑定表而不是节点标题：绑了
+    `last_frame` 却没有末帧、绑了 9 个参考图槽位而这个镜头只有 2 张——那些格子里留着的是
+    用户在 ComfyUI 里存图时挂着的示例文件，不摘就等于把不相干的图真喂进模型，
+    而队列里一条错误都没有。
+
+    标量槽位（seed / steps / 宽高 / 时长）没给值时照旧保持图里原来的值，那是用户有意
+    存进去的默认参数。这条分界只有一张表：`comfy/graph.py::MEDIA_SLOTS`。
+    """
+    keep: set[str] = set()
+    idle: dict[str, str] = {}
+    for slot, target in bindings.items():
+        node_id = target.split(".", 1)[0]
+        if slot in MEDIA_SLOTS and values.get(slot) is None:
+            idle[node_id] = SLOT_LABEL.get(slot, slot)
+        else:
+            #: 填了值的、以及所有标量槽位那几个节点：绝不能被连带摘掉。
+            #: 一个节点同时被两行绑定指着时（单槽参考图与 `__ref_0` 常常是同一个节点），
+            #: 只要有一行填上了值，这个节点就得留。
+            keep.add(node_id)
+    for target in unused_refs:
+        idle.setdefault(target.split(".", 1)[0], "参考图槽位")
+    idle = {node_id: label for node_id, label in idle.items() if node_id not in keep}
+    if not idle:
+        return []
+    removed = detach(payload, list(idle), keep=keep)
+    counts: dict[str, int] = {}
+    for label in idle.values():
+        counts[label] = counts.get(label, 0) + 1
+    which = "、".join(f"{n} 个{label}" if n > 1 else label for label, n in counts.items())
+    cascade = len(removed) - len(idle)
+    req.notes.append(
+        f"工作流 {name} 这一版没有用到这几个槽位：{which}。它们已经从提交的那份图里摘掉"
+        + (f"（连带 {cascade} 个只为它们服务的中间节点）" if cascade > 0 else "")
+        + "——图里挂在这些节点上的示例文件一个都没有送进 ComfyUI。"
+    )
+    log.info(
+        "provider.entries_detached",
+        workflow=name,
+        idle=len(idle),
+        removed=len(removed),
+    )
+    return removed
 
 
 class ComfyWorkflowProvider(ComfyTasks):
@@ -139,16 +208,20 @@ class ComfyWorkflowProvider(ComfyTasks):
             "reference_image": ref_names[0] if ref_names else first_name,
         }
         slots = spec.bindings.get(REF_SLOTS_KEY)
+        #: 绑了槽位、但这一版没有第 N 张图可填的那几行。它们与「绑了末帧却没有末帧」是同一件事
+        #: （见 `_detach_idle`）：不摘掉就会把图里那张示例图当成参考图喂进模型。
+        unused_refs: list[str] = []
         if isinstance(slots, list):
             for index, target in enumerate(slots):
-                if index >= len(ref_names) or not isinstance(target, str) or "." not in target:
+                if not isinstance(target, str) or "." not in target:
+                    continue
+                if index >= len(ref_names):
+                    unused_refs.append(target)
                     continue
                 values[f"__ref_{index}"] = ref_names[index]
                 bindings[f"__ref_{index}"] = target
             if len(ref_names) > len(slots):
-                dropped = "、".join(
-                    r.label or r.path.name for r in images[len(slots) :]
-                )
+                dropped = "、".join(r.label or r.path.name for r in images[len(slots) :])
                 req.notes.append(
                     f"工作流 {spec.name} 只绑了 {len(slots)} 个 AIVS_REF_* 槽位，"
                     f"账单里这几张没喂进去：{dropped}。"
@@ -165,9 +238,12 @@ class ComfyWorkflowProvider(ComfyTasks):
                 f"账单里 {len(ref_names)} 张参考图只有第一张按「参考图」那个单槽送了出去"
                 "——人物形象容易跑偏。"
             )
-        prompt_id = await self._client.submit(
-            apply_bindings(graph, bindings, values), client_id=client_id
-        )
+        payload = apply_bindings(graph, bindings, values)
+        removed = _detach_idle(payload, spec.name, bindings, values, unused_refs, req)
+        try:
+            prompt_id = await self._client.submit(payload, client_id=client_id)
+        except AppError as exc:
+            raise detached_submit_error(exc, f"工作流 {spec.name}", removed) from exc
         self._used[prompt_id] = spec.name
         log.info(
             "provider.submitted",
@@ -176,5 +252,6 @@ class ComfyWorkflowProvider(ComfyTasks):
             prompt_id=prompt_id,
             mode=req.mode,
             refs=len(ref_names),
+            detached=len(removed),
         )
         return prompt_id

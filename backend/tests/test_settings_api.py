@@ -132,10 +132,18 @@ def test_reference_labels_are_configurable_but_the_count_is_not(client: TestClie
     assert cap.detail, "为什么是这个上限得说出来，界面上要显示"
 
 
-def test_legacy_provider_is_offered_but_marked(client: TestClient) -> None:
+def test_all_three_routes_are_offered_alike(client: TestClient) -> None:
+    """三条路一视同仁：`legacy` 恒为 `False`，一条都不再标「兼容选项」。
+
+    `comfy_workflow` 以前是被 registry 拒掉的死路（靠一个从未写过值的 `job.workflow_id`
+    触发），现在是一等适配器。`legacy` 这个键本身留着不删——前端那个类型与老客户端还在
+    读它，为了一个恒假的布尔改型不值得。「这条路绑没绑上」改由 `GET /projects/{pid}/route`
+    按工程 + 能力回答，不是设置页这一层的事。
+    """
     rows = {p["name"]: p for p in client.get("/api/v1/settings").json()["providers"]}
-    assert rows["comfy_preset"]["legacy"] is False
-    assert rows["comfy_workflow"]["legacy"] is True, "旧绑定路径要标成兼容选项"
+    assert list(rows) == ["comfy_preset", "http_api", "comfy_workflow"]
+    assert [row["legacy"] for row in rows.values()] == [False, False, False]
+    assert rows["comfy_workflow"]["label"] == "ComfyUI 工作流绑定"
 
 
 def test_system_prompt_is_configurable_but_the_shape_is_not(client: TestClient) -> None:

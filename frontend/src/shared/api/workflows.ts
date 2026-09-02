@@ -107,7 +107,15 @@ export interface CapabilityMatrix {
   project_bindings?: ProjectWorkflowBindings
 }
 
-export type GenerationMode = 'comfy_preset' | 'http_api' | 'workflow_api'
+/**
+ * 工程那一列的「调用方式」。**空串 = 跟随设置页**，不是「没配置」——绝大多数工程是这一种，
+ * 所以那个下拉的第一项就是它（`GET /projects/{pid}/route` 的 `options[0]`）。
+ *
+ * 老名字 `workflow_api` 不在这里：后端读写两侧都过 `route.normalize()` 归一成
+ * `comfy_workflow`，前端再留一个同义词只会让下拉和库里的值对不上（显示成「没选」，
+ * 而库里明明选着）。
+ */
+export type GenerationMode = '' | 'comfy_preset' | 'http_api' | 'comfy_workflow'
 export interface ProjectWorkflowBindings {
   generation_mode: GenerationMode
   text2image: string | null

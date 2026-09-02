@@ -138,9 +138,16 @@ def test_a_preset_without_ref_slots_reports_zero(monkeypatch: pytest.MonkeyPatch
     assert "AIVS_REF_" in cap.detail and "首帧" in cap.detail
 
 
-def test_the_rest_contract_and_the_legacy_path_are_unlimited(
+def test_the_rest_contract_is_unlimited_and_the_binding_route_only_feeds_images(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """应用级那一问（还没有工程上下文）：两条非预设的路各自答什么。
+
+    `comfy_workflow` 的参考图**答不上来**（几张取决于这个能力绑的那份图，由
+    `services/route.py::capacity()` 数绑定行），但参考视频 / 音频**确定是 0**——绑定表里
+    根本没有能接它们的槽位。这个 0 不是「不知道」：它会让账单如实说出「你挂的那段对白
+    音频这条路喂不进去」，回 `None` 的话用户会以为送出去了。
+    """
     monkeypatch.setattr(settings, "video_provider", "http_api")
     monkeypatch.setattr(settings, "video_base_url", "http://127.0.0.1:9/api")
     registry.reset()
@@ -148,9 +155,11 @@ def test_the_rest_contract_and_the_legacy_path_are_unlimited(
 
     monkeypatch.setattr(settings, "video_provider", "comfy_workflow")
     registry.reset()
-    legacy = ref_capacity()
-    assert legacy.limit is None
-    assert "不注入" in legacy.detail, "旧绑定路径连首帧都不注入，得说清楚"
+    bound = ref_capacity()
+    assert bound.limit is None, "几张取决于绑的那份图，凭空造一个数字只会白丢角色图"
+    assert bound.source == "工作流绑定"
+    assert (bound.video, bound.audio) == (0, 0), "这条路只喂图片，0 是事实不是「不知道」"
+    assert "只喂图片" in bound.detail
 
 
 def test_a_rewritten_preset_is_recounted(monkeypatch: pytest.MonkeyPatch) -> None:
