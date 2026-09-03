@@ -145,9 +145,13 @@ def test_generate_without_a_workflow_names_the_missing_capability(
 
 
 def test_default_path_needs_no_workflow_but_still_gates_on_context(
-    client: TestClient, pid: str
+    client: TestClient, pid: str, video_preset: str
 ) -> None:
-    """默认走适配层：门槛从「有没有绑工作流」变成「上下文齐不齐」。"""
+    """默认走适配层：门槛从「有没有绑工作流」变成「这条路绑没绑上」+「上下文齐不齐」。
+
+    `video_preset` 摆好前一半（默认那条路有一份能用的图，见
+    `services/route.py::require()`），于是这条用例测得到的就是后一半。
+    """
     pause(client, pid)
     scene = make_scene(client, pid)
     shot = make_shot(client, pid, scene["id"])
@@ -162,7 +166,9 @@ def test_default_path_needs_no_workflow_but_still_gates_on_context(
     assert forced.json()["workflow_id"] is None, "适配层路径不该给任务塞一个工作流"
 
 
-def test_generate_gate_on_incomplete_context_can_be_bypassed(client: TestClient, pid: str) -> None:
+def test_generate_gate_on_incomplete_context_can_be_bypassed(
+    client: TestClient, pid: str, video_preset: str
+) -> None:
     pause(client, pid)
     ready_workflow(client, pid, "image2video")
     scene = make_scene(client, pid)
@@ -182,7 +188,9 @@ def test_generate_gate_on_incomplete_context_can_be_bypassed(client: TestClient,
     assert forced.json()["status"] == "queued"
 
 
-def test_complete_context_enqueues_with_a_frozen_snapshot(client: TestClient, pid: str) -> None:
+def test_complete_context_enqueues_with_a_frozen_snapshot(
+    client: TestClient, pid: str, video_preset: str
+) -> None:
     pause(client, pid)
     ready_workflow(client, pid, "image2video")
     made = complete_shot(client, pid)
@@ -200,7 +208,9 @@ def test_complete_context_enqueues_with_a_frozen_snapshot(client: TestClient, pi
     assert len(jobs[0]["params"]["context"]["included"]) == 2
 
 
-def test_upstream_dependency_waits_with_an_explicit_reason(client: TestClient, pid: str) -> None:
+def test_upstream_dependency_waits_with_an_explicit_reason(
+    client: TestClient, pid: str, video_preset: str
+) -> None:
     pause(client, pid)
     ready_workflow(client, pid, "first_last_frame")
     scene = make_scene(client, pid)
@@ -256,7 +266,7 @@ def enqueue(client: TestClient, pid: str, shot_id: str, **body: Any) -> dict[str
     return dict(resp.json())
 
 
-def test_cancel_and_retry_state_machine(client: TestClient, pid: str) -> None:
+def test_cancel_and_retry_state_machine(client: TestClient, pid: str, video_preset: str) -> None:
     pause(client, pid)
     ready_workflow(client, pid, "image2video")
     scene = make_scene(client, pid)
@@ -287,7 +297,7 @@ def test_cancel_and_retry_state_machine(client: TestClient, pid: str) -> None:
 
 
 def test_priority_reorders_the_queue_and_resume_clears_the_pause(
-    client: TestClient, pid: str
+    client: TestClient, pid: str, video_preset: str
 ) -> None:
     pause(client, pid)
     ready_workflow(client, pid, "image2video")
@@ -320,7 +330,9 @@ def test_priority_reorders_the_queue_and_resume_clears_the_pause(
     assert client.post(f"/api/v1/projects/{pid}/queue/retry-failed").json() == {"retried": []}
 
 
-def test_cancel_all_and_clear_failed_and_delete_job(client: TestClient, pid: str) -> None:
+def test_cancel_all_and_clear_failed_and_delete_job(
+    client: TestClient, pid: str, video_preset: str
+) -> None:
     pause(client, pid)
     ready_workflow(client, pid, "image2video")
     scene = make_scene(client, pid)
@@ -674,7 +686,9 @@ def test_overview_tracks_progress_and_resume_pointer(client: TestClient, pid: st
     assert body["resume"]["status_label"] == "已生成"
 
 
-def test_activity_merges_versions_and_canceled_jobs(client: TestClient, pid: str) -> None:
+def test_activity_merges_versions_and_canceled_jobs(
+    client: TestClient, pid: str, video_preset: str
+) -> None:
     pause(client, pid)
     ready_workflow(client, pid, "image2video")
     scene = make_scene(client, pid)

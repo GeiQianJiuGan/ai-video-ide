@@ -10,10 +10,13 @@ AI Video Studio（`aivs`）：桌面端优先的 AI 原生长视频制作工作�
 
 1. **业务层不绑定具体视频模型**——不允许出现 `if model == "wan"` 或 `if provider == "comfy"`；
    差异全部下沉到 `app/generation/providers/*`（provider 适配层）。Shot 只写 capability
-   （`text2image` / `image2video` / `first_last_frame` / `upscale`）与 provider 名。整个后端只有
-   `providers/comfy_preset.py` 与 `app/generation/comfy/client.py` 知道 ComfyUI 存在；
-   老的 Workflow 绑定表（`services/workflows.py::apply_bindings`）降级为兼容路径，
-   只在 `job.workflow_id` 非空时才走。
+   （`text2image` / `image2video` / `first_last_frame` / `upscale`）与 provider 名。知道 ComfyUI
+   存在的只有 `providers/comfy_*.py`（共用 `comfy_base.py`）与 `app/generation/comfy/*`
+   （外加两处兼容 / 只读用途：`services/workflows.py` 导入与校验那份图、`services/overview.py`
+   探测服务在不在）。**全后端按调用方式的名字分岔只有一处**：`services/route.py::BINDS`
+   （「这条路要绑什么」那张表，界面照 `binds` 画控件）——service 层与前端一个名字都不写死。
+   **走哪条路是入队时解析一次并冻结进 `job.params.route`，执行与重试只读冻结值**
+   （见下面生成层那段的「工程路由」）。
 2. **LLM 不是必选项**——默认 `llm_provider="none"`，AI 入口返回 `LLM_UNAVAILABLE`，且建议里
    必须写明手动路径。Manual 模式必须能走完全流程，Source of Truth 始终是 `project.db`。
 3. **生成版本永不覆盖**——`GenerationVersion` 只增不改，冻结当次 prompt / workflow /
@@ -30,18 +33,20 @@ AI Video Studio（`aivs`）：桌面端优先的 AI 原生长视频制作工作�
 ## 当前进度（先读这段，别假设前端已经接上后端）
 
 - **后端已全量落地**：docs/04 的 Step 1–9 都有实现，之后又落了「两级场景系统」这一轮
-  （应用级设置 → provider 适配层 → 衔接与编排 → 场景工作台 → 幕流程图 → AI 协作栏）——
-  25 个 service（cast / world / assets / workflows / story / context / generation / timeline /
+  （应用级设置 → provider 适配层 → 衔接与编排 → 场景工作台 → 幕流程图 → AI 协作栏）与
+  「工程路由」这一轮（`services/route.py` 一份口径 + `comfy_workflow` 提成一等适配器）——
+  26 个 service（cast / world / assets / workflows / story / context / generation / timeline /
   overview / projects / library / adopt / fsbrowse / appsettings / frames / sequence / director /
-  packages / ingest / dub / refine / audio / images / describe / **onboarding**；`base` /
-  `params` / `global_registry` 是公共件不算）+ 25 个 router（含 `/ws`），464 passed（1 skipped：
+  packages / ingest / dub / refine / audio / images / describe / onboarding / **route**；`base` /
+  `params` / `global_registry` 是公共件不算）+ 25 个 router（含 `/ws`），480 passed（1 skipped：
   没跑过 `fetch_ffmpeg.py` 的机器上跳过「用的是内置那份」那条正向断言）。
 - **前端也全部接上了后端**：`app/features.ts` 里 15 个功能都是 `ready: true`，
   `/p/:pid` 下不再有外壳页。`shared/ui/FeatureView.vue`（按注册表画工作区骨架与能力锁）
   暂时没人用，留给下一个「登记了但还没接后端」的功能——那种情况先挂它，绝不给假界面。
 - 生成层的主路是 `flow`（幕）→ `scene`（场景工作台）；`workflows`（Workflow 管理）与
-  `queue`（生成队列细看）都是 `advanced: true` 的兼容 / 细看路径，不在导航里，只从命令面板、
-  设置页或底部控制台进——队列日常看的是控制台的任务框（见下面的「队列」段）。
+  `queue`（生成队列细看）都是 `advanced: true` 的高级 / 细看路径，不在导航里，只从命令面板、
+  设置页或底部控制台进——队列日常看的是控制台的任务框（见下面的「队列」段），
+  Workflow 管理是 `comfy_workflow` 那条路绑图的地方（见下面的「工程路由」段）。
 - 单个能力仍会缺（ComfyUI 离线、没有 LLM）：这类按钮保持 `disabled` 并把原因写进 tooltip，
   不画假界面、不造假数据。
 - 本机装了 `frontend/node_modules` 与 `backend/.venv`（后端命令用 `.venv/Scripts/python`），
@@ -295,9 +300,11 @@ kind / priority / included / reason / **media**（`image` / `video` / `audio`，
 （`_assign_roles`），`services/generation.py::_images_of` 照账单读它，绝不在生成层再挑一遍
 （两边各挑一次的话，检查器上标的和真正喂进去的会分叉）。**账单不截断**：采用的照样全采用，
 超出槽位的部分变成生成前的一次确认（`REF_OVER_CAPACITY` + `allow_ref_drop`），
-真正的截断只发生在提交那一刻并如实写进 `params.ref_notes` / `params.refs`。上限来自**预设里
-数出来的槽位**（`presets.slot_counts` → `RefCapacity`），不是应用级设置——`video.ref_limit`
-已经不再是上限来源。
+真正的截断只发生在提交那一刻并如实写进 `params.ref_notes` / `params.refs`。上限来自**这个工程
+这个能力真正会提交的那条路**（`route.capacity()` 一份口径，`context.project_ref_capacity` 只把
+`capability` 传下去）：预设路数那份图上的 `AIVS_REF_*`、REST 路不限量（`None`）、绑定路只收图片
+（视频 / 音频是实打实的 `0`）。**既不是应用级设置**（`video.ref_limit` 已经不再是上限来源），
+**也不能只看一份预设**——首尾帧镜头提交的是 `flf` 那份图，照 R2V 那份数出来的数字是假的。
 
 **时间线与导出**（`services/timeline.py`）：完全不依赖 AI。撤销栈是整轨快照（`UNDO_DEPTH=50`）；
 `GET /export/command` 只产出 ffmpeg 参数计划，`POST /export` 才真的起进程。
@@ -345,7 +352,7 @@ kind / priority / included / reason / **media**（`image` / `video` / `audio`，
   账单上每条都显示这句话（`features/story/ShotView.vue` 与 `features/flow/SceneWorkbench.vue`），
   空的标「没有描述 · 模型只看到一个文件名」——判断用后端的 `desc_missing`，前端不算第二遍。
 
-**生成层 = 两级场景系统 + provider 适配层**（不再是「Workflow 为中心」）：
+**生成层 = 两级场景系统 + 工程路由 + provider 适配层**（不再是「Workflow 为中心」）：
 
 - **第一级：幕流程图**（`services/sequence.py` + `api/sequence.py`，前端 `features/flow/FlowView.vue`）。
   一个节点是一幕（`Scene`），节点之间那一条是**衔接**（新表 `SceneLink`，三种 mode）：
@@ -464,11 +471,41 @@ kind / priority / included / reason / **media**（`image` / `video` / `audio`，
     `_wire_pending` 一处），绝不让一条被丢弃的提案带走整个镜头。
     **前端必须把这几句显示出来**（`DirectorPanel.vue::appliedRows`）：落成了的那张提案卡会
     走掉，只给一行「已落库 N 条」等于把降级藏起来（硬约束 4）。
+- **工程路由**（`services/route.py` + `GET /projects/{pid}/route`，迁移 `0022_project_route`）：
+  「**这个工程 + 这个能力 → 走哪条路、这条路要绑什么、绑没绑上、缺什么**」全应用只有这一份口径，
+  概览页、Workflow 管理页那条横幅、二次处理弹窗、入队守卫读的都是它。六条不许绕的：
+  - **调用方式是工程级可继承的一列**（`project.generation_mode`）：**空串 `''` = 跟随设置页**
+    （绝大多数工程是这一种，改设置页就跟着变），显式选一条之后就不再跟。所以
+    `summary()` 同时给 `provider`（最终走哪条）与 `source`（`project` / `settings` / `default`，
+    是谁给的这个答案）——「跟随设置页」和「谁都没选过用的是代码里那个默认值」对用户是一回事，
+    排查时方向不同，所以分开说。文案只有一份：`ROUTE_SOURCE_LABEL`。
+  - **界面照 `binds` 分岔，不照调用方式的名字**（硬约束 1）：`preset` 显示两份预设选择器 /
+    `base_url` 显示服务地址 / `workflow` 显示四个能力各一份图。`BINDS` 那张表是唯一真源，
+    前端一个 provider 名字都不写死；未知名字是空串（「什么都不用绑」）。
+  - **readiness 是按能力算的**，不是按工程：同一个工程 `image2video` 可以是 ready 而
+    `first_last_frame` 缺一份图。`capabilities[]` 每条自带 `ready` + `issues`（四要素，
+    `suggestions` 原样显示）+ `slots`（一次能喂几个参考素材，**`null` = 不限制，`0` 是有意义的
+    答案**，两者不能都画成「—」）。
+  - **读路径绝不抛**：`resolve()` / `capacity()` / `summary()` 缺什么都写进 `issues` 照常返回
+    （概览页要能画出「缺什么」这张图）；**入队那道门是 `require()`**，它把 `issues[0]` 抛出来。
+    编出来的调用方式名走 `normalize()` 报 `VALIDATION_ERROR`。
+  - **入队解析一次并冻结，执行与重试只读冻结值**：`Route.frozen()` 落进
+    `job.params["route"]`，`generation._provider_of()` 三级回退（`params.route.provider` →
+    `params.generation_mode` → 应用级设置，最后一级只为这次改造之前入队的老任务）。
+    中途在设置页改了调用方式，「重试」不该变成「换个后端跑一遍」（硬约束 3）。
+    冻结的**只有事实，没有当时的 readiness**——`ready` / `issues` 说的是解析那一刻缺什么，
+    冻进去只会让半年后翻参数的人把它当成这次任务的失败原因。**地址进档，密钥永不进档。**
+  - 老任务里没有这一项，所以前端 `shared/api/projects.ts::frozenRoute()` 回 `null` 而不是替它
+    编一条「ComfyUI 预设」——谎报走了哪条路正是这次要修的 bug 的形状。
 - **provider 适配层**（`app/generation/providers/`）：`base.py` 定义与模型无关的 `VideoRequest`
   （`mode` = `i2v` / `flf`、prompt、首尾帧、**参考素材 `refs`**（`RefAsset`，带 `media` =
   `image` / `video` / `audio`）、时长、seed、透传 `extra`、降级说明 `notes`）与 `VideoProvider`
-  协议（`probe` / `submit` / `poll` / `fetch`）；`comfy_preset.py` 是默认核心，`http_api.py`
-  是通用 REST 合同，`registry.py::provider()` 按应用级设置选。
+  协议（`probe` / `submit` / `poll` / `fetch`）。**三条正经路，谁都不是兼容路径**：
+  `comfy_preset.py`（默认核心，照节点标题约定注入）· `http_api.py`（通用 REST 合同）·
+  `comfy_workflow.py`（按你自己那份图的绑定表填，绑定表来自 Workflow 管理页）。
+  `registry.py::provider()` 按名字取一个适配器，**那个名字由工程路由给**（入队时
+  `route.require()` 解析并冻结，见上一条），不再由业务层写死 `provider("comfy_preset")`。
+  不传名字才回退到应用级设置——只有设置页那颗「测试连接」用得上（那里没有工程上下文）。
   **本工具不维护模型端的图**：ComfyUI 适配器只按**节点 title 约定**注入入口参数——
   `AIVS_FIRST_FRAME` / `AIVS_LAST_FRAME` / `AIVS_PROMPT` / `AIVS_NEGATIVE` / `AIVS_DURATION` /
   `AIVS_SEED` / `AIVS_REF_1`…`AIVS_REF_9`（参考图，最多 9 个）/
@@ -476,12 +513,29 @@ kind / priority / included / reason / **media**（`image` / `video` / `audio`，
   `AIVS_REF_AUDIO_1`…`AIVS_REF_AUDIO_4`（参考音频，最多 4 个）——不解析、不校验、不改写图里的
   lora 与加速节点。缺必需 title 时报 `INVALID_WORKFLOW`，建议里写「在 ComfyUI 里把该节点标题改成
   X」。lora、加速节点、采样器怎么摆是模型端自己的事，本工具跟着改迟早两边打架。
+  **标了标题却这一次没有值时，媒体入口连节点一起摘掉、标量保持原值**
+  （`comfy_preset._detach_idle` / `comfy_workflow._detach_idle` → `comfy/graph.py::detach`，
+  两张分界表 `presets.MEDIA_MARKERS` 与 `graph.MEDIA_SLOTS`）：图里那一格存的不是空值，而是用户在
+  ComfyUI 里存图时挂着的**示例文件**，留着就等于把一张不相干的图真喂进模型——画面往它上面收敛，
+  而队列里一条错误都没有，于是「多标几个入口」反过来成了风险，用户不敢在图里多摆节点。口径是
+  **标了 `AIVS_*` = 这一格由本工具填，本工具这次没填 = 这一格这次不用**；标量相反
+  （seed / 时长 / 宽高 / 负向），保持图里原来的值才对——那是用户有意存进去的默认参数。
+  摘节点**只跟着连线走**（不认识任何 `class_type`，照旧不 import 服务层、不打 `/object_info`）：
+  切掉指向被摘节点的输入之后**一条连线输入都不剩**的下游节点是只为它服务的中间件，跟着摘；还连着
+  别的线的是汇合点（`WanImageToVideo` 丢了 `end_image` 还连着 `positive` / `vae` / `start_image`），
+  到此为止；这一次真填了值的入口节点走 `keep=` 保护。摘了什么写进 `req.notes` → 冻结成
+  `params.ref_notes`（硬约束 4）。**唯一残余风险**：被摘的那一格在图里是必填的
+  （`ImageBatch.image1`），此时 ComfyUI 拒绝提交，`comfy_base.detached_submit_error` 在原错误上补两
+  条点名建议——**只在真摘过、且错误真是 `WORKFLOW_ERROR` 时补**，离线 / 超时那类失败加这两句只会
+  把真正的原因埋掉。
 - **首尾帧 ≠ 参考素材**（`AIVS_REF_*` 三族就是为这件事加的）：首尾帧决定「画面从哪一格开始 /
   结束」，参考素材决定「谁出场、在哪儿、什么动作、什么声音」。只喂一张首帧最容易丢的就是
   人物形象，所以账单里采用的条目**除首帧那一张之外全部当参考素材送到模型端**
   （`generation._images_of`）。**槽位不够只降级、不失败**：图里标了 3 个而账单给了 5 张就填
   前 3 张，把少喂了哪几张写进 `req.notes` → 冻结成版本参数 `ref_notes`（`refs` 记实际喂了
-  哪几张），界面上看得见。一个 `AIVS_REF_*` 都没有的预设照样 `ready`，只是设置页的预设列表会把
+  哪几张），界面上看得见。**反过来槽位多余就摘掉**：标了 9 个而这个镜头只有 2 张时，剩下 7 个槽位
+  连节点一起从提交的副本里摘掉（见上一条），所以标多了不再有代价。
+  一个 `AIVS_REF_*` 都没有的预设照样 `ready`，只是设置页的预设列表会把
   「参考图 0 槽」标成警告；**参考视频 / 参考音频 0 槽是常态**（绝大多数图只收图片），只在真标了
   槽位时画徽标，否则会把前面那个真问题埋掉。默认会在 prompt 末尾附一句
   `参考图说明：参考图1=…`（`base.ref_hint`，ComfyUI 那类图收不到标签，只能靠这句对号），
@@ -546,9 +600,17 @@ kind / priority / included / reason / **media**（`image` / `video` / `audio`，
   **绝不落盘**（不然得先存一份可能是错的配置）；`current_present=false` 表示连得上但这个端上
   没有当前模型。所有出网请求走 `protocols._client(timeout)` 这唯一出口——
   `tests/test_llm_protocols.py` 就是靠 monkeypatch 它把 24 个用例全部关在机器里跑。
-- **老的「Workflow 管理」是高级 / 兼容路径**：页面与代码原样保留（`features.ts` 里
-  `advanced: true`、不进 `PROJECT_NAV`），`GenerationService._execute` 默认走 provider，
-  只有 `job.workflow_id` 非空时才走 `apply_bindings` 那一支。
+- **「Workflow 管理」是高级页面，但它管的那条路不是兼容路径**（`features.ts` 里 `advanced: true`、
+  不进 `PROJECT_NAV`，从命令面板或设置页进）：它是 `comfy_workflow` 那条路**绑图的地方**——
+  一个能力绑一份图 + 一张字段绑定表（`services/workflows.py`，纯函数下沉在
+  `app/generation/comfy/graph.py`：`SLOTS` / `parse_graph` / `apply_bindings`）。
+  工程没选这条路时四个能力下拉是禁用的，**判据是 `binds_workflow` 而不是调用方式的名字**，
+  且旁边必须写清为什么禁用。执行侧 `_execute` **不再按 `job.workflow_id` 分支**
+  （老的 `_run_legacy` 整个删掉了，那支从来没被触发过，等于选了「工作流绑定」什么都不会发生）：
+  装不装 `WorkflowSpec` 判的是「这个任务有没有绑定的图」这个事实（`_workflow_spec_of`，
+  id 来自入队冻结的 `params.route.workflow_id`），提交由 `providers/comfy_workflow.py` 做。
+  **图与绑定表刻意不进 `params_json`**——一份 api_json 动辄几十 KB，每个版本存一份会把工程库
+  撑起来，冻结的是 id。
 
 **新手引导与演示工程**（`services/onboarding.py` + `api/onboarding.py` + `core/pngdraw.py`，
 前端 `features/onboarding/`）：第一次打开应用的人面前不该只有「新建 / 打开」两个按钮，
@@ -590,12 +652,16 @@ kind / priority / included / reason / **media**（`image` / `video` / `audio`，
 - **新增表**：工程表必须在 `persistence/all_models.py` 里 import，否则 `Base.metadata` 漏表；
   素材库表相反——挂 `LibraryBase`，**不要**进 `all_models.py`（理由见上面的素材库段）。
 - **新增迁移**：`alembic/versions/` 加脚本 → 在 `persistence/migrate.py::REVISION_SCHEMA` 登记
-  它对应的 schema 版本 → 同步 `settings.schema_version`（当前 21，最新一条是
-  `0021_asset_description`：`asset.description` + `character.description` 两列，见下面的
-  「素材描述」段；上一条 `0020_image_jobs` 是图片任务——它不挂在镜头上，所以 `job.shot_id`
-  改可空，另加 `target_kind` / `target_id` 两列指向出图对象（`appearance` / `location_variant` /
-  `prop` / `shot_first_frame` / `shot_last_frame`）；`GenerationVersion` 一列不动——素材图的
-  「永不覆盖」由 `SheetVersion` / `LocationReference` / `PropReference` 已有的
+  它对应的 schema 版本 → 同步 `settings.schema_version`（当前 22，最新一条是
+  `0022_project_route`：`project.generation_mode` 改**可空、默认 `''`**——空串 = 跟随设置页，
+  同时把老库里的 `workflow_api` 归一成 `comfy_workflow`、把等于旧默认值 `comfy_preset` 的行清成
+  空串（这一列在此之前从未被读过，所以不丢用户意图），见上面的「工程路由」段；
+  **`job` / `generation_version` 一列都不动**——那条路是入队时冻结进 `job.params_json["route"]` 的，
+  不是新列。上一条 `0021_asset_description` 是 `asset.description` + `character.description` 两列，
+  见下面的「素材描述」段；再上一条 `0020_image_jobs` 是图片任务——它不挂在镜头上，所以
+  `job.shot_id` 改可空，另加 `target_kind` / `target_id` 两列指向出图对象（`appearance` /
+  `location_variant` / `prop` / `shot_first_frame` / `shot_last_frame`）；`GenerationVersion` 一列
+  不动——素材图的「永不覆盖」由 `SheetVersion` / `LocationReference` / `PropReference` 已有的
   `version_no` + `is_current` 保证）。漏登记会导致打开旧工程时无法告诉用户「schema X → Y」。
 - **落盘**：资产 `path` 相对工程目录存（整个目录拷走仍然有效）；类型→子目录映射在
   `services/assets.py::KIND_DIR`，`generations/` 只放生成物，手动素材一律进 `assets/`，
@@ -617,9 +683,14 @@ kind / priority / included / reason / **media**（`image` / `video` / `audio`，
   并在收尾时停掉所有 pump——工程、素材库、应用级设置、provider 实例都是应用级状态，
   绝不能泄漏到下一个测试。
 - 涉及入队的测试**先 `POST /queue/pause`**，pump 就不会真去连 ComfyUI；需要一个「已生成」的镜头时
-  用 `POST /shots/{id}/versions` 手工造版本。
+  用 `POST /shots/{id}/versions` 手工造版本。**再要用 `video_preset` fixture**：入队门槛在
+  `route.require()`（这条路绑没绑上），缺预设时按下生成立刻是四要素错误、根本排不进队列——
+  队列机制 / 编排 / 批次那些用例测的不是这道门槛，所以让 fixture 一次把前提摆齐。
 - conftest 提供 `error_of`（断言错误四要素齐全）、`ready_workflow`（导入 + `validate?probe=false`，
-  本地绑定校验不需要 ComfyUI）、`upload_png`、`GRAPH` / `BINDINGS`；素材库侧是 `library`
+  本地绑定校验不需要 ComfyUI）、`video_preset` / `write_preset` / `PRESET_GRAPH`（摆一份
+  `AIVS_*` 标题齐全的预设图并让设置页指向它，**走 `app_settings.patch()` 真落
+  settings.json**——`TestClient` 起 lifespan 时会再 `apply()` 一遍，monkeypatch 单例会被擦回
+  默认值）、`upload_png`、`GRAPH` / `BINDINGS`；素材库侧是 `library`
   （在 `tmp_path` 下 configure 一个库，`clean_runtime` 收尾时 `library_service.shutdown()`）
   与 `lib_png`。
 - **LLM 一律 monkeypatch 掉**（`tests/test_director_agent.py::use_fake_llm` 是范本：改
@@ -636,8 +707,9 @@ kind / priority / included / reason / **media**（`image` / `video` / `audio`，
 ## 文档
 
 `docs/01` 架构与选型 · `docs/02` 模块规格与 M0–M6 里程碑 · `docs/03` 全量表结构 + REST/WS 契约
-+ 落盘规范 + 测试清单 · `docs/04` Step 1–9 与完成标准 · `docs/05` 三种调用方式与模型端要
-准备什么（`AIVS_*` 节点标题约定、http_api 合同、最小验收清单）· `docs/06` 打包与分发
-（五步流水线、各平台前置、冻结后的路径规则、sidecar 那三个坑）。service / api 的 docstring
-里写的「Step N」对应 `docs/04`；改接口或表结构时同步 `docs/03`，改生成层的入口约定或适配器
-时同步 `docs/05`，改打包脚本 / spec / `tauri.conf.json` 时同步 `docs/06`。
++ 落盘规范 + 测试清单（`2.18` 工程路由那一列 / `3.4` Route 的形状与冻结） · `docs/04` Step 1–9
+与完成标准 · `docs/05` 三条路与「这个工程走哪一条」（`AIVS_*` 节点标题约定、http_api 合同、
+绑定表、最小验收清单）· `docs/06` 打包与分发（五步流水线、各平台前置、冻结后的路径规则、
+sidecar 那三个坑）。service / api 的 docstring 里写的「Step N」对应 `docs/04`；改接口或表结构时
+同步 `docs/03`，改生成层的入口约定或适配器时同步 `docs/05`，改打包脚本 / spec /
+`tauri.conf.json` 时同步 `docs/06`。

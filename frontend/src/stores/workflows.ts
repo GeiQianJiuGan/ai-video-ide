@@ -21,16 +21,25 @@ import {
   type ProjectWorkflowBindings,
 } from '@/shared/api/workflows'
 
-export const useWorkflowStore = defineStore('workflows', () => {
-  const list = ref<Workflow[]>([])
-  const matrix = ref<CapabilityMatrix | null>(null)
-  const projectBindings = ref<ProjectWorkflowBindings>({
-    generation_mode: 'comfy_preset',
+/**
+ * 还没读到工程那一行时的绑定表。**`generation_mode: ''` = 跟随设置页**，不是
+ * 「这个工程选了 ComfyUI 预设」——以前这里预置 `'comfy_preset'`，于是没打开工程时那个下拉
+ * 显示的是一条工程根本没选过的路，用户以为选着，实际走的是设置页那条。
+ */
+function emptyBindings(): ProjectWorkflowBindings {
+  return {
+    generation_mode: '',
     text2image: null,
     image2video: null,
     first_last_frame: null,
     upscale: null,
-  })
+  }
+}
+
+export const useWorkflowStore = defineStore('workflows', () => {
+  const list = ref<Workflow[]>([])
+  const matrix = ref<CapabilityMatrix | null>(null)
+  const projectBindings = ref<ProjectWorkflowBindings>(emptyBindings())
   const selectedId = ref('')
   /** 选中那条的完整体（带 api_json），列表里的没有原始图。 */
   const detail = ref<Workflow | null>(null)
@@ -79,9 +88,7 @@ export const useWorkflowStore = defineStore('workflows', () => {
       ])
       list.value = rows
       matrix.value = mtx
-      projectBindings.value = pid
-        ? bindings
-        : { generation_mode: 'comfy_preset', text2image: null, image2video: null, first_last_frame: null, upscale: null }
+      projectBindings.value = pid ? bindings : emptyBindings()
       if (!rows.some((r) => r.id === selectedId.value)) selectedId.value = rows[0]?.id ?? ''
       await loadDetail(pid)
     })

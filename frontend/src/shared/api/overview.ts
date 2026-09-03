@@ -9,7 +9,8 @@
  *      所以 title / detail / suggestions 原样显示，判断权留给导演。
  */
 
-import { api } from './client'
+import { api, type ErrorPayload } from './client'
+import type { RouteSource } from './projects'
 
 export interface OverviewCounts {
   scenes: number
@@ -112,8 +113,28 @@ export interface EnvironmentStatus {
   }
   capabilities: { capabilities: CapabilityRow[]; comfy: unknown } | null
   generation: {
-    mode: 'comfy_preset'
+    /**
+     * 最终走哪条路（`comfy_preset` / `http_api` / `comfy_workflow`）。**不写成字面量联合**：
+     * 名字来自后端的适配器注册表，加一条路时前端不该跟着改型（硬约束 1）。
+     */
+    mode: string
+    /** 这条路的中文名，由后端给（`registry.LABELS`），前端不写第二份。 */
+    mode_label: string
+    /** 这个答案是谁给的：工程显式选了 / 跟随设置页 / 谁都没选过。 */
+    mode_source: RouteSource
+    /** 界面上那句「这条路不需要工作流绑定」只看这一个布尔。 */
+    binds_workflow: boolean
+    /** 绑定那条路上普通镜头绑的是哪份图；其余两条路是 null。 */
+    workflow_name: string | null
+    /** 这条路的服务在不在（「测试连接」那一下）。**它不回答「绑没绑上」**，那半句在 `issues` 里。 */
+    service: { ok: boolean; target: string; detail: string; error: ErrorPayload | null }
+    /** 两条能力（普通镜头 / 衔接与转场）各自 ready 才算这个工程能出片。 */
+    ready: boolean
+    /** 缺什么。四要素形状，suggestions 原样显示（硬约束 4）。 */
+    issues: ErrorPayload[]
+    /** 预设那条路才有值：走 REST / 工作流绑定时是 null，**不是「未绑定预设」**。 */
     preset_name: string | null
+    /** 说的是**这条路**能不能出片，不是「有没有选预设」。 */
     preset_ready: boolean
     ref_slots: number | null
     /**
@@ -123,6 +144,8 @@ export interface EnvironmentStatus {
      */
     ref_video_slots: number | null
     ref_audio_slots: number | null
+    /** 这几个数是哪份图 / 哪条合同给的。 */
+    ref_detail: string | null
     r2v_name: string | null
     r2v_ready: boolean
     r2v_ref_slots: number | null

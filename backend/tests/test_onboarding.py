@@ -9,11 +9,24 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import pytest
 from fastapi.testclient import TestClient
 
 from tests.conftest import error_of
 
 API = "/api/v1"
+
+
+@pytest.fixture(autouse=True)
+def demo_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """把「家目录」指到 tmp_path 里。
+
+    演示工程的默认落点是 `~/Documents/AI Video Studio/演示项目`（`_default_demo_dir`），
+    所以「那个目录里是不是已经有演示工程」照真机去判：开发者自己在应用里点过一次
+    「创建演示工程」之后，`demo_exists is False` 这条断言就永远失败了——而它测的本来是
+    状态接口的形状，不是这台机器上恰好有什么。理由与 `no_ffmpeg` 那条完全相同。
+    """
+    monkeypatch.setattr(Path, "home", lambda *_: tmp_path / "home")
 
 
 def _state(client: TestClient) -> dict[str, Any]:

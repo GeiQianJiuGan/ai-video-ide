@@ -226,6 +226,69 @@ def test_deleted_preset_does_not_break_project_preset_change(client: TestClient,
     assert update_resp.json()["flf_name"] == "预设B"
 
 
+# --- 工程路由：同一条路只有一个名字，改预设不许改路 ---
+
+
+def test_generation_mode_alias_is_normalized_on_both_sides(client: TestClient, pid: str) -> None:
+    """`workflow_api` 是老库里那条路的旧名字，读写两侧都归一成 `comfy_workflow`。
+
+    同一条路两个名字、中间没有映射，前端就拿它和 registry 给的候选比对不上（下拉框
+    显示空白、`:disabled` 判断永远为真）。归一的唯一口径是 `services/route.py::ALIAS`。
+    空串 = 跟随设置页（`route.INHERIT`），**这才是新工程的默认值**——以前默认写死
+    `comfy_preset`，于是「跟随设置页」这件事根本表达不出来。
+    """
+    assert client.get(f"/api/v1/projects/{pid}/workflow-bindings").json()["generation_mode"] == ""
+
+    saved = client.put(
+        f"/api/v1/projects/{pid}/workflow-bindings", json={"generation_mode": "workflow_api"}
+    )
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["generation_mode"] == "comfy_workflow", "写进去的别名要立刻归一"
+    read = client.get(f"/api/v1/projects/{pid}/workflow-bindings").json()
+    assert read["generation_mode"] == "comfy_workflow", "重新读也是同一个名字"
+
+    route = client.get(f"/api/v1/projects/{pid}/route").json()
+    assert (route["mode"], route["provider"], route["source"]) == (
+        "comfy_workflow",
+        "comfy_workflow",
+        "project",
+    )
+    assert route["binds"] == "workflow", "这条路绑的是工作流，界面照 binds 画控件"
+
+    bad = client.put(
+        f"/api/v1/projects/{pid}/workflow-bindings", json={"generation_mode": "wan"}
+    )
+    assert bad.status_code == 422
+    err = error_of(bad)
+    assert err["code"] == "VALIDATION_ERROR"
+    assert "comfy_preset" in err["detail"], "不认识的值要说清认识哪些，别静默丢弃"
+    assert (
+        client.get(f"/api/v1/projects/{pid}/workflow-bindings").json()["generation_mode"]
+        == "comfy_workflow"
+    ), "被拒的那一次不该改动已有的选择"
+
+
+def test_changing_the_preset_never_changes_the_route(client: TestClient, pid: str) -> None:
+    """`PUT /preset` 只换用哪一份图，不许顺手把调用方式改回 ComfyUI 预设。
+
+    这里以前无条件写 `row.generation_mode = "comfy_preset"`：一个走通用 REST 的工程只要
+    有人点了一下预设下拉，整条路就被悄悄搬回 ComfyUI，而界面上什么都没说。
+    """
+    from app.generation.providers import presets
+    from tests.test_providers import GRAPH
+
+    presets.save("预设A", json.dumps(GRAPH, ensure_ascii=False))
+    client.put(f"/api/v1/projects/{pid}/workflow-bindings", json={"generation_mode": "http_api"})
+
+    resp = client.put(f"/api/v1/projects/{pid}/preset", json={"r2v_name": "预设A"})
+    assert resp.status_code == 200, resp.text
+    assert (
+        client.get(f"/api/v1/projects/{pid}/workflow-bindings").json()["generation_mode"]
+        == "http_api"
+    ), "改预设不许改路"
+    assert client.get(f"/api/v1/projects/{pid}/route").json()["provider"] == "http_api"
+
+
 # --- Step 5：剧本 / Scene / Shot / 分镜板 ---
 
 

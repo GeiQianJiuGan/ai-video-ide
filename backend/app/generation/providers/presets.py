@@ -145,6 +145,23 @@ DECLARE_IMAGE = "AIVS_IMAGE"
 #: （已有的预设一份都不用重新标），所以刻意没有对称的 `AIVS_VIDEO`。
 DECLARATIONS: dict[str, str] = {DECLARE_IMAGE: "出图那份图（T2I / 图生图）"}
 
+#: `MARKERS` 里**接文件**的那几个入口（首尾帧、源视频、音色参考、三族参考素材槽位）。
+#: 与标量入口的区别不是数据类型，而是**这一次没有值时该怎么办**：
+#:
+#:   · 标量（种子 / 步数 / 时长 / 宽高）保持图里原来的值——那是用户有意存进去的默认参数；
+#:   · 媒体**必须把那个节点从提交的副本里摘掉**（`comfy/graph.py::detach`）。图里那一格存的是
+#:     在 ComfyUI 里存图时挂着的示例文件，留着就等于把一张不相干的图真喂进模型：画面会往
+#:     那张示例图上收敛，而队列里一条错误都没有。于是「多标几个入口」反而成了风险，
+#:     用户不敢在图里多摆节点——这个便利就废了。
+#:
+#: **从 `MARKERS` 推出来而不是手写一遍**：以后再加一族媒体入口时这里自动跟上，
+#: 不会漏掉一个而留下同一个坑。绑定那条路上同一件事的表是 `comfy/graph.py::MEDIA_SLOTS`。
+MEDIA_MARKERS: frozenset[str] = frozenset(
+    marker
+    for marker, fields in MARKERS.items()
+    if fields in (IMAGE_FIELDS, VIDEO_FIELDS, AUDIO_FIELDS)
+)
+
 #: 入口标题 → 人看得懂的说法。**只有这一份**：错误文案、设置页的手动对应表、
 #: 「这一格是干什么的」都从这里取，写两份必然对不上。
 MARKER_LABEL: dict[str, str] = {

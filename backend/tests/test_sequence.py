@@ -22,11 +22,21 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
 from fastapi.testclient import TestClient
 
 from tests.conftest import error_of, upload_png
 
 API = "/api/v1"
+
+
+@pytest.fixture(autouse=True)
+def _preset(video_preset: str) -> None:
+    """编排要真入队，所以默认那条路必须有一份能用的图。
+
+    入队门槛在 `services/route.py::require()`（缺预设 = 四要素错误，不进队列），
+    而这个文件测的是编排的账单与顺序，不是那道门槛。
+    """
 
 
 def make_world(client: TestClient, pid: str) -> tuple[str, str]:

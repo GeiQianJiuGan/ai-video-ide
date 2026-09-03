@@ -168,10 +168,15 @@ class ComfyAudioProvider(ComfyPresetProvider):
                 )
                 continue
             values[marker] = await self._upload(path)
+        # 这条链**刻意不摘节点**（出画面那两条会，见 `comfy_preset._detach_idle`）：音源图上
+        # `AIVS_VOICE_REF` 挂着的那段示例音频**就是这份图的默认音色**，而不是一个碰巧留在格子里
+        # 的不相干文件——没指定音色时用它是对的，摘掉反而会让「只能靠参考音频跑」的克隆图直接报
+        # 「Required input is missing」。`AIVS_SOURCE_VIDEO`（口型驱动）同理。所以这里照旧
+        # 「没给的项保持图里原来的值」，一个字都不要跟着视频那条路改。
         for marker, spot in points.items():
             value = values.get(marker)
             if value is None or value == "":
-                continue  # 没给的项保持图里原来的值，不要用空串把它冲掉
+                continue
             graph[spot["node_id"]]["inputs"][spot["field"]] = value
         prompt_id = await self._client.submit(graph, client_id=client_id)
         self._used[prompt_id] = name

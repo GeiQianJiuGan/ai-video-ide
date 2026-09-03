@@ -59,6 +59,7 @@ import {
   type GenerationVersion,
 } from '@/shared/api/generation'
 import { SHOT_STATUS, SHOT_STATUS_LABEL, type ShotStatus } from '@/shared/api/story'
+import { frozenRoute } from '@/shared/api/projects'
 import { useConsoleStore } from '@/stores/console'
 import { useSceneStore, type FrameSlotKey } from '@/stores/scene'
 
@@ -243,6 +244,15 @@ function refCount(params: Record<string, unknown>): number {
 function refNotes(params: Record<string, unknown>): string[] {
   const notes = params.ref_notes
   return Array.isArray(notes) ? notes.map(String) : []
+}
+
+/**
+ * 这一版是走哪条路出的 —— 同样是入队那一刻冻结的（`params.route`）。同一个镜头的两版
+ * 完全可以来自两条路（中间换过设置），不写出来就没法解释「这两版为什么长得不像」。
+ * 改造之前的老版本里没有这一项，那就一个字都不显示，不替它编一条。
+ */
+function routeLabel(params: Record<string, unknown>): string {
+  return frozenRoute(params)?.label ?? ''
 }
 
 async function reload(): Promise<void> {
@@ -1124,6 +1134,8 @@ function cancelDrop(): void {
                   <template v-if="refCount(v.params)">
                     · 参考素材 {{ refCount(v.params) }} 个
                   </template>
+                  <!-- 这一版是哪条路出的：同一个镜头的两版可以来自两条路，不写出来就没法比 -->
+                  <template v-if="routeLabel(v.params)">· {{ routeLabel(v.params) }}</template>
                 </p>
                 <!-- 适配器说「少喂了几张」时原样显示：这就是形象跑偏的现场证据 -->
                 <p

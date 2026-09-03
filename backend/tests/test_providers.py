@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -20,10 +21,11 @@ import httpx
 import pytest
 
 from app.core.config import settings
-from app.core.errors import AppError
+from app.core.errors import AppError, ErrorCode
 from app.generation.providers import presets, registry
-from app.generation.providers.base import RefAsset, VideoRequest
+from app.generation.providers.base import RefAsset, VideoRequest, WorkflowSpec
 from app.generation.providers.comfy_preset import ComfyPresetProvider
+from app.generation.providers.comfy_workflow import ComfyWorkflowProvider
 from app.generation.providers.http_api import HttpApiProvider
 
 # --- comfy_preset ---
@@ -664,6 +666,48 @@ async def test_http_api_carries_the_asset_description_in_the_refs_body(
     assert [r["label"] for r in seen["refs"]] == ["林小雨（常服）", "雨夜巷口"]
 
 
+async def test_http_api_refine_carries_the_source_video_itself(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """二次处理（`mode="refine"`）必须把**那一段视频本身**带过去，不只是一句提示词。
+
+    合同里少了 `source_video` 这一项，REST 路上的超分就变成「凭提示词重出一段」，而版本轨上
+    写着「从 v1 超分而来」——血缘就是假的了。它与 `refs` 里 `media="video"` 的那些严格分开：
+    那些是参考，这一条是「就处理这一段」。
+    """
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/submit"):
+            seen.update(json.loads(request.content))
+            return httpx.Response(200, json={"task_id": "t-refine"})
+        return httpx.Response(404, json={"error": "no"})
+
+    stub_transport(monkeypatch, handler)
+    monkeypatch.setattr(settings, "video_base_url", "http://127.0.0.1:9100")
+    source = tmp_path / "shot_01_v1.mp4"
+    source.write_bytes(b"MP4_SOURCE")
+    reference = tmp_path / "action_ref.mp4"
+    reference.write_bytes(b"MP4_REF")
+
+    task_id = await HttpApiProvider().submit(
+        VideoRequest(
+            mode="refine",
+            prompt="放大到 4K",
+            source_video=source,
+            refs=[RefAsset(path=reference, label="动作参考", kind="source_video", media="video")],
+        ),
+        client_id="aivs-test",
+    )
+
+    assert task_id == "t-refine"
+    assert seen["mode"] == "refine"
+    assert seen["source_video_name"] == "shot_01_v1.mp4"
+    assert base64.b64decode(seen["source_video"]) == b"MP4_SOURCE", "要处理的那一段本身"
+    assert [r["name"] for r in seen["refs"]] == ["action_ref.mp4"], "参考视频不该顶掉源视频"
+    assert seen["refs"][0]["media"] == "video"
+
+
 async def test_http_api_without_an_address_points_at_the_settings_page(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -723,23 +767,95 @@ async def test_http_api_failed_task_always_has_a_reason(monkeypatch: pytest.Monk
 # --- registry ---
 
 
-def test_registry_refuses_the_legacy_path_and_names_the_way_out(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_registry_treats_the_three_routes_alike(monkeypatch: pytest.MonkeyPatch) -> None:
+    """三条路在 registry 里一视同仁——`comfy_workflow` 不再是被拒的兼容路径。
+
+    它以前长在 `GenerationService._run_legacy` 里，靠 `job.workflow_id` 非空触发，而那一列
+    从来没被写过值：选了它等于什么都没选，所以 registry 直接拒绝它并劝人改回预设。现在它是
+    一等适配器（`providers/comfy_workflow.py`），`is_legacy()` 也随之删掉——**「这条路绑没绑上」
+    改由 `services/route.py` 按工程 + 能力回答**，不再是应用级的一句「不支持」。
+    """
     monkeypatch.setattr(settings, "video_provider", "comfy_workflow")
     registry.reset()
-    assert registry.is_legacy() is True
-    with pytest.raises(AppError) as caught:
-        registry.provider()
-    assert any("ComfyUI 预设" in s for s in caught.value.suggestions)
+    assert registry.provider().name == "comfy_workflow", "选了工作流绑定就得真拿到它"
+    assert not hasattr(registry, "is_legacy"), "拉平之后不该再有「哪条是兼容路径」这个问题"
+    assert [row["legacy"] for row in registry.listing()] == [False, False, False]
 
     monkeypatch.setattr(settings, "video_provider", "wan")
     with pytest.raises(AppError) as caught:
         registry.provider()
     assert caught.value.code == "VALIDATION_ERROR"
+    assert caught.value.related_ids["available"] == ["comfy_preset", "http_api", "comfy_workflow"]
 
     monkeypatch.setattr(settings, "video_provider", "comfy_preset")
     assert registry.provider().name == "comfy_preset"
+
+
+async def test_workflow_route_submits_by_bindings_and_says_what_it_dropped(
+    tmp_path: Path,
+) -> None:
+    """工作流绑定那条路：按绑定表填、只喂图片、少喂的每一张都写进 notes。
+
+    这两条降级原样搬自被删掉的 `_run_legacy`（一个字都没放宽）：图是用户自己维护的，
+    我们没资格因为它只绑了一个参考图槽位就拒绝生成——但静默丢掉更糟，事后没人查得出
+    「我挂的那段对白音频到底送没送出去」。
+    """
+    graph = {
+        "10": {"class_type": "LoadImage", "inputs": {"image": "first.png"}},
+        "11": {"class_type": "LoadImage", "inputs": {"image": "ref.png"}},
+        "6": {"class_type": "CLIPTextEncode", "inputs": {"text": "原提示词"}},
+    }
+    head = tmp_path / "head.png"
+    head.write_bytes(b"PNG_HEAD")
+    sheet = tmp_path / "sheet.png"
+    sheet.write_bytes(b"PNG_SHEET")
+    extra = tmp_path / "extra.png"
+    extra.write_bytes(b"PNG_EXTRA")
+    voice = tmp_path / "line.wav"
+    voice.write_bytes(b"WAV")
+
+    fake = FakeComfy()
+    provider = ComfyWorkflowProvider(client=fake)  # type: ignore[arg-type]
+    req = VideoRequest(
+        mode="i2v",
+        prompt="雨夜推门",
+        first_frame=head,
+        refs=[
+            RefAsset(path=sheet, label="阿岚 默认形象", kind="character_sheet", media="image"),
+            RefAsset(path=extra, label="城南旧宅 雨夜", kind="location_reference", media="image"),
+            RefAsset(path=voice, label="对白", kind="dialogue_audio", media="audio"),
+        ],
+        workflow=WorkflowSpec(
+            id="wf_1",
+            name="绑定图",
+            api_json=json.dumps(graph),
+            bindings={
+                "prompt": "6.text",
+                "first_frame": "10.image",
+                "reference_image_slots": ["11.image"],
+            },
+        ),
+    )
+    assert await provider.submit(req, client_id="aivs-test") == "pid-1"
+
+    submitted = fake.submitted or {}
+    assert submitted["10"]["inputs"]["image"] == "aivs/head.png", "首帧按绑定表进它那个节点"
+    assert submitted["11"]["inputs"]["image"] == "aivs/sheet.png", "第一张参考图进唯一那个槽位"
+    assert submitted["6"]["inputs"]["text"] == "雨夜推门"
+    assert fake.uploaded == ["head.png", "sheet.png", "extra.png"], "音频连上传都不该发生"
+    assert any("对白" in note and "只能喂图片" in note for note in req.notes)
+    assert any("城南旧宅 雨夜" in note and "1 个" in note for note in req.notes)
+
+
+async def test_workflow_route_without_a_bound_graph_names_the_way_out() -> None:
+    """这条路的前提就是「这个能力绑了一份图」，没有就是四要素错误（不是 500、不是静默出片）。"""
+    with pytest.raises(AppError) as caught:
+        await ComfyWorkflowProvider(client=FakeComfy()).submit(  # type: ignore[arg-type]
+            VideoRequest(mode="i2v", prompt="x"), client_id="aivs-test"
+        )
+    assert caught.value.code == "MISSING_CAPABILITY"
+    assert any("Workflow 管理页" in s for s in caught.value.suggestions)
+    assert any("ComfyUI 预设" in s for s in caught.value.suggestions)
 
 
 async def test_preset_injects_source_video_and_ref_video(tmp_path: Path) -> None:
@@ -780,3 +896,307 @@ async def test_preset_injects_source_video_and_ref_video(tmp_path: Path) -> None
     assert submitted["1"]["inputs"]["video"] == "aivs/slice_01_10.00_15.00.mp4"
     assert submitted["2"]["inputs"]["video"] == "aivs/ref_action.mp4"
     assert fake.uploaded == ["slice_01_10.00_15.00.mp4", "ref_action.mp4"]
+
+
+# --- 这一版用不上的媒体入口：连节点一起摘掉 ---
+#
+# 「标了 AIVS_* 标题却这一次没有值」以前是「保持图里原来的值」，而图里那一格存的是用户在
+# ComfyUI 里存图时挂着的**示例文件**——于是不需要末帧的镜头会被真喂一张不相干的图，画面往它
+# 上面收敛，队列里却一条错误都没有。结果是「多标几个入口」反过来成了风险，用户不敢在图里
+# 多摆节点。这一组盯的就是新口径：**标了标题 = 这一格由本工具填，本工具这次没填 = 这一格
+# 这次不用**（标量相反，保持原值才是对的）。
+
+
+async def test_unused_media_entry_is_detached_instead_of_feeding_its_sample_file(
+    tmp_path: Path,
+) -> None:
+    """只给首帧时，末帧那个节点整个不进提交的图；标量与文本入口照旧保持原值。"""
+    write_preset("wan-flf", GRAPH)
+    first = tmp_path / "first.png"
+    first.write_bytes(b"A")
+    fake = FakeComfy()
+    provider = ComfyPresetProvider(client=fake)  # type: ignore[arg-type]
+    req = VideoRequest(
+        mode="i2v",
+        prompt="雨夜推门",
+        first_frame=first,
+        extra={"preset": "wan-flf"},
+    )
+
+    await provider.submit(req, client_id="aivs-test")
+
+    graph = fake.submitted or {}
+    assert "2" not in graph, "AIVS_LAST_FRAME 这次没有值，那个节点连它的示例图一起摘掉"
+    assert graph["1"]["inputs"]["image"] == "aivs/first.png"
+    assert graph["3"]["inputs"]["text"] == "雨夜推门"
+    assert graph["4"]["inputs"]["text"] == "旧负向", "文本入口没给值时保持图里原来的值"
+    assert graph["5"]["inputs"]["seed"] == 1, "标量入口没给值时保持图里原来的值（这才是默认参数）"
+    assert graph["9"] == GRAPH["9"], "模型端的 lora / 加速节点绝不能被动"
+    assert fake.uploaded == ["first.png"]
+    note = next(n for n in req.notes if "末帧" in n)
+    assert "示例文件一个都没有送进 ComfyUI" in note, "摘一个节点是降级，必须说出来"
+    assert "连带" not in note, "这份图上末帧没有下游中间节点，不该凭空说连带摘了几个"
+
+
+#: 真实的图不是一排孤立的 LoadImage：末帧那一支往往还串着一个缩放 / 裁剪节点，再汇进
+#: 主节点。摘节点必须跟着连线走一层——**只摘只为它服务的，不动共用的汇合点**。
+LINKED_GRAPH: dict[str, Any] = {
+    "1": {
+        "class_type": "LoadImage",
+        "inputs": {"image": "首帧示例.png"},
+        "_meta": {"title": "AIVS_FIRST_FRAME"},
+    },
+    "2": {
+        "class_type": "LoadImage",
+        "inputs": {"image": "末帧示例.png"},
+        "_meta": {"title": "AIVS_LAST_FRAME"},
+    },
+    "3": {
+        "class_type": "CLIPTextEncode",
+        "inputs": {"text": "旧提示词", "clip": ["8", 1]},
+        "_meta": {"title": "AIVS_PROMPT"},
+    },
+    "5": {
+        "class_type": "KSampler",
+        "inputs": {"seed": 1, "steps": 20, "positive": ["7", 0]},
+        "_meta": {"title": "AIVS_SEED"},
+    },
+    # 只为末帧那一支服务的中间节点：末帧一摘，它就没有存在的理由了
+    "6": {"class_type": "ImageScale", "inputs": {"image": ["2", 0], "width": 832, "height": 480}},
+    # 汇合点：丢了 end_image 还连着 positive / vae / start_image，绝不能跟着摘
+    "7": {
+        "class_type": "WanImageToVideo",
+        "inputs": {
+            "positive": ["3", 0],
+            "vae": ["8", 2],
+            "start_image": ["1", 0],
+            "end_image": ["6", 0],
+            "length": 81,
+        },
+    },
+    "8": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "wan.safetensors"}},
+}
+
+
+async def test_detaching_follows_the_links_one_hop_and_stops_at_a_junction(
+    tmp_path: Path,
+) -> None:
+    """末帧那一支连着的缩放节点跟着摘；汇合点只少一个输入键，那条主链一刀都不能断。"""
+    write_preset("接了线的图", LINKED_GRAPH)
+    first = tmp_path / "first.png"
+    first.write_bytes(b"A")
+    fake = FakeComfy()
+    provider = ComfyPresetProvider(client=fake)  # type: ignore[arg-type]
+    req = VideoRequest(
+        mode="i2v", prompt="雨夜推门", first_frame=first, extra={"preset": "接了线的图"}
+    )
+
+    await provider.submit(req, client_id="aivs-test")
+
+    graph = fake.submitted or {}
+    assert "2" not in graph and "6" not in graph, "末帧与只为它服务的缩放节点一起摘"
+    assert "7" in graph, "汇合点绝不能跟着摘——摘断它就等于这次什么都跑不出来"
+    assert "end_image" not in graph["7"]["inputs"], "指向被摘节点的连线连键一起删"
+    assert graph["7"]["inputs"]["start_image"] == ["1", 0]
+    assert graph["7"]["inputs"]["positive"] == ["3", 0]
+    assert (graph["7"]["inputs"]["vae"], graph["7"]["inputs"]["length"]) == (["8", 2], 81)
+    assert graph["8"] == LINKED_GRAPH["8"], "不认识 class_type，也就不会去动模型加载那一支"
+    assert graph["5"]["inputs"]["seed"] == 1
+    note = next(n for n in req.notes if "末帧" in n)
+    assert "连带 1 个只为它们服务的中间节点" in note, "连带摘了几个也得说出来"
+
+
+async def test_unused_ref_slots_do_not_leave_their_placeholder_images_behind(
+    tmp_path: Path,
+) -> None:
+    """标了 3 个参考图槽位而这一版只有 1 张：另外两个节点连占位图一起摘掉。
+
+    这正是「不敢在图里多标槽位」的现场——多标的那几格留着的是存图时挂着的占位图，
+    于是这个镜头会被喂进两张不相干的图，而账单上写着只喂了一张。
+    """
+    write_preset("三个槽位", with_ref_slots(3))
+    first = tmp_path / "first.png"
+    first.write_bytes(b"A")
+    fake = FakeComfy()
+    provider = ComfyPresetProvider(client=fake)  # type: ignore[arg-type]
+    req = VideoRequest(
+        mode="i2v",
+        prompt="雨夜推门",
+        first_frame=first,
+        refs=make_refs(tmp_path, "林小雨（常服）"),
+        extra={"preset": "三个槽位"},
+    )
+
+    await provider.submit(req, client_id="aivs-test")
+
+    graph = fake.submitted or {}
+    assert graph["11"]["inputs"]["image"] == "aivs/ref1.png", "填上的那个槽位照旧填"
+    assert "12" not in graph and "13" not in graph, "没填的槽位连它的占位图一起摘掉"
+    assert fake.uploaded == ["first.png", "ref1.png"], "没有素材可填的槽位不该凭空上传什么"
+    note = next(n for n in req.notes if "没有用到" in n)
+    assert "末帧" in note and "2 个参考图槽位" in note, "九个槽位逐个点名会把真正要紧的那句埋掉"
+    text = graph["3"]["inputs"]["text"]
+    assert "参考图1=林小雨（常服）" in text and "参考图2" not in text, "描述只说真喂进去的那几张"
+
+
+class RejectingComfy(FakeComfy):
+    """提交阶段就被 ComfyUI 拒了（图里那一格是必填的，我们刚好把它摘了）。"""
+
+    def __init__(self, code: str = "WORKFLOW_ERROR") -> None:
+        super().__init__()
+        self._code = code
+
+    async def submit(self, graph: dict[str, Any], client_id: str) -> str:
+        raise AppError(
+            ErrorCode(self._code),
+            "ComfyUI 拒绝了本次任务",
+            "Required input is missing: image1",
+            ["照 ComfyUI 给的字段名去图里找那个节点"],
+        )
+
+
+async def test_a_rejected_submit_points_at_what_was_detached(tmp_path: Path) -> None:
+    """摘掉的那一格恰好是必填的时候，报错里必须指出这件事——否则用户只会对着自己存好的图发愣。"""
+    write_preset("wan-flf", GRAPH)
+    first = tmp_path / "first.png"
+    first.write_bytes(b"A")
+    req = VideoRequest(
+        mode="i2v", prompt="雨夜推门", first_frame=first, extra={"preset": "wan-flf"}
+    )
+
+    with pytest.raises(AppError) as caught:
+        await ComfyPresetProvider(client=RejectingComfy()).submit(  # type: ignore[arg-type]
+            req, client_id="aivs-test"
+        )
+    err = caught.value
+    assert err.detail == "Required input is missing: image1", "ComfyUI 给的原因绝不能被我们盖掉"
+    assert err.suggestions[0] == "照 ComfyUI 给的字段名去图里找那个节点", "原来的建议排在前面"
+    assert any("摘掉了 1 个" in s and "AIVS_LAST_FRAME#2" in s for s in err.suggestions)
+    assert any("必填" in s for s in err.suggestions), "得给出「把这个入口从图里删掉」这条出路"
+
+
+async def test_a_rejected_submit_without_detaching_keeps_the_real_reason_alone(
+    tmp_path: Path,
+) -> None:
+    """没摘过节点、或失败与提交这份图无关（离线 / 超时）时，绝不多说那两句——会把真原因埋掉。"""
+    write_preset("wan-flf", GRAPH)
+    first = tmp_path / "first.png"
+    last = tmp_path / "last.png"
+    first.write_bytes(b"A")
+    last.write_bytes(b"B")
+    full = VideoRequest(
+        mode="flf",
+        prompt="雨夜推门",
+        first_frame=first,
+        last_frame=last,
+        extra={"preset": "wan-flf"},
+    )
+
+    with pytest.raises(AppError) as caught:
+        await ComfyPresetProvider(client=RejectingComfy()).submit(  # type: ignore[arg-type]
+            full, client_id="aivs-test"
+        )
+    assert caught.value.suggestions == ["照 ComfyUI 给的字段名去图里找那个节点"]
+
+    only_first = replace(full, last_frame=None, notes=[])
+    offline_comfy = RejectingComfy("COMFY_OFFLINE")
+    with pytest.raises(AppError) as offline:
+        await ComfyPresetProvider(client=offline_comfy).submit(  # type: ignore[arg-type]
+            only_first, client_id="aivs-test"
+        )
+    assert offline.value.suggestions == ["照 ComfyUI 给的字段名去图里找那个节点"], "与摘节点无关"
+
+
+async def test_workflow_route_detaches_the_slots_this_take_has_nothing_for(
+    tmp_path: Path,
+) -> None:
+    """绑定那条路同一件事：绑了末帧却没有末帧、绑了两个参考图槽位却只有一张——都得摘掉。
+
+    这条路的图是**用户自己维护**的，所以「多绑几个槽位」更需要没有代价：绑定表里那几行
+    指着的节点，格子里留的是他在 ComfyUI 里存图时挂着的示例文件。
+    标量槽位（这里的 seed）相反，没给值时保持图里原来的值。
+    """
+    graph = {
+        "10": {"class_type": "LoadImage", "inputs": {"image": "首帧示例.png"}},
+        "20": {"class_type": "LoadImage", "inputs": {"image": "末帧示例.png"}},
+        "11": {"class_type": "LoadImage", "inputs": {"image": "参考示例1.png"}},
+        "12": {"class_type": "LoadImage", "inputs": {"image": "参考示例2.png"}},
+        "6": {"class_type": "CLIPTextEncode", "inputs": {"text": "原提示词"}},
+        "5": {"class_type": "KSampler", "inputs": {"seed": 7, "steps": 20}},
+    }
+    head = tmp_path / "head.png"
+    head.write_bytes(b"PNG_HEAD")
+    sheet = tmp_path / "sheet.png"
+    sheet.write_bytes(b"PNG_SHEET")
+
+    fake = FakeComfy()
+    provider = ComfyWorkflowProvider(client=fake)  # type: ignore[arg-type]
+    req = VideoRequest(
+        mode="i2v",
+        prompt="雨夜推门",
+        first_frame=head,
+        refs=[RefAsset(path=sheet, label="阿岚 默认形象", kind="character_sheet", media="image")],
+        workflow=WorkflowSpec(
+            id="wf_1",
+            name="绑定图",
+            api_json=json.dumps(graph),
+            bindings={
+                "prompt": "6.text",
+                "first_frame": "10.image",
+                "last_frame": "20.image",
+                "seed": "5.seed",
+                "reference_image_slots": ["11.image", "12.image"],
+            },
+        ),
+    )
+
+    await provider.submit(req, client_id="aivs-test")
+
+    submitted = fake.submitted or {}
+    assert "20" not in submitted, "绑了末帧而这个镜头没有末帧：那个节点连示例图一起摘掉"
+    assert "12" not in submitted, "第二个参考图槽位这一版没有图可填，同样摘掉"
+    assert submitted["10"]["inputs"]["image"] == "aivs/head.png"
+    assert submitted["11"]["inputs"]["image"] == "aivs/sheet.png"
+    assert submitted["5"]["inputs"] == {"seed": 7, "steps": 20}, "标量槽位保持图里原来的值"
+    assert submitted["6"]["inputs"]["text"] == "雨夜推门"
+    note = next(n for n in req.notes if "没有用到" in n)
+    assert "末帧" in note and "参考图槽位" in note
+    assert "示例文件一个都没有送进 ComfyUI" in note
+
+
+async def test_workflow_route_never_detaches_a_node_another_slot_filled(tmp_path: Path) -> None:
+    """同一个 LoadImage 常常被两行绑定同时指着（首帧 / 单槽参考图 与 `AIVS_REF_1`）：
+    只要有一行填上了值，这个节点就得留。
+
+    这条按**节点 id** 判而不是按槽位判。按槽位判的话，`first_frame` 这一版没有值就会把
+    `__ref_0` 刚填好的那个节点一起摘掉——这一版真正要喂的那张图反而丢了。
+    """
+    graph = {
+        "11": {"class_type": "LoadImage", "inputs": {"image": "参考示例1.png"}},
+        "6": {"class_type": "CLIPTextEncode", "inputs": {"text": "原提示词"}},
+    }
+    sheet = tmp_path / "sheet.png"
+    sheet.write_bytes(b"PNG_SHEET")
+    fake = FakeComfy()
+    provider = ComfyWorkflowProvider(client=fake)  # type: ignore[arg-type]
+    req = VideoRequest(
+        mode="i2v",
+        prompt="雨夜推门",
+        refs=[RefAsset(path=sheet, label="阿岚 默认形象", kind="character_sheet", media="image")],
+        workflow=WorkflowSpec(
+            id="wf_1",
+            name="绑定图",
+            api_json=json.dumps(graph),
+            bindings={
+                "prompt": "6.text",
+                "first_frame": "11.image",
+                "reference_image_slots": ["11.image"],
+            },
+        ),
+    )
+
+    await provider.submit(req, client_id="aivs-test")
+
+    submitted = fake.submitted or {}
+    assert submitted["11"]["inputs"]["image"] == "aivs/sheet.png", "参考图那一行填上了，节点必须留"
+    assert not any("没有用到" in note for note in req.notes), "什么都没摘就别说摘了东西"

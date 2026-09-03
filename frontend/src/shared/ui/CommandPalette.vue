@@ -53,7 +53,7 @@ const entries = computed<Entry[]>(() => {
         badge: f.ready ? '可用' : f.milestone,
         go: () => void router.push({ name: f.route, params: { pid } }),
       })),
-      // 高级 / 兼容路径不进左栏，但搜得到——已经配好的东西必须还能进去
+      // 高级路径不进左栏，但搜得到——已经配好的东西必须还能进去
       ...PROJECT_ADVANCED_FEATURES.map((f) => ({
         key: f.id,
         title: f.title,
