@@ -34,3 +34,9 @@ logs
 *.log
 *.sqlite
 *.db
+
+# 打包产物：dist/docker 里是上一次 docker save 出来的 tar（好几个 GB），
+# 不排掉的话每次构建都要先把它们传给 daemon 当上下文，越打越慢。
+dist
+tauri/target
+.tmp-pytest

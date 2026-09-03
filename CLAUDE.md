@@ -145,6 +145,13 @@ python scripts/build_desktop.py --check
 python scripts/build_sidecar.py
 ```
 
+出 Docker 镜像 tar（体检 → 版本对账 → build → 启动自检 → `docker save`，落 `dist/docker`；
+`--target split` 出 compose 那两个镜像，`--check` 只体检，详见 `docs/docker-deployment.md`）：
+
+```bash
+python scripts/package-docker.py
+```
+
 迁移是**按工程库**跑的，没有全局数据库：
 
 ```bash
@@ -285,6 +292,32 @@ Windows 上出、Linux 包只能在 Linux 上出，两个平台的产物靠 `.gi
 
 图标**提交进版本库**（纯 Python 画的，打包机不必装 Pillow 或跑 `npx`）；有设计稿就放
 `tauri/icons/source.png` 再 `make_icons.py --force`。
+
+**Docker 分发是另一条路**（`scripts/package-docker.py` 是唯一入口，详见
+`docs/docker-deployment.md`）：一条命令走完「体检 → 版本对账 → build → 启动自检 →
+`docker save`」，落 `dist/docker/<镜像>-<版本>-<平台>.tar` + 一份同名 `.json` 回执
+（tag / commit / 镜像 id / 自检结论 / 搬过去怎么跑）。五条不许绕的：
+
+- **镜像名只有那张 `Image` 表**（`aivs-allinone` / `aivs-backend` / `aivs-frontend`），
+  `docker-compose.yml` 的 `image:` 与它同源。compose 里不写 `image:` 就会按目录名瞎起
+  （`xunjie_video_ide-backend` 就是那么来的），于是「这个 tar 里装的是什么」每次都不一样。
+- **版本号只有一个源头** `tauri/tauri.conf.json`，另外三处（`frontend/package.json` /
+  `backend/pyproject.toml` / `backend/app/core/config.py`）对不上就报错 + 给 `--sync-version`，
+  **绝不替用户挑一个**。同一个数同时进 tag、OCI 标签与容器里的 `AIVS_VERSION`
+  （两份 Dockerfile 的 `ARG AIVS_VERSION` → `ENV`；`AIVS_` 前缀会盖掉 `Settings.version`，
+  所以 `/health` 报的与 tar 文件名永远是同一个数）。手敲 `docker build` 不传这个 build-arg，
+  打出来的镜像自报 `0.0.0-dev`——那正是「版本名不一致」的来源。
+- **导出前每个镜像真跑一次**（照 `build_sidecar.py` 的规矩：产物必须自己启动过才算打完）：
+  探静态首页与 `/api/v1/health`、核对自报版本号，跑不起来就不写 tar。**502 / 503 要接着等**
+  ——all-in-one 里 nginx 先起、uvicorn 后起，那几秒的 502 是启动过程不是启动结果，
+  只有「容器已经退了」才提前结束等待。`aivs-frontend` 刻意不自检并把原因写进回执
+  （它的 nginx 启动时就要解析 `backend:8765` 这个上游，单独跑必然 emerg 退出）。
+- **进容器执行的东西必须是 LF**：根目录 `.gitattributes` 把 `*.sh` 钉成 `eol=lf`，
+  `Dockerfile` 里另有一道 `sed -i 's/\r$//'` 兜底。Windows 上 `core.autocrlf` 检出的 CRLF
+  shebang 会让内核去找 `/bin/bash\r`，容器只报一句
+  `exec /app/entrypoint.sh: no such file or directory`（文件其实就在那儿）。
+- **平台只进文件名不进构建参数**：**不替用户交叉编译**（那要 buildx + QEMU，失败信息又长又难认），
+  但 amd64 的 tar 在 arm64 上 load 出来是个跑不起来的容器，所以架构必须写在名字上。
 
 **事件**：进程内 `EventBus`（`events/bus.py`）→ 单个 `/ws` 端点按 `project_id` + `channels`
 过滤（job / queue / shot / version / asset / system / error）。事件幂等、可丢失（队列满丢最旧），

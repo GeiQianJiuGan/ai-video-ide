@@ -1,0 +1,29 @@
+# 换行符口径：仓库里存的一律是 LF（现在索引里的每个文件都已经是），检出时**进容器 / 进 Linux
+# 跑的东西不许跟着平台变**。这台机器 core.autocrlf=true，于是 docker build 把工作区那份带 CRLF 的
+# entrypoint.sh COPY 进镜像，内核照 `#!/bin/bash\r` 去找 `/bin/bash\r` 这个解释器，容器起不来只报
+# 一句 `exec /app/entrypoint.sh: no such file or directory`——文件其实就在那儿，是解释器名字多了个
+# \r。镜像侧另有一道 sed 兜底（见 Dockerfile），这里管的是源头。
+* text=auto
+
+# 在 Linux 容器 / 服务器上执行的脚本
+*.sh text eol=lf
+
+# 容器与部署配置（nginx 能容忍 CRLF，但没理由让它们跟着平台变）
+Dockerfile text eol=lf
+*.Dockerfile text eol=lf
+*.conf text eol=lf
+
+# Windows 批处理保持 CRLF：换成 LF 之后某些 cmd.exe 会把最后一行吃掉
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# 二进制：不做换行转换、不参与 diff
+*.png binary
+*.ico binary
+*.icns binary
+*.mp4 binary
+*.mp3 binary
+*.wav binary
+*.zip binary
+*.tar binary
+*.aivspkg binary

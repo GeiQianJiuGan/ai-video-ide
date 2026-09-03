@@ -11,6 +11,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     AIVS_REQUIRE_HANDSHAKE=false \
     AIVS_DEV_CORS=true
 
+# 镜像自报版本号：由 scripts/package-docker.py 用 --build-arg 传进来。AIVS_ 前缀的环境变量
+# 会盖掉 Settings 里的默认值，所以后端 /health 报的版本号与镜像 tag 永远是同一个数。
+ARG AIVS_VERSION=0.0.0-dev
+ENV AIVS_VERSION=${AIVS_VERSION}
+
 # 安装系统依赖：FFmpeg 与基础运行时
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \

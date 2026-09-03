@@ -1,9 +1,13 @@
 services:
   backend:
-    image: xunjie_video_ide-backend:latest
+    # 镜像名与 scripts/package-docker.py 里那张表是同一份口径，别让 compose 按目录名瞎起名
+    # （`xunjie_video_ide-backend:latest` 就是那么来的）。AIVS_VERSION 不给时用浮动的 latest。
+    image: aivs-backend:${AIVS_VERSION:-latest}
     build:
       context: .
       dockerfile: backend/Dockerfile
+      args:
+        AIVS_VERSION: ${AIVS_VERSION:-0.0.0-dev}
     container_name: aivs-backend
     restart: unless-stopped
     ports:
@@ -31,7 +35,7 @@ services:
       - aivs-network
 
   frontend:
-    image: xunjie_video_ide-frontend:latest
+    image: aivs-frontend:${AIVS_VERSION:-latest}
     build:
       context: .
       dockerfile: frontend/Dockerfile
