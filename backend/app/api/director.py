@@ -1,13 +1,15 @@
-"""AI 导演接口（幕流程图右栏的后端）。
+"""AI 导演接口（全局协作栏的后端）。
 
-四个端点，界线就是「提案」与「落库」的界线：
+五个端点，界线就是「提案」与「落库」的界线：
 
   - `POST /director/chat`        说一句话 → 拿回一份提案，**数据库一行不动**；
   - `POST /director/chat/stream` 同一件事，边跑边吐（SSE）。上面那条原样保留：
     不支持 SSE 的调用方与后端自己的测试都还走它；
   - `POST /director/apply`       把审阅通过的条目落库，只落 `op != "reject"` 的；
+  - `POST /director/attach`      一份 .docx / .xlsx / … → 一段纯文本，**只填输入框**：
+    不落库、不落盘、不出网，也**不要求配好 LLM**（用户得先看见抽出来什么）；
   - `GET  /director`             历史对话与提案（刷新页面不丢）+ LLM 状态
-    （未配置时前端据此显示去配置页的引导，而不是一个红叉）。
+    （未配置时前端据此显示去配置页的引导，而不是一个红叉）+ 附件能收什么。
 
 这一层照旧极薄：SSE 那条也只是**把 service 给的事件按 `event:` / `data:` 写出去**，
 一个业务判断都不做。
@@ -19,7 +21,7 @@ import json
 from collections.abc import AsyncIterator
 from typing import Any
 
-from fastapi import APIRouter
+from fastapi import APIRouter, File, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -84,6 +86,16 @@ async def chat_stream(pid: str, body: ChatBody) -> StreamingResponse:
 @router.post("/projects/{pid}/director/apply", status_code=201)
 async def apply(pid: str, body: ApplyBody) -> dict[str, Any]:
     return await director.apply(pid, body.ops)
+
+
+@router.post("/projects/{pid}/director/attach")
+async def attach(pid: str, file: UploadFile = File(...)) -> dict[str, Any]:
+    """一份附件 → 一段纯文本，回给前端填进输入框。**什么都不落，也不出网。**
+
+    刻意**不是** 201：这一下没有创建任何东西——没有记录、没有文件、没有资产。
+    """
+    data = await file.read()
+    return await director.attach(pid, file.filename or "附件", data)
 
 
 @router.delete("/projects/{pid}/director", status_code=204)

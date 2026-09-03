@@ -5,7 +5,7 @@
 「参考图1=阿岚（褪色军绿夹克，短发，左颊一道旧疤）」。没有它，那个括号是空的——
 喂进去的只是一个文件名，人物形象在几秒里就丢了。
 
-四条边界写在这里，因为它们就是这个服务的全部意义：
+五条边界写在这里，因为它们就是这个服务的全部意义：
 
   · **一行库都不改。** `plan()` 与 `suggest()` 都是只读的：`suggest()` 回的是建议文字，
     落库只有一条路——用户在界面上按保存，走已有的 `PATCH /assets/{id}`
@@ -17,6 +17,13 @@
     路径是登记时就相对化过的，这里不接受任何外部路径。
   · **绝不把整段视频塞给 LLM**：非图片资产（视频 / 音频）在调用之前就跳过并说清原因；
     超过 `MAX_IMAGE_BYTES` 的图也不送字节，退回「只按名字与已有设定写」。
+  · **看不了图时可以不编**（`allow_text=False`）：`source` 一栏一直在说这一句是怎么来的
+    （`vision` 真看了图 / `text` 只按线索写），但**那两种句子读起来一模一样**——
+    素材页那个按钮由人来看，所以默认照旧出 `text`（`tests/test_describe.py` 盯着）；
+    AI 协作栏那条路上没有人把关，它按 `allow_text=False` 调，于是端看不了图时这里
+    一个字都不写，只回 `source="blocked"` + `ask_user`（那句该问用户的话）。
+    一批里第一次真送图失败之后剩下的不再送字节：同一个 400 撞二十次只是把几十 MB
+    白发出去，还把同一句话说二十遍。
 
 一条失败不拖累其余几条：那一条带自己的四要素错误回去（`items[].error`），
 其它照旧出建议。整批都失败时 `ok_count == 0`，界面照 `error` 里的 suggestions 提示。
@@ -48,6 +55,19 @@ MAX_IMAGE_BYTES = 8 * 1024 * 1024
 
 #: 手填那条路。端不认图 / 图送不出去 / 整个 LLM 没配，出路都是这一句（硬约束 2）。
 MANUAL_WAY_OUT = "描述是纯文本：在素材的描述框里手填一句，与 AI 写的完全等价"
+
+#: 看不了图时该问用户的那一句。**只有这一处口径**：`plan()` / `suggest()` 的 `ask_user`、
+#: AI 协作栏的 `list_undescribed` / `look_at_image` 都引它。
+#:
+#: 为什么必须问而不是直接写：按名字与已有设定推断出来的那一句，读起来和真看过图的那一句
+#: 一模一样，但它说的是「这个角色的设定」而不是「这张图长什么样」。它会被当成后者拼进
+#: 每一个引用这张素材的镜头（`providers/base.py::ref_hint`），于是画面里那个人穿的衣服
+#: 与 prompt 里写的不是一回事——而这种错在图上看不出来，要等成片出来才发现。
+NO_VISION_ASK = (
+    "当前模型看不了图，所以我没法照着这张素材写它长什么样。"
+    "要不要改成**按剧本与已有设定推断**着写一句（那一句可能与画面不符，"
+    "采用前请自己看一眼图）？也可以在素材的描述框里手填一句，两者完全等价。"
+)
 
 #: 图片之外的素材不送给 LLM 看。视频要整段读进内存再 base64，音频看了也没有画面可写。
 SKIP_REASON = {
@@ -89,7 +109,6 @@ DESC_TARGET_LABEL = {
 }
 
 
-
 class DescribeService:
     """「照着这张素材写一句描述」的唯一入口。素材页那个按钮与 AI 那条读工具都走它。"""
 
@@ -102,37 +121,55 @@ class DescribeService:
         不必先点一次「AI 补全」才知道做不了。
         """
         items, err = await self._prepare(pid, asset_ids)
+        vision_count = sum(1 for i in items if i["mode"] == "vision")
+        pending = any(not i["skipped"] for i in items)
         return {
             "items": [_public(i) for i in items],
             "count": len(items),
             #: 真会送出去字节的有几张。0 而 count > 0 时界面要说清「只按名字写」。
-            "vision_count": sum(1 for i in items if i["mode"] == "vision"),
+            "vision_count": vision_count,
             "skipped_count": sum(1 for i in items if i["skipped"]),
+            #: 这个端到底能不能看图。**AI 那条路的分岔就在这一位**：能看就一张一张看，
+            #: 不能看就先问用户要不要按剧本与设定推断着写（`ask_user`）。
+            "can_see": llm.supports_vision(),
+            #: 非空 = 这一批一张图都不会真看，动手之前该先问用户一句。
+            #: 按 `vision_count` 而不是 `can_see` 判断：端能看图但这几张全都太大 / 不在了，
+            #: 结果一样是「按线索编」，那就一样该问。
+            "ask_user": NO_VISION_ASK if pending and vision_count == 0 else "",
             "llm": llm.status(),
             #: 描述进 prompt 时的截断上限。前端照它显示字数提示，不写死第二份。
             "desc_max": DESC_MAX,
-            "note": (
-                "AI 只是把建议填进输入框，**不会自动保存**——"
-                "要落库请逐条确认后按保存。"
-            ),
+            "note": ("AI 只是把建议填进输入框，**不会自动保存**——要落库请逐条确认后按保存。"),
             "missing": [err.to_dict()] if err else [],
-            "can_run": err is None and any(not i["skipped"] for i in items),
+            "can_run": err is None and pending,
         }
 
     # --- 出建议（仍然一行库都不改） ---
 
-    async def suggest(self, pid: str, asset_ids: list[str]) -> dict[str, Any]:
+    async def suggest(
+        self, pid: str, asset_ids: list[str], allow_text: bool = True
+    ) -> dict[str, Any]:
         """让模型照着这几张素材各写一句描述。**不落库**，回的是建议文字。
 
         `source` 说清这一句是怎么来的：`vision` = 真看了图；`text` = 没送字节
-        （端不认图 / 文件太大 / 读不到），只按名字与它挂着的那个实体的设定写。
+        （端不认图 / 文件太大 / 读不到），只按名字与它挂着的那个实体的设定写；
+        `skipped` = 压根没送（视频 / 音频）；`blocked` = 本来会退回 `text`，但调用方
+        用 `allow_text=False` 说了「不看图就不要编」，于是一个字都没写。
         用户看得到这个区别，才知道该不该信它。
+
+        **`allow_text` 默认 `True`**：素材页那个按钮由人一条一条过目，`text` 那种句子
+        比什么都没有好（硬约束 2 的手填那条路也一直在）。AI 协作栏那条路上没有人把关，
+        它按 `False` 调——那边宁可回一句「我看不了图，要不要按设定推断着写」，
+        也不能给出一句读起来像看过图的话。
         """
         items, err = await self._prepare(pid, asset_ids)
         if err is not None:
             raise err
         system = prompts.describe()
         out: list[dict[str, Any]] = []
+        #: 这一批里已经确认「送字节也没用」之后那句原因。非空就不再往后送图：
+        #: 同一个 400 撞二十次只是把几十 MB 白发出去，还把同一句话说二十遍。
+        dead = ""
         for item in items:
             row = {
                 "asset_id": item["asset_id"],
@@ -143,29 +180,50 @@ class DescribeService:
                 "suggestion": "",
                 "source": item["mode"],
                 "warnings": list(item["warnings"]),
+                #: 非空 = 这一条得先问用户一句再继续（看不了图那条路）。
+                "ask_user": "",
                 "error": None,
             }
             if item["skipped"]:
                 row["source"] = "skipped"
                 out.append(row)
                 continue
+            mode = "text" if dead else item["mode"]
+            if dead:
+                row["warnings"].append(dead)
+            row["source"] = mode
+            if mode == "text" and not allow_text:
+                # **不看图就不编**：调用方明确要「真看过的那一句」，这里一个字都不写，
+                # 只把原因与该问用户的话带回去（硬约束 4：绝不静默）。
+                row["source"] = "blocked"
+                row["ask_user"] = NO_VISION_ASK
+                out.append(row)
+                continue
             try:
-                row["suggestion"] = await self._one(system, item)
+                row["suggestion"] = await self._one(system, {**item, "mode": mode})
             except AppError as exc:
                 # 一条失败不拖累其余几条：把四要素原样带回去，界面照 suggestions 提示。
                 row["error"] = exc.to_dict()
                 log.warning("describe.item_failed", asset=item["asset_id"], code=exc.code.value)
+                if mode == "vision" and exc.code is ErrorCode.LLM_UNAVAILABLE:
+                    # 真送了图却被端拒了：`supports_vision` 是协议级的事实，而「这个**模型**
+                    # 收不收图」只有送出去才知道。剩下几张不必再撞一遍同一堵墙。
+                    dead = f"这个端这次没能看图（{exc.title}），这一批剩下的不再送字节"
+                    row["ask_user"] = NO_VISION_ASK
             out.append(row)
         ok = sum(1 for r in out if r["suggestion"])
-        log.info("describe.suggested", count=len(out), ok=ok)
+        blocked = sum(1 for r in out if r["source"] == "blocked")
+        log.info("describe.suggested", count=len(out), ok=ok, blocked=blocked)
         return {
             "items": out,
             "count": len(out),
             "ok_count": ok,
+            #: 因为「不看图就不编」而一个字都没写的有几条（`allow_text=False` 才会 > 0）。
+            "blocked_count": blocked,
+            #: 非空 = 先把这句话说给用户听并等他回答，别自己接着写。
+            "ask_user": next((r["ask_user"] for r in out if r["ask_user"]), ""),
             "desc_max": DESC_MAX,
-            "note": (
-                "这些只是建议：**还没有写进库**。逐条看过之后按保存才落库。"
-            ),
+            "note": ("这些只是建议：**还没有写进库**。逐条看过之后按保存才落库。"),
         }
 
     # --- 「这一句写到哪儿」的唯一一张表 ---

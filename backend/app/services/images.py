@@ -33,7 +33,7 @@ from app.core.ids import new_id
 from app.core.logging import get_logger
 from app.events.bus import Channel, bus
 from app.generation.providers import image as image_protocols
-from app.generation.providers import registry
+from app.generation.providers import presets, registry
 from app.generation.providers.base import RefAsset
 from app.persistence.models import utc_now
 from app.persistence.models_cast import Appearance, Character
@@ -121,6 +121,24 @@ class ImageService:
 
     def skills(self) -> dict[str, Any]:
         return {"items": skills.image_listing(), "rule": skills.IMAGE_RULE}
+
+    # --- 「出图这条链现在能不能用」 ---
+
+    def capability(self) -> dict[str, Any]:
+        """三件事实：配没配、走的哪个协议、它收不收参考图。**只有这一处口径。**
+
+        账单里那个 `provider` 一节读它，AI 那侧的 `list_missing_materials` 也读它——
+        「缺参考图的素材能不能顺手排一张图」与「账单上写的能不能生成」必须是同一个判断，
+        否则模型会提一堆永远出不了图的提案，用户点了才发现这条链根本没配。
+        """
+        configured = registry.image_configured()
+        proto = image_protocols.get(settings.image_provider) if configured else None
+        return {
+            "configured": configured,
+            "provider": settings.image_provider,
+            "label": proto.label if proto else image_protocols.NONE_LABEL,
+            "supports_refs": bool(proto.supports_refs) if proto else False,
+        }
 
     # --- 账单（只读） ---
 
@@ -294,7 +312,8 @@ class ImageService:
         positive, negative = skills.render_image_prompt(name, prompt)
         detail = skills.image_get(name)
         refs = await self._refs(pid, ref_asset_ids or [])
-        configured = registry.image_configured()
+        cap = self.capability()
+        configured = bool(cap["configured"])
         proto = image_protocols.get(settings.image_provider) if configured else None
         warnings: list[str] = []
         err: AppError | None = None
@@ -323,6 +342,8 @@ class ImageService:
                     ],
                     {"protocol": proto.name},
                 )
+            elif proto.wants_preset:
+                err = self._preset_issue(str(settings.image_preset), warnings)
             if refs and not proto.supports_refs:
                 warnings.append(
                     f"{proto.label} 收不了参考图：这 {len(refs)} 张只会被跳过，"
@@ -341,9 +362,9 @@ class ImageService:
             "asset_kind": spec.asset_kind,
             "provider": {
                 "name": settings.image_provider,
-                "label": proto.label if proto else image_protocols.NONE_LABEL,
+                "label": cap["label"],
                 "configured": configured,
-                "supports_refs": bool(proto.supports_refs) if proto else False,
+                "supports_refs": cap["supports_refs"],
                 "preset": settings.image_preset,
                 "model": settings.image_model,
                 "size": settings.image_size,
@@ -351,6 +372,50 @@ class ImageService:
             "warnings": warnings,
             "_error": err,
         }
+
+    def _preset_issue(self, name: str, warnings: list[str]) -> AppError | None:
+        """设置里指的那份出图预设**现在还能不能用**——不能用就在账单上说，别等到出图那一刻。
+
+        以前这里只查「有没有指一份」：图被删掉、或者指的那份根本没有提示词入口时，账单照旧
+        写着「可以生成」，用户按下去才在队列里得到一条失败——`先账单再动手` 那条规矩在这一步
+        是漏的。
+
+        **判的是 `prompt_ok` 而不是 `t2i_ready`**（与 `providers/image.py::probe()` 同一份口径）：
+        没标 `AIVS_IMAGE` 的图照旧能当出图预设用（否则升级前配好的机器当场坏掉），
+        那只是一条警告——它同时还留在 R2V / 首尾帧的候选里，选错一次就是一次白跑。
+        """
+        row = next((x for x in presets.listing() if x["name"] == name), None)
+        if row is None:
+            return AppError(
+                ErrorCode.INVALID_WORKFLOW,
+                "指定的出图预设不在了",
+                f"设置里 `image.preset` 指的是「{name}」，但预设目录里已经没有这份图。",
+                [
+                    "到左侧「预设 Workflow」重新上传这份图（出图那一栏）",
+                    "或在设置页的「图片生成 API」里改指一份还在的预设",
+                    image_protocols.MANUAL_WAY_OUT,
+                ],
+                {"preset": name},
+            )
+        if not row.get("prompt_ok"):
+            return AppError(
+                ErrorCode.INVALID_WORKFLOW,
+                "这份出图预设里没有提示词入口",
+                f"预设「{name}」里没有标了 AIVS_PROMPT 的节点，本工具没法告诉它要画什么。",
+                [
+                    "在 ComfyUI 里把接正向提示词的节点标题改成 AIVS_PROMPT，重新导出上传",
+                    "负向标 AIVS_NEGATIVE、画幅标 AIVS_WIDTH / AIVS_HEIGHT（都可选）",
+                    image_protocols.MANUAL_WAY_OUT,
+                ],
+                {"preset": name, "impact": row.get("impact")},
+            )
+        if not row.get("declares_image"):
+            warnings.append(
+                f"预设「{name}」没标 {presets.DECLARE_IMAGE}：它照旧会被当出图那份图用，"
+                "但同时还留在 R2V / 首尾帧的候选里——给图里任意一个节点加上这个标题，"
+                "它就只归「出图」那一栏。"
+            )
+        return None
 
     async def _label(self, pid: str, spec: TargetSpec, target_id: str) -> str:
         """一句人话，队列面板与账单共用（前端不拼第二遍）。"""

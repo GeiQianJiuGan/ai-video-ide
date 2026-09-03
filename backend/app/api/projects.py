@@ -141,6 +141,8 @@ async def get_project_route(pid: str) -> dict[str, Any]:
 
 @router.put("/projects/{pid}/preset")
 async def set_project_preset(pid: str, payload: dict[str, str | None]) -> dict[str, Any]:
+    from app.services import route
+
     listing = presets.listing()
 
     def normalized(key: str) -> str | None:
@@ -151,34 +153,25 @@ async def set_project_preset(pid: str, payload: dict[str, str | None]) -> dict[s
     requested_r2v = normalized("r2v_name") if "r2v_name" in payload else legacy
     requested_flf = normalized("flf_name") if "flf_name" in payload else legacy
 
-    def validate(name: str | None, role: str) -> None:
-        if not name:
-            return
-        item = next((x for x in listing if x["name"] == name), None)
-        ready_key = "flf_ready" if role == "flf" else "r2v_ready"
-        if item and item.get(ready_key):
-            return
-        from app.core.errors import AppError, ErrorCode
+    def settle(name: str | None, role: str, current: str | None) -> str | None:
+        """这一次要写进库的预设名——不合格就报错，除非它本来就是库里那一份。
 
-        raise AppError(
-            ErrorCode.INVALID_WORKFLOW,
-            "预设不可用",
-            (f"预设 {name} 不存在或不能用于{'首尾帧 / FL2VA' if role == 'flf' else 'R2V'}。"),
-            [
-                "到左侧「预设 Workflow」导入并修复这份图",
-                # 两个角色要的东西不一样，说错一句用户就会去改一个本来没问题的标题：
-                # R2V 只要一个提示词入口（首尾帧节点可以一个都没有），
-                # 补转场要的是严格首尾帧，缺哪一头都接不上。
-                (
-                    "FL2VA 预设必须同时标出 AIVS_FIRST_FRAME、AIVS_LAST_FRAME、AIVS_PROMPT"
-                    if role == "flf"
-                    else "R2V 预设至少要标出 AIVS_PROMPT；首尾帧节点没有也行，"
-                    "首帧会当作参考图 1 送进去"
-                ),
-                "再回项目选择它",
-            ],
-            {"preset": name, "role": role},
-        )
+        **「预设不可用」那句话只有 `route.preset_error` 一份**（选的时候、按下生成的时候、
+        概览页那份账单共用它）。这里以前抄了一份一模一样的文案，于是「这是出图那份图」
+        这类新说法只会出现在其中一处，用户在两个地方看到两种解释。
+
+        库里存着的那份如今不合格时（比如它刚被标上 `AIVS_IMAGE`，成了出图那份图），
+        **原样重选等于清空**：不能让用户保存一个已经不能用的选择，但也不该拿一个他自己
+        没改的字段挡住整个请求——那样连另一个角色的预设都没法改了。
+        """
+        if not name:
+            return None
+        item = next((x for x in listing if x["name"] == name), None)
+        if item and item.get("flf_ready" if role == "flf" else "r2v_ready"):
+            return name
+        if name == current:
+            return None
+        raise route.preset_error(name, route.ROLE_CAPABILITY[role])
 
     db = db_of(pid)
     async with db.write() as session:
@@ -186,38 +179,15 @@ async def set_project_preset(pid: str, payload: dict[str, str | None]) -> dict[s
         assert row is not None
 
         if explicit_roles:
+            # 只动 payload 里真的给了的那个角色：另一个保持原样（可能正被别的页面用着）。
             if "r2v_name" in payload:
-                if requested_r2v:
-                    item_r2v = next((x for x in listing if x["name"] == requested_r2v), None)
-                    if requested_r2v == row.r2v_preset_name and (not item_r2v or not item_r2v.get("r2v_ready")):
-                        requested_r2v = None
-                    else:
-                        validate(requested_r2v, "r2v")
-                row.r2v_preset_name = requested_r2v
-
+                row.r2v_preset_name = settle(requested_r2v, "r2v", row.r2v_preset_name)
             if "flf_name" in payload:
-                if requested_flf:
-                    item_flf = next((x for x in listing if x["name"] == requested_flf), None)
-                    if requested_flf == row.flf_preset_name and (not item_flf or not item_flf.get("flf_ready")):
-                        requested_flf = None
-                    else:
-                        validate(requested_flf, "flf")
-                row.flf_preset_name = requested_flf
+                row.flf_preset_name = settle(requested_flf, "flf", row.flf_preset_name)
         else:
-            if requested_r2v:
-                item_r2v = next((x for x in listing if x["name"] == requested_r2v), None)
-                if requested_r2v == row.r2v_preset_name and (not item_r2v or not item_r2v.get("r2v_ready")):
-                    requested_r2v = None
-                else:
-                    validate(requested_r2v, "r2v")
-            if requested_flf:
-                item_flf = next((x for x in listing if x["name"] == requested_flf), None)
-                if requested_flf == row.flf_preset_name and (not item_flf or not item_flf.get("flf_ready")):
-                    requested_flf = None
-                else:
-                    validate(requested_flf, "flf")
-            row.r2v_preset_name = requested_r2v
-            row.flf_preset_name = requested_flf
+            # 老形状（只给一个 `name`）：两个角色都指向它。
+            row.r2v_preset_name = settle(requested_r2v, "r2v", row.r2v_preset_name)
+            row.flf_preset_name = settle(requested_flf, "flf", row.flf_preset_name)
 
         # 旧字段继续镜像 R2V，供旧版本应用打开工程时使用。
         row.preset_name = row.r2v_preset_name

@@ -20,6 +20,10 @@
  *   6. **点「停」= abort，不是失败**：已经收到的照旧有效，但那一轮**没落成记录**
  *      （后端是在收尾时才写的），所以 `unsaved` 置真，界面必须说出「刷新会丢」——
  *      静默丢掉用户看过的东西是最糟的一种。
+ *   7. **附件只是输入法**（`attach()`）：一份 Word 剧本 / Excel 分镜表抽成文字**塞进
+ *      `draft`**，没落库、没落盘、没出网，也不要求配好 LLM。抽出来什么用户先看得见、
+ *      改得动，按下发送才跟着那句话一起走；`attached` 留着「按 gb18030 读的」
+ *      「太长截断了」这些话，界面必须显示出来。
  */
 
 import { defineStore } from 'pinia'
@@ -28,6 +32,7 @@ import { ApiError } from '@/shared/api/client'
 import {
   directorApi,
   type DirectorApply,
+  type DirectorAttachment,
   type DirectorHistory,
   type DirectorOp,
   type DirectorScope,
@@ -68,6 +73,14 @@ export const useDirectorStore = defineStore('director', () => {
   /** true = 手上这几条提案还没落成记录（用户中途点了「停」），刷新会丢。 */
   const unsaved = ref(false)
 
+  /**
+   * 这一轮已经抽进输入框的附件。**它不是「待发送的文件」**——文字早就在 `draft` 里了，
+   * 这几条留着的是「按什么读的 / 有没有截断」这些必须显示出来的话。
+   */
+  const attached = ref<DirectorAttachment[]>([])
+  /** true = 正在抽某一份附件。与 `busy` 分开：抽文字不该把整栏锁住。 */
+  const attaching = ref(false)
+
   const busy = ref(false)
   const lastError = ref<ApiError | null>(null)
 
@@ -83,6 +96,12 @@ export const useDirectorStore = defineStore('director', () => {
   const configured = computed(() => Boolean(history.value?.llm.configured))
   const note = computed(() => history.value?.note ?? '')
   const hasPending = computed(() => pending.value.length > 0)
+  /**
+   * 附件能收什么。**后端那一份是唯一口径**（`core/doctext.py::KINDS`）——
+   * 界面上的 `accept` 与「最大 N MB」都读它，前端不写死第二张后缀清单。
+   * 历史还没拉回来时是 null，此时那颗按钮 disabled。
+   */
+  const attachInfo = computed(() => history.value?.attach ?? null)
 
   function clearError(): void {
     lastError.value = null
@@ -163,6 +182,8 @@ export const useDirectorStore = defineStore('director', () => {
     live.value = ''
     trace.value = []
     pending.value = []
+    // 那段文字已经跟着这句话走了，输入框空了——附件那几条提示也就过期了。
+    attached.value = []
     let ok = false
     try {
       for await (const event of directorApi.chatStream(pid, message, scope, ctl.signal)) {
@@ -195,6 +216,34 @@ export const useDirectorStore = defineStore('director', () => {
   /** 点「停」。abort 不算失败：已经收到的照旧有效（但没落成记录，见 `unsaved`）。 */
   function stop(): void {
     running?.abort()
+  }
+
+  /**
+   * 一份附件 → 一段纯文本，交给调用方塞进输入框。**一行库都不动，也不出网。**
+   *
+   * 抽不了（.pdf / .doc / 太大 / 整份都是图）时回 null，原因连 suggestions 一起进
+   * `lastError`——和这一栏其它失败同一个显示位置。**刻意不走 `guarded()`**：
+   * 抽文字不该把「停」和已经在手上的提案一起锁住。
+   */
+  async function attach(pid: string, file: File): Promise<DirectorAttachment | null> {
+    attaching.value = true
+    try {
+      const out = await directorApi.attach(pid, file)
+      lastError.value = null
+      attached.value = [...attached.value, out]
+      return out
+    } catch (err) {
+      lastError.value = err instanceof ApiError ? err : null
+      return null
+    } finally {
+      attaching.value = false
+    }
+  }
+
+  /** 把某一条附件的提示从列表里去掉。**不动 `draft`**：那段文字是用户自己的了。 */
+  function forgetAttachment(filename: string): void {
+    const at = attached.value.findIndex((row) => row.filename === filename)
+    if (at >= 0) attached.value = attached.value.filter((_, i) => i !== at)
   }
 
   /** 丢弃一条：本地把 op 改成 'reject' 并移出待审列表，不发请求。 */
@@ -244,6 +293,7 @@ export const useDirectorStore = defineStore('director', () => {
       live.value = ''
       trace.value = []
       unsaved.value = false
+      attached.value = []
     })
   }
 
@@ -262,11 +312,16 @@ export const useDirectorStore = defineStore('director', () => {
     trace,
     streaming,
     unsaved,
+    attachInfo,
+    attached,
+    attaching,
     busy,
     lastError,
     load,
     send,
     stop,
+    attach,
+    forgetAttachment,
     discard,
     discardAll,
     apply,

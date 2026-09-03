@@ -17,13 +17,18 @@ import { api } from './client'
 import type { ErrorPayload } from './client'
 import type { LlmStatus } from './settings'
 
-/** 这一句是怎么来的。`skipped` = 压根没送出去（视频 / 音频 / 图太大 / 读不到）。 */
-export type DescribeSource = 'vision' | 'text' | 'skipped'
+/**
+ * 这一句是怎么来的。`skipped` = 压根没送出去（视频 / 音频 / 图太大 / 读不到）；
+ * `blocked` = 端看不了图，而调用方说了「不看图就不要编」（AI 协作栏走这一支，
+ * 素材页这个按钮不走——它有人一条一条过目）。
+ */
+export type DescribeSource = 'vision' | 'text' | 'skipped' | 'blocked'
 
 export const DESCRIBE_SOURCE_LABEL: Record<DescribeSource, string> = {
   vision: '看图写的',
   text: '只按名字写的',
   skipped: '已跳过',
+  blocked: '看不了图，没写',
 }
 
 /** 账单里的一条素材。`mode` 说的是「点下去之后会不会真的送字节出去」。 */
@@ -55,6 +60,10 @@ export interface DescribePlan {
   /** 真会送出去字节的有几张。0 而 count > 0 = 只按名字写，界面要说清。 */
   vision_count: number
   skipped_count: number
+  /** 这个端到底能不能看图（协议级事实）。 */
+  can_see: boolean
+  /** 非空 = 这一批一张图都不会真看，动手之前该先把这句话说给用户听。 */
+  ask_user: string
   llm: LlmStatus
   desc_max: number
   note: string
@@ -73,6 +82,8 @@ export interface DescribeSuggestion {
   suggestion: string
   source: DescribeSource
   warnings: string[]
+  /** 非空 = 这一条得先问用户一句（`source === 'blocked'` 时就是它）。 */
+  ask_user: string
   /** 这一条失败了（其余几条照旧）。照 suggestions 提示，不吞。 */
   error: ErrorPayload | null
 }
@@ -81,6 +92,9 @@ export interface DescribeSuggestions {
   items: DescribeSuggestion[]
   count: number
   ok_count: number
+  /** 因为「不看图就不编」而一个字都没写的有几条。素材页这条路上恒为 0。 */
+  blocked_count: number
+  ask_user: string
   desc_max: number
   note: string
 }

@@ -1,10 +1,13 @@
 <script setup lang="ts">
 /**
- * AI 协作栏（剧本页叫「AI 编剧」，幕流程图页叫「AI 协作」）。**两页共用这一个组件，
- * 也共用同一个会话**（同一份 `DirectorTurn`）——所以它放在 `features/director/`
- * 而不是某一个 feature 下面。
+ * AI 导演协作栏。**全应用只有这一个实例、一份会话**（同一份 `DirectorTurn`）——所以它放在
+ * `features/director/` 而不是某一个 feature 下面，而挂它的地方是常驻外壳里的
+ * `app/layout/DirectorDock.vue`（右侧停靠栏，换页不卸载）。
  *
- * 这一栏的全部意义是**把「加一幕雨夜追车」变成一份可逐条审阅的 Diff**。八个刻意的设计：
+ * 以前它内嵌在剧本页与幕流程图页上，一离开那两页就卸载，正在写的那段话与手上那几条待审提案
+ * 跟着一起消失；现在那两页只负责把这一栏叫出来（`shell.showDirector()`）。
+ *
+ * 这一栏的全部意义是**把「加一幕雨夜追车」变成一份可逐条审阅的 Diff**。十个刻意的设计：
  *
  *   1. **提案不是改动**。这里列出来的每一条，数据库里都还没有发生。只有按下「采用」
  *      才落库，所以每条都要给出 `before → after`——不是「AI 说它要改点东西」。
@@ -23,8 +26,15 @@
  *      编排生成全都不依赖 LLM，这一栏关掉整条链路照旧能走完。
  *   8. **`scope` 只是一句提示**。它透传给后端拼系统提示词（用户现在在哪一页），
  *      不落库、不分会话——换页不该让历史对话变味。
+ *   9. **附件是输入法，不是暗地里带上的东西**。一份 Word 剧本 / Excel 分镜表抽成文字后
+ *      **原样塞进输入框**（前后各一行界标），用户看得见、删得掉、改得动；「按 gb18030
+ *      读的」「太长截断了」这些话贴在输入框上方。绝不做「文件跟着请求偷偷走一遍」——
+ *      那样用户永远不知道模型到底读到了什么。
+ *  10. **落库回执里那几句话必须显示出来**。落成了的那张提案卡会走掉，于是「同一批新建的
+ *      角色接上了没有」「参考图排上没排上」「哪个名字对不上」只剩这里能说了。只给一行
+ *      「已落库 N 条」等于把降级藏起来（硬约束 4）——少接一个人不该让用户等到成片才发现。
  *
- * 宽度由**调用方**给（`class="w-80"`）：剧本页把它当主栏（宽），流程图页当侧栏（窄）。
+ * 宽度由**调用方**给（停靠栏是拖出来的像素宽度，见 `DirectorDock.vue`）。
  */
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
@@ -33,6 +43,8 @@ import {
   ChevronDown,
   ChevronRight,
   Eraser,
+  PanelRightClose,
+  Paperclip,
   Send,
   Settings,
   Sparkles,
@@ -49,6 +61,7 @@ import {
   OP_FIELD_LABEL,
   OP_LABEL,
   type DirectorApplyFail,
+  type DirectorAttachment,
   type DirectorOp,
   type DirectorScope,
   type DirectorTurn,
@@ -64,18 +77,21 @@ const props = withDefaults(
     emptyBody?: string
     /** 一排 chip，点一下把这句话填进输入框（不直接发送——发出去之前用户还能改）。 */
     quickActions?: string[]
+    /** 停靠栏模式：多画一个「收起」。内嵌进页面时不需要。 */
+    closable?: boolean
   }>(),
   {
     scope: 'flow',
-    title: 'AI 协作',
+    title: 'AI 导演',
     placeholder: '要它做什么？Enter 发送，Shift+Enter 换行',
     emptyBody:
       '例如「在第 2 幕后面加一幕雨夜追车」「把第 1 幕的出场角色改成只有阿岚」。它会先看清现状，再提一份提案——按下采用之前，库里什么都不会变。',
     quickActions: () => [],
+    closable: false,
   },
 )
 /** 落库成功后通知外面重拉——幕数、镜头数、衔接都可能变了。 */
-const emit = defineEmits<{ applied: [] }>()
+const emit = defineEmits<{ applied: []; close: [] }>()
 
 const router = useRouter()
 const director = useDirectorStore()
@@ -86,6 +102,10 @@ const onlyChanged = ref(true)
 const opened = ref<Set<string>>(new Set())
 /** 对话区的滚动容器：流式时要跟着往下走。 */
 const feed = ref<HTMLElement | null>(null)
+/** 输入框本体。抽完附件要把光标放到最后，否则用户得在两万字里自己找地方打字。 */
+const composer = ref<HTMLTextAreaElement | null>(null)
+/** 藏起来的那个 `<input type=file>`。`accept` 只认后端给的那一份。 */
+const filePicker = ref<HTMLInputElement | null>(null)
 
 /** 提案改的是什么对象。分组标题用它。 */
 const TARGET_LABEL: Record<string, string> = {
@@ -214,6 +234,62 @@ const failByTemp = computed(() => {
 /** 认不回哪张卡的失败（没带 temp_id）还是要显示——绝不静默丢掉。 */
 const orphanFails = computed(() => (director.lastApply?.failed ?? []).filter((f) => !f.temp_id))
 
+/**
+ * 落库回执里**有话要说**的那几个键。`scene_id` / `shot_id` 那些给人看没有意义，
+ * 而这一族是后端唯一会交代「顺带发生了什么」的地方：
+ * 同一批新建的角色 / 道具 / 地点接上了没有，以及参考图为什么没排上。
+ *
+ * 键名照后端（`services/director.py::_wire_pending` 与 `_maybe_image`），前端不猜、不改写
+ * 那几句话——它们本来就是给用户看的整句中文，改写只会变成第二份口径。
+ */
+const APPLIED_NOTES: { key: string; tone: 'done' | 'warn' }[] = [
+  { key: 'cast_wired', tone: 'done' },
+  { key: 'props_wired', tone: 'done' },
+  { key: 'location_wired', tone: 'done' },
+  { key: 'cast_skipped', tone: 'warn' },
+  { key: 'props_skipped', tone: 'warn' },
+  { key: 'location_skipped', tone: 'warn' },
+  { key: 'image_skipped', tone: 'warn' },
+]
+
+interface AppliedRow {
+  key: string
+  label: string
+  headline: string
+  notes: { text: string; tone: 'done' | 'warn' }[]
+}
+
+/**
+ * 这一次落库里有话要说的那几条。**没话说的不列**——一轮拆解常常是「1 幕 + 8 镜」，
+ * 全列出来只会把真正该看的那两句埋掉，条数本身由下面那行「已落库 N 条」交代。
+ */
+const appliedRows = computed<AppliedRow[]>(() => {
+  const out: AppliedRow[] = []
+  ;(director.lastApply?.applied ?? []).forEach((row, i) => {
+    const label = String(row.target_label ?? '')
+    const headline = String(row.title ?? row.name ?? '') || label
+    const notes: { text: string; tone: 'done' | 'warn' }[] = []
+    if (row.job_id) {
+      // 出图对象那句话在标题上已经有了就不重复一遍（`generate_reference` 那一族）。
+      const who = label && label !== headline ? `：${label}` : ''
+      notes.push({ text: `参考图已排进队列${who}。进度在底部控制台的任务框里看。`, tone: 'done' })
+    }
+    for (const spec of APPLIED_NOTES) {
+      const text = String(row[spec.key] ?? '')
+      if (text) notes.push({ text, tone: spec.tone })
+    }
+    if (!notes.length) return
+    const op = String(row.op ?? '')
+    out.push({
+      key: `${String(row.temp_id ?? '')}-${i}`,
+      label: OP_LABEL[op] ?? op,
+      headline,
+      notes,
+    })
+  })
+  return out
+})
+
 async function reload(): Promise<void> {
   if (!props.pid) return
   await director.load(props.pid).catch(() => {})
@@ -246,6 +322,46 @@ async function send(): Promise<void> {
   if (!text) return
   draft.value = ''
   await director.send(props.pid, text, props.scope)
+}
+
+function pickFile(): void {
+  filePicker.value?.click()
+}
+
+/**
+ * 抽出来的文字**塞进输入框**，前后各一行界标。
+ *
+ * 界标是给两边看的：模型得分清哪一段是文档、哪一句是用户自己说的话；用户得看见这一整段
+ * 会跟着发出去（所以它能删、能改、能只留要用的那几段）。
+ */
+function spliceIn(att: DirectorAttachment): void {
+  const block = `【附件 ${att.filename} · ${att.kind_label}】\n${att.text}\n【附件结束】`
+  const had = draft.value.replace(/\s+$/, '')
+  draft.value = had ? `${had}\n\n${block}\n` : `${block}\n`
+  // 光标落到最后：接着打字就是「照这份文档做什么」，不用在两万字里找位置。
+  nextTick(() => {
+    const el = composer.value
+    if (!el) return
+    el.focus()
+    el.setSelectionRange(el.value.length, el.value.length)
+    el.scrollTop = el.scrollHeight
+  })
+}
+
+/**
+ * 选了几份就一份份抽。**一份抽不了不影响其余几份**——原因（连 suggestions）显示在
+ * 输入框上方那块错误里，抽成了的照旧进输入框。
+ *
+ * 收尾把 `value` 清空：不清的话同一个文件第二次选不出 change 事件。
+ */
+async function onPicked(ev: Event): Promise<void> {
+  const input = ev.target as HTMLInputElement
+  const files = [...(input.files ?? [])]
+  input.value = ''
+  for (const file of files) {
+    const out = await director.attach(props.pid, file)
+    if (out) spliceIn(out)
+  }
 }
 
 async function accept(op: DirectorOp): Promise<void> {
@@ -293,6 +409,19 @@ function discardGroup(ops: DirectorOp[]): void {
         @click="director.clear(pid).catch(() => {})"
       >
         <Eraser :size="10" />清空
+      </AppButton>
+      <!--
+        收起不是清空：会话、待审提案、正在流的那一轮都活在 store 里，
+        再打开还是刚才那一栏（`streaming` 甚至不会中断）。
+      -->
+      <AppButton
+        v-if="closable"
+        size="sm"
+        variant="ghost"
+        title="收起这一栏。对话与待审提案都留着，随时从标题栏再叫出来"
+        @click="emit('close')"
+      >
+        <PanelRightClose :size="10" />
       </AppButton>
     </template>
 
@@ -530,14 +659,39 @@ function discardGroup(ops: DirectorOp[]): void {
             <p class="text-fg-4 mt-0.5 font-mono text-2xs">{{ f.op }} · {{ f.error.code }}</p>
           </div>
 
-          <!-- 这一次落了什么。落库是不可见的，不说一句就等于没发生 -->
-          <p v-if="director.lastApply && director.lastApply.count" class="text-st-done text-2xs">
-            已落库 {{ director.lastApply.count }} 条{{
-              director.lastApply.failed.length
-                ? `，另有 ${director.lastApply.failed.length} 条没落成（原因贴在对应那张卡上）`
-                : ''
-            }}。
-          </p>
+          <!--
+            这一次落了什么。落库是不可见的，不说一句就等于没发生——而**落成了的那张提案卡
+            已经走掉了**，所以「同一批新建的角色接上了没有」「图排上没排上」只剩这里能说。
+          -->
+          <div v-if="director.lastApply && director.lastApply.count" class="space-y-1">
+            <p class="text-st-done text-2xs">
+              已落库 {{ director.lastApply.count }} 条{{
+                director.lastApply.failed.length
+                  ? `，另有 ${director.lastApply.failed.length} 条没落成（原因贴在对应那张卡上）`
+                  : ''
+              }}。
+            </p>
+            <div
+              v-for="row in appliedRows"
+              :key="row.key"
+              class="border-line-1 bg-base-2 border px-2 py-1"
+            >
+              <p class="text-fg-3 text-2xs">
+                {{ row.label
+                }}<span v-if="row.headline" class="text-fg-2"> · {{ row.headline }}</span>
+              </p>
+              <ul class="mt-0.5 space-y-px">
+                <li
+                  v-for="n in row.notes"
+                  :key="n.text"
+                  class="text-2xs break-words"
+                  :class="n.tone === 'done' ? 'text-st-done' : 'text-st-review'"
+                >
+                  · {{ n.text }}
+                </li>
+              </ul>
+            </div>
+          </div>
         </div>
 
         <div class="border-line-1 shrink-0 space-y-1.5 border-t p-2">
@@ -560,7 +714,43 @@ function discardGroup(ops: DirectorOp[]): void {
               {{ q }}
             </button>
           </div>
+          <!--
+            抽进输入框的附件。**这几条不是「待上传的文件」**——文字已经在输入框里了，
+            这里留着的是「按什么读的 / 有没有截断」这些必须显示出来的话。
+          -->
+          <div v-if="director.attached.length" class="space-y-1">
+            <div
+              v-for="att in director.attached"
+              :key="att.filename"
+              class="border-line-1 bg-base-2 border px-1.5 py-1"
+            >
+              <div class="flex items-center gap-1">
+                <Paperclip :size="10" class="text-fg-4 shrink-0" />
+                <span class="text-fg-2 min-w-0 flex-1 truncate text-2xs" :title="att.filename">
+                  {{ att.filename }}
+                </span>
+                <span class="text-fg-4 shrink-0 text-2xs">
+                  {{ att.kind_label }} · {{ att.chars }} 字
+                </span>
+                <AppBadge v-if="att.truncated" tone="warn">已截断</AppBadge>
+                <button
+                  class="text-fg-4 hover:text-fg-2 shrink-0"
+                  title="只把这条提示收起来。文字已经在输入框里，要去掉请在输入框里删那一段"
+                  @click="director.forgetAttachment(att.filename)"
+                >
+                  <X :size="10" />
+                </button>
+              </div>
+              <!-- 「按 gb18030 读的」「日期是原始值」这类话必须显示，否则用户不知道读到了什么 -->
+              <ul v-if="att.notes.length" class="mt-0.5 space-y-px">
+                <li v-for="n in att.notes" :key="n" class="text-fg-4 text-2xs break-words">
+                  · {{ n }}
+                </li>
+              </ul>
+            </div>
+          </div>
           <textarea
+            ref="composer"
             v-model="draft"
             rows="3"
             :placeholder="placeholder"
@@ -569,7 +759,33 @@ function discardGroup(ops: DirectorOp[]): void {
             @keydown.enter.exact.prevent="send()"
           />
 
-          <div class="flex items-center gap-1.5">
+          <!-- 停靠栏能被拖窄，所以这一排允许换行——挤成一行会把「发送」推出去 -->
+          <div class="flex flex-wrap items-center gap-1.5">
+            <!--
+              附件：抽成文字填进输入框，**不落库、不落盘、不出网**。
+              `accept` 只认后端那一份（`core/doctext.py::KINDS`），前端不写死后缀清单。
+            -->
+            <input
+              ref="filePicker"
+              type="file"
+              multiple
+              class="hidden"
+              :accept="director.attachInfo?.accept"
+              @change="onPicked($event)"
+            />
+            <AppButton
+              size="sm"
+              variant="ghost"
+              :disabled="!director.attachInfo || director.attaching || director.streaming"
+              :title="
+                director.attachInfo
+                  ? `一份 Word / Excel / PPT / 文本 → 一段文字填进输入框（最大 ${director.attachInfo.max_mb} MB，最多 ${director.attachInfo.max_chars} 字）。${director.attachInfo.note}`
+                  : '还在读这一栏的配置'
+              "
+              @click="pickFile()"
+            >
+              <Paperclip :size="10" />{{ director.attaching ? '抽文字…' : '附件' }}
+            </AppButton>
             <label
               class="text-fg-4 flex items-center gap-1 text-2xs"
               title="整幕覆盖那种提案 before/after 大半是同值，全列出来反而看不清"

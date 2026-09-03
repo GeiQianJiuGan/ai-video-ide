@@ -32,6 +32,16 @@ R2V 图往往根本没有首帧入口。所以必需入口只剩 `AIVS_PROMPT` �
 输入是已经出好的那一段），标了 `AIVS_AUDIO_TEXT` / `AIVS_AUDIO_PROMPT` 的是音源图
 （另一条链，见 `providers/audio.py`）。所以 `inspect()` 回的 `ready` 是「至少能做一件事」，
 音源图与超分图不需要 `AIVS_PROMPT`——按老口径它们连保存都过不了。
+
+**出图那份图靠一句声明分出来**（`AIVS_IMAGE`，见 `DECLARATIONS`）：出图与出画面用的是
+同一批入口标题（提示词、负向、种子、参考图槽位），所以**从入口标题分不出「这是 T2I 还是
+R2V」**——以前只能靠设置页的 `image.preset` 指名，而那份 T2I 图照旧躺在 R2V / 首尾帧的候选
+列表里，选错一次就是一次白跑。现在给图里**任意一个**节点加个 `AIVS_IMAGE` 标题就等于说
+「这份是出图那份」：它进「出图」那一栏，同时从视频那两栏里消失。
+
+声明**不是入口**（不往里填任何值），所以它刻意不在 `MARKERS` 里——`entry_points()` 会要求
+节点上有我们认得的可填输入，而用户最顺手的落点（SaveImage、模型加载器）往往一个都没有。
+反过来，**没有声明就是老样子**：已有的预设一份都不用重新标，只是仍然要在设置页指名。
 """
 
 from __future__ import annotations
@@ -115,8 +125,8 @@ MARKERS: dict[str, tuple[str, ...]] = {
     "AIVS_AUDIO_SEED": SEED_FIELDS,
     #: 出图那份图的画幅入口（**另一条链**，见 `providers/image.py`）。刻意只有这两个：
     #: 提示词 / 负向 / 种子 / 参考图那几族出图与出视频用的是同一批标题，T2I 图上本来就有。
-    #: **`inspect()` 不因为它们多一条 ready 判定**——从入口标题分不出「这是 T2I 还是 R2V」，
-    #: 出图用哪份图靠 `image.preset` 设置指名，硬猜只会猜错。
+    #: **它们不构成「这是出图那份图」的判定**——从入口标题分不出 T2I 与 R2V，硬猜只会猜错；
+    #: 那句话由声明标题 `AIVS_IMAGE` 说（见 `DECLARATIONS`）。
     "AIVS_WIDTH": SIZE_FIELDS,
     "AIVS_HEIGHT": SIZE_FIELDS,
     #: 参考素材：角色表 / 地点参考图 / 动作参考视频 / 对白音频从这里进去。
@@ -125,6 +135,15 @@ MARKERS: dict[str, tuple[str, ...]] = {
     **dict.fromkeys(REF_VIDEO_MARKERS, VIDEO_FIELDS),
     **dict.fromkeys(REF_AUDIO_MARKERS, AUDIO_FIELDS),
 }
+
+#: **声明标题**：只用来说明「这份图是干什么的」，一个值都不往里填。
+#: 所以它刻意不在 `MARKERS` 里——`entry_points()` 会要求节点上有我们认得的可填输入，
+#: 而声明最顺手的落点（SaveImage、模型加载器）往往一个都没有。
+#: 落在**任意一个**节点上都算，因为它说的是整份图的用途，不是某个节点的角色。
+DECLARE_IMAGE = "AIVS_IMAGE"
+#: 声明标题 → 它声明的是什么。目前只有出图那一句：**没有声明就是老样子**
+#: （已有的预设一份都不用重新标），所以刻意没有对称的 `AIVS_VIDEO`。
+DECLARATIONS: dict[str, str] = {DECLARE_IMAGE: "出图那份图（T2I / 图生图）"}
 
 #: 入口标题 → 人看得懂的说法。**只有这一份**：错误文案、设置页的手动对应表、
 #: 「这一格是干什么的」都从这里取，写两份必然对不上。
@@ -206,9 +225,9 @@ HOW_TO = [
     "音源那份图另存一份：台词标 AIVS_AUDIO_TEXT、声音描述标 AIVS_AUDIO_PROMPT"
     "（两者有其一即可）、音色参考标 AIVS_VOICE_REF、时长与种子标 AIVS_AUDIO_DURATION /"
     " AIVS_AUDIO_SEED——它不需要 AIVS_PROMPT",
-    "出参考图（角色四视图 / 地点图 / 道具图）那份 T2I 图也另存一份：提示词、负向、种子、"
-    "参考图槽位用的是同一批标题，只多两个可选的 AIVS_WIDTH / AIVS_HEIGHT"
-    "——它由设置页的「图片预设」指名，不靠标题猜",
+    "出参考图（角色四视图 / 地点图 / 道具图）那份 T2I 图也另存一份，并给图里**任意一个节点**"
+    "加 AIVS_IMAGE 标题——标了它这份图就只出现在「出图」那一栏，不再混进 R2V / 首尾帧的候选；"
+    "提示词、负向、种子、参考图槽位用的是同一批标题，画幅另有可选的 AIVS_WIDTH / AIVS_HEIGHT",
     "再用「Save (API Format)」导出，重新上传这份预设",
 ]
 
@@ -261,6 +280,16 @@ def entry_points(graph: dict[str, Any]) -> dict[str, dict[str, str]]:
             "class_type": str(node.get("class_type") or ""),
         }
     return found
+
+
+def declarations(graph: dict[str, Any]) -> set[str]:
+    """图里出现过的**声明标题**（`DECLARATIONS` 的键）。
+
+    与 `entry_points()` 分开走一遍标题，是因为声明不填值：它落在哪个节点上都算，
+    那个节点也不需要有我们认得的输入。落在多个节点上也只算一次——它说的是整份图的用途。
+    """
+    titles = {str((node.get("_meta") or {}).get("title") or "").strip() for node in graph.values()}
+    return titles & set(DECLARATIONS)
 
 
 def ref_slots(points: dict[str, dict[str, str]], media: str = "image") -> list[str]:
@@ -410,45 +439,91 @@ def _ref_hint(by_media: dict[str, list[str]], first_frame: bool) -> str:
     ) + tail
 
 
+def _image_hint(by_media: dict[str, list[str]], size_ok: bool) -> str:
+    """出图那份图怎么收东西——UI 上那一句话。
+
+    **它不能用 `_ref_hint()` 那句**：那句话在讲首帧与补转场，而出图这条链根本没有首尾帧
+    这回事（`AIVS_FIRST_FRAME` 在 T2I 图上无意义）。照那句显示只会让人去改一个
+    本来没问题的标题。
+    """
+    slots = by_media.get("image") or []
+    size = "" if size_ok else "；没有 AIVS_WIDTH / AIVS_HEIGHT，出来的是图里原本的画幅"
+    if slots:
+        return f"出图那份图：能收 {len(slots)} 张参考图（{'、'.join(slots)}），图生图走它们{size}"
+    return (
+        "出图那份图：只按提示词画——一个 AIVS_REF_* 槽位都没有，参考图喂不进去（图生图做不了）。"
+        f"要收图就加 AIVS_REF_1…AIVS_REF_{REF_SLOTS} 标题{size}"
+    )
+
+
 def inspect(graph: dict[str, Any]) -> dict[str, Any]:
     """预设的体检报告：找到哪些入口、缺哪些、缺了会怎样。
 
     **一份图能做的事不止出画面**（`capabilities`）：出正片（r2v）、补转场（flf）、
-    二次处理（refine）、出声音（audio）。所以 `ready` 是「至少能做一件事」，
+    二次处理（refine）、出声音（audio）、出图（t2i）。所以 `ready` 是「至少能做一件事」，
     而不是「有 AIVS_PROMPT」——音源图与超分图压根不需要画面提示词，按老口径它们连保存
     都过不了，用户只能被逼着往音源图里塞一个没人读的文本框。
+
+    **出图那一项只认声明**（`AIVS_IMAGE`）：出图与出正片的入口标题完全一样，从标题分不出
+    是哪一种，所以「这是 T2I」只能由用户说。声明了就换一种口径——它不再出现在
+    `r2v_ready` / `flf_ready` 里（视频那两栏的候选就此干净），`ref_hint` 也换成出图那句话。
     """
     points = entry_points(graph)
+    declared = declarations(graph)
+    declares_image = DECLARE_IMAGE in declared
     missing = [m for m in REQUIRED if m not in points]
     missing_flf = [m for m in FLF_REQUIRED if m not in points]
     by_media = ref_slots_by_media(points)
     slots = by_media["image"]
     first_frame = "AIVS_FIRST_FRAME" in points
+    size_ok = "AIVS_WIDTH" in points or "AIVS_HEIGHT" in points
+    prompt_ok = not missing
     refine_ready = all(m in points for m in REFINE_REQUIRED)
     audio_ready = any(m in points for m in AUDIO_REQUIRED_ANY)
-    ready = not missing or refine_ready or audio_ready
+    #: 声明了出图的图**从视频那两栏里退出**：一份 T2I 图躺在 R2V 候选里，选错一次就是一次
+    #: 白跑（提交上去只会得到一张图或一个报错）。这正是「出图与出画面分开管理」的落点。
+    r2v_ready = prompt_ok and not declares_image
+    flf_ready = not missing_flf and not declares_image
+    t2i_ready = prompt_ok and declares_image
+    ready = prompt_ok or refine_ready or audio_ready
     return {
         "node_count": len(graph),
         "entry_points": points,
         "found": sorted(points),
+        #: 图里的声明标题（目前只有 AIVS_IMAGE）。列出来而不是只给一个 bool：
+        #: 以后多一种声明时前端不用改形状。
+        "declared": sorted(declared),
+        "declares_image": declares_image,
         "missing_required": missing,
         "ready": ready,
-        "r2v_ready": not missing,
-        "flf_ready": not missing_flf,
+        #: 有没有提示词入口。**出图与出正片共用这一条判定**（标题分不出两者），
+        #: 所以 `providers/image.py` 那侧判的是它，而不是 `r2v_ready`——否则用户一声明
+        #: 出图，出图自己反而先报「没有提示词入口」。
+        "prompt_ok": prompt_ok,
+        "r2v_ready": r2v_ready,
+        "flf_ready": flf_ready,
         #: 能不能当二次处理 / 音源那份图用。两者各自独立，与出画面互不影响：
         #: 同一份图既能出正片又能超分是可能的（标了 AIVS_SOURCE_VIDEO 就行）。
         "refine_ready": refine_ready,
         "audio_ready": audio_ready,
+        #: 能不能当出图那份图用 = 声明了 + 填得进提示词。**没声明的图不在这里为真**，
+        #: 但设置页照旧能指名它（老工程不用重新标标题），只是会提醒一句。
+        "t2i_ready": t2i_ready,
+        #: 有没有画幅入口。缺了不影响任何 ready——出来的是图里原本的画幅，只需说一句。
+        "size_ok": size_ok,
         #: 有没有首帧入口。没有不影响 ready，但首帧只能当参考图送——UI 要标出来。
         "first_frame_ok": first_frame,
         "capabilities": [
             capability
             for capability, available in (
-                ("r2v", not missing),
-                ("flf", not missing_flf),
+                ("r2v", r2v_ready),
+                ("flf", flf_ready),
                 #: 二次处理与出声音各算一项独立能力：设置页要能一眼看出「哪一份是音源图」。
                 ("refine", refine_ready),
                 ("audio", audio_ready),
+                #: 出图同理。**它只在声明过的图上出现**：给每份带提示词的图都挂一个 t2i
+                #: 等于什么都没说（出正片那份图也有提示词入口）。
+                ("t2i", t2i_ready),
                 #: 能收参考视频 / 参考音频算两项独立能力：动作参考与对白音频是两类图，
                 #: UI 上要能一眼看出「这份图接不接音频」。
                 ("ref_video", bool(by_media["video"])),
@@ -463,13 +538,20 @@ def inspect(graph: dict[str, Any]) -> dict[str, Any]:
         "ref_video_slots": len(by_media["video"]),
         "ref_audio_slots": len(by_media["audio"]),
         "ref_slots_by_media": {media: len(v) for media, v in by_media.items()},
-        "ref_hint": _ref_hint(by_media, first_frame),
+        "ref_hint": (
+            _image_hint(by_media, size_ok) if declares_image else _ref_hint(by_media, first_frame)
+        ),
         "impact": (
             None
             if ready
-            else "这份图里既没有 AIVS_PROMPT（出画面要它），也没有 AIVS_SOURCE_VIDEO"
-            "（二次处理要它）或 AIVS_AUDIO_TEXT / AIVS_AUDIO_PROMPT（出声音要它）"
-            "——本工具无法往里填任何东西。"
+            else (
+                f"这份图标了 {DECLARE_IMAGE}（{DECLARATIONS[DECLARE_IMAGE]}），却没有 "
+                "AIVS_PROMPT——本工具没法告诉它要画什么。"
+                if declares_image
+                else "这份图里既没有 AIVS_PROMPT（出画面要它），也没有 AIVS_SOURCE_VIDEO"
+                "（二次处理要它）或 AIVS_AUDIO_TEXT / AIVS_AUDIO_PROMPT（出声音要它）"
+                "——本工具无法往里填任何东西。"
+            )
         ),
     }
 
@@ -536,10 +618,15 @@ def listing() -> list[dict[str, Any]]:
             "name": path.stem,
             "path": path.as_posix(),
             "ready": False,
+            "declared": [],
+            "declares_image": False,
+            "prompt_ok": False,
             "r2v_ready": False,
             "flf_ready": False,
             "refine_ready": False,
             "audio_ready": False,
+            "t2i_ready": False,
+            "size_ok": False,
             "first_frame_ok": False,
             "capabilities": [],
             "ref_slots": 0,

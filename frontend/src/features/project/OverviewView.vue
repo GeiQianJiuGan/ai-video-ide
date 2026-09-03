@@ -20,6 +20,7 @@ import {
   Activity,
   CheckCircle2,
   Library,
+  PackagePlus,
   PlayCircle,
   RefreshCw,
   ScanSearch,
@@ -36,9 +37,11 @@ import { COUNT_CARDS } from '@/shared/api/overview'
 import { projectsApi } from '@/shared/api/projects'
 import { settingsApi, type PresetRow } from '@/shared/api/settings'
 import { useOverviewStore } from '@/stores/overview'
+import { useShellStore } from '@/stores/shell'
 
 const route = useRoute()
 const ov = useOverviewStore()
+const shell = useShellStore()
 
 const pid = computed(() => String(route.params.pid ?? ''))
 const presets = ref<PresetRow[]>([])
@@ -81,7 +84,8 @@ async function selectPreset(role: 'r2v' | 'flf', name: string): Promise<void> {
     const otherPresetValid = (otherName: string | null | undefined, otherRole: 'r2v' | 'flf') => {
       if (!otherName) return null
       return presets.value.some(
-        (p) => p.name === otherName && (otherRole === 'r2v' ? (p.r2v_ready ?? p.ready) : p.flf_ready)
+        (p) =>
+          p.name === otherName && (otherRole === 'r2v' ? (p.r2v_ready ?? p.ready) : p.flf_ready),
       )
         ? otherName
         : null
@@ -139,6 +143,17 @@ function duration(sec: number): string {
       </AppButton>
       <AppButton size="sm" :disabled="ov.checking" @click="ov.check(pid)">
         <ScanSearch :size="10" />{{ ov.checking ? '检查中…' : '连续性检查' }}
+      </AppButton>
+      <!--
+        导出入口在这里是**第三处**（另两处是标题栏与命令面板）：概览页是打开工程后的落地页，
+        「把这个工程带走」是站在这一页最自然会想到的动作。弹窗本体挂在常驻外壳上。
+      -->
+      <AppButton
+        size="sm"
+        title="把当前工程导出成一个 .aivspkg 包（先出账单再动手）。密钥与服务地址一律不进包"
+        @click="shell.openExport()"
+      >
+        <PackagePlus :size="10" />导出工程包
       </AppButton>
       <AppButton size="sm" variant="ghost" class="ml-auto" :disabled="ov.busy" @click="reload()">
         <RefreshCw :size="10" />刷新

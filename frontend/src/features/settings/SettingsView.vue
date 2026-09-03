@@ -444,13 +444,31 @@ async function pastePreset(): Promise<void> {
             <AppBadge v-if="row.ready && row.ref_audio_slots" tone="neutral">
               参考音频 {{ row.ref_audio_slots }} 槽
             </AppBadge>
+            <!--
+              **这份图是出图那一份**（图里标了 AIVS_IMAGE）。从入口标题分不出 T2I 与 R2V
+              （两边都是 AIVS_PROMPT / AIVS_NEGATIVE / AIVS_SEED），所以只有这个声明说得清；
+              标了它之后后端已经把它从 R2V / 首尾帧的候选里撤掉，这里只把结论标出来。
+            -->
+            <AppBadge v-if="row.t2i_ready" tone="ok">T2I 出图</AppBadge>
+            <AppBadge v-if="row.declares_image && !row.prompt_ok" tone="fail">
+              缺 AIVS_PROMPT
+            </AppBadge>
             <span class="text-fg-4 min-w-0 flex-1 truncate text-2xs">
               {{ row.ready ? (row.found ?? []).join(' · ') : row.impact }}
             </span>
+            <!--
+              出图那份图不该能被设成视频默认：提交上去只会得到一张图或一个报错，
+              而「这一份到底是哪一栏的」现在有声明说得清，就不该等到生成那一刻才报错。
+            -->
             <AppButton
               size="sm"
               variant="ghost"
-              :disabled="!row.ready || cfg.busy"
+              :disabled="!row.ready || row.declares_image || cfg.busy"
+              :title="
+                row.declares_image
+                  ? '这份图标了 AIVS_IMAGE，是出图那一份——出画面请另选一份没标它的图'
+                  : '把这份图当出画面（R2V / 补转场）用的那一份'
+              "
               @click="cfg.setOne('video.preset', row.name)"
             >
               设为默认
@@ -458,13 +476,23 @@ async function pastePreset(): Promise<void> {
             <!--
               只有认预设的出图协议（本机 ComfyUI）才需要这个按钮：`wants_preset` 来自协议表，
               云端 API 那几家指一份图毫无意义，所以那时这颗按钮根本不出现。
+
+              **禁用条件是 `prompt_ok` 而不是 `t2i_ready`**：没标 AIVS_IMAGE 的图照旧能当出图
+              预设用（否则每一台升级前就配好出图预设的机器当场坏掉），只是它同时还留在视频
+              那两栏的候选里——这一句写进 tooltip，不拿禁用来说。
             -->
             <AppButton
               v-if="cfg.draftImageProtocol?.wants_preset"
               size="sm"
               variant="ghost"
-              :disabled="cfg.busy"
-              title="把这份图当出图用的那一份（角色四视图 / 地点参考图 / 道具图走它）"
+              :disabled="cfg.busy || !row.prompt_ok"
+              :title="
+                !row.prompt_ok
+                  ? '这份图里没有 AIVS_PROMPT，本工具没法告诉它要画什么'
+                  : row.declares_image
+                    ? '把这份图当出图用的那一份（角色四视图 / 地点参考图 / 道具图走它）'
+                    : '可以用，但这份图没标 AIVS_IMAGE，它同时还留在 R2V / 首尾帧的候选里——给它加上这个标题就只归「出图」那一栏'
+              "
               @click="cfg.setOne('image.preset', row.name)"
             >
               设为出图默认

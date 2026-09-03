@@ -156,11 +156,32 @@ export interface PresetRow {
   ready: boolean
   r2v_ready?: boolean
   flf_ready?: boolean
-  capabilities?: Array<'r2v' | 'flf' | 'ref_video' | 'ref_audio'>
+  capabilities?: Array<'r2v' | 'flf' | 't2i' | 'ref_video' | 'ref_audio'>
   impact: string | null
   found?: string[]
   missing_required?: string[]
   node_count?: number
+  /**
+   * 这份图上标了哪几个**声明**（纯标记，不填值）。目前只有 `AIVS_IMAGE`。
+   * 声明与入口标题是两码事：入口要有一个能填的输入，声明可以标在 SaveImage 上。
+   */
+  declared?: string[]
+  /**
+   * **它是出图那份图**（标了 `AIVS_IMAGE`）。从入口标题分不出 T2I 与 R2V
+   * （两边都是 AIVS_PROMPT / AIVS_NEGATIVE / AIVS_SEED），所以只有这个声明说得清。
+   * 为真时后端已经把 `r2v_ready` / `flf_ready` 压成 false——它退出视频候选就是这么退的，
+   * 前端不再另算一遍。
+   */
+  declares_image?: boolean
+  /**
+   * 有没有提示词入口（`AIVS_PROMPT`）。出图那条链**只认这一个**：
+   * 声明过的图在 `r2v_ready` 上永远为假，拿它当「能不能出图」判会自相矛盾。
+   */
+  prompt_ok?: boolean
+  /** 出图就绪 = 有提示词入口 **且**标了 `AIVS_IMAGE`。 */
+  t2i_ready?: boolean
+  /** 有没有画幅入口（`AIVS_WIDTH` / `AIVS_HEIGHT`）。没有就出图里原本的画幅。 */
+  size_ok?: boolean
   /** 有没有首帧入口。没有不影响 `ready`，但首帧只能当参考图 1 送进去。 */
   first_frame_ok?: boolean
   /**

@@ -75,6 +75,7 @@ REF_SLOTS_KEY = "reference_image_slots"
 #: 它**：那边要先 `apply()` 把 `_baseline` 装起来，只读路径不该依赖这个时序。
 _DEFAULT_PROVIDER: str = str(Settings.model_fields["video_provider"].default or "")
 
+
 @dataclass(frozen=True)
 class Route:
     """一条解析完的出片路：**解析那一刻的只读快照**，入队时整个冻结进版本参数。"""
@@ -210,6 +211,10 @@ def preset_error(name: str | None, capability: str) -> AppError:
 
     `api/projects.py::PUT /preset`（选的时候）、入队门槛（按下生成的时候）、概览页那份账单
     （还没按的时候）共用它。三处各写一遍的话，用户会在三个地方看到三种说法。
+
+    **「它其实是出图那份图」要单独说**：一份标了 `AIVS_IMAGE` 的图入口标题一个不缺，
+    照通用那句话说下去会让用户去改一个本来没问题的标题，而真正的原因是这份图声明了自己
+    是出图用的（见 `providers/presets.DECLARATIONS`）。
     """
     role = preset_role(capability)
     which = "首尾帧 / FL2VA" if role == "flf" else "R2V"
@@ -224,6 +229,20 @@ def preset_error(name: str | None, capability: str) -> AppError:
                 "预设要先在「预设 Workflow」里导入并校验通过",
             ],
             {"capability": capability, "role": role},
+        )
+    item = next((x for x in presets.listing() if x["name"] == name), None)
+    if item and item.get("declares_image"):
+        return AppError(
+            ErrorCode.INVALID_WORKFLOW,
+            "这是出图那份图，不能用来出画面",
+            f"预设 {name} 里标了 {presets.DECLARE_IMAGE}，它声明自己是"
+            f"{presets.DECLARATIONS[presets.DECLARE_IMAGE]}，所以不出现在{which}的候选里。",
+            [
+                f"{which}请另选一份没标 {presets.DECLARE_IMAGE} 的预设",
+                "这份图要用在「图片生成 API」那一栏（设置页 → 设为出图默认）",
+                f"如果它其实是出画面那份图，把节点上的 {presets.DECLARE_IMAGE} 标题去掉",
+            ],
+            {"preset": name, "role": role, "capability": capability, "declares_image": True},
         )
     return AppError(
         ErrorCode.INVALID_WORKFLOW,
@@ -555,4 +574,3 @@ async def summary(pid: str) -> dict[str, Any]:
         #: REST 那条路上服务端要实现什么。写死在前端的话，改合同就得改两处。
         "contract": list(CONTRACT),
     }
-

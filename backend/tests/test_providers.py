@@ -120,6 +120,21 @@ def media_ref(tmp_path: Path, name: str, media: str, label: str) -> RefAsset:
     return RefAsset(path=path, label=label, kind="manual", media=media)
 
 
+def with_declaration(graph: dict[str, Any], title: str = presets.DECLARE_IMAGE) -> dict[str, Any]:
+    """把声明标题挂在一个**没有任何可填输入**的节点上——用户最顺手的落点就是这种。
+
+    SaveImage 的 `filename_prefix` 不在 `MARKERS` 的任何一族里，所以这份图能证明
+    「声明不是入口」：照 `entry_points()` 那条路走会直接报「没有可填的输入」。
+    """
+    out = {k: dict(v) for k, v in graph.items()}
+    out["20"] = {
+        "class_type": "SaveImage",
+        "inputs": {"images": ["5", 0], "filename_prefix": "aivs"},
+        "_meta": {"title": title},
+    }
+    return out
+
+
 async def test_preset_injection_hits_titles_and_leaves_the_rest_alone(tmp_path: Path) -> None:
     write_preset("wan-flf", GRAPH)
     first = tmp_path / "first.png"
@@ -401,6 +416,96 @@ def test_preset_without_frame_titles_is_accepted_and_says_the_first_frame_become
     assert row["flf_ready"] is False, "补转场要的是严格首尾帧，这份图做不了"
     assert row["r2v_ready"] is True
     assert "参考图 1" in row["ref_hint"], "要说清首帧会怎么被喂进去"
+
+
+def test_a_declared_image_preset_leaves_the_video_candidates() -> None:
+    """出图那份图靠一句声明分出来：标了 AIVS_IMAGE 就只归「出图」那一栏。
+
+    T2I 与 R2V 用的是**同一批入口标题**（提示词 / 负向 / 种子 / 参考图槽位），从标题分不出
+    是哪一种，所以这句话只能由用户说。声明之后能存、能当出图预设选，但**从视频那两栏里
+    消失**——一份 T2I 图躺在 R2V 候选里，选错一次就是一次白跑。
+    """
+    presets.save("四视图", json.dumps(with_declaration(with_ref_slots(2)), ensure_ascii=False))
+    row = next(r for r in presets.listing() if r["name"] == "四视图")
+    assert row["ready"] is True, "声明不该让它体检不过——它只是换了一栏"
+    assert row["declares_image"] is True
+    assert row["declared"] == [presets.DECLARE_IMAGE]
+    assert row["prompt_ok"] is True, "提示词入口照旧在，只是这份图不出画面"
+    assert row["t2i_ready"] is True
+    assert row["r2v_ready"] is False, "声明过的图不该再出现在 R2V 候选里"
+    assert row["flf_ready"] is False, "首尾帧入口齐全也一样——它声明了自己是出图那份"
+    assert row["capabilities"] == ["t2i"]
+
+
+def test_a_declaration_needs_no_fillable_input() -> None:
+    """声明不是入口：它落在 SaveImage 这种「一个我们认得的输入都没有」的节点上也算。
+
+    反过来说，把它写进 `MARKERS` 就会让这份图直接报「入口节点没有可填的输入」——
+    而 SaveImage / 模型加载器正是用户最顺手的落点。
+    """
+    graph = with_declaration(GRAPH)
+    assert presets.declarations(graph) == {presets.DECLARE_IMAGE}
+    assert presets.DECLARE_IMAGE not in presets.entry_points(graph), "声明不占入口"
+    presets.save("能存", json.dumps(graph, ensure_ascii=False))
+    assert next(r for r in presets.listing() if r["name"] == "能存")["t2i_ready"] is True
+
+
+def test_a_declared_image_preset_gets_its_own_hint() -> None:
+    """出图那句提示不能照抄出画面那句：T2I 图上没有首帧，也不补转场。
+
+    照那句显示只会让用户去改一个本来没问题的标题（`AIVS_FIRST_FRAME` 在这份图上无意义）。
+    """
+    write_preset("出图-有槽位", with_declaration(with_ref_slots(2)))
+    write_preset("出图-无槽位", with_declaration(GRAPH))
+    rows = {r["name"]: r for r in presets.listing()}
+    with_slots = rows["出图-有槽位"]["ref_hint"]
+    assert "出图那份图" in with_slots and "2 张参考图" in with_slots
+    assert "首帧" not in with_slots, "出图这条链没有首尾帧这回事"
+    without = rows["出图-无槽位"]["ref_hint"]
+    assert "图生图做不了" in without, "一个槽位都没有要说清代价"
+    assert "AIVS_WIDTH" in without, "没有画幅入口也要说一句——出来的是图里原本的画幅"
+    assert rows["出图-有槽位"]["size_ok"] is False
+
+
+def test_a_declared_preset_without_a_prompt_says_which_one_it_is() -> None:
+    """声明了出图却没有提示词入口：这种图存不进来，而且要说清它声明的是什么。
+
+    通用那句话（「既没有 AIVS_PROMPT 也没有 AIVS_SOURCE_VIDEO…」）会把用户往超分 / 音源
+    那两条链上引，而他明明是在做一份出图的图。
+    """
+    bare = {
+        "1": {"class_type": "SaveImage", "inputs": {"filename_prefix": "x"}},
+        "20": {
+            "class_type": "EmptyLatentImage",
+            "inputs": {"batch_size": 1},
+            "_meta": {"title": presets.DECLARE_IMAGE},
+        },
+    }
+    with pytest.raises(AppError) as caught:
+        presets.save("只有声明", json.dumps(bare, ensure_ascii=False))
+    assert presets.DECLARE_IMAGE in caught.value.detail
+    assert "AIVS_PROMPT" in caught.value.detail
+
+
+def test_picking_a_declared_image_preset_for_video_says_why(tmp_path: Path) -> None:
+    """在视频那一栏选中一份出图的图：错误必须说「这是出图那份图」。
+
+    照通用的「预设不可用」说下去，用户会去 ComfyUI 里找一个根本不缺的标题——
+    真正的原因是这份图自己声明了用途。这句话只有 `route.preset_error` 一份。
+    """
+    from app.services import route
+
+    write_preset("四视图", with_declaration(with_ref_slots(2)))
+    err = route.preset_error("四视图", "image2video")
+    assert err.code == "INVALID_WORKFLOW"
+    assert presets.DECLARE_IMAGE in err.detail
+    assert err.related_ids.get("declares_image") is True
+    assert any(presets.DECLARE_IMAGE in s for s in err.suggestions)
+    assert route.preset_ready("四视图", "image2video") is False
+    # 没声明的那份照旧走通用文案，一个字都没变
+    write_preset("wan-i2v", GRAPH)
+    assert route.preset_ready("wan-i2v", "image2video") is True
+    assert route.preset_error("wan-i2v", "image2video").title == "预设不可用"
 
 
 async def test_preset_without_a_first_frame_title_sends_it_as_reference_one(tmp_path: Path) -> None:

@@ -20,6 +20,13 @@
 
 **`read_script` 是「一次性拆解会超时」那个毛病的解药**：模型自己按 offset 分段读原文，
 一段一段地提案，于是每一轮 chat 的输入输出都是有界的——不再需要一次吐出整部片子。
+
+**素材描述这一支多一条边界：看不了图就不编。** 素材上那一句回答的是「**这张图**长什么样」，
+它会被当成画面事实拼进每一个引用它的镜头（`providers/base.py::ref_hint`）。所以
+`look_at_image` 默认 `allow_text=False`——端看不了图时它一个字都不写，只回
+`source="blocked"` + 该问用户的那句话（`describe.NO_VISION_ASK`）；用户同意「按剧本与设定
+推断着写」之后才带 `allow_text=true` 再调一次。`set_description` 那边靠 `to_op(looked_at=…)`
+兜底：这一轮没真看过图的素材提案挂一句警告，`_run_one` 会把它回喂给模型。
 """
 
 from __future__ import annotations
@@ -27,6 +34,7 @@ from __future__ import annotations
 from typing import Any
 
 from app.ai import prompts, skills
+from app.ai.llm import client as llm
 from app.core.errors import AppError, ErrorCode
 from app.generation.providers import registry
 from app.generation.providers.base import DESC_MAX
@@ -35,7 +43,12 @@ from app.persistence.models_gen import IMAGE_TARGETS
 from app.services.assets import assets
 from app.services.cast import cast
 from app.services.context import APPEARANCE_DESC_FIELDS
-from app.services.describe import DESC_TARGET_LABEL, DESC_TARGETS, describe
+from app.services.describe import (
+    DESC_TARGET_LABEL,
+    DESC_TARGETS,
+    NO_VISION_ASK,
+    describe,
+)
 from app.services.images import images
 from app.services.sequence import sequence
 from app.services.story import story
@@ -112,22 +125,46 @@ TOOLS: dict[str, dict[str, Any]] = {
         "params": {},
     },
     "list_props": {"kind": "read", "desc": "列出所有道具（带 description）。", "params": {}},
+    "list_missing_materials": {
+        "kind": "read",
+        "desc": (
+            "**拆完一段之后对一遍账**：哪几幕还没有出场角色 / 没有地点，哪些形象还没有定妆图、"
+            "哪些地点变体与道具还没有参考图。只喂一句文字的镜头在几秒里就把人物形象丢掉，"
+            "所以缺参考图和缺人一样要补。"
+            "回的 image 一节说清出图那条链配没配——没配时按 image.how_to 那句先告诉用户，"
+            "别提一堆永远出不了图的提案。"
+        ),
+        "params": {},
+    },
     "list_undescribed": {
         "kind": "read",
         "desc": (
             "列出**还没有描述**的素材。素材被镜头引用时，模型看到的只有那一句描述——"
             "空的等于只递过去一个文件名，人物形象在几秒里就丢了。"
             "抽出来的首尾帧是临时文件，不在这张清单里。"
+            "回的 vision 一节说清这个端能不能看图、这一轮该怎么走。"
         ),
         "params": {},
     },
     "look_at_image": {
         "kind": "read",
         "desc": (
-            "看一张素材图，回一句「它长什么样」的建议文字。**只是建议，一行库都不改**——"
-            "要落库请再用 set_description 提一条案。非图片素材与看不了图的端会说明原因。"
+            "看**一张**素材图，回一句「它长什么样」的建议文字。**只是建议，一行库都不改**——"
+            "要落库请再用 set_description 提一条案。一次只看一张：要补三张就调三次，"
+            "别看一张就把三张的描述都写了。"
+            '端看不了图时回 source="blocked"（一个字都不写）+ 该问用户的那句话；'
+            "用户明确同意「按剧本与已有设定推断着写」之后才带 allow_text=true 再调一次。"
         ),
-        "params": {"asset_id": {"type": "string", "description": "资产 id"}},
+        "params": {
+            "asset_id": {"type": "string", "description": "资产 id"},
+            "allow_text": {
+                "type": "boolean",
+                "description": (
+                    "看不了图时是否允许按名字与已有设定推断着写一句（默认 false）。"
+                    "**只有用户明确同意之后才传 true**，并在提案的 why 里写明这一点"
+                ),
+            },
+        },
         "required": ["asset_id"],
     },
     "list_scenes": {
@@ -181,6 +218,13 @@ TOOLS: dict[str, dict[str, Any]] = {
             "summary": {"type": "string", "description": "一两句剧情概要"},
             "time_of_day": {"type": "string", "description": "白天 / 黄昏 / 雨夜等"},
             "location_variant_id": {"type": "string", "description": "地点变体 id，可留空"},
+            "location_name": {
+                "type": "string",
+                "description": (
+                    "地点名。没有 id 时用它——工程里还没有这个地点时，"
+                    "同一批里 add_location 建一个，落库时会自动接到这一幕上"
+                ),
+            },
             "shots": {
                 "type": "array",
                 "description": "这一幕的镜头，按时间顺序",
@@ -202,6 +246,10 @@ TOOLS: dict[str, dict[str, Any]] = {
             "summary": {"type": "string"},
             "time_of_day": {"type": "string"},
             "location_variant_id": {"type": "string"},
+            "location_name": {
+                "type": "string",
+                "description": "地点名。没有 id 时用它（同一批里新建的地点也接得上）",
+            },
             "why": {"type": "string"},
         },
         "required": ["scene_id"],
@@ -402,7 +450,9 @@ TOOLS: dict[str, dict[str, Any]] = {
             "提议给一个东西补 / 改那一句描述。**这一句是模型引用它时唯一看得到的说明**，"
             "所以只写画面里看得见的事实（外形、服装配色、材质、光线、环境），"
             "不写心理活动与剧情，不超过 120 字（超出的部分在拼 prompt 时会被截断）。"
-            "先用 list_undescribed 看缺哪些、look_at_image 看一眼图，再提这条案。"
+            '`target_kind="asset"` 回答的是「**这张图**长什么样」，'
+            "**必须先对同一个 target_id 调过 look_at_image**——没看过图就写等于凭空编，"
+            "提案上会挂一句警告说明这一点。角色 / 地点 / 道具上那一句是设定，可以照剧本写。"
         ),
         "params": {
             "target_kind": {
@@ -457,6 +507,70 @@ def _has_appearance_desc(row: dict[str, Any]) -> bool:
     return any(str(row.get(f) or "").strip() for f in APPEARANCE_DESC_FIELDS)
 
 
+def _vision_hint() -> dict[str, Any]:
+    """「这个端能不能看图」+ 该怎么办。**只有这一处口径**（`list_undescribed` 与系统提示词
+    共用，`look_at_image` 回的 `ask_user` 也来自同一句 `NO_VISION_ASK`）。
+
+    为什么要在清单里就说：素材的那一句描述回答的是「**这张图**长什么样」，会被当成这句话
+    拼进每一个引用它的镜头。照剧本编出来的句子填在这里是错的，而**这种错在图上看不出来**
+    ——要等成片里那个人穿的衣服和 prompt 里写的不是一回事才发现。
+    """
+    can_see = llm.supports_vision()
+    return {
+        "can_see": can_see,
+        "how_to": (
+            "一张一张来：对每个 asset_id 调一次 look_at_image，照它回的那一句提"
+            " set_description。**不要照剧本或角色设定凭空写一张图的描述**。"
+            if can_see
+            else "这个端看不了图：**先把这件事告诉用户**，问他要不要改成按剧本与已有设定"
+            "推断着写（也可以他自己手填）。他同意之后才用"
+            " look_at_image(asset_id, allow_text=true)，并在 set_description 的 why 里"
+            "写明「这一句是按设定推断的，不是看图看到的」。"
+        ),
+        "ask_user": "" if can_see else NO_VISION_ASK,
+    }
+
+
+def _image_how_to(cap: dict[str, Any]) -> str:
+    """缺图的时候到底能干什么。**判断只有一份**（`images.capability()`），这里只把它
+    翻成一句给模型的下一步。
+
+    没配出图服务时**必须先把这件事说给用户听**（硬约束 2 的同一个作风）：素材照样建得出来、
+    图不会有，所以那条路是「用户自己上传一张」，不是「提一条永远出不了图的提案」。
+    """
+    if cap["configured"]:
+        return (
+            "建新素材时直接带上 image_prompt，已有的素材用 generate_reference(target_kind,"
+            " target_id, image_prompt) 补一张。**一次只给一个素材写一句「长什么样」**，"
+            "四视图 / 纯背景 / 无文字那几句由系统补。"
+        )
+    return (
+        f"出图那条链没配（image.provider = {cap['provider']}）：**先把这件事告诉用户**，"
+        "说清素材照样建得出来、只是不会有图，再问他要不要去设置页配一个，"
+        "或者自己在角色 / 地点 / 道具页上传一张。提案照旧可以带 image_prompt"
+        "（用户看得见你想出什么图），但这一轮不会真出图。"
+    )
+
+
+def _look_next_step(source: str) -> str:
+    """看完一张图之后该干什么。四种 `source` 各有一条明确的下一步——**含糊的话模型只会
+    照它最想做的那件事做**（直接编一句描述提上来）。"""
+    if source == "vision":
+        return "照这一句提 set_description（可以改写得更准），然后看下一张。"
+    if source == "blocked":
+        return (
+            "**这里没有任何描述可用**：先把 ask_user 那句话告诉用户并等他回答。"
+            "他同意按剧本与设定推断，就带 allow_text=true 再调一次；"
+            "他要自己写，就到此为止。不要凭空提 set_description。"
+        )
+    if source == "text":
+        return (
+            "这一句是按名字与已有设定推断的，**不是看图看到的**："
+            "提案的 why 里必须写明这一点，让用户知道该自己核一眼图。"
+        )
+    return "这个素材没法看（原因在 warnings 里）——请让用户手填一句，不要自己编。"
+
+
 async def run_read(pid: str, name: str, args: dict[str, Any]) -> Any:
     """执行一个读工具。返回值直接回给模型，所以只给它需要的字段——
     把整张表塞回去只会挤爆上下文，还让它更容易挑错 id。"""
@@ -509,23 +623,40 @@ async def run_read(pid: str, name: str, args: dict[str, Any]) -> Any:
             }
             for p in await world.list_props(pid)
         ]
+    if name == "list_missing_materials":
+        return await _missing_materials(pid)
     if name == "list_undescribed":
         #: 只读清单，转调已有服务（`assets.undescribed`），这里不另算一遍「什么算缺描述」。
-        return await assets.undescribed(pid)
+        #: 另外多回一句「这个端能不能看图」：**AI 那条路的分岔就在这一位**——
+        #: 能看就一张一张看着写，不能看就先问用户一句，别照剧本编一句「这张图长什么样」。
+        return {**await assets.undescribed(pid), "vision": _vision_hint()}
     if name == "look_at_image":
         #: 看图是**读**：`describe.suggest` 一行库都不改，回的是建议文字。
         #: 落库仍然只有 `set_description` 提案 + 用户点采用那一条路。
-        out = await describe.suggest(pid, [str(args.get("asset_id") or "")])
+        #:
+        #: **`allow_text` 默认 false**（与素材页那个按钮刻意不同）：端看不了图时不回一句
+        #: 按名字与设定编出来的描述——那种句子读起来和真看过图的一模一样，模型会照抄进
+        #: 提案，用户在 Diff 上也看不出区别。这里宁可回 `source="blocked"` + 该问的那句话。
+        allow_text = bool(args.get("allow_text") or False)
+        out = await describe.suggest(pid, [str(args.get("asset_id") or "")], allow_text=allow_text)
         row = (out.get("items") or [{}])[0]
+        source = str(row.get("source") or "")
         return {
             "asset_id": row.get("asset_id"),
             "label": row.get("label"),
             "suggestion": row.get("suggestion") or "",
             #: `vision` = 真看了图；`text` = 没送字节，只按名字与已有设定写；
-            #: `skipped` = 非图片素材，没看。模型该知道这一句可信到什么程度。
-            "source": row.get("source"),
+            #: `skipped` = 非图片素材，没看；`blocked` = 看不了图，所以一个字都没写。
+            #: 模型该知道这一句可信到什么程度。
+            "source": source,
+            #: **这一句是不是看图看出来的。** `false` 时绝不要当成「这张图长什么样」用——
+            #: `set_description` 那边也会给这条提案挂一句警告（`to_op` 的 `looked_at`）。
+            "looked_at_image": source == "vision",
             "current_description": row.get("description") or "",
             "warnings": row.get("warnings") or [],
+            #: 非空 = 先把这句话说给用户听并等他回答，别自己接着写。
+            "ask_user": row.get("ask_user") or "",
+            "next_step": _look_next_step(source),
             "error": row.get("error"),
         }
     if name == "list_scenes":
@@ -575,6 +706,112 @@ async def run_read(pid: str, name: str, args: dict[str, Any]) -> Any:
         "不认识这个工具",
         f"{name} 不在工具白名单里。",
         [f"可用的工具：{'、'.join(TOOLS)}"],
+    )
+
+
+async def _missing_materials(pid: str) -> dict[str, Any]:
+    """拆完一段之后的那张账：**还缺哪些参考图、哪几幕还没有人也没有地点。**
+
+    四种判断**全部转调已有的那一份**，这里一条都不另算——两处各算一遍的话，模型看到的
+    「缺不缺」和界面上标的会分叉：
+
+      · 形象缺定妆图 → `list_characters` 那支的 `has_sheet`（它读的是
+        `cast.list_appearances()` 的 `current_sheet`）；
+      · 道具缺参考图 → `world.list_props()` 的 `current_reference`；
+      · 地点变体缺参考图 → `world.variant_references()`；
+      · 幕里没有人 / 没有地点 / 没有画面描述 → `story.storyboard()` 每个镜头上的
+        `context_issues`（`services/story.py` 里那一份，规则只有那一处；转场镜头它本来
+        就不判）。
+
+    **出图那条链配没配一起回**（`images.capability()`）：没配的时候「补一张参考图」这条路
+    走不通，模型得照实说出来再问用户走手动那条（硬约束 2），而不是提一堆出不了图的提案。
+    """
+    cap = images.capability()
+    chars = await run_read(pid, "list_characters", {})
+    people = [
+        {
+            "character_id": char["id"],
+            "appearance_id": app["id"],
+            "name": char["name"],
+            "label": f"{char['name']} · {app['name']}",
+            "has_description": bool(app["has_description"]),
+        }
+        for char in chars
+        for app in char["appearances"]
+        if not app["has_sheet"]
+    ]
+    spots: list[dict[str, Any]] = []
+    for loc in await world.list_locations(pid):
+        for variant in loc["variants"]:
+            refs = await world.variant_references(pid, variant["id"])
+            if any(str(r.get("asset_id") or "") for r in refs):
+                continue
+            spots.append(
+                {
+                    "location_id": loc["id"],
+                    "variant_id": variant["id"],
+                    "name": loc["name"],
+                    "label": f"{loc['name']} · {variant['name']}",
+                    "has_description": bool(str(variant.get("description") or "").strip()),
+                }
+            )
+    things = [
+        {
+            "prop_id": prop["id"],
+            "name": prop["name"],
+            "label": prop["name"],
+            "has_description": bool(str(prop.get("description") or "").strip()),
+        }
+        for prop in await world.list_props(pid)
+        if not (prop.get("current_reference") or {}).get("asset_id")
+    ]
+    scenes: list[dict[str, Any]] = []
+    for lane in await story.storyboard(pid):
+        issues = sorted({i for s in lane["shots"] for i in s.get("context_issues") or []})
+        if issues:
+            scenes.append(
+                {
+                    "scene_id": lane["id"],
+                    "index_no": lane["index_no"],
+                    "title": lane["title"],
+                    "location_variant_id": lane["location_variant_id"],
+                    "issues": issues,
+                }
+            )
+    total = len(people) + len(spots) + len(things) + len(scenes)
+    return {
+        "image": {**cap, "how_to": _image_how_to(cap)},
+        #: 形象有了、定妆图还没有。生成时它只有一句文字，人物形象撑不过几秒。
+        "characters": people,
+        "locations": spots,
+        "props": things,
+        #: 幕本身缺人 / 缺地点。这几条得先 add_character / add_location 把人和地点建出来，
+        #: 再用 set_scene_cast / update_scene 挂上去（同一批里按名字对得上，见下面那句）。
+        "scenes": scenes,
+        "total": total,
+        "next_step": _missing_next_step(total, cap),
+    }
+
+
+def _missing_next_step(total: int, cap: dict[str, Any]) -> str:
+    """这张账看完该干什么。**顺序是「先建人和地点，再补图」**——反过来会给一个不存在的
+    素材出图。"""
+    if not total:
+        return "人物、地点、道具与各幕都齐了，不用补素材。"
+    same_batch = (
+        "同一批提案里新建的角色 / 地点 / 道具**可以直接按名字用**："
+        "add_shot / set_scene_cast 里写 character_names、update_scene 里写 location_name，"
+        "落库时会自动接到那一条新建的素材上（那一条被用户丢掉时只是接不上，不会连累别的）。"
+    )
+    if not cap["configured"]:
+        return (
+            "先补缺的人物与地点（add_character / add_location），图这一项照 image.how_to 办。"
+            + same_batch
+        )
+    return (
+        "一条一条来：缺的人物用 add_character(name, description, image_prompt)、"
+        "缺的地点用 add_location(name, variant, image_prompt)；已经有了只缺图的用"
+        " generate_reference。" + same_batch
     )
 
 
@@ -632,7 +869,14 @@ def _clean(args: dict[str, Any], keys: tuple[str, ...]) -> dict[str, Any]:
 
 
 async def _resolve_appearances(pid: str, args: dict[str, Any]) -> tuple[list[dict], list[str]]:
-    """角色名 / 形象 id → 形象。对不上的名字进 warnings，不静默丢。"""
+    """角色名 / 形象 id → 形象。对不上的名字进 warnings，不静默丢。
+
+    **对不上不等于到此为止**：拆剧本时「这一镜有谁」和「这个人是谁」往往在同一批提案里
+    （模型先 `add_character` 再 `add_shot`），而这里跑在提案阶段——那个角色还没落库，
+    按名字当然找不到。所以这种名字留成一条 `pending_name` 条目，
+    `services/director.py::apply()` 落库时再按名字接到同一批里新建的那个角色上。
+    真的只是写错名字时它也不会闷掉：那边接不上会写一句「没接上谁」回来。
+    """
     picked: list[dict[str, Any]] = []
     warnings: list[str] = []
     chars = await run_read(pid, "list_characters", {})
@@ -646,20 +890,37 @@ async def _resolve_appearances(pid: str, args: dict[str, Any]) -> tuple[list[dic
         picked.append({"appearance_id": app["id"], "label": f"{char['name']} · {app['name']}"})
     for raw in args.get("character_names") or []:
         name = str(raw).strip()
+        if not name:
+            continue
         char = next((c for c in chars if c["name"] == name), None) or next(
-            (c for c in chars if name and (name in c["name"] or c["name"] in name)), None
+            (c for c in chars if name in c["name"] or c["name"] in name), None
         )
         if char is None or not char["appearances"]:
-            warnings.append(f"「{name}」对不上任何角色，先在角色工作台建一个")
+            warnings.append(
+                f"工程里还没有「{name}」这个角色：同一批里用 add_character(name=「{name}」,"
+                " description, image_prompt) 建一个，落库时会自动接到这一镜上；"
+                "不建的话这一镜就少了这个人"
+            )
+            picked.append(
+                {"appearance_id": "", "pending_name": name, "label": f"{name}（这一批新建的）"}
+            )
             continue
         app = next((a for a in char["appearances"] if a["is_default"]), char["appearances"][0])
         picked.append({"appearance_id": app["id"], "label": f"{char['name']} · {app['name']}"})
     seen: set[str] = set()
-    unique = [p for p in picked if not (p["appearance_id"] in seen or seen.add(p["appearance_id"]))]
+    unique: list[dict[str, Any]] = []
+    for p in picked:
+        key = str(p["appearance_id"]) or f"?{p.get('pending_name')}"
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(p)
     return unique, warnings
 
 
 async def _resolve_props(pid: str, args: dict[str, Any]) -> tuple[list[dict], list[str]]:
+    """道具名 / 道具 id → 道具。对不上的名字照 `_resolve_appearances` 那条规矩留成
+    `pending_name`，同一批里新建的道具落库时接得上。"""
     props = await world.list_props(pid)
     picked: list[dict[str, Any]] = []
     warnings: list[str] = []
@@ -671,15 +932,67 @@ async def _resolve_props(pid: str, args: dict[str, Any]) -> tuple[list[dict], li
         picked.append({"prop_id": hit["id"], "label": hit["name"]})
     for raw in args.get("prop_names") or []:
         name = str(raw).strip()
+        if not name:
+            continue
         hit = next((p for p in props if p["name"] == name), None) or next(
-            (p for p in props if name and (name in p["name"] or p["name"] in name)), None
+            (p for p in props if name in p["name"] or p["name"] in name), None
         )
         if hit is None:
-            warnings.append(f"「{name}」对不上任何道具，先在道具库建一个")
+            warnings.append(
+                f"工程里还没有「{name}」这个道具：同一批里用 add_prop(name=「{name}」,"
+                " description, image_prompt) 建一个，落库时会自动接上"
+            )
+            picked.append({"prop_id": "", "pending_name": name, "label": f"{name}（这一批新建的）"})
             continue
         picked.append({"prop_id": hit["id"], "label": hit["name"]})
     seen: set[str] = set()
-    return [p for p in picked if not (p["prop_id"] in seen or seen.add(p["prop_id"]))], warnings
+    unique: list[dict[str, Any]] = []
+    for p in picked:
+        key = str(p["prop_id"]) or f"?{p.get('pending_name')}"
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(p)
+    return unique, warnings
+
+
+async def _resolve_variant(pid: str, args: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    """地点名 / 地点变体 id → 这一幕挂哪个变体。照 `_resolve_appearances` 那条规矩：
+    对不上的名字留成 `location_name`，同一批里新建的地点落库时接得上。
+
+    **两个都给了时以 id 为准**——id 是它自己 `list_locations` 查出来的，名字往往只是
+    顺手写的一句；反过来按名字覆盖那个 id 只会把它查准的东西改掉。
+
+    「没有这个地点」与「有这个地点但一个场景变体都没有」合成同一句话：挂在幕上的从来
+    是变体而不是地点（`Scene.location_variant_id`），两种情况下模型要做的事完全一样。
+    """
+    out: dict[str, Any] = {}
+    warnings: list[str] = []
+    vid = str(args.get("location_variant_id") or "").strip()
+    name = str(args.get("location_name") or "").strip()
+    if vid:
+        out["location_variant_id"] = vid
+        if name:
+            warnings.append(f"同时给了地点变体 id 与地点名「{name}」：按 id 那个来，名字只当备注")
+        return out, warnings
+    if not name:
+        return out, warnings
+    spots = await world.list_locations(pid)
+    hit = next((s for s in spots if s["name"] == name), None) or next(
+        (s for s in spots if name in s["name"] or s["name"] in name), None
+    )
+    variants = (hit or {}).get("variants") or []
+    if hit is not None and variants:
+        out["location_variant_id"] = variants[0]["id"]
+        out["location_label"] = f"{hit['name']} · {variants[0]['name']}"
+        return out, warnings
+    warnings.append(
+        f"工程里还没有「{name}」这个地点（或者它一个场景变体都没有）：同一批里用"
+        f" add_location(name=「{name}」, description, image_prompt) 建一个，"
+        "落库时会自动接到这一幕上；不建的话这一幕就没有地点"
+    )
+    out["location_name"] = name
+    return out, warnings
 
 
 async def _scene(pid: str, sid: str) -> dict[str, Any]:
@@ -831,8 +1144,20 @@ def _image_after(
     return out
 
 
-async def to_op(pid: str, name: str, args: dict[str, Any], temp_no: int) -> dict[str, Any]:
-    """把一次写工具调用翻译成一条提案。**这里绝不碰数据库的写路径。**"""
+async def to_op(
+    pid: str,
+    name: str,
+    args: dict[str, Any],
+    temp_no: int,
+    looked_at: set[str] | None = None,
+) -> dict[str, Any]:
+    """把一次写工具调用翻译成一条提案。**这里绝不碰数据库的写路径。**
+
+    `looked_at` 是这一轮里**真的看过图**的那几个 asset_id（`agent.collaborate` 攒着，
+    只有 `look_at_image` 回了 `looked_at_image=true` 才进去）。`set_description` 写到
+    素材上时靠它判断「这一句是看图看出来的吗」——不是的话挂一句警告，警告同时会被
+    `_run_one` 以「注意：…」回喂给模型，于是它有机会先去看一眼图再提。
+    """
     if name not in WRITE_TOOLS:
         raise AppError(
             ErrorCode.VALIDATION_ERROR,
@@ -865,8 +1190,11 @@ async def to_op(pid: str, name: str, args: dict[str, Any], temp_no: int) -> dict
                     **after,
                 }
             )
+        spot, warn = await _resolve_variant(pid, args)
+        op["warnings"].extend(warn)
         op["after"] = {
-            **_clean(args, ("title", "summary", "time_of_day", "location_variant_id")),
+            **_clean(args, ("title", "summary", "time_of_day")),
+            **spot,
             "shots": shots,
         }
         return op
@@ -874,9 +1202,11 @@ async def to_op(pid: str, name: str, args: dict[str, Any], temp_no: int) -> dict
     if name == "update_scene":
         row = await _scene(pid, args.get("scene_id", ""))
         keys = ("title", "summary", "time_of_day", "location_variant_id")
+        spot, warn = await _resolve_variant(pid, args)
         op["scene_id"] = row["id"]
         op["before"] = {k: row[k] for k in keys}
-        op["after"] = _clean(args, keys)
+        op["after"] = {**_clean(args, ("title", "summary", "time_of_day")), **spot}
+        op["warnings"].extend(warn)
         return op
 
     if name == "set_scene_prompt":
@@ -1180,6 +1510,15 @@ async def to_op(pid: str, name: str, args: dict[str, Any], temp_no: int) -> dict
             )
         if not text and row["description"]:
             op["warnings"].append("description 是空的：采用后会把现在那一句清掉")
+        if text and kind == "asset" and row["id"] not in (looked_at or set()):
+            # **素材上那一句回答的是「这张图长什么样」**，不是「这个角色的设定是什么」。
+            # 这一轮没有对它调过 `look_at_image`（或者调了但端没能看图）的话，这句话
+            # 只能是照剧本 / 设定推断出来的——采用后它会被当成画面事实拼进每一个引用它
+            # 的镜头，而这种错在图上看不出来。所以说出来（`warnings` 也会回喂给模型）。
+            op["warnings"].append(
+                "这一句**不是看图看出来的**（这一轮没有对这张素材成功调用过 look_at_image）"
+                "——它会被当成「这张图长什么样」喂给视频模型，采用前请自己看一眼那张图"
+            )
         return op
 
     row = await _scene(pid, args.get("scene_id", ""))  # delete_scene

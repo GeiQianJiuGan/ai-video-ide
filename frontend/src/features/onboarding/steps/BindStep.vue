@@ -44,6 +44,28 @@ function slots(row: PresetRow): string {
   return parts.join(' · ')
 }
 
+/**
+ * 绑不上的时候到底为什么——**「这份图是出图那一份」与「这份图缺入口标题」是两件事**。
+ *
+ * 标了 AIVS_IMAGE 的图入口标题一个不缺（提示词、负向、种子、参考图槽位用的就是同一批
+ * 标题），照「先照约定改好节点标题」那句说下去，只会让人去改一个本来没问题的标题；
+ * 真正的原因是它声明了自己出图，所以后端把它从 R2V / 首尾帧的候选里撤掉了。
+ */
+function why(row: PresetRow, role: 'r2v' | 'flf'): string {
+  if (!pid.value) return '先回上一步建（或打开）一个工程，绑定是落在工程上的'
+  if (row.declares_image) {
+    return '这份图标了 AIVS_IMAGE，是出图那一份（角色四视图 / 地点参考图 / 道具图走它）——出画面请另选一份没标它的图'
+  }
+  if (role === 'r2v') {
+    return (row.r2v_ready ?? row.ready)
+      ? '用它做「参考图 + prompt 出片段」'
+      : '这份图缺必需的入口标题，先照上面的约定改好节点标题'
+  }
+  return row.flf_ready
+    ? '用它做「首帧 + 末帧」那种严格衔接'
+    : '这份图没有首尾帧入口（AIVS_FIRST_FRAME / AIVS_LAST_FRAME）'
+}
+
 async function loadBound(): Promise<void> {
   if (!pid.value) return
   bound.value = await projectsApi.preset(pid.value).catch(() => null)
@@ -127,16 +149,15 @@ async function bind(role: 'r2v' | 'flf', name: string): Promise<void> {
             <AppBadge v-if="row.ready" :tone="row.ref_slots ? 'neutral' : 'warn'">
               {{ slots(row) }}
             </AppBadge>
+            <!--
+              标了 AIVS_IMAGE 的图在这一页是**不能绑的**（它出的是素材图，不是画面）：
+              下面两颗按钮此时都禁用，所以先把「它是哪一栏的」标出来，用户才不会以为坏了。
+            -->
+            <AppBadge v-if="row.declares_image" tone="ok">T2I 出图</AppBadge>
             <AppButton
               size="sm"
               :disabled="!pid || busy || !(row.r2v_ready ?? row.ready)"
-              :title="
-                !pid
-                  ? '先回上一步建（或打开）一个工程，绑定是落在工程上的'
-                  : (row.r2v_ready ?? row.ready)
-                    ? '用它做「参考图 + prompt 出片段」'
-                    : '这份图缺必需的入口标题，先照上面的约定改好节点标题'
-              "
+              :title="why(row, 'r2v')"
               @click="bind('r2v', row.name)"
             >
               <Link2 :size="10" />绑为 R2V
@@ -144,13 +165,7 @@ async function bind(role: 'r2v' | 'flf', name: string): Promise<void> {
             <AppButton
               size="sm"
               :disabled="!pid || busy || !row.flf_ready"
-              :title="
-                !pid
-                  ? '先回上一步建（或打开）一个工程'
-                  : row.flf_ready
-                    ? '用它做「首帧 + 末帧」那种严格衔接'
-                    : '这份图没有首尾帧入口（AIVS_FIRST_FRAME / AIVS_LAST_FRAME）'
-              "
+              :title="why(row, 'flf')"
               @click="bind('flf', row.name)"
             >
               <Link2 :size="10" />绑为首尾帧

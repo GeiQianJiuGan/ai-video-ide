@@ -44,6 +44,9 @@ FALLBACK_SHAPE = """你现在没有工具可用。根据用户的要求与下面
 
 所有 id 必须来自「工程现状」里出现过的 id。每个 args 里都要带 why 字段说明理由。
 SKILL 全文这条路上取不到（这个端不支持工具），照清单里那句「什么时候用」判断该写哪种锚定语。
+**这条路上也看不了任何一张图**（没有 look_at_image）：所以不要对素材提 set_description
+（`target_kind="asset"`）——那只能是编的。缺素材描述时，在 reply 里告诉用户这个端不支持
+看图补描述，问他要不要按剧本与已有设定推断着写，或者去素材页一张一张手填。
 只输出 JSON，不要解释。"""
 
 #: 退化路径喂进去的剧本原文最多多少字。这条路没法分段读，所以只给开头一段，
@@ -136,6 +139,11 @@ async def collaborate(
     messages.extend(history)
     messages.append({"role": "user", "content": message})
     ops: list[dict[str, Any]] = []
+    #: 这一轮对话里**真的看过图**的那几个 asset_id（`look_at_image` 回了
+    #: `looked_at_image=true` 才进来）。`set_description` 写到素材上时靠它判断
+    #: 「这一句是看图看出来的吗」——不是的话提案上挂一句警告（`to_op(looked_at=…)`）。
+    #: **只活在这一次请求里**：不落库、不跨会话，下一次 chat 得重新看一眼。
+    looked: set[str] = set()
     #: 中途几轮的「我先看一下现状」也算它说过的话：用户在流里看见了，落库的记录里
     #: 就不该只剩最后一句，不然刷新页面等于把看过的内容擦掉。
     said: list[str] = []
@@ -177,7 +185,7 @@ async def collaborate(
         )
         for call in calls:
             yield {"kind": "tool", "name": call["name"], "phase": "start"}
-            done = await _run_one(pid, call, len(ops) + 1)
+            done = await _run_one(pid, call, len(ops) + 1, looked)
             if done["op"] is not None:
                 ops.append(done["op"])
                 yield {"kind": "op", "op": done["op"]}
@@ -219,21 +227,31 @@ async def _one_round(messages: list[dict[str, Any]], live: bool) -> AsyncIterato
     yield {"kind": "final", "out": out}
 
 
-async def _run_one(pid: str, call: dict[str, Any], seq: int) -> dict[str, Any]:
+async def _run_one(
+    pid: str, call: dict[str, Any], seq: int, looked: set[str] | None = None
+) -> dict[str, Any]:
     """执行一次工具调用。返回 `{text, op, ok, error}`——`text` 是回给模型看的那段。
 
     工具报错**不中断整轮**：把错误原样回给模型，它常常能自己纠正（比如换个对的 id）。
     一路抛出去只会让用户看到一条「AI 失败了」，什么也没拿到。
+
+    `looked` 是调用方（`collaborate`）攒着的「这一轮真看过图的素材」，**这里会往里加**：
+    `look_at_image` 真看到图时把那个 asset_id 记下来，于是后面的 `set_description`
+    提案能诚实地说清「这一句是不是看图看出来的」。
     """
     name = call["name"]
+    seen = looked if looked is not None else set()
     try:
         if name in WRITE_TOOLS:
-            op = await to_op(pid, name, call["arguments"], seq)
+            op = await to_op(pid, name, call["arguments"], seq, looked_at=seen)
             note = "已记入提案，尚未写入数据库；用户会逐条审阅。"
             if op["warnings"]:
                 note += " 注意：" + "；".join(op["warnings"])
             return {"text": note, "op": op, "ok": True, "error": ""}
-        payload = json.dumps(await run_read(pid, name, call["arguments"]), ensure_ascii=False)
+        out = await run_read(pid, name, call["arguments"])
+        if name == "look_at_image" and isinstance(out, dict) and out.get("looked_at_image"):
+            seen.add(str(out.get("asset_id") or ""))
+        payload = json.dumps(out, ensure_ascii=False)
         return {"text": payload, "op": None, "ok": True, "error": ""}
     except Exception as exc:  # noqa: BLE001 —— 工具的任何失败都只是这一步失败
         log.info("director tool %s failed: %s", name, exc)
@@ -267,6 +285,8 @@ async def _without_tools(
         name = str(raw.get("tool") or "")
         args = raw.get("args") if isinstance(raw.get("args"), dict) else {}
         try:
+            # `looked_at` 刻意不给：这条路一次调用就出全部 ops，**从来没有看过任何一张图**。
+            # 于是素材描述那种提案会自带「这一句不是看图看出来的」那句警告——正是实话。
             op = await to_op(pid, name, args, len(ops) + 1)
         except Exception as exc:  # noqa: BLE001 —— 一条不成立不该毁掉其余几条
             notes.append(f"{name}：{getattr(exc, 'title', type(exc).__name__)}")

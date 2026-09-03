@@ -187,7 +187,11 @@ onMounted(() => void proj.refreshRecent())
         <AppButton
           size="sm"
           :disabled="!connected || !proj.current"
-          :title="proj.current ? '导出当前打开的工程' : '先打开一个工程，导出的是那个工程'"
+          :title="
+            proj.current
+              ? '导出当前打开的工程'
+              : '先打开一个工程，导出的是那个工程。打开之后标题栏上也有「导出工程」，不必回到这一页'
+          "
           @click="exporting = true"
         >
           <PackagePlus :size="10" />导出当前工程

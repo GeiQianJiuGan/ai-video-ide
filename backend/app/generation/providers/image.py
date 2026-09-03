@@ -798,9 +798,10 @@ class ComfyImageProvider(ComfyPresetProvider):
                 f"设置里的图片预设是 {name}，但预设目录里没有它。",
                 ["在设置页重新上传这份预设", "或改选一个已有的预设"],
             )
-        if not report.get("r2v_ready"):
-            # 出图那份图必需的入口只有 AIVS_PROMPT 一个，与 r2v 是同一条判定
-            # （从标题分不出「这是 T2I 还是 R2V」，所以这里只查提示词入口）。
+        if not report.get("prompt_ok"):
+            # 出图那份图必需的入口只有 AIVS_PROMPT 一个：从入口标题分不出「这是 T2I 还是
+            # R2V」，所以这里判的是 `prompt_ok` 而不是 `r2v_ready`——后者会因为这份图
+            # 声明了 AIVS_IMAGE 而为 false（那是它退出视频候选的方式），照它判会自相矛盾。
             raise AppError(
                 ErrorCode.INVALID_WORKFLOW,
                 "这份图里没有提示词入口",
@@ -809,13 +810,23 @@ class ComfyImageProvider(ComfyPresetProvider):
                 {"preset": name, "found": report.get("found")},
             )
         slots = report.get("ref_slots", 0)
+        declared = bool(report.get("declares_image"))
+        detail = f"图片服务已连接 · 预设 {name} 就绪（{slots} 个参考图槽位）"
+        if not declared:
+            # **没声明照旧能用**（老工程一份都不用重新标），但要说出代价：这份图同时还
+            # 躺在 R2V / 首尾帧的候选里，在那边选中它只会白跑一趟。
+            detail += (
+                f"。这份图没标 {presets.DECLARE_IMAGE}，所以它同时还出现在视频预设的候选里"
+                "——给它加上这个标题就只归「出图」那一栏"
+            )
         return {
             "ok": True,
             "target": self._client.base_url,
             "preset": name,
             "preset_ready": True,
             "ref_slots": slots,
-            "detail": f"图片服务已连接 · 预设 {name} 就绪（{slots} 个参考图槽位）",
+            "declares_image": declared,
+            "detail": detail,
         }
 
     async def submit(self, req: ImageRequest, *, client_id: str) -> str:  # type: ignore[override]
@@ -845,6 +856,13 @@ class ComfyImageProvider(ComfyPresetProvider):
             "AIVS_WIDTH": width,
             "AIVS_HEIGHT": height,
         }
+        # 声明是**可选**的：没标照旧提交（老工程一份都不用重新标），但这次用的是哪份图、
+        # 它还混在视频候选里这件事得留档——冻结进版本参数，界面上看得见。
+        if presets.DECLARE_IMAGE not in presets.declarations(graph):
+            req.notes.append(
+                f"预设 {name} 没标 {presets.DECLARE_IMAGE}，本工具只能按设置里指名的那一份"
+                "当出图预设用；它同时还出现在视频预设的候选里。"
+            )
         # 画幅是**可选**入口：图里没标就用图里原来的尺寸，只说一句，不失败。
         if "AIVS_WIDTH" not in points and "AIVS_HEIGHT" not in points:
             req.notes.append(

@@ -65,9 +65,30 @@
 cd backend && .venv/Scripts/python -m pytest -q
 ```
 
-我在交接前刚起了这条命令，**结果没等到**（输出在
-`C:\Users\76763\AppData\Local\Temp\claude\E--01-Work-01-codeSource-aipj-xunjie-video-ide\4041907a-a90d-4e8a-85d1-d285e07312b3\tasks\bip6uzhur.output`，
-带 `-x`，第一个失败就停）。**新会话第一件事就是重跑它。** 已知需要跟着改的现存断言：
+**已经跑过一次（`-x`），结果：`1 failed, 146 passed`，停在
+`tests/test_job_batch.py::test_sequential_run_merges_into_one_batch`。**
+
+```
+assert len(state["batches"]) == 1   →  assert 0 == 1   （batches 是空的）
+```
+
+**诊断（不是 bug，是入队门槛生效了）**：`sequence/run` 照旧回了 `batch_id`，但一条任务都没进队列
+——每一条都被 `route.require()` 挡下来收进 `skipped` 了。测试环境里
+`presets_dir()`（= `tmp_path/presets`）是空的、`settings.video_preset` 也没设，于是
+`comfy_preset` 那条路 `ready=False`（「还没有选生成预设」）。**这正是 H7 要的行为**：以前这些任务
+排进队列、到 pump 里才炸，而测试里 pump 是 pause 的，所以「没配预设也能入队」一直没人发现。
+
+**建议的修法（改 fixture，不是改门槛）**：在 `tests/conftest.py` 的 `clean_runtime` 里顺手播一份
+**ready 的预设**（往 `presets_dir()` 写一个带 `AIVS_PROMPT` + `AIVS_FIRST_FRAME` / `AIVS_LAST_FRAME`
+节点标题的 json，再设 `settings.video_preset`），也就是让默认的测试机器代表**一台配好了的机器**。
+理由：受影响的入队断言有 26 处（`test_job_batch.py` 5 · `test_m4_generation_timeline_overview.py` 10 ·
+`test_sequence.py` 10 · `test_scene_nodes.py` 1），而它们测的是批次合并 / 顺序 / 取消重试，
+从来不是「什么都没配的时候会怎样」——一处 fixture 比 26 处断言诚实得多。
+「什么都没配」的那几条（入队门槛、`route` 的三条 readiness）反过来在用例里显式清空
+`settings.video_preset` / `video_provider`。播完预设后再跑一遍全量，剩下会露出来的是
+「断言预设列表为空」那一类（`test_settings_api.py`、`test_m4` 的环境栏那几条）。
+
+其余已知需要跟着改的现存断言：
 
 - `tests/test_providers.py:626` —— `registry.is_legacy` 已删除。
 - `tests/test_ref_capacity.py:151–153`、`tests/test_settings_api.py:137–138` —— 槽位现在按解析出来的

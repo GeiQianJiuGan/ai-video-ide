@@ -12,6 +12,9 @@
 失败的处理刻意不是「一条挂了整批回滚」：每条独立落，失败的连四要素错误一起回给前端。
 一条角色名对不上，不该让另外四条通过审阅的改动也进不去。
 
+**附件（`attach()`）只是输入法**：一份 Word 剧本 / Excel 分镜表在这里被抽成纯文本填进
+输入框，不落库、不落盘、不出网，`chat()` 那侧一个字都不用改——它收到的仍然只是一句话。
+
 **流式（`chat_stream()`）与不流式（`chat()`）落的是同一份记录。** 两条路都走
 `agent.collaborate()` 那一个循环，落库那几步也只有一份实现（`_persist()`）——
 于是「刷新页面提案还在」这件事不会因为走了哪条路而不一样。三条边界：
@@ -26,10 +29,13 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from dataclasses import dataclass, field
 from typing import Any
 
 from app.ai.director import agent
 from app.ai.llm import client as llm
+from app.core import doctext
+from app.core.config import settings
 from app.core.errors import AppError, ErrorCode
 from app.core.ids import new_id
 from app.core.logging import get_logger
@@ -51,6 +57,87 @@ log = get_logger("director")
 #: 而现状是靠读工具查的，不靠聊天记录记着。
 HISTORY_TURNS = 10
 
+#: 三种「等这一批新建的素材」的接线各自叫什么。落库结果里的
+#: `<kind>_wired` / `<kind>_skipped` 两个键就是拿它拼的，前端照键显示，不猜。
+_WIRE_WORD = {"cast": "角色", "props": "道具", "location": "地点"}
+
+
+@dataclass(slots=True)
+class _Waiting:
+    """一条等着「同一批里新建的素材」的接线。
+
+    `ids` 是提案里**现在就有**的那几个 id：接线时要和刚建出来的一起写回去——
+    `set_shot_cast` / `set_shot_props` 是整份覆盖而不是追加。
+    """
+
+    kind: str
+    #: 落点。`cast` / `props` 是镜头 id（可能是一幕里的一串），`location` 是幕 id。
+    targets: list[str]
+    ids: list[str]
+    names: list[str]
+    #: 这一条接线属于哪条提案的落库结果——接上了没接上都写回它，贴在它自己那张卡上。
+    entry: dict[str, Any] | None = None
+
+
+@dataclass(slots=True)
+class _Batch:
+    """一次 `apply()` 里「谁刚被建出来」的那本账。
+
+    提案之间**没有引用机制**（`temp_id` 只是给人看的标号），所以「同一批里新建的角色 /
+    地点 / 道具可以直接按名字用」这件事只能在落库这一层按名字对：素材落成时把
+    名字 → id 记在这里，整批落完再统一接线（`_wire_pending`）。
+
+    **刻意分两步**：提案的先后由模型决定，`add_shot` 完全可能排在 `add_character`
+    前面。落一条就立刻接一次的话，顺序不同结果就不同。
+    """
+
+    cast: dict[str, str] = field(default_factory=dict)
+    props: dict[str, str] = field(default_factory=dict)
+    location: dict[str, str] = field(default_factory=dict)
+    waiting: list[_Waiting] = field(default_factory=list)
+
+    def born(self, kind: str, name: Any, target_id: Any) -> None:
+        """记一笔「这个名字现在有了」。名字或 id 空着就当没这回事（不占位）。"""
+        key = str(name or "").strip()
+        if key and target_id:
+            getattr(self, kind)[key] = str(target_id)
+
+    def lookup(self, kind: str, name: str) -> str:
+        return str(getattr(self, kind).get(str(name or "").strip()) or "")
+
+    def wait(self, kind: str, targets: list[str], ids: list[str], names: list[str]) -> None:
+        if names:
+            self.waiting.append(_Waiting(kind, list(targets), list(ids), list(names)))
+
+    def claim(self, entry: dict[str, Any]) -> None:
+        """刚落成的那一条领走它自己登记的接线——结果要写回它的卡片。"""
+        for wait in self.waiting:
+            if wait.entry is None:
+                wait.entry = entry
+
+
+def _split_ids(items: Any, key: str) -> tuple[list[str], list[str]]:
+    """提案里那份出场表 / 道具表 → （现在就有的 id，等这一批新建的名字）。
+
+    `ai/director/tools.py::_resolve_appearances` 对不上的名字留的是 `id 为空 +
+    pending_name`，所以这里**必须把空 id 滤掉**——原样喂给 `set_shot_cast`
+    会当成一个不存在的形象整条失败。
+    """
+    ids: list[str] = []
+    names: list[str] = []
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        got = str(item.get(key) or "").strip()
+        if got:
+            if got not in ids:
+                ids.append(got)
+            continue
+        name = str(item.get("pending_name") or "").strip()
+        if name and name not in names:
+            names.append(name)
+    return ids, names
+
 
 class DirectorService:
     # --- 会话 ---
@@ -61,8 +148,55 @@ class DirectorService:
         return {
             "turns": [{**as_dict(row), "content": load_json(row.content_json, {})} for row in rows],
             "llm": llm.status(),
+            "attach": self.attach_limits(),
             "note": "提案只是提案：没点「采用」之前，数据库里什么都没变。",
         }
+
+    def attach_limits(self) -> dict[str, Any]:
+        """附件那颗按钮要知道的一切：能选什么后缀、多大、抽多少字。
+
+        口径只有 `core/doctext.py::KINDS` 与两个设置项各一处——前端不写第二份后缀清单，
+        不然「能选却传不上去」这种事迟早出现。
+        """
+        return {
+            "kinds": [{"suffix": s, "label": doctext.KINDS[s]} for s in sorted(doctext.KINDS)],
+            "accept": doctext.accept_attr(),
+            "max_mb": settings.director_attach_max_mb,
+            "max_chars": settings.director_attach_max_chars,
+            "note": "附件只抽文字填进输入框：抽完你先过一眼，按下发送才跟着这句话一起走。",
+        }
+
+    async def attach(self, pid: str, filename: str, data: bytes) -> dict[str, Any]:
+        """一份附件 → 一段能填进输入框的纯文本。**不落库、不落盘、不出网。**
+
+        三条刻意的边界：
+
+          · **不要求配好 LLM**：抽文字是本机做的事，用户得先看见抽出来什么才决定发不发。
+            把它拦在 `require_configured()` 后面等于「没配模型连文档都打不开」；
+          · **工程没打开先 404**（`db_of`）：与 `stream_precheck()` 同一个口径，
+            附件是这个工程的会话素材，不该在没有工程的时候上传；
+          · **不自己造 Asset**：这段文字不是落盘素材，它连一个文件都没有留下。真要把
+            文档收进工程，走资产库那条上传路。
+        """
+        name = (filename or "").strip() or "附件"
+        cap = max(1, int(settings.director_attach_max_mb)) * 1024 * 1024
+        db_of(pid)
+        if len(data) > cap:
+            raise AppError(
+                ErrorCode.VALIDATION_ERROR,
+                "附件太大了",
+                f"{name} 有 {len(data) / 1024 / 1024:.1f} MB，超过上限 "
+                f"{settings.director_attach_max_mb} MB。",
+                [
+                    "只把要给它看的那部分另存成一份小文件再传",
+                    f"上限可改：backend/.env 里设 AIVS_DIRECTOR_ATTACH_MAX_MB（当前 "
+                    f"{settings.director_attach_max_mb}）",
+                ],
+                {"filename": name, "bytes": len(data), "max_mb": settings.director_attach_max_mb},
+            )
+        out = doctext.extract(name, data, limit=settings.director_attach_max_chars)
+        log.info("director.attached", project_id=pid, filename=out.filename, chars=out.chars)
+        return out.to_dict()
 
     async def _add_turn(self, pid: str, role: str, content: dict[str, Any]) -> dict[str, Any]:
         db = db_of(pid)
@@ -273,36 +407,100 @@ class DirectorService:
         """把审阅通过的条目落库。只接受 `op != "reject"` 的条目。
 
         每条独立落：一条失败不回滚已经成功的那几条，失败的连四要素错误一起回给前端。
+
+        **整批落完还有一步收尾**（`_wire_pending`）：拆剧本时「这一镜有谁」和「这个人是谁」
+        本来就在同一批里，所以镜头里那几个还不存在的角色 / 道具 / 地点在这一步按名字接到
+        刚建出来的那一条上。接不上不算失败，只在那一条的落库结果里说清少接了谁。
         """
         applied: list[dict[str, Any]] = []
         failed: list[dict[str, Any]] = []
+        batch = _Batch()
         for op in ops:
             name = str(op.get("op") or "")
             if name == "reject" or not name:
                 continue
             try:
-                done = await self._one(pid, op)
-                applied.append({"op": name, "temp_id": op.get("temp_id"), **done})
+                done = await self._one(pid, op, batch)
+                entry = {"op": name, "temp_id": op.get("temp_id"), **done}
+                applied.append(entry)
             except AppError as exc:
-                failed.append({"op": name, "temp_id": op.get("temp_id"), "error": exc.to_dict()})
+                entry = {"op": name, "temp_id": op.get("temp_id"), "error": exc.to_dict()}
+                failed.append(entry)
             except Exception as exc:  # noqa: BLE001 —— 归一成四要素，绝不静默
                 log.warning("director apply %s failed: %s", name, exc)
-                failed.append(
-                    {
-                        "op": name,
-                        "temp_id": op.get("temp_id"),
-                        "error": AppError(
-                            ErrorCode.INTERNAL,
-                            "这一条没落成",
-                            f"{type(exc).__name__}: {exc}",
-                            ["刷新流程图看看现在的状态", "或在流程图上手动做这一步"],
-                        ).to_dict(),
-                    }
-                )
+                entry = {
+                    "op": name,
+                    "temp_id": op.get("temp_id"),
+                    "error": AppError(
+                        ErrorCode.INTERNAL,
+                        "这一条没落成",
+                        f"{type(exc).__name__}: {exc}",
+                        ["刷新流程图看看现在的状态", "或在流程图上手动做这一步"],
+                    ).to_dict(),
+                }
+                failed.append(entry)
+            #: 半路挂掉的那一条也要认领它已经登记的接线（`add_scene` 可能已经建了两个镜头
+            #: 才失败）——不认领的话这几条接线会挂到**下一条**成功的卡片上，说的话就错了。
+            batch.claim(entry)
+        await self._wire_pending(pid, batch)
         await self._add_turn(
             pid, "applied", {"applied": applied, "failed": failed, "count": len(applied)}
         )
         return {"applied": applied, "failed": failed, "count": len(applied)}
+
+    async def _wire_pending(self, pid: str, batch: _Batch) -> None:
+        """收尾：把这一批里新建的素材接到等着它的那几个镜头 / 幕上。
+
+        **接不上绝不算失败**：素材与镜头都已经落好了，接不上的原因往往是用户把那条
+        `add_character` 丢掉了、或者模型只是把名字写岔了一个字。这一步只把结果写回那条
+        提案的落库记录（`cast_wired` / `cast_skipped` / …），前端照常显示——
+        少接了一个人是必须说出来的事（硬约束 4），但不该让整条镜头白落。
+
+        接线一律**转调已有写方法**，且写的是「该有的全量」而不是追加：
+        `set_shot_cast` / `set_shot_props` 都是整份覆盖。
+        """
+        for wait in batch.waiting:
+            hit: list[str] = []
+            got: list[str] = []
+            miss: list[str] = []
+            for name in wait.names:
+                found = batch.lookup(wait.kind, name)
+                if found:
+                    hit.append(name)
+                    got.append(found)
+                else:
+                    miss.append(name)
+            if got:
+                try:
+                    await self._wire_one(pid, wait, got)
+                except AppError as exc:
+                    hit, miss = [], wait.names
+                    log.warning("director wire %s failed: %s", wait.kind, exc.title)
+            word = _WIRE_WORD[wait.kind]
+            entry = wait.entry
+            if entry is None:
+                continue
+            if hit:
+                entry[f"{wait.kind}_wired"] = f"这一批新建的{word}已经接上：{'、'.join(hit)}。"
+            if miss:
+                entry[f"{wait.kind}_skipped"] = (
+                    f"这一批里没有建成「{'、'.join(miss)}」这个{word}（提案被丢掉了，"
+                    f"或者名字对不上），所以这一条没接上它。"
+                    f"到{word}那一页建好之后再挂一次即可，已经落库的其余部分不受影响。"
+                )
+
+    async def _wire_one(self, pid: str, wait: _Waiting, got: list[str]) -> None:
+        """一条接线怎么落。**全部转调已有写方法**，这里不碰 ORM。"""
+        if wait.kind == "location":
+            await story.update_scene(pid, wait.targets[0], {"location_variant_id": got[0]})
+            return
+        if wait.kind == "cast":
+            for shot in wait.targets:
+                await story.set_shot_cast(pid, shot, [*wait.ids, *got])
+            return
+        items = [{"prop_id": i} for i in (*wait.ids, *got)]
+        for shot in wait.targets:
+            await story.set_shot_props(pid, shot, items)
 
     #: 提案的 `after` 里能直接落库的镜头字段。**只有这一张表**——`camera_motion` /
     #: `visual_prompt` / `audio_dialogue` / `skill` 是给人看的过程量，正向 prompt 已经在
@@ -317,8 +515,12 @@ class DirectorService:
         "negative_prompt",
     )
 
-    async def _one(self, pid: str, op: dict[str, Any]) -> dict[str, Any]:
-        """一条提案怎么落。**全部转调已有的写方法**，这里不碰 ORM。"""
+    async def _one(self, pid: str, op: dict[str, Any], batch: _Batch) -> dict[str, Any]:
+        """一条提案怎么落。**全部转调已有的写方法**，这里不碰 ORM。
+
+        `batch` 是这一批的名字账：素材落成时往里记一笔，镜头 / 幕上还对不上的名字往里
+        登记一条接线，整批落完由 `_wire_pending` 统一接上（顺序无关）。
+        """
         name = str(op["op"])
         after = op.get("after") or {}
         sid = str(op.get("scene_id") or "")
@@ -337,13 +539,18 @@ class DirectorService:
                     pid, row["id"], {k: shot.get(k) for k in self.SHOT_PATCH_KEYS}
                 )
                 made += 1
-                ids = [c["appearance_id"] for c in shot.get("cast") or []]
+                ids, pending = _split_ids(shot.get("cast"), "appearance_id")
                 if ids:
                     await story.set_shot_cast(pid, created["id"], ids)
+                batch.wait("cast", [created["id"]], ids, pending)
+            if not after.get("location_variant_id") and after.get("location_name"):
+                batch.wait("location", [row["id"]], [], [str(after["location_name"])])
             return {"scene_id": row["id"], "title": row["title"], "shots_created": made}
 
         if name == "update_scene":
             row = await story.update_scene(pid, sid, after)
+            if not after.get("location_variant_id") and after.get("location_name"):
+                batch.wait("location", [row["id"]], [], [str(after["location_name"])])
             return {"scene_id": row["id"], "title": row["title"]}
 
         if name == "delete_scene":
@@ -371,9 +578,10 @@ class DirectorService:
                 str(after.get("scene_id") or sid),
                 {k: after.get(k) for k in self.SHOT_PATCH_KEYS},
             )
-            ids = [c["appearance_id"] for c in after.get("cast") or []]
+            ids, pending = _split_ids(after.get("cast"), "appearance_id")
             if ids:
                 await story.set_shot_cast(pid, created["id"], ids)
+            batch.wait("cast", [created["id"]], ids, pending)
             #: 插在中间要走 `move_shot`（它内部重排 + 全局重排）。`position` 是 1 起的，
             #: `move_shot` 收 0 起的落点。
             if after.get("position"):
@@ -393,9 +601,9 @@ class DirectorService:
             else:
                 row = await story.get_shot(pid, shot_id)
             if "cast" in after:
-                await story.set_shot_cast(
-                    pid, shot_id, [c["appearance_id"] for c in after.get("cast") or []]
-                )
+                ids, pending = _split_ids(after.get("cast"), "appearance_id")
+                await story.set_shot_cast(pid, shot_id, ids)
+                batch.wait("cast", [shot_id], ids, pending)
             return {"shot_id": row["id"], "title": row["title"]}
 
         if name == "delete_shot":
@@ -438,6 +646,8 @@ class DirectorService:
                 "appearance_id": appearance["id"] if appearance else None,
             }
             if appearance is not None:
+                # 这一批里按名字等着这个角色的镜头，收尾时就靠这一笔接上（默认形象那一个）。
+                batch.born("cast", row["name"], appearance["id"])
                 out.update(await self._maybe_image(pid, after, "appearance", appearance["id"]))
             return out
 
@@ -453,6 +663,9 @@ class DirectorService:
                     "time_of_day": after.get("time_of_day"),
                 },
             )
+            #: 幕上挂的是变体而不是地点，所以这一笔记的是**第一个变体**——
+            #: 与 `tools.py::_resolve_variant` 按名字找到已有地点时取的是同一个。
+            batch.born("location", row["name"], variant["id"])
             return {
                 "location_id": row["id"],
                 "name": row["name"],
@@ -463,6 +676,7 @@ class DirectorService:
 
         if name == "add_prop":
             row = await world.create_prop(pid, {k: after.get(k) for k in ("name", "description")})
+            batch.born("props", row["name"], row["id"])
             return {
                 "prop_id": row["id"],
                 "name": row["name"],
@@ -493,14 +707,17 @@ class DirectorService:
                 await story.update_shot(pid, shot, {"prompt": str(after.get("prompt") or "")})
             return {"scene_id": sid, "shots_touched": len(shots)}
         if name == "set_scene_cast":
-            ids = [c["appearance_id"] for c in after.get("cast") or []]
+            ids, pending = _split_ids(after.get("cast"), "appearance_id")
             for shot in shots:
                 await story.set_shot_cast(pid, shot, ids)
+            batch.wait("cast", shots, ids, pending)
             return {"scene_id": sid, "shots_touched": len(shots), "cast_count": len(ids)}
         if name == "set_scene_props":
-            items = [{"prop_id": p["prop_id"]} for p in after.get("props") or []]
+            ids, pending = _split_ids(after.get("props"), "prop_id")
+            items = [{"prop_id": i} for i in ids]
             for shot in shots:
                 await story.set_shot_props(pid, shot, items)
+            batch.wait("props", shots, ids, pending)
             return {"scene_id": sid, "shots_touched": len(shots), "prop_count": len(items)}
 
         raise AppError(

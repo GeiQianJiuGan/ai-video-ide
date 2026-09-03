@@ -31,8 +31,9 @@ import pytest
 from app.core.config import settings
 from app.core.errors import AppError, ErrorCode
 from app.generation.providers import image as image_protocols
-from app.generation.providers import registry
+from app.generation.providers import presets, registry
 from app.generation.providers.base import ImageRequest, RefAsset
+from tests.test_providers import GRAPH, with_declaration, with_ref_slots, write_preset
 
 #: 故意是个一眼能认出来的假密钥：断言「它没出现在 URL 里」时看得清。
 KEY = "sk-image-never-leaks-4f2"
@@ -313,6 +314,98 @@ async def test_comfy_submit_requires_preset() -> None:
     err = caught.value
     assert err.code is ErrorCode.MISSING_CAPABILITY
     assert err.suggestions and any(image_protocols.MANUAL_WAY_OUT == s for s in err.suggestions)
+
+
+class FakeImageComfy:
+    """够 `ComfyImageProvider.probe()` / `submit()` 用的那几个方法。"""
+
+    base_url = "http://127.0.0.1:8188"
+
+    def __init__(self) -> None:
+        self.submitted: dict[str, Any] | None = None
+
+    async def ping(self) -> dict[str, Any]:
+        return {"online": True, "base_url": self.base_url, "detail": "已连接"}
+
+    async def upload_input(self, filename: str, data: bytes, subfolder: str = "aivs") -> str:
+        return f"aivs/{filename}"
+
+    async def submit(self, graph: dict[str, Any], client_id: str) -> str:
+        self.submitted = graph
+        return "pid-img-1"
+
+
+def comfy_provider() -> tuple[image_protocols.ComfyImageProvider, FakeImageComfy]:
+    provider = image_protocols.ComfyImageProvider()
+    fake = FakeImageComfy()
+    provider._client = fake  # type: ignore[assignment]
+    return provider, fake
+
+
+async def test_comfy_probe_accepts_an_undeclared_preset_but_says_so() -> None:
+    """**没标 AIVS_IMAGE 照旧能用**——否则每一台已经配好出图预设的机器升级后当场坏掉。
+
+    但代价要说出来：这份图同时还躺在 R2V / 首尾帧的候选里，在那边选中它就是一次白跑。
+    """
+    write_preset("出图-老的", GRAPH)
+    use_settings("comfy_preset", preset="出图-老的")
+    provider, _fake = comfy_provider()
+
+    report = await provider.probe()
+
+    assert report["ok"] is True, "没声明不是错误，只是少了一句话"
+    assert report["declares_image"] is False
+    assert presets.DECLARE_IMAGE in report["detail"]
+
+
+async def test_comfy_probe_is_clean_once_declared() -> None:
+    """标上之后那句提醒消失——提醒不是常驻噪音，它是「还有一件事没做」。"""
+    write_preset("出图-新的", with_declaration(GRAPH))
+    use_settings("comfy_preset", preset="出图-新的")
+    provider, _fake = comfy_provider()
+
+    report = await provider.probe()
+
+    assert report["declares_image"] is True
+    assert presets.DECLARE_IMAGE not in report["detail"]
+    assert "就绪" in report["detail"]
+
+
+async def test_comfy_submit_leaves_a_note_when_the_preset_is_not_declared() -> None:
+    """降级说明进 `req.notes` → 冻结进版本参数：事后能说清「当时用的是哪份图」。
+
+    声明之后一句都不多说——`notes` 里只该有真正发生过的降级。
+    """
+    write_preset("出图-老的", GRAPH)
+    write_preset("出图-新的", with_declaration(GRAPH))
+    use_settings("comfy_preset", preset="出图-老的")
+    provider, fake = comfy_provider()
+
+    old = ImageRequest(prompt="一位女性四视图")
+    assert await provider.submit(old, client_id="t") == "pid-img-1"
+    assert fake.submitted is not None
+    assert any(presets.DECLARE_IMAGE in note for note in old.notes)
+
+    use_settings("comfy_preset", preset="出图-新的")
+    new = ImageRequest(prompt="一位女性四视图")
+    await provider.submit(new, client_id="t")
+    assert not any(presets.DECLARE_IMAGE in note for note in new.notes)
+
+
+async def test_comfy_probe_still_refuses_a_graph_without_a_prompt() -> None:
+    """判的是「有没有提示词入口」而不是 `r2v_ready`：声明过的图在后者上永远为假，
+    照它判会让用户一标上 AIVS_IMAGE 就被告知「这份图没有提示词入口」。"""
+    write_preset("出图-有提示词", with_declaration(with_ref_slots(1)))
+    use_settings("comfy_preset", preset="出图-有提示词")
+    provider, _fake = comfy_provider()
+    assert (await provider.probe())["preset_ready"] is True
+
+    write_preset("出图-没提示词", {k: v for k, v in with_declaration(GRAPH).items() if k != "3"})
+    use_settings("comfy_preset", preset="出图-没提示词")
+    with pytest.raises(AppError) as caught:
+        await provider.probe()
+    assert caught.value.code is ErrorCode.INVALID_WORKFLOW
+    assert "AIVS_PROMPT" in caught.value.detail
 
 
 # --- 降级：收不了参考图不等于用不了 ---

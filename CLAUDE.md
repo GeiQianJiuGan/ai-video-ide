@@ -446,6 +446,24 @@ kind / priority / included / reason / **media**（`image` / `video` / `audio`，
     请求拼出来的系统提示词里那一句「用户现在在哪一页」，**不落库、不分会话、不需要迁移**——
     换页不该让历史对话变味。剧本页右栏是「AI 编剧」Tab（`scope="script"`），
     幕流程图页右栏是「AI 协作」（`scope="flow"`），两边看到的是同一份对话。
+  - **拆完一段之后要对一遍账**（读工具 `list_missing_materials` + 素材级写工具
+    `add_character` / `add_location` / `add_prop` / `generate_reference`）：拆出来的镜头里那些
+    人名、地名一个都没有对应素材时，每个镜头只喂得进一句文字，人物形象在几秒里就丢了，
+    而这件事**在剧本页上完全看不出来**（幕与镜头都好端端地立着）。那张账的四类
+    （形象缺定妆图 / 地点变体缺参考图 / 道具缺参考图 / 幕缺人缺地点）**全部转调已有判断**
+    ——幕那一类直接读 `story.storyboard()` 的 `context_issues`，「出图这条链配没配」读
+    `images.capability()`，绝不在这里再算一遍。没配出图服务时账上先说这件事
+    （`image.configured=false` + `how_to`），素材照旧建、图这一项走手动那条路（硬约束 2）。
+  - **同一批里新建的素材按名字接线，且与提案顺序无关**（`services/director.py::_Batch` +
+    `_wire_pending`）：`add_shot` 完全可能排在 `add_character` 前面（顺序由模型定），
+    所以提案阶段对不上的名字只留成 `pending_name`（**一行库都不改**），整批落完再统一接一次。
+    接线**转调已有写方法且写的是「该有的全量」**——`set_shot_cast` / `set_shot_props` 是整份
+    覆盖而不是追加，只写新建那几个会把先落的冲掉。**接不上只是接不上**：用户把那条
+    `add_character` 丢掉时，那一镜照样落库，只在它自己的落库回执里多一句
+    `cast_wired` / `cast_skipped`（道具 `props_*`、地点 `location_*` 同理，措辞只有
+    `_wire_pending` 一处），绝不让一条被丢弃的提案带走整个镜头。
+    **前端必须把这几句显示出来**（`DirectorPanel.vue::appliedRows`）：落成了的那张提案卡会
+    走掉，只给一行「已落库 N 条」等于把降级藏起来（硬约束 4）。
 - **provider 适配层**（`app/generation/providers/`）：`base.py` 定义与模型无关的 `VideoRequest`
   （`mode` = `i2v` / `flf`、prompt、首尾帧、**参考素材 `refs`**（`RefAsset`，带 `media` =
   `image` / `video` / `audio`）、时长、seed、透传 `extra`、降级说明 `notes`）与 `VideoProvider`

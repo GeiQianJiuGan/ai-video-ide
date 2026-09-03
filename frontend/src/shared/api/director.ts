@@ -26,6 +26,14 @@ export const OP_FIELD_LABEL: Record<string, string> = {
   summary: '概要',
   time_of_day: '时间',
   location_variant_id: '地点变体',
+  /**
+   * 这两个都是「这一幕在哪儿」，但状态不同，所以后端刻意分成两个键（互斥）：
+   * `location_label` = 已经定到库里那个变体了（`城南旧宅 · 雨夜`）；
+   * `location_name` = 库里还没有这个地点，等同一批里的 `add_location` 建好再接。
+   * 界面上都叫「地点」——差别由那条 warning 说清楚，不靠字段名暗示。
+   */
+  location_label: '地点',
+  location_name: '地点',
   prompt: '画面描述',
   cast: '出场角色',
   props: '道具',
@@ -144,9 +152,33 @@ export interface DirectorLlm {
   hint: string
 }
 
+/** 附件能收什么。**口径只有后端一处**（`core/doctext.py::KINDS`），前端不写死后缀清单。 */
+export interface DirectorAttachInfo {
+  kinds: { suffix: string; label: string }[]
+  /** 直接塞给 `<input accept=…>`。 */
+  accept: string
+  max_mb: number
+  max_chars: number
+  note: string
+}
+
+/** 一份附件抽出来的文字。**它只是输入框里的一段草稿**：没落库、没落盘、没出网。 */
+export interface DirectorAttachment {
+  filename: string
+  kind: string
+  kind_label: string
+  text: string
+  chars: number
+  /** true = 太长被截断了，`notes` 里写着少了多少。 */
+  truncated: boolean
+  /** 「按 gb18030 读的」「日期是原始值」这类话，必须显示出来。 */
+  notes: string[]
+}
+
 export interface DirectorHistory {
   turns: DirectorTurn[]
   llm: DirectorLlm
+  attach: DirectorAttachInfo
   note: string
 }
 
@@ -227,6 +259,17 @@ export const directorApi = {
   ): AsyncGenerator<DirectorStreamEvent> => stream(pid, message, scope, signal),
   apply: (pid: string, ops: DirectorOp[]) =>
     api.post<DirectorApply>(`/projects/${pid}/director/apply`, { ops }),
+  /**
+   * 一份 .docx / .xlsx / … → 一段纯文本，**只填进输入框**。
+   *
+   * 三条与 `chat()` 不同的规矩：
+   *   1. **什么都不落**：没记录、没文件、没资产，所以它回 200 而不是 201；
+   *   2. **不要求配好 LLM**：用户得先看见抽出来什么，才决定发不发（硬约束 2）；
+   *   3. **`accept` 只认后端给的那一份**（`history().attach.accept`），
+   *      别在界面上再写第二张后缀清单。
+   */
+  attach: (pid: string, file: File) =>
+    api.upload<DirectorAttachment>(`/projects/${pid}/director/attach`, file),
   clear: (pid: string) => api.del<void>(`/projects/${pid}/director`),
 }
 

@@ -21,6 +21,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.core.config import settings
+from app.generation.providers import presets
 from app.persistence.models_cast import SheetVersion
 from app.persistence.models_gen import Job
 from app.persistence.models_story import Shot
@@ -31,6 +32,7 @@ from app.services.images import images
 from app.services.story import story
 from app.services.world import world
 from tests.conftest import PNG_1PX, error_of
+from tests.test_providers import GRAPH, with_declaration, write_preset
 
 API = "/api/v1"
 
@@ -176,6 +178,81 @@ def test_unknown_skill_name_is_rejected(client: TestClient, pid: str) -> None:
     )
     assert resp.status_code in (404, 422)
     error_of(resp)
+
+
+# --- 出图那份预设：账单上就要说清它还能不能用 ---
+
+
+def use_comfy_preset(name: str) -> None:
+    """把出图那一族切到本机 ComfyUI 那条路（它是唯一 `wants_preset` 的协议）。"""
+    settings.image_provider = "comfy_preset"
+    settings.image_preset = name
+
+
+async def test_plan_refuses_an_image_preset_that_is_gone(client: TestClient, pid: str) -> None:
+    """指的那份图被删掉时**账单上就说**，不是按下生成才在队列里得到一条失败。"""
+    appearance = await appearance_of(pid)
+    use_comfy_preset("早就删了的图")
+
+    resp = client.post(
+        f"{API}/projects/{pid}/images/plan",
+        json={"target_kind": "appearance", "target_id": appearance["id"], "prompt": "军绿夹克"},
+    )
+    assert resp.status_code == 200, resp.text
+    bill = resp.json()
+
+    assert bill["can_generate"] is False
+    err = bill["missing"][0]
+    assert err["code"] == "INVALID_WORKFLOW"
+    assert "早就删了的图" in err["detail"]
+    assert any("上传" in s or "手动" in s for s in err["suggestions"])
+    # 入队那道门也认同一份判断（同一个 `_prepare`）
+    enqueue = client.post(
+        f"{API}/projects/{pid}/images/generate",
+        json={"target_kind": "appearance", "target_id": appearance["id"], "prompt": "军绿夹克"},
+    )
+    assert enqueue.status_code == 400, enqueue.text
+    error_of(enqueue)
+    assert await fetch_all(db_of(pid), Job) == []
+
+
+async def test_plan_refuses_an_image_preset_without_a_prompt(client: TestClient, pid: str) -> None:
+    """标了声明却没有 AIVS_PROMPT：这份图在出图那一栏里也是不能用的。"""
+    appearance = await appearance_of(pid)
+    graph = with_declaration(GRAPH)
+    write_preset("四视图-没提示词", {k: v for k, v in graph.items() if k != "3"})
+    use_comfy_preset("四视图-没提示词")
+
+    resp = client.post(
+        f"{API}/projects/{pid}/images/plan",
+        json={"target_kind": "appearance", "target_id": appearance["id"], "prompt": "军绿夹克"},
+    )
+    bill = resp.json()
+
+    assert bill["can_generate"] is False
+    assert bill["missing"][0]["code"] == "INVALID_WORKFLOW"
+    assert "AIVS_PROMPT" in bill["missing"][0]["detail"]
+
+
+async def test_plan_warns_when_the_image_preset_is_not_declared(
+    client: TestClient, pid: str
+) -> None:
+    """没标 `AIVS_IMAGE` 照旧能出图（升级前配好的机器不许坏），但代价要说出来：
+    这份图同时还留在 R2V / 首尾帧的候选里。标上之后那句话消失。"""
+    appearance = await appearance_of(pid)
+    body = {"target_kind": "appearance", "target_id": appearance["id"], "prompt": "军绿夹克"}
+
+    write_preset("四视图-老的", GRAPH)
+    use_comfy_preset("四视图-老的")
+    bill = client.post(f"{API}/projects/{pid}/images/plan", json=body).json()
+    assert bill["can_generate"] is True, "只是一条警告，不是门槛"
+    assert any(presets.DECLARE_IMAGE in w for w in bill["warnings"])
+
+    write_preset("四视图-新的", with_declaration(GRAPH))
+    use_comfy_preset("四视图-新的")
+    bill = client.post(f"{API}/projects/{pid}/images/plan", json=body).json()
+    assert bill["can_generate"] is True
+    assert not any(presets.DECLARE_IMAGE in w for w in bill["warnings"])
 
 
 # --- 入队：同一张 job 表、同一个 pump ---

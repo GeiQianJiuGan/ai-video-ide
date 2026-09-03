@@ -11,8 +11,16 @@
  *      就是那份清单，强删按钮旁边永远写着破坏几处。
  *   3. **文件丢了不等于登记错了**。`missing` 的资产照常列出来并标红：它是需要处理的
  *      事实，藏起来只会让导出在半路失败。
+ *
+ * **网格是一页一页长出来的**（`PAGE` + 哨兵），而不是一次把全部资产铺进 DOM。
+ * 这一页列的是整个工程的落盘文件——跑过几轮生成之后成片、抽帧、代理动辄上千条，
+ * 而每个格子里那张 `<img>` 指的是**原图**（这一页没有缩略图服务，`/files/{rel}` 给的是
+ * 落盘那张）：一张 1024×1024 的 PNG 解码出来是 4 MB 位图，几百张一起进 DOM 就是
+ * 「点进来卡住半秒」的来源。所以两件事一起做：**只挂当前这几页**（DOM 节点有界）+
+ * `loading="lazy"`（滚不到的那些连字节都不请求）。筛选换了就回到第一页——
+ * 「已显示 X / Y」那一行照实写出来，绝不假装列完了。
  */
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { Image as ImageIcon, FileText, Library, RefreshCw, Search, Trash2 } from '@lucide/vue'
 import AppPanel from '@/shared/ui/AppPanel.vue'
@@ -86,6 +94,72 @@ async function reload(): Promise<void> {
 
 onMounted(reload)
 watch(pid, reload)
+
+/** 一页多少个格子。够铺满两三屏，滚起来看不到接缝，又不会让首屏解码几百张原图。 */
+const PAGE = 60
+const shown = ref(PAGE)
+/** 真正挂进 DOM 的那一批（`store.visible` 是筛完之后的全量）。 */
+const rendered = computed(() => store.visible.slice(0, shown.value))
+const hasMore = computed(() => shown.value < store.visible.length)
+
+/** 网格自己的滚动容器：哨兵的可见性要按它算，不是按窗口。 */
+const scroller = ref<HTMLElement | null>(null)
+/** 网格末尾那一行「已显示 X / Y」，滚到它就再长一页。 */
+const sentinel = ref<HTMLElement | null>(null)
+let observer: IntersectionObserver | null = null
+let growing = false
+
+/**
+ * 长一页。**长完要再看一眼哨兵是不是还在视野里**：一屏放得下两页时，
+ * IntersectionObserver 对「一直可见」的元素不会再报第二次，只听回调会停在半路。
+ */
+async function grow(): Promise<void> {
+  if (growing) return
+  growing = true
+  try {
+    while (hasMore.value) {
+      shown.value += PAGE
+      await nextTick()
+      const box = sentinel.value?.getBoundingClientRect()
+      const root = scroller.value?.getBoundingClientRect()
+      if (!box || !root || box.top > root.bottom + 400) break
+    }
+  } finally {
+    growing = false
+  }
+}
+
+onMounted(() => {
+  observer = new IntersectionObserver(
+    (entries) => {
+      if (entries.some((e) => e.isIntersecting)) void grow()
+    },
+    // 提前 400px 开始长：等滚到底再长会看见一段空白。
+    { root: scroller.value, rootMargin: '400px' },
+  )
+  if (sentinel.value) observer.observe(sentinel.value)
+})
+
+// 哨兵是 v-if 出来的，全部列完时它会消失、又长出来时是另一个元素——所以要跟着换。
+watch(sentinel, (el, old) => {
+  if (old) observer?.unobserve(old)
+  if (el) observer?.observe(el)
+})
+
+onBeforeUnmount(() => {
+  observer?.disconnect()
+  observer = null
+})
+
+// 换工程 / 换类型 / 切「只看缺描述」/ 列表本身变了 → 回到第一页。
+// 不回第一页的话，从一个上千条的类型切到只有几条的类型，`shown` 还挂着上一次的数字。
+watch(
+  () => [pid.value, store.kind, store.onlyUndescribed, store.assets.length] as const,
+  () => {
+    shown.value = PAGE
+    scroller.value?.scrollTo({ top: 0 })
+  },
+)
 
 const confirmForce = ref('')
 
@@ -219,7 +293,7 @@ function goOwner(ownerKind: string, ownerId: string): void {
       </AppPanel>
 
       <!-- 中：资产网格 -->
-      <AppPanel title="资产网格" class="min-h-0 min-w-0 flex-1">
+      <AppPanel title="资产网格" :scroll="false" class="min-h-0 min-w-0 flex-1">
         <template #actions>
           <span class="text-fg-4 text-2xs">
             {{
@@ -231,69 +305,102 @@ function goOwner(ownerKind: string, ownerId: string): void {
             }}
           </span>
         </template>
-        <EmptyState
-          v-if="store.visible.length === 0"
-          :title="
-            store.onlyUndescribed
-              ? '这一批都写了描述'
-              : store.kind
-                ? '这个类型下还没有文件'
-                : '工程里还没有落盘文件'
-          "
-          :body="
-            store.onlyUndescribed
-              ? '当前筛选下每个素材都有描述了。再点一下上面那颗按钮回到全部。'
-              : store.kind
-                ? '换一个类型看看，或者点「全部」。'
-                : '上传角色表、场景参考图，或者跑一次生成——所有落盘文件都会登记到这里，包括导出的成片。'
-          "
-        />
-        <div v-else class="grid grid-cols-[repeat(auto-fill,minmax(9rem,1fr))] gap-2 p-2">
-          <article
-            v-for="a in store.visible"
-            :key="a.id"
-            class="border bg-base-2"
-            :class="
-              a.id === store.selectedId
-                ? 'border-accent/60'
-                : a.missing
-                  ? 'border-st-failed/60'
-                  : 'border-line-1'
+        <!-- 滚动容器写在这里而不是用 AppPanel 的：哨兵要按它算可见性，得拿到这个元素 -->
+        <div ref="scroller" class="h-full overflow-auto">
+          <EmptyState
+            v-if="store.visible.length === 0"
+            :title="
+              store.onlyUndescribed
+                ? '这一批都写了描述'
+                : store.kind
+                  ? '这个类型下还没有文件'
+                  : '工程里还没有落盘文件'
             "
-          >
-            <button class="block w-full text-left" @click="store.loadRefs(pid, a.id)">
-              <span class="bg-base-3 flex h-20 items-center justify-center overflow-hidden">
-                <img
-                  v-if="isImage(a) && thumb(a)"
-                  :src="thumb(a)"
-                  alt=""
-                  class="h-full w-full object-cover"
-                />
-                <ImageIcon v-else :size="14" class="text-fg-4" />
-              </span>
-              <span class="block truncate px-1.5 pt-1">
-                <span class="text-fg-1 text-2xs">{{ ASSET_KIND_LABEL[a.kind] ?? a.kind }}</span>
-              </span>
-              <span class="text-fg-4 block truncate px-1.5 text-2xs">{{ a.path }}</span>
-              <span class="flex flex-wrap items-center gap-1 px-1.5 pt-1 pb-1.5">
-                <AppBadge v-if="a.missing" tone="fail">文件丢失</AppBadge>
-                <AppBadge v-else-if="isOrphan(a)" tone="warn">孤儿</AppBadge>
-                <AppBadge v-else-if="a.ref_count > 0" tone="ok">{{ a.ref_count }} 处引用</AppBadge>
-                <!-- 与上面那串状态独立：被引用得再多，没描述照样只是一个文件名 -->
-                <AppBadge
-                  v-if="store.undescribedIds.has(a.id)"
-                  tone="warn"
-                  title="还没有描述：模型引用它时只看到一个文件名"
-                >
-                  缺描述
-                </AppBadge>
-                <span class="text-fg-4 tnum text-2xs">{{ humanBytes(a.size_bytes) }}</span>
-                <span v-if="a.width && a.height" class="text-fg-4 tnum text-2xs">
-                  {{ a.width }}×{{ a.height }}
-                </span>
-              </span>
+            :body="
+              store.onlyUndescribed
+                ? '当前筛选下每个素材都有描述了。再点一下上面那颗按钮回到全部。'
+                : store.kind
+                  ? '换一个类型看看，或者点「全部」。'
+                  : '上传角色表、场景参考图，或者跑一次生成——所有落盘文件都会登记到这里，包括导出的成片。'
+            "
+          />
+          <template v-else>
+            <div class="grid grid-cols-[repeat(auto-fill,minmax(9rem,1fr))] gap-2 p-2">
+              <article
+                v-for="a in rendered"
+                :key="a.id"
+                class="border bg-base-2"
+                :class="
+                  a.id === store.selectedId
+                    ? 'border-accent/60'
+                    : a.missing
+                      ? 'border-st-failed/60'
+                      : 'border-line-1'
+                "
+              >
+                <button class="block w-full text-left" @click="store.loadRefs(pid, a.id)">
+                  <span class="bg-base-3 flex h-20 items-center justify-center overflow-hidden">
+                    <!--
+                      这里指的是原图（没有缩略图服务）：lazy 让滚不到的那些一个字节都不请求，
+                      decoding=async 把解码挪出主线程——否则一屏几十张 4K 图会卡住滚动。
+                    -->
+                    <img
+                      v-if="isImage(a) && thumb(a)"
+                      :src="thumb(a)"
+                      alt=""
+                      loading="lazy"
+                      decoding="async"
+                      class="h-full w-full object-cover"
+                    />
+                    <ImageIcon v-else :size="14" class="text-fg-4" />
+                  </span>
+                  <span class="block truncate px-1.5 pt-1">
+                    <span class="text-fg-1 text-2xs">
+                      {{ ASSET_KIND_LABEL[a.kind] ?? a.kind }}
+                    </span>
+                  </span>
+                  <span class="text-fg-4 block truncate px-1.5 text-2xs">{{ a.path }}</span>
+                  <span class="flex flex-wrap items-center gap-1 px-1.5 pt-1 pb-1.5">
+                    <AppBadge v-if="a.missing" tone="fail">文件丢失</AppBadge>
+                    <AppBadge v-else-if="isOrphan(a)" tone="warn">孤儿</AppBadge>
+                    <AppBadge v-else-if="a.ref_count > 0" tone="ok">
+                      {{ a.ref_count }} 处引用
+                    </AppBadge>
+                    <!-- 与上面那串状态独立：被引用得再多，没描述照样只是一个文件名 -->
+                    <AppBadge
+                      v-if="store.undescribedIds.has(a.id)"
+                      tone="warn"
+                      title="还没有描述：模型引用它时只看到一个文件名"
+                    >
+                      缺描述
+                    </AppBadge>
+                    <span class="text-fg-4 tnum text-2xs">{{ humanBytes(a.size_bytes) }}</span>
+                    <span v-if="a.width && a.height" class="text-fg-4 tnum text-2xs">
+                      {{ a.width }}×{{ a.height }}
+                    </span>
+                  </span>
+                </button>
+              </article>
+            </div>
+            <!--
+              还没铺完就说清还剩多少，别让人以为列完了。滚到这一行就再长一页；
+              点一下也能长——触控板滚不到底或哨兵被别的层挡住时还有一条路。
+            -->
+            <button
+              v-if="hasMore"
+              ref="sentinel"
+              class="text-fg-4 hover:text-fg-2 tnum block w-full px-2 pb-3 text-center text-2xs"
+              @click="grow()"
+            >
+              已显示 {{ rendered.length }} / {{ store.visible.length }} —— 继续滚动加载更多
             </button>
-          </article>
+            <p
+              v-else-if="store.visible.length > PAGE"
+              class="text-fg-4 tnum px-2 pb-3 text-center text-2xs"
+            >
+              已显示全部 {{ store.visible.length }} 个
+            </p>
+          </template>
         </div>
       </AppPanel>
 

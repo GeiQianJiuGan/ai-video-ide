@@ -133,6 +133,12 @@ class Settings(BaseSettings):
     llm_vision_model: str = ""
     llm_api_key: str = ""
 
+    # --- AI 协作栏的附件：一份 Word 剧本 / Excel 分镜表 → 一段纯文本（core/doctext.py）---
+    # 抽出来的文字只填进输入框，不落库、不落盘、不出网，所以这两个数只是「别把界面和
+    # 模型的上下文撑爆」的护栏：字节数挡住误传的整部片子，字符数挡住三百页的文档。
+    director_attach_max_mb: int = 20
+    director_attach_max_chars: int = 20000
+
     # --- 系统提示词：空字符串表示「用内置默认」（内置文本在 app/ai/prompts.py）---
     # 「AI 拆出来的场景不够好」多半是这段话不够好，所以它必须可改。
     # 但 JSON 输出形状由代码始终追加，不受这两个字段影响。

@@ -35,7 +35,6 @@ import AppPanel from '@/shared/ui/AppPanel.vue'
 import EmptyState from '@/shared/ui/EmptyState.vue'
 import ErrorPanel from '@/shared/ui/ErrorPanel.vue'
 import FeatureHeader from '@/shared/ui/FeatureHeader.vue'
-import DirectorPanel from '../director/DirectorPanel.vue'
 import SceneNodeCard from './SceneNodeCard.vue'
 import SceneNodeInspector from './SceneNodeInspector.vue'
 import ImportSceneDialog from '@/features/packages/ImportSceneDialog.vue'
@@ -49,16 +48,16 @@ import {
 } from '@/shared/api/sequence'
 import { useConsoleStore } from '@/stores/console'
 import { useFlowStore } from '@/stores/flow'
+import { useShellStore } from '@/stores/shell'
 
 const route = useRoute()
 const router = useRouter()
 const flow = useFlowStore()
 const consolePanel = useConsoleStore()
+const shell = useShellStore()
 
 const pid = computed(() => String(route.params.pid ?? ''))
 const newSceneTitle = ref('')
-/** AI 协作栏。默认开着——它是这一级的核心；关掉也不影响手动编排走完全程。 */
-const showDirector = ref(true)
 /** 从别的工程导一幕的设定进来。 */
 const importing = ref(false)
 
@@ -91,6 +90,16 @@ async function reload(): Promise<void> {
 
 onMounted(reload)
 watch(pid, () => reload())
+/**
+ * 提案落库后整张图都可能变了（幕数、镜头数、衔接），所以重拉。
+ *
+ * 触发者是右侧那条全局停靠栏（`app/layout/DirectorDock.vue`）。它不知道此刻开着哪一页，
+ * 只递增 `shell.appliedTick`，由关心的页面自己 watch。
+ */
+watch(
+  () => shell.appliedTick,
+  () => void reload(),
+)
 
 async function addScene(): Promise<void> {
   const title = newSceneTitle.value.trim() || `第 ${flow.nodes.length + 1} 幕`
@@ -184,11 +193,11 @@ function switchMode(value: string): void {
       </AppButton>
       <AppButton
         size="sm"
-        :variant="showDirector ? 'primary' : 'ghost'"
-        title="AI 协作栏：跟它说一句话，它提一份可逐条审阅的提案（按下采用之前库里什么都不会变）"
-        @click="showDirector = !showDirector"
+        :variant="shell.directorOpen ? 'primary' : 'ghost'"
+        title="AI 导演现在是右侧那条常驻栏：跟它说一句话，它提一份可逐条审阅的提案（按下采用之前库里什么都不会变）。换页不会关掉它（Ctrl I）"
+        @click="shell.toggleDirector()"
       >
-        <Bot :size="10" />AI 协作
+        <Bot :size="10" />AI 导演
       </AppButton>
       <AppButton size="sm" variant="ghost" :disabled="flow.busy" @click="reload()">
         <RefreshCw :size="10" />刷新
@@ -384,12 +393,9 @@ function switchMode(value: string): void {
           </div>
         </AppPanel>
       </div>
-      <!-- 最右：AI 协作栏。提案落库后重拉整张图（幕数、镜头数、衔接都可能变了）。
-           宽度由这里给——同一个组件在剧本页是宽的主栏 -->
-      <DirectorPanel v-if="showDirector" :pid="pid" class="w-80 shrink-0" @applied="reload()" />
     </div>
 
-    <!-- 导进来的是一整幕，图上多了一个节点，所以照 DirectorPanel 的规矩重拉整张图 -->
+    <!-- 导进来的是一整幕，图上多了一个节点，所以照提案落库的规矩重拉整张图 -->
     <ImportSceneDialog v-model:open="importing" :pid="pid" @done="reload()" />
   </div>
 </template>

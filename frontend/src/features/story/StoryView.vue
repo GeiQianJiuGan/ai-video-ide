@@ -2,15 +2,17 @@
 /**
  * 剧本工作台（Step 5 的前端）。
  *
- * 这一页的主角是 **AI 编剧**（左边那一大栏），右边是它做出来的结果。四条规矩：
- *   1. **没有「剧本原文」这一栏了**。粘一大段原文再让 AI 去读，多了一道没必要的手续——
+ * 这一页管的是**已经落库的幕与镜头**：左边一列幕（展开看它的镜头），右边改这一场的属性。
+ * 四条规矩：
+ *   1. **AI 编剧不在这一页里了**。它是右侧那条全局停靠栏（`app/layout/DirectorDock.vue`），
+ *      从这一页走到分镜板、流程图、资产库都不会关掉，写到一半的话与待审提案跟着人走。
+ *      这一页只留一颗「叫它出来」的按钮；提案落库后靠 `shell.appliedTick` 重拉本页。
+ *   2. **没有「剧本原文」这一栏**。粘一大段原文再让 AI 去读，多了一道没必要的手续——
  *      直接把剧情讲给它就行。后端的 `PATCH /story`（raw_text）与 `read_script` 工具
  *      **原样留着当兼容路径**：老工程里存过原文的，AI 照旧能一段一段读；界面不再有入口。
- *   2. **AI 是协作者，不是一个「一键拆解」按钮**。它先看清现状再提一份提案，提案一个字都不
+ *   3. **AI 是协作者，不是一个「一键拆解」按钮**。它先看清现状再提一份提案，提案一个字都不
  *      写库，逐条审阅、按「采用」才落。老的一次性拆解（`breakdown/propose`）后端保留当兼容
  *      路径，这一页没有入口——一次调用要吐出全部幕 + 全部镜头，长剧本必然超时或被截断。
- *   3. **剧本页与幕流程图共用同一个会话**（同一份 `DirectorTurn`）：在这里聊到一半去流程图
- *      页，看到的是同一段对话。`scope` 只让后端多说一句「用户现在在剧本页」。
  *   4. **序号是时间顺序**——Scene / Shot 的 index_no 由后端重排，前端只提交顺序；
  *      Scene 挂的是**地点变体**（雨夜 / 白天）而不是地点本身，所以下拉框按地点分组。
  *
@@ -20,6 +22,7 @@
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
+  Bot,
   ChevronDown,
   ChevronUp,
   Pencil,
@@ -36,8 +39,8 @@ import AppDialog from '@/shared/ui/AppDialog.vue'
 import EmptyState from '@/shared/ui/EmptyState.vue'
 import ErrorPanel from '@/shared/ui/ErrorPanel.vue'
 import FeatureHeader from '@/shared/ui/FeatureHeader.vue'
-import DirectorPanel from '../director/DirectorPanel.vue'
 import { castApi, type AppearanceRow, type Character } from '@/shared/api/cast'
+import { useShellStore } from '@/stores/shell'
 import { useStoryStore } from '@/stores/story'
 import { useWorldStore } from '@/stores/world'
 
@@ -45,30 +48,19 @@ const route = useRoute()
 const router = useRouter()
 const story = useStoryStore()
 const world = useWorldStore()
+const shell = useShellStore()
 
 const pid = computed(() => String(route.params.pid ?? ''))
 
 const newSceneTitle = ref('')
 const newShotTitle = ref('')
 
-/** 右栏两个 Tab：看它做出来的东西 / 改这一场的属性。主栏（左）永远是 AI 编剧。 */
-const rightTab = ref<'result' | 'scene'>('result')
-const RIGHT_TABS = [
-  { key: 'result', label: '幕与镜头' },
-  { key: 'scene', label: '场景属性' },
-] as const
-
 /**
- * 剧本页的快捷句。点一下只是填进输入框——发出去之前用户还能改。
- * 没有「原文」这一栏了，所以第一句是**直接把剧情讲给它**，不是「去读左栏」。
+ * 左右两栏同时看得见：幕与镜头（主）+ 场景属性（右）。
+ *
+ * 以前这两块挤在一个 Tab 组里，因为主栏被 AI 编剧占着。编剧搬到全局停靠栏之后
+ * 这一页腾出了整个宽度——改一场的属性时还能看着它的镜头，就不用来回切了。
  */
-const QUICK_ACTIONS = [
-  '我讲一段剧情，你拆成幕和镜头：',
-  '按现在这几幕往下接一幕',
-  '给第 1 幕补齐镜头 prompt',
-  '按首尾帧规范重写这一幕的 prompt',
-]
-
 type ShotDraft = {
   title: string
   description: string
@@ -276,11 +268,18 @@ async function setVariant(value: string): Promise<void> {
   await story.updateScene(pid.value, sid, { location_variant_id: value || null }).catch(() => {})
 }
 
-/** 提案落库之后：幕、镜头、顺序都可能变了，整页重拉。 */
+/**
+ * 提案落库之后：幕、镜头、顺序都可能变了，整页重拉。
+ *
+ * 触发者是右侧那条全局停靠栏。它不知道此刻开着哪一页，所以只递增
+ * `shell.appliedTick`，由关心的页面自己 watch——这一页就是其中之一。
+ */
 async function onDirectorApplied(): Promise<void> {
   await reload()
   await story.loadBoard(pid.value).catch(() => {})
 }
+
+watch(() => shell.appliedTick, onDirectorApplied)
 
 function fmtDuration(n: number): string {
   return `${Math.round(n * 10) / 10}s`
@@ -293,10 +292,19 @@ function fmtDuration(n: number): string {
 
     <div class="border-line-1 bg-base-1 flex h-row shrink-0 items-center gap-1 border-b px-2">
       <span class="text-fg-4 text-2xs">
-        直接把剧情讲给左边的 AI 编剧——它先看清现状再提一份提案，按「采用」才落库。 右边手动新建
-        Scene 与 Shot 能把同一件事做完，不依赖 LLM。
+        把剧情讲给右侧的 AI 编剧——它先看清现状再提一份提案，按「采用」才落库。 这一页手动新建 Scene
+        与 Shot 能把同一件事做完，不依赖 LLM。
       </span>
-      <AppButton size="sm" variant="ghost" class="ml-auto" :disabled="story.busy" @click="reload()">
+      <AppButton
+        size="sm"
+        class="ml-auto"
+        :variant="shell.directorOpen ? 'primary' : 'default'"
+        title="AI 编剧现在是右侧那条常驻栏：换到分镜板、流程图、资产库都不会关掉，写到一半的话与待审提案都留着（Ctrl I）"
+        @click="shell.toggleDirector()"
+      >
+        <Bot :size="10" />{{ shell.directorOpen ? '收起 AI 编剧' : '叫出 AI 编剧' }}
+      </AppButton>
+      <AppButton size="sm" variant="ghost" :disabled="story.busy" @click="reload()">
         <RefreshCw :size="10" />刷新
       </AppButton>
     </div>
@@ -309,244 +317,213 @@ function fmtDuration(n: number): string {
     />
 
     <div class="flex min-h-0 flex-1 gap-2 p-2">
-      <!--
-        左（主栏）：AI 编剧。对话与那份可逐条审阅的提案都在这一栏里，所以它要宽的那一半——
-        宽度由这里给（组件自己不写死），流程图页的同一个组件是窄侧栏。
-      -->
-      <DirectorPanel
-        class="min-h-0 flex-1"
-        :pid="pid"
-        scope="script"
-        title="AI 编剧"
-        placeholder="讲讲这段戏要什么。Enter 发送，Shift+Enter 换行"
-        empty-body="直接把剧情讲给它，例如「一个女孩在雨夜追一辆车，追到桥头车不见了」。它会先看清现在几幕，再提一份逐条可审的提案——按下采用之前，库里什么都不会变。"
-        :quick-actions="QUICK_ACTIONS"
-        @applied="onDirectorApplied()"
-      />
-
-      <!-- 右：它做出来的东西。两个 Tab 都是「就这一场做事」，共用这一栏 -->
-      <div class="flex w-96 shrink-0 flex-col gap-2">
-        <div class="border-line-1 bg-base-1 flex shrink-0 border">
-          <button
-            v-for="t in RIGHT_TABS"
-            :key="t.key"
-            type="button"
-            class="flex-1 px-2 py-1 text-2xs"
-            :class="rightTab === t.key ? 'bg-accent/10 text-fg-1' : 'text-fg-4 hover:text-fg-2'"
-            @click="rightTab = t.key"
+      <!-- 主栏：已落库的 Scene / Shot。AI 的提案不画在这里——它在右侧停靠栏里逐条审阅 -->
+      <AppPanel title="幕与镜头" class="min-h-0 min-w-0 flex-1">
+        <template #actions>
+          <input
+            v-model="newSceneTitle"
+            placeholder="新场景名"
+            class="border-line-1 bg-base-2 text-fg-1 placeholder:text-fg-4 focus:border-accent/60 h-5 w-32 border px-1.5 text-2xs outline-none"
+            @keyup.enter="createScene()"
+          />
+          <AppButton
+            size="sm"
+            variant="primary"
+            :disabled="story.busy"
+            title="建一场；名字空着就叫「第 N 场」"
+            @click="createScene()"
           >
-            {{ t.label }}
-          </button>
-        </div>
+            <Plus :size="10" />新建
+          </AppButton>
+        </template>
 
-        <!-- 已落库的 Scene / Shot。AI 的提案不画在这里——它在左栏逐条审阅 -->
-        <AppPanel v-if="rightTab === 'result'" title="幕与镜头" class="min-h-0 flex-1">
-          <template #actions>
-            <input
-              v-model="newSceneTitle"
-              placeholder="新场景名"
-              class="border-line-1 bg-base-2 text-fg-1 placeholder:text-fg-4 focus:border-accent/60 h-5 w-32 border px-1.5 text-2xs outline-none"
-              @keyup.enter="createScene()"
-            />
-            <AppButton
-              size="sm"
-              variant="primary"
-              :disabled="story.busy"
-              title="建一场；名字空着就叫「第 N 场」"
-              @click="createScene()"
-            >
-              <Plus :size="10" />新建
-            </AppButton>
-          </template>
-
-          <!-- 已落库 -->
-          <EmptyState
-            v-if="story.scenes.length === 0"
-            title="还没有场景"
-            body="从上面「新建」开始，或者把剧情讲给左栏的 AI 编剧，让它一段一段提案。手动与 AI 出的东西在库里没有区别。"
-          />
-          <div v-else class="space-y-1.5 p-2">
-            <section
-              v-for="scene in story.scenes"
-              :key="scene.id"
-              class="border bg-base-2"
-              :class="scene.id === story.selectedSceneId ? 'border-accent/60' : 'border-line-1'"
-            >
-              <header class="border-line-1 flex items-center gap-1.5 border-b px-2 py-1">
-                <button class="min-w-0 flex-1 text-left" @click="story.selectScene(scene.id)">
-                  <span class="text-fg-1 flex items-center gap-1.5 text-xs">
-                    <span class="text-fg-4 tnum">{{ scene.index_no }}</span>
-                    <span class="truncate">{{ scene.title }}</span>
-                  </span>
-                  <span class="text-fg-4 block truncate text-2xs">
-                    {{ scene.shot_count }} 镜 · {{ fmtDuration(scene.duration_total) }}
-                    <template v-if="scene.location_variant_name">
-                      · {{ scene.location_variant_name }}
-                    </template>
-                  </span>
-                </button>
-                <AppButton size="sm" variant="ghost" title="上移" @click="moveScene(scene.id, -1)">
-                  <ChevronUp :size="10" />
-                </AppButton>
-                <AppButton size="sm" variant="ghost" title="下移" @click="moveScene(scene.id, 1)">
-                  <ChevronDown :size="10" />
-                </AppButton>
-                <AppButton
-                  size="sm"
-                  variant="ghost"
-                  title="删除这一场（连带它的镜头）"
-                  @click="removeScene(scene.id)"
-                >
-                  <Trash2 :size="10" />
-                </AppButton>
-              </header>
-              <ul v-if="scene.id === story.selectedSceneId" class="divide-line-1 divide-y">
-                <li
-                  v-for="card in sceneShots"
-                  :key="card.id"
-                  class="text-2xs"
-                  :class="card.id === story.selectedShotId ? 'bg-accent/5' : ''"
-                >
-                  <div class="flex items-center gap-1.5 px-2 py-1">
-                    <div
-                      class="flex min-w-0 flex-1 items-center gap-1.5 text-left"
-                      :title="`查看 ${card.title} 的摘要`"
-                    >
-                      <span class="text-fg-4 tnum shrink-0">{{ card.index_no }}</span>
-                      <span class="text-fg-1 min-w-0 flex-1 truncate">{{ card.title }}</span>
-                      <AppBadge
-                        v-if="!card.context_ok"
-                        tone="warn"
-                        :title="card.context_issues.join('；')"
-                      >
-                        上下文缺 {{ card.context_issues.length }} 项
-                      </AppBadge>
-                      <span class="text-fg-3 tnum shrink-0">{{ fmtDuration(card.duration) }}</span>
-                    </div>
-                    <AppButton
-                      size="sm"
-                      variant="ghost"
-                      title="编辑 Shot 剧情、角色和 Prompt"
-                      @click="openShotEditor(card.id)"
-                    >
-                      <Pencil :size="10" />编辑
-                    </AppButton>
-                    <AppButton
-                      size="sm"
-                      variant="ghost"
-                      title="删除镜头"
-                      @click="removeShot(card.id)"
-                    >
-                      <Trash2 :size="10" />
-                    </AppButton>
-                  </div>
-                </li>
-                <li class="flex items-center gap-1 px-2 py-1">
-                  <input
-                    v-model="newShotTitle"
-                    placeholder="新镜头名，例如 推近·雨中的手"
-                    class="border-line-1 bg-base-1 text-fg-1 placeholder:text-fg-4 focus:border-accent/60 h-5 min-w-0 flex-1 border px-1.5 text-2xs outline-none"
-                    @keyup.enter="createShot()"
-                  />
-                  <AppButton
-                    size="sm"
-                    :disabled="story.busy || !story.selectedSceneId"
-                    :title="
-                      story.selectedSceneId
-                        ? '在这一场末尾加一个镜头；名字空着就叫「镜头 N」'
-                        : '先在上面选一场——镜头必须挂在某一场下面'
-                    "
-                    @click="createShot()"
-                  >
-                    <Plus :size="10" />加镜头
-                  </AppButton>
-                </li>
-              </ul>
-            </section>
-          </div>
-        </AppPanel>
-
-        <AppPanel v-else title="场景属性" class="min-h-0 flex-1">
-          <EmptyState
-            v-if="!story.selectedScene"
-            title="尚无选中场景"
-            body="选一场之后可以改它的梗概与时间，并把它挂到某个地点变体上——镜头的上下文会顺着这条线取参考图。"
-          />
-          <div v-else class="space-y-3 p-2">
-            <section class="space-y-1">
-              <label class="block">
-                <span class="text-fg-4 text-2xs">场景名</span>
-                <input
-                  :value="story.selectedScene.title"
-                  class="border-line-1 bg-base-2 text-fg-1 focus:border-accent/60 mt-px h-5 w-full border px-1.5 text-2xs outline-none"
-                  @change="saveScene('title', ($event.target as HTMLInputElement).value)"
-                />
-              </label>
-              <label class="block">
-                <span class="text-fg-4 text-2xs">梗概</span>
-                <textarea
-                  :value="story.selectedScene.summary ?? ''"
-                  rows="3"
-                  class="border-line-1 bg-base-2 text-fg-1 focus:border-accent/60 mt-px w-full resize-none border px-1.5 py-1 text-2xs outline-none"
-                  @change="saveScene('summary', ($event.target as HTMLTextAreaElement).value)"
-                />
-              </label>
-              <label class="block">
-                <span class="text-fg-4 text-2xs">时间（白天 / 雨夜 / 黄昏）</span>
-                <input
-                  :value="story.selectedScene.time_of_day ?? ''"
-                  class="border-line-1 bg-base-2 text-fg-1 focus:border-accent/60 mt-px h-5 w-full border px-1.5 text-2xs outline-none"
-                  @change="saveScene('time_of_day', ($event.target as HTMLInputElement).value)"
-                />
-              </label>
-              <label class="block">
-                <span class="text-fg-4 text-2xs">备注</span>
-                <input
-                  :value="story.selectedScene.notes ?? ''"
-                  class="border-line-1 bg-base-2 text-fg-1 focus:border-accent/60 mt-px h-5 w-full border px-1.5 text-2xs outline-none"
-                  @change="saveScene('notes', ($event.target as HTMLInputElement).value)"
-                />
-              </label>
-            </section>
-            <section class="border-line-1 border-t pt-2">
-              <p class="text-fg-3 text-2xs tracking-wide uppercase">地点变体</p>
-              <select
-                :value="story.selectedScene.location_variant_id ?? ''"
-                class="border-line-1 bg-base-2 text-fg-1 focus:border-accent/60 mt-1 h-5 w-full border px-1 text-2xs outline-none"
-                @change="setVariant(($event.target as HTMLSelectElement).value)"
-              >
-                <option value="">（未指定）</option>
-                <optgroup v-for="loc in world.locations" :key="loc.id" :label="loc.name">
-                  <option v-for="v in loc.variants" :key="v.id" :value="v.id">{{ v.name }}</option>
-                </optgroup>
-              </select>
-              <p class="text-fg-4 mt-1 text-2xs">
-                挂的是变体（雨夜 / 白天）而不是地点：同一个院子不同天气是两套参考图。
-                <template v-if="world.locations.length === 0">
-                  现在库里还没有地点，先去「场景与地点」页建一个。
-                </template>
-              </p>
-            </section>
-
-            <section class="border-line-1 border-t pt-2">
-              <p class="text-fg-3 text-2xs tracking-wide uppercase">Shot 编辑</p>
-              <p class="text-fg-4 mt-1 text-2xs">
-                在「幕与镜头」那个 Tab 里点镜头右侧的「编辑」，就能在弹窗里改剧情、角色与
-                Prompt；这一栏只管场景级属性。
-              </p>
+        <!-- 已落库 -->
+        <EmptyState
+          v-if="story.scenes.length === 0"
+          title="还没有场景"
+          body="从上面「新建」开始，或者把剧情讲给右侧的 AI 编剧，让它一段一段提案。手动与 AI 出的东西在库里没有区别。"
+        />
+        <div v-else class="space-y-1.5 p-2">
+          <section
+            v-for="scene in story.scenes"
+            :key="scene.id"
+            class="border bg-base-2"
+            :class="scene.id === story.selectedSceneId ? 'border-accent/60' : 'border-line-1'"
+          >
+            <header class="border-line-1 flex items-center gap-1.5 border-b px-2 py-1">
+              <button class="min-w-0 flex-1 text-left" @click="story.selectScene(scene.id)">
+                <span class="text-fg-1 flex items-center gap-1.5 text-xs">
+                  <span class="text-fg-4 tnum">{{ scene.index_no }}</span>
+                  <span class="truncate">{{ scene.title }}</span>
+                </span>
+                <span class="text-fg-4 block truncate text-2xs">
+                  {{ scene.shot_count }} 镜 · {{ fmtDuration(scene.duration_total) }}
+                  <template v-if="scene.location_variant_name">
+                    · {{ scene.location_variant_name }}
+                  </template>
+                </span>
+              </button>
+              <AppButton size="sm" variant="ghost" title="上移" @click="moveScene(scene.id, -1)">
+                <ChevronUp :size="10" />
+              </AppButton>
+              <AppButton size="sm" variant="ghost" title="下移" @click="moveScene(scene.id, 1)">
+                <ChevronDown :size="10" />
+              </AppButton>
               <AppButton
                 size="sm"
-                class="mt-1.5"
-                :disabled="!story.shot"
-                title="去镜头工作台查看上下文账单、版本和生成参数"
-                @click="router.push({ name: 'shot', params: { pid, sid: story.shot?.id ?? '' } })"
+                variant="ghost"
+                title="删除这一场（连带它的镜头）"
+                @click="removeScene(scene.id)"
               >
-                <Sparkles :size="10" />打开完整 Shot 工作台
+                <Trash2 :size="10" />
               </AppButton>
-            </section>
-          </div>
-        </AppPanel>
-      </div>
+            </header>
+            <ul v-if="scene.id === story.selectedSceneId" class="divide-line-1 divide-y">
+              <li
+                v-for="card in sceneShots"
+                :key="card.id"
+                class="text-2xs"
+                :class="card.id === story.selectedShotId ? 'bg-accent/5' : ''"
+              >
+                <div class="flex items-center gap-1.5 px-2 py-1">
+                  <div
+                    class="flex min-w-0 flex-1 items-center gap-1.5 text-left"
+                    :title="`查看 ${card.title} 的摘要`"
+                  >
+                    <span class="text-fg-4 tnum shrink-0">{{ card.index_no }}</span>
+                    <span class="text-fg-1 min-w-0 flex-1 truncate">{{ card.title }}</span>
+                    <AppBadge
+                      v-if="!card.context_ok"
+                      tone="warn"
+                      :title="card.context_issues.join('；')"
+                    >
+                      上下文缺 {{ card.context_issues.length }} 项
+                    </AppBadge>
+                    <span class="text-fg-3 tnum shrink-0">{{ fmtDuration(card.duration) }}</span>
+                  </div>
+                  <AppButton
+                    size="sm"
+                    variant="ghost"
+                    title="编辑 Shot 剧情、角色和 Prompt"
+                    @click="openShotEditor(card.id)"
+                  >
+                    <Pencil :size="10" />编辑
+                  </AppButton>
+                  <AppButton
+                    size="sm"
+                    variant="ghost"
+                    title="删除镜头"
+                    @click="removeShot(card.id)"
+                  >
+                    <Trash2 :size="10" />
+                  </AppButton>
+                </div>
+              </li>
+              <li class="flex items-center gap-1 px-2 py-1">
+                <input
+                  v-model="newShotTitle"
+                  placeholder="新镜头名，例如 推近·雨中的手"
+                  class="border-line-1 bg-base-1 text-fg-1 placeholder:text-fg-4 focus:border-accent/60 h-5 min-w-0 flex-1 border px-1.5 text-2xs outline-none"
+                  @keyup.enter="createShot()"
+                />
+                <AppButton
+                  size="sm"
+                  :disabled="story.busy || !story.selectedSceneId"
+                  :title="
+                    story.selectedSceneId
+                      ? '在这一场末尾加一个镜头；名字空着就叫「镜头 N」'
+                      : '先在上面选一场——镜头必须挂在某一场下面'
+                  "
+                  @click="createShot()"
+                >
+                  <Plus :size="10" />加镜头
+                </AppButton>
+              </li>
+            </ul>
+          </section>
+        </div>
+      </AppPanel>
+
+      <AppPanel title="场景属性" class="min-h-0 w-80 shrink-0">
+        <EmptyState
+          v-if="!story.selectedScene"
+          title="尚无选中场景"
+          body="选一场之后可以改它的梗概与时间，并把它挂到某个地点变体上——镜头的上下文会顺着这条线取参考图。"
+        />
+        <div v-else class="space-y-3 p-2">
+          <section class="space-y-1">
+            <label class="block">
+              <span class="text-fg-4 text-2xs">场景名</span>
+              <input
+                :value="story.selectedScene.title"
+                class="border-line-1 bg-base-2 text-fg-1 focus:border-accent/60 mt-px h-5 w-full border px-1.5 text-2xs outline-none"
+                @change="saveScene('title', ($event.target as HTMLInputElement).value)"
+              />
+            </label>
+            <label class="block">
+              <span class="text-fg-4 text-2xs">梗概</span>
+              <textarea
+                :value="story.selectedScene.summary ?? ''"
+                rows="3"
+                class="border-line-1 bg-base-2 text-fg-1 focus:border-accent/60 mt-px w-full resize-none border px-1.5 py-1 text-2xs outline-none"
+                @change="saveScene('summary', ($event.target as HTMLTextAreaElement).value)"
+              />
+            </label>
+            <label class="block">
+              <span class="text-fg-4 text-2xs">时间（白天 / 雨夜 / 黄昏）</span>
+              <input
+                :value="story.selectedScene.time_of_day ?? ''"
+                class="border-line-1 bg-base-2 text-fg-1 focus:border-accent/60 mt-px h-5 w-full border px-1.5 text-2xs outline-none"
+                @change="saveScene('time_of_day', ($event.target as HTMLInputElement).value)"
+              />
+            </label>
+            <label class="block">
+              <span class="text-fg-4 text-2xs">备注</span>
+              <input
+                :value="story.selectedScene.notes ?? ''"
+                class="border-line-1 bg-base-2 text-fg-1 focus:border-accent/60 mt-px h-5 w-full border px-1.5 text-2xs outline-none"
+                @change="saveScene('notes', ($event.target as HTMLInputElement).value)"
+              />
+            </label>
+          </section>
+          <section class="border-line-1 border-t pt-2">
+            <p class="text-fg-3 text-2xs tracking-wide uppercase">地点变体</p>
+            <select
+              :value="story.selectedScene.location_variant_id ?? ''"
+              class="border-line-1 bg-base-2 text-fg-1 focus:border-accent/60 mt-1 h-5 w-full border px-1 text-2xs outline-none"
+              @change="setVariant(($event.target as HTMLSelectElement).value)"
+            >
+              <option value="">（未指定）</option>
+              <optgroup v-for="loc in world.locations" :key="loc.id" :label="loc.name">
+                <option v-for="v in loc.variants" :key="v.id" :value="v.id">{{ v.name }}</option>
+              </optgroup>
+            </select>
+            <p class="text-fg-4 mt-1 text-2xs">
+              挂的是变体（雨夜 / 白天）而不是地点：同一个院子不同天气是两套参考图。
+              <template v-if="world.locations.length === 0">
+                现在库里还没有地点，先去「场景与地点」页建一个。
+              </template>
+            </p>
+          </section>
+
+          <section class="border-line-1 border-t pt-2">
+            <p class="text-fg-3 text-2xs tracking-wide uppercase">Shot 编辑</p>
+            <p class="text-fg-4 mt-1 text-2xs">
+              在左边「幕与镜头」里点镜头右侧的「编辑」，就能在弹窗里改剧情、角色与
+              Prompt；这一栏只管场景级属性。
+            </p>
+            <AppButton
+              size="sm"
+              class="mt-1.5"
+              :disabled="!story.shot"
+              title="去镜头工作台查看上下文账单、版本和生成参数"
+              @click="router.push({ name: 'shot', params: { pid, sid: story.shot?.id ?? '' } })"
+            >
+              <Sparkles :size="10" />打开完整 Shot 工作台
+            </AppButton>
+          </section>
+        </div>
+      </AppPanel>
     </div>
 
     <AppDialog

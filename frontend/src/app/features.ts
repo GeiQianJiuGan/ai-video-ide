@@ -253,8 +253,8 @@ const PROJECT_DEFS: FeatureDef[] = [
   {
     id: 'story',
     route: 'story',
-    title: '剧本与 AI 编剧',
-    purpose: '把剧情讲给 AI 编剧，逐条审阅它的提案；手动建 Scene / Shot 同样能走完',
+    title: '剧本与幕镜头',
+    purpose: '管理已落库的幕与镜头；把剧情讲给右侧常驻的 AI 导演，逐条审阅它的提案',
     group: 'story',
     icon: ScrollText,
     milestone: 'M3',
@@ -262,15 +262,15 @@ const PROJECT_DEFS: FeatureDef[] = [
     requires: ['backend'],
     panels: {
       main: {
-        title: 'AI 编剧',
-        body: '一边说一边出字，提案产出即可审：每条给出 before → after，采用之前库里什么都不变',
+        title: '幕与镜头',
+        body: '已落库的 Scene / Shot；建一场、加镜头、改剧情与 Prompt 都不依赖 LLM',
       },
-      right: { title: '幕与镜头', body: '已落库的 Scene / Shot 与这一场的属性、地点变体' },
+      right: { title: '场景属性', body: '这一场的梗概、时间与地点变体（雨夜 / 白天是两套参考图）' },
     },
     actions: [
       {
         label: '讲一段剧情',
-        hint: '需要配置 LLM；它提的每一条都要你按「采用」才落库',
+        hint: '在右侧那条常驻的 AI 导演栏里说；需要配置 LLM，它提的每一条都要你按「采用」才落库',
         primary: true,
       },
       { label: '手动添加 Scene', hint: '不依赖 LLM，完整流程照样可用' },

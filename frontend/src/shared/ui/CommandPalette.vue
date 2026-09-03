@@ -13,12 +13,14 @@ import { Search } from '@lucide/vue'
 import AppBadge from './AppBadge.vue'
 import { APP_NAV_FEATURES, PROJECT_ADVANCED_FEATURES, PROJECT_NAV_FEATURES } from '@/app/features'
 import { useOnboardingStore } from '@/stores/onboarding'
+import { useShellStore } from '@/stores/shell'
 
 const props = defineProps<{ open: boolean; projectId: string | null }>()
 const emit = defineEmits<{ 'update:open': [boolean] }>()
 
 const router = useRouter()
 const wiz = useOnboardingStore()
+const shell = useShellStore()
 const query = ref('')
 const cursor = ref(0)
 
@@ -59,6 +61,22 @@ const entries = computed<Entry[]>(() => {
         badge: '高级',
         go: () => void router.push({ name: f.route, params: { pid } }),
       })),
+      // 下面两条不是页面而是**动作**：一个开右侧停靠栏，一个开导出弹窗。
+      // 它们进面板的理由和「高级路径」一样——不在左栏里，但必须找得到。
+      {
+        key: 'director',
+        title: shell.directorOpen ? 'AI 导演 · 收起右侧那一栏' : 'AI 导演 · 停在右侧',
+        desc: '说一句话，它提一份可逐条审阅的提案；这一栏跟着你换页（Ctrl I）',
+        badge: '可用',
+        go: () => shell.toggleDirector(),
+      },
+      {
+        key: 'export-package',
+        title: '导出当前工程为工程包',
+        desc: '打成一个 .aivspkg，换机器导入。先出账单再动手，密钥与服务地址不进包',
+        badge: '可用',
+        go: () => shell.openExport(),
+      },
     )
   }
   list.push(
