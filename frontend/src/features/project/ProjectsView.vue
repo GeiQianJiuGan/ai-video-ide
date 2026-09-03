@@ -20,7 +20,6 @@ import {
   FolderSearch,
   GraduationCap,
   PackageOpen,
-  PackagePlus,
   RefreshCw,
   Trash2,
 } from '@lucide/vue'
@@ -31,7 +30,6 @@ import AppDialog from '@/shared/ui/AppDialog.vue'
 import EmptyState from '@/shared/ui/EmptyState.vue'
 import ErrorPanel from '@/shared/ui/ErrorPanel.vue'
 import DirPicker from '@/shared/ui/DirPicker.vue'
-import ExportPackageDialog from '@/features/packages/ExportPackageDialog.vue'
 import ImportProjectDialog from '@/features/packages/ImportProjectDialog.vue'
 import type { DurationUnit } from '@/shared/api/projects'
 import { useProjectStore } from '@/stores/project'
@@ -49,12 +47,15 @@ const creating = ref(false)
 const opening = ref(false)
 
 /**
- * 跨机搬迁：导出当前打开的工程成一个 `.aivspkg`，或把一个包还原成新工程。
+ * 跨机搬迁：这一页只留「导入」。
  *
- * 「导出当前工程」要求先打开一个——导出的是**这个**工程的库与素材，
- * 没打开的时候连问谁都不知道，所以按钮 disabled 并在 tooltip 里说原因。
+ * **导出不在这里**——导出的是「某一个工程」的库与素材，而这一页上根本没有打开的工程，
+ * 以前那颗按钮指的是「上次打开的那个」，disabled 与否全靠 `proj.current` 碰运气。
+ * 打开工程之后标题栏、命令面板、概览页三处都有「导出工程」（同一个弹窗，挂在
+ * `WorkbenchLayout` 上），那才是它该在的地方。
+ *
+ * 导入相反：它的产物是一个**还不存在的工程**，只能在这一页做。
  */
-const exporting = ref(false)
 const importing = ref(false)
 
 const form = ref({
@@ -178,24 +179,14 @@ onMounted(() => void proj.refreshRecent())
         </AppButton>
       </div>
 
-      <!-- 跨机搬迁：导出的是「当前打开的那个」工程，没打开时无从下手，所以禁用并说原因 -->
+      <!-- 跨机搬迁：这一页只有「导入」，导出在工程里面（标题栏 / 命令面板 / 概览页） -->
       <div class="border-line-1 mt-3 flex items-center gap-2 border-t pt-2">
         <p class="text-fg-4 min-w-0 flex-1 text-2xs">
-          换机器继续：把工程导出成一个 <code class="text-fg-3">.aivspkg</code> 包，在另一台机器上
-          导入。包里带工程库与素材，密钥与服务地址一律不进包。
+          换机器继续：在另一台机器上把工程导出成一个 <code class="text-fg-3">.aivspkg</code> 包，
+          在这里导入。包里带工程库与素材，密钥与服务地址一律不进包。
+          <span class="text-fg-3">导出</span> 在工程里面做——打开工程后标题栏、命令面板与概览页
+          都有「导出工程」。
         </p>
-        <AppButton
-          size="sm"
-          :disabled="!connected || !proj.current"
-          :title="
-            proj.current
-              ? '导出当前打开的工程'
-              : '先打开一个工程，导出的是那个工程。打开之后标题栏上也有「导出工程」，不必回到这一页'
-          "
-          @click="exporting = true"
-        >
-          <PackagePlus :size="10" />导出当前工程
-        </AppButton>
         <AppButton size="sm" :disabled="!connected" @click="importing = true">
           <PackageOpen :size="10" />导入工程包
         </AppButton>
@@ -430,8 +421,6 @@ onMounted(() => void proj.refreshRecent())
       @pick="picked"
     />
 
-    <!-- 导出要有一个「当前工程」；v-if 让它随工程切换重建，不留上一个工程的账单 -->
-    <ExportPackageDialog v-if="proj.current" v-model:open="exporting" :pid="proj.current.id" />
     <ImportProjectDialog v-model:open="importing" @done="imported" />
   </div>
 </template>

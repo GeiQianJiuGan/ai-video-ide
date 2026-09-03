@@ -8,10 +8,21 @@
  * 路径刻意是 `/package` 而不是 `/export`：`POST /projects/{pid}/export` 早就是时间线的
  * 「导出成片」了（产出 mp4），两者语义完全不同。
  *
+ * **落点的主路是用户那台机器**：界面跑在浏览器 / WebView 里，拿不到也不该猜后端机器上的
+ * 路径。所以导出走 `downloadProject` / `downloadScene`（附件流回来，`saveBlob` 保存），
+ * 导入走 `upload`（把文件传上去落进暂存区，回的形状**和 `inspect` 一样**，于是
+ * `importProject` / `importScene` 一行都不用改）。用户看了账单又取消时调 `discardStaged`
+ * 把那份临时副本删掉——几个 G 的东西攒起来是实打实的磁盘问题。
+ *
+ * 「写进后端机器上某个目录 / 读那台机器上某个路径」那条老路照旧留着（`exportProject` 收
+ * `outDir`、`inspect` 收路径）：桌面版里两台机器其实是同一台，几个 G 的包不必从自己这儿
+ * 传给自己一遍。
+ *
  * `omitted` 是「带不走的东西」，界面**必须原样显示**——跳过不是失败，但不能不说。
  */
 
 import { api } from './client'
+import type { Downloaded } from './client'
 import type { Project } from './projects'
 
 export type PackageScope = 'project' | 'scene'
@@ -131,6 +142,17 @@ export interface ImportProjectResult {
   env_check: EnvCheck
 }
 
+/**
+ * 刚上传上来、还躺在暂存区里的一份包。
+ *
+ * 形状与 `PackageInfo` 完全一样（同一段后端代码出的账单），只多两项：`staged` 认出它是
+ * 临时副本，`name` 是给人看的原文件名。`path` 照旧交给 `importProject` / `importScene`。
+ */
+export interface StagedPackage extends PackageInfo {
+  staged: boolean
+  name: string
+}
+
 /** 一个人物 / 地点 / 道具是复用已有的还是新建一个。 */
 export interface EntityPlanItem {
   kind: 'character' | 'location' | 'prop'
@@ -167,6 +189,14 @@ export interface SceneImportResult {
   env_check: EnvCheck
 }
 
+/** 下载那两个入口的查询串。空值不发，后端两个参数都有默认值。 */
+function query(includeGenerated: boolean, filename: string): string {
+  const parts: string[] = []
+  if (includeGenerated) parts.push('include_generated=true')
+  if (filename.trim()) parts.push(`filename=${encodeURIComponent(filename.trim())}`)
+  return parts.length ? `?${parts.join('&')}` : ''
+}
+
 export const packagesApi = {
   planProject: (pid: string, includeGenerated = false) =>
     api.post<ProjectExportPlan>(`/projects/${pid}/package/plan`, {
@@ -198,8 +228,39 @@ export const packagesApi = {
       include_generated: includeGenerated,
     }),
 
+  /**
+   * 导出并**下载到用户那台机器**（导出的主路）。包写在后端的临时目录，流完就删。
+   *
+   * 走 GET + `api.download`：握手开着时 `<a href>` 带不了 `X-AIVS-Token`，所以必须
+   * fetch 回 Blob 再交给 `saveBlob`。
+   */
+  downloadProject: (pid: string, includeGenerated = false, filename = ''): Promise<Downloaded> =>
+    api.download(`/projects/${pid}/package/download${query(includeGenerated, filename)}`),
+
+  downloadScene: (
+    pid: string,
+    sid: string,
+    includeGenerated = false,
+    filename = '',
+  ): Promise<Downloaded> =>
+    api.download(
+      `/projects/${pid}/scenes/${sid}/package/download${query(includeGenerated, filename)}`,
+    ),
+
   /** 只读清单：这是什么包、带了什么，以及**它要的环境本机齐不齐**。 */
   inspect: (path: string) => api.post<PackageInfo>('/packages/inspect', { path }),
+
+  /**
+   * 把用户电脑上的一个包传上去（导入的主路），回**和 `inspect` 一样**的那份账单。
+   *
+   * 回来的 `path` 是暂存副本的路径，直接交给 `importProject` / `importScene`；
+   * 用户看了账单又取消时调 `discardStaged(path)`。
+   */
+  upload: (file: File) => api.upload<StagedPackage>('/packages/upload', file),
+
+  /** 丢掉一份上传上来的临时副本。只认暂存区里的路径，指到别处后端会拒。 */
+  discardStaged: (path: string) =>
+    api.post<{ ok: boolean; discarded: string }>('/packages/staged/discard', { path }),
 
   /** 还原成一个工程并打开它。**导入的副本会拿到一个新的工程 id。** */
   importProject: (path: string, dir: string) =>

@@ -1,6 +1,6 @@
 """导入导出包：把「一套能跑起来的环境」搬到另一台机器上。
 
-这个文件盯的是八件事，每一条都对应一个「换机之后会哑掉」的老问题：
+这个文件盯的是九件事，每一条都对应一个「换机之后会哑掉」的老问题：
 
   1. **工程往返**：导出 → 换个空目录导入 → 幕与镜头对得上、素材文件真的在磁盘上，
      并且**新工程拿到的是新 id**（`ProjectService._open` 按 pid 索引，同机导入一份副本
@@ -16,18 +16,24 @@
   7. **环境要求清单**：包里带的是「要一份标了这几个入口的图」，本机缺了要在
      `/packages/inspect` 的比对结果里标出来（只报告，不抛）；
   8. **密钥与地址一律不进包**：`settings.json` 不是包成员，清单里不出现
-     `api_key` / `base_url` 字面量。
+     `api_key` / `base_url` 字面量；
+  9. **下载 / 上传那条主路**：导出能当附件流回浏览器（流完删掉临时包，不攒垃圾），
+     上传能落进暂存区并回**和 `inspect` 一样**的清单，导入完 / 用户取消后那份
+     临时副本必须消失——几个 G 的东西攒起来是实打实的磁盘问题。
 """
 
 from __future__ import annotations
 
 import json
+import tempfile
 import zipfile
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 from fastapi.testclient import TestClient
 
+from app.core.config import settings
 from app.generation.providers import presets
 from tests.conftest import error_of, upload_png
 
@@ -544,3 +550,137 @@ def test_no_credentials_or_addresses_are_packed(
     assert not [n for n in names if "cache/" in n or "proxies/" in n or ".runtime" in n]
     for forbidden in ("api_key", "base_url", "10.0.0.9", "token"):
         assert forbidden not in manifest, f"清单里不该出现 {forbidden}"
+
+
+# --- 9. 下载 / 上传那条主路 ---
+
+
+def staged_files() -> list[Path]:
+    """暂存区里现在有几份上传上来的包。"""
+    root = settings.runtime_dir / "uploads"
+    return sorted(root.rglob("*.aivspkg")) if root.is_dir() else []
+
+
+def temp_downloads() -> set[str]:
+    """写包用的临时目录。流完必须被 `BackgroundTask` 带走，不然攒一堆几个 G 的包。"""
+    return {p.name for p in Path(tempfile.gettempdir()).glob("aivs-pkg-dl-*")}
+
+
+def test_downloading_streams_the_package_and_drops_the_temp_copy(
+    client: TestClient, pid: str
+) -> None:
+    make_scene(client, pid, "雨夜旧宅", prompt="雨夜，旧宅门口")
+    before = temp_downloads()
+
+    resp = client.get(f"{API}/projects/{pid}/package/download", params={"filename": "带走"})
+    assert resp.status_code == 200, resp.text
+    assert resp.headers["content-type"] == "application/octet-stream"
+    #: 浏览器靠这个头拿文件名——没有它，下载下来会是一串 uuid。中文名走 RFC 5987 的
+    #: `filename*=utf-8''` 那一支（百分号编码），所以前端解析必须先认这一支再认 `filename=`
+    disposition = resp.headers["content-disposition"]
+    assert disposition.startswith("attachment;")
+    assert "带走.aivspkg" in unquote(disposition)
+    assert resp.content[:2] == b"PK", "回来的应该是那个 zip 本身"
+    assert temp_downloads() == before, "临时目录必须跟着响应一起走"
+
+
+def test_downloading_a_scene_package_works_the_same_way(client: TestClient, pid: str) -> None:
+    sid = make_scene(client, pid, "巷口", prompt="雨停了")
+    before = temp_downloads()
+    resp = client.get(f"{API}/projects/{pid}/scenes/{sid}/package/download")
+    assert resp.status_code == 200, resp.text
+    assert resp.content[:2] == b"PK"
+    assert temp_downloads() == before
+
+
+def test_uploading_a_package_stages_it_and_importing_cleans_it_up(
+    client: TestClient, pid: str, tmp_path: Path
+) -> None:
+    make_scene(client, pid, "雨夜旧宅", prompt="雨夜，旧宅门口")
+    raw = client.get(f"{API}/projects/{pid}/package/download").content
+
+    resp = client.post(
+        f"{API}/packages/upload",
+        files={"file": ("我的片子.aivspkg", raw, "application/octet-stream")},
+    )
+    assert resp.status_code == 200, resp.text
+    info = resp.json()
+    #: 回的形状要和 `inspect` 完全一样，否则前端得为「上传」再写一套账单渲染
+    assert info["staged"] is True
+    assert info["name"] == "我的片子.aivspkg"
+    assert info["scope"] == "project"
+    assert info["counts"]["scenes"] == 1
+    assert info["env_check"]["schema"]["ok"] is True
+    assert len(staged_files()) == 1
+
+    #: 暂存副本的路径照旧交给原来那个导入入口——导入侧一行都不用改
+    resp = client.post(
+        f"{API}/packages/import/project", json={"path": info["path"], "dir": str(tmp_path / "还原")}
+    )
+    assert resp.status_code == 201, resp.text
+    scenes = client.get(f"{API}/projects/{resp.json()['project']['id']}/scenes").json()
+    assert [s["title"] for s in scenes] == ["雨夜旧宅"]
+    assert staged_files() == [], "导入完那份临时副本没人再需要了"
+
+
+def test_uploading_a_scene_package_imports_and_cleans_up(
+    client: TestClient, pid: str, tmp_path: Path
+) -> None:
+    made = build_scene(client, pid)
+    raw = client.get(f"{API}/projects/{pid}/scenes/{made['scene_id']}/package/download").content
+    other = make_project(client, tmp_path, "干净片", "film_up")
+
+    info = client.post(
+        f"{API}/packages/upload", files={"file": ("一幕.aivspkg", raw, "application/octet-stream")}
+    ).json()
+    assert info["scope"] == "scene"
+    resp = client.post(
+        f"{API}/projects/{other['id']}/packages/import/scene", json={"path": info["path"]}
+    )
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["shots"] == len(made["shots"])
+    assert staged_files() == []
+
+
+def test_discarding_only_touches_the_staging_area(
+    client: TestClient, pid: str, tmp_path: Path
+) -> None:
+    raw = client.get(f"{API}/projects/{pid}/package/download").content
+    info = client.post(
+        f"{API}/packages/upload",
+        files={"file": ("看一眼.aivspkg", raw, "application/octet-stream")},
+    ).json()
+    assert len(staged_files()) == 1
+
+    resp = client.post(f"{API}/packages/staged/discard", json={"path": info["path"]})
+    assert resp.status_code == 200, resp.text
+    assert staged_files() == []
+
+    # 磁盘上那份包是用户自己的东西，「取消导入」不该顺手删掉它
+    mine = client.post(
+        f"{API}/projects/{pid}/package", json={"out_dir": out_dir(tmp_path), "filename": "我的"}
+    ).json()["path"]
+    resp = client.post(f"{API}/packages/staged/discard", json={"path": mine})
+    assert resp.status_code == 422, resp.text
+    assert error_of(resp)["code"] == "VALIDATION_ERROR"
+    assert Path(mine).is_file()
+
+
+def test_uploading_something_that_is_not_a_package_leaves_nothing_behind(
+    client: TestClient,
+) -> None:
+    resp = client.post(
+        f"{API}/packages/upload",
+        files={"file": ("伪装.aivspkg", b"not a zip at all", "application/octet-stream")},
+    )
+    assert resp.status_code == 422, resp.text
+    err = error_of(resp)
+    assert err["code"] == "VALIDATION_ERROR"
+    assert staged_files() == [], "看不懂的包不该留在暂存区"
+
+    resp = client.post(
+        f"{API}/packages/upload", files={"file": ("空的.aivspkg", b"", "application/octet-stream")}
+    )
+    assert resp.status_code == 422, resp.text
+    assert error_of(resp)["code"] == "VALIDATION_ERROR"
+    assert staged_files() == []

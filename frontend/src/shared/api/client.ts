@@ -182,8 +182,94 @@ export const api = {
     for (const [k, v] of Object.entries(fields)) if (v) form.append(k, v)
     return request<T>('POST', path, form)
   },
+  /** 下载二进制（见下面的 download）。 */
+  download: downloadRequest,
   /** SSE（见下面的 stream）。 */
   stream: streamRequest,
+}
+
+/** 下载回来的一份文件：字节 + 后端说的那个文件名。 */
+export interface Downloaded {
+  blob: Blob
+  filename: string
+}
+
+/**
+ * GET 一个二进制附件。
+ *
+ * **刻意不用 `<a href>` 直连**：握手开着时后端只在路径里含 `/files/` 的 GET 上接受
+ * `?token=`（`app/main.py::_authorized`），别的入口一律要 `X-AIVS-Token` 头，而
+ * `<a href>` 带不了自定义头。所以走 fetch + Blob，再由 `saveBlob` 交给浏览器保存。
+ *
+ * 失败仍然是 `ApiError`：后端在开始流之前把 `{error}` 抛出来（工程没打开、磁盘满…），
+ * 这里照 `request()` 那套解出来——否则用户只会看到一个下载失败的空文件（静默失败）。
+ */
+async function downloadRequest(path: string): Promise<Downloaded> {
+  const headers: Record<string, string> = {}
+  if (endpoint.token) headers['X-AIVS-Token'] = endpoint.token
+
+  let resp: Response
+  try {
+    resp = await fetch(`${endpoint.baseUrl}${path}`, { method: 'GET', headers })
+  } catch (cause) {
+    throw networkError(cause)
+  }
+
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => '')
+    let wrapped: { error?: ErrorPayload } | null = null
+    try {
+      wrapped = text ? (JSON.parse(text) as { error?: ErrorPayload }) : null
+    } catch {
+      wrapped = null
+    }
+    if (!wrapped?.error) throw offContractError(resp.status, text)
+    throw new ApiError(wrapped.error, resp.status)
+  }
+
+  return {
+    blob: await resp.blob(),
+    filename: filenameOf(resp.headers.get('Content-Disposition') ?? ''),
+  }
+}
+
+/**
+ * 从 `Content-Disposition` 里取文件名。
+ *
+ * 两支都要认：中文名走 RFC 5987 的 `filename*=utf-8''%E5%B8%A6...`（Starlette 对非
+ * ASCII 名字只给这一支），纯 ASCII 名字给的是 `filename="x.aivspkg"`。只认后者的话
+ * 中文工程名会下载成一串百分号编码。
+ */
+function filenameOf(disposition: string): string {
+  const star = /filename\*=(?:utf-8|UTF-8)''([^;]+)/.exec(disposition)?.[1]
+  if (star !== undefined) {
+    try {
+      return decodeURIComponent(star.trim())
+    } catch {
+      return star.trim()
+    }
+  }
+  const plain = /filename="?([^";]+)"?/.exec(disposition)?.[1]
+  return plain === undefined ? '' : plain.trim()
+}
+
+/**
+ * 把一份下载好的字节交给浏览器保存。
+ *
+ * 桌面版里这一步同样有效（WebView 会弹系统保存对话框），所以不需要为 Tauri 再走一条
+ * 路。对象 URL 必须撤销，否则这几个 G 的 Blob 会一直挂在内存里；延迟一下是因为点击
+ * 触发的下载是异步开始的，立刻撤销会把文件抽走。
+ */
+export function saveBlob(blob: Blob, filename: string): void {
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename || 'download'
+  a.style.display = 'none'
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  window.setTimeout(() => URL.revokeObjectURL(url), 60_000)
 }
 
 /** 一条 SSE 事件。`data` 后端保证是一行 JSON。 */

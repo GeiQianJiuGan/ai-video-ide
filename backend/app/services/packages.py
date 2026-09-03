@@ -13,6 +13,11 @@
      打进包里，两台机器的图迟早对不上，而且用户根本不知道自己在用哪一份。
   3. **密钥与地址一律不进包**：`settings.json` 不是包成员，`env` 里只有「要什么」，
      没有「在哪、用什么密钥」。
+  4. **落点有两条路，主路是「下载到用户那台机器」**：界面跑在浏览器（或 Tauri 的 WebView）
+     里，拿不到、也不该去猜后端机器上的路径。所以导出默认写进临时目录再当附件流回去
+     （`download_project` / `download_scene`），导入默认是把文件传上来落进暂存区
+     （`stage`）。「写进后端机器上某个目录 / 读后端机器上某个路径」那条老路照旧留着：
+     桌面版里两台机器其实是同一台，几个 G 的包不必再从自己这儿传给自己一遍。
 
 一个包 = 一个 zip（扩展名 `.aivspkg`），`manifest.json` 里**先认 kind 再解内容**——
 与 `services/projects.py::MANIFEST_KIND` 同一套做法。
@@ -30,7 +35,9 @@ import json
 import shutil
 import sqlite3
 import tempfile
+import time
 import zipfile
+from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
@@ -100,6 +107,14 @@ NEVER_PACK = ("cache", "proxies", ".runtime", "settings.json")
 
 #: 打包 / 解包时每处理这么多文件往控制台报一次进度。
 PROGRESS_EVERY = 20
+
+#: 上传上来的包先落这一层（`runtime_dir` 之下，与 `recent.json` / `settings.json` 同级）。
+#: 浏览器只能给我们一个文件对象，落盘之后才有路径给 `inspect` / 导入那几道门用。
+UPLOAD_SUB = "uploads"
+#: 暂存的包活这么久就当废弃清掉——看了账单又关掉弹窗的那种，攒起来能有好几个 G。
+UPLOAD_TTL_SECONDS = 6 * 3600
+#: 接收上传时的分片大小。整包 `read()` 进内存的话，一个带成片的工程包能把后端顶掉。
+UPLOAD_CHUNK = 1 << 20
 
 # --- 路径与 zip 的公共件 ---
 
@@ -525,6 +540,66 @@ def _safe_stem(name: str) -> str:
     """工程名 → 建议的文件名。中文照留，路径分隔符与盘符一律换掉。"""
     text = "".join("_" if c in '\\/:*?"<>|' else c for c in str(name or "").strip())
     return text.strip(". ") or "package"
+
+
+# --- 上传上来的包：暂存区 ---
+
+
+def _upload_root() -> Path:
+    """暂存区。应用级临时区，**不在任何工程目录里**——它还不属于任何工程。"""
+    root = settings.runtime_dir / UPLOAD_SUB
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _upload_name(filename: str) -> str:
+    """上传上来的文件名只用来给人看，一律压成一个安全的裸文件名。"""
+    raw = str(filename or "").replace("\\", "/").split("/")[-1]
+    stem = _safe_stem(raw)
+    return stem if stem.endswith(PACKAGE_EXT) else f"{stem}{PACKAGE_EXT}"
+
+
+def _is_staged(path: Path) -> bool:
+    """这是一份刚上传上来的临时副本吗（用完就该删的那种）。"""
+    try:
+        return path.resolve().is_relative_to(_upload_root().resolve())
+    except (OSError, ValueError):
+        return False
+
+
+def _drop_staged(path: Path) -> None:
+    """删掉一份暂存副本（连它那层目录）。
+
+    删不掉不算失败：下一次上传时 `_prune_uploads` 还会再来一次，而这时候用户等着的是
+    「导入成功了没有」，不该被一个清理动作绊住。
+    """
+    if not _is_staged(path):
+        return
+    root = _upload_root().resolve()
+    holder = path.parent.resolve()
+    # 每份上传各有一层自己的目录；万一有人把包直接摆在暂存区根下，只删那一个文件
+    if holder == root:
+        with contextlib.suppress(OSError):
+            path.unlink(missing_ok=True)
+        return
+    shutil.rmtree(holder, ignore_errors=True)
+
+
+def _prune_uploads() -> None:
+    """清掉过期的暂存包。看了账单又关掉弹窗时那份副本没人删，所以每次上传前扫一遍。"""
+    cutoff = time.time() - UPLOAD_TTL_SECONDS
+    try:
+        children = list(_upload_root().iterdir())
+    except OSError:
+        return
+    for child in children:
+        with contextlib.suppress(OSError):
+            if child.stat().st_mtime >= cutoff:
+                continue
+            if child.is_dir():
+                shutil.rmtree(child, ignore_errors=True)
+            else:
+                child.unlink(missing_ok=True)
 
 
 def _reid_project(db_path: Path) -> dict[str, Any]:
@@ -1071,6 +1146,42 @@ class PackageService:
             "omitted": plan["omitted"],
         }
 
+    # --- 下载到用户那台机器（两个 scope 共用的落点） ---
+
+    async def download_project(
+        self, pid: str, include_generated: bool = False, filename: str = ""
+    ) -> dict[str, Any]:
+        """导出工程包并**交给浏览器下载**：包写在临时目录，流完就删。
+
+        与 `export_project` 的差别只有落点：那边写进用户在**后端机器**上选的目录，这边
+        根本不问目录——界面跑在浏览器里，拿不到那台机器的路径，用户要的也是「存到我自己
+        这台电脑上」。写包本身完全是同一段代码，所以这里只负责摆一个临时落点。
+
+        回的字典里多一个 `temp_dir`：**调用方（`api/packages.py`）流完必须删掉它**。
+        """
+        return await self._to_temp(
+            lambda out_dir: self.export_project(pid, out_dir, filename, include_generated)
+        )
+
+    async def download_scene(
+        self, pid: str, sid: str, include_generated: bool = False, filename: str = ""
+    ) -> dict[str, Any]:
+        """导出场景包并交给浏览器下载。规矩同 `download_project`。"""
+        return await self._to_temp(
+            lambda out_dir: self.export_scene(pid, sid, out_dir, filename, include_generated)
+        )
+
+    @staticmethod
+    async def _to_temp(run: Callable[[str], Awaitable[dict[str, Any]]]) -> dict[str, Any]:
+        """在一个临时目录里跑一次导出。**失败要把临时目录带走**，不然攒一堆半截包。"""
+        tmp = Path(tempfile.mkdtemp(prefix="aivs-pkg-dl-"))
+        try:
+            out = await run(tmp.as_posix())
+        except BaseException:
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise
+        return {**out, "temp_dir": tmp.as_posix()}
+
     # --- 看一眼包里是什么（不解包） ---
 
     async def inspect(self, path: str) -> dict[str, Any]:
@@ -1099,6 +1210,65 @@ class PackageService:
             "env": env,
             "env_check": _env_check(manifest),
         }
+
+    # --- 从用户那台机器传一个包上来（导入的主入口） ---
+
+    async def stage(self, filename: str, chunks: AsyncIterator[bytes]) -> dict[str, Any]:
+        """接收上传的包，落进暂存区，然后照 `inspect` 出**同一份**清单。
+
+        浏览器能给的只有一个文件对象，没有后端机器上的路径，所以先落盘再走原来那几道门
+        ——回的 `path` 就是暂存副本的路径，导入那两个入口原样收它，一行都不用改。
+
+        三条：
+          · **分片写**：一个带成片的工程包动辄几个 G，整包读进内存会把后端顶掉；
+          · **看不懂就地删**：不是包 / 空文件时连暂存副本一起带走，不留垃圾；
+          · **导入完（或用户取消）也要删**——见 `_drop_staged` 与 `discard_staged`。
+        """
+        _prune_uploads()
+        holder = _upload_root() / new_id("package")
+        target = holder / _upload_name(filename)
+        written = 0
+        try:
+            holder.mkdir(parents=True, exist_ok=True)
+            with target.open("wb") as out:
+                async for chunk in chunks:
+                    if chunk:
+                        out.write(chunk)
+                        written += len(chunk)
+            if written == 0:
+                raise AppError(
+                    ErrorCode.VALIDATION_ERROR,
+                    "上传的包是空文件",
+                    f"{filename or '(未命名)'} 一个字节都没有。",
+                    ["确认选中的是导出的 .aivspkg 文件", "重新导出一份包再上传"],
+                )
+            info = await self.inspect(target.as_posix())
+        except OSError as exc:
+            shutil.rmtree(holder, ignore_errors=True)
+            raise _disk_error(target, exc, "接收上传的包") from exc
+        except BaseException:
+            shutil.rmtree(holder, ignore_errors=True)
+            raise
+        log.info("package.staged", path=target.as_posix(), bytes=written)
+        return {**info, "staged": True, "name": target.name}
+
+    async def discard_staged(self, path: str) -> dict[str, Any]:
+        """丢掉一份暂存副本（用户看了账单又取消）。
+
+        **只认暂存区里的路径**：这个入口会删文件，指到别处一律拒绝——磁盘上那份包是
+        用户自己的东西，不该被一个「取消导入」顺手删掉。
+        """
+        target = _resolve_pkg(path)
+        if not _is_staged(target):
+            raise AppError(
+                ErrorCode.VALIDATION_ERROR,
+                "只能丢弃上传上来的临时副本",
+                f"{target} 不在暂存区里。",
+                ["这个入口只用来清理上传的包", "磁盘上的包请自己删"],
+                {"path": target.as_posix()},
+            )
+        _drop_staged(target)
+        return {"ok": True, "discarded": target.as_posix()}
 
     # --- 工程包：导入 ---
 
@@ -1161,6 +1331,8 @@ class PackageService:
         row = await asyncio.to_thread(_reid_project, db_path)
         _write_json(target / MANIFEST_NAME, _project_manifest(row, stored))
         proj = await projects.open(target.as_posix())
+        # 包已经还原成一个目录了，上传上来的那份临时副本没人再需要（几个 G 的东西）
+        _drop_staged(src)
         log.info(
             "package.imported",
             scope=SCOPE_PROJECT,
@@ -1639,6 +1811,8 @@ class PackageService:
                 )
                 adopted += 1
 
+        # 落库全部完成，上传上来的那份临时副本可以走了（走成 `_drop_staged` 的空操作也无所谓）
+        _drop_staged(src)
         log.info(
             "package.scene_imported",
             project=pid,

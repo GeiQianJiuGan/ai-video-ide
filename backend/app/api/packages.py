@@ -9,16 +9,32 @@
 
 `/packages/inspect` 与工程导入挂在顶层（不带 pid）：导入的目标是一个**还不存在的工程**，
 此时没有任何 pid 可传。错误码全部复用已有的，**不新增 ErrorCode**。
+
+**落点有两条路，主路是用户那台机器**（界面跑在浏览器 / WebView 里，拿不到也不该猜后端
+机器上的路径）：
+
+  · 下载 `GET …/package/download` —— 包写在临时目录，当附件流回去，流完就删；
+  · 上传 `POST /packages/upload` —— multipart 收一个文件落进暂存区，回的形状**与
+    `inspect` 完全一样**（多 `staged` / `name`），于是导入那两个入口一行不用改；
+    用户看了账单又取消时走 `POST /packages/staged/discard` 把副本删掉。
+
+「写进后端机器上某个目录 / 读后端机器上某个路径」那条老路照旧留着（`POST …/package`、
+`inspect` 收路径）：桌面版里两台机器其实是同一台，几个 G 的包不必从自己这儿传给自己一遍。
+下载走 GET 是刻意的——只有 GET 能被 `<a download>` 之外的东西复用，且它本身只读。
 """
 
 from __future__ import annotations
 
+import shutil
+from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter
+from fastapi import APIRouter, File, UploadFile
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
+from starlette.background import BackgroundTask
 
-from app.services.packages import packages
+from app.services.packages import UPLOAD_CHUNK, packages
 
 router = APIRouter(tags=["packages"])
 
@@ -86,6 +102,38 @@ async def export_scene(pid: str, sid: str, body: ExportBody) -> dict[str, Any]:
     )
 
 
+# --- 下载到用户那台机器（导出的主路） ---
+
+
+#: 刻意是 GET：浏览器那侧要的是一个「文件下载」，而它是只读的——写包写在临时目录，
+#: 工程本身一个字节都不动。`temp_dir` 由 `BackgroundTask` 在响应发完之后删掉：提前删会
+#: 把正在流的文件抽走，不删就攒一堆几个 G 的临时包。
+def _attachment(out: dict[str, Any]) -> FileResponse:
+    target = Path(str(out["path"]))
+    return FileResponse(
+        target,
+        media_type="application/octet-stream",
+        filename=target.name,
+        background=BackgroundTask(shutil.rmtree, out["temp_dir"], ignore_errors=True),
+    )
+
+
+@router.get("/projects/{pid}/package/download")
+async def download_project(
+    pid: str, include_generated: bool = False, filename: str = ""
+) -> FileResponse:
+    """导出工程包并直接下载。与 `POST …/package` 唯一的差别是落点（临时目录 → 附件流）。"""
+    return _attachment(await packages.download_project(pid, include_generated, filename))
+
+
+@router.get("/projects/{pid}/scenes/{sid}/package/download")
+async def download_scene(
+    pid: str, sid: str, include_generated: bool = False, filename: str = ""
+) -> FileResponse:
+    """导出场景包并直接下载。"""
+    return _attachment(await packages.download_scene(pid, sid, include_generated, filename))
+
+
 # --- 导入 ---
 
 
@@ -94,6 +142,33 @@ async def inspect(body: PathBody) -> dict[str, Any]:
     """只读清单，不解包：这是什么包、带了什么，以及**它要的环境本机齐不齐**
     （哪份预设缺了、provider 配没配、schema 吃不吃得下）。缺什么只在比对结果里标，不抛。"""
     return await packages.inspect(body.path)
+
+
+@router.post("/packages/upload")
+async def upload(file: UploadFile = File(...)) -> dict[str, Any]:
+    """从用户那台机器传一个包上来，落进暂存区，回**和 `inspect` 一样**的那份清单。
+
+    多回两项：`staged=true` 与 `name`（人看的文件名）。`path` 是暂存副本的路径，
+    照旧交给 `/packages/import/project` 或 `…/import/scene` ——导入成功后由服务层删掉，
+    用户中途取消时前端调 `/packages/staged/discard`。
+
+    **分片读**：一个带成片的工程包动辄几个 G，`await file.read()` 会把它整个读进内存。
+    """
+
+    async def chunks():  # noqa: ANN202
+        while True:
+            chunk = await file.read(UPLOAD_CHUNK)
+            if not chunk:
+                break
+            yield chunk
+
+    return await packages.stage(file.filename or "", chunks())
+
+
+@router.post("/packages/staged/discard")
+async def discard_staged(body: PathBody) -> dict[str, Any]:
+    """丢掉一份上传上来的临时副本。**只认暂存区里的路径**，指到别处一律 422。"""
+    return await packages.discard_staged(body.path)
 
 
 @router.post("/packages/import/project", status_code=201)

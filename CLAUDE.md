@@ -204,8 +204,21 @@ token}` 写进 `.runtime/endpoint.json` → 壳校验后用 `window.__AIVS_ENDPO
 两种粒度——整个工程（`project.db` 的 `backup()` 快照 + `assets/`，勾了才带 `generations/`）
 与单独一幕（行级快照，能导进**任意**已打开的工程）。它照 `services/adopt.py` 的规矩办：
 **先账单再动手**，落库全部转调已有写方法，不新增写路径、不加迁移、不加列
-（出处只进 `Asset.meta_json`，`ids.PREFIX` 只多一项 `"package": "pkg"`）。五条不许绕的：
+（出处只进 `Asset.meta_json`，`ids.PREFIX` 只多一项 `"package": "pkg"`）。六条不许绕的：
 
+- **落点与来源的主路是用户那台机器，不是后端机器上的一个路径**：界面跑在浏览器 / WebView 里，
+  拿不到也不该猜那台机器上的路径。导出走 `GET …/package/download`（包写进后端临时目录 →
+  当附件流回来 → 流完 `BackgroundTask` 删掉临时目录），前端必须 **fetch 回 Blob 再
+  `saveBlob`**——握手开着时 `<a href>` 带不了 `X-AIVS-Token`（`?token=` 只在路径含 `/files/`
+  的 GET 上接受），文件名以 `Content-Disposition` 为准（非 ASCII 只有 RFC 5987 那一支）。
+  导入走 `POST /packages/upload`（分片落进 `<runtime_dir>/uploads/<pkg_id>/`），回的形状
+  **和 `inspect` 完全一样**、只多 `staged` / `name`，所以两个导入入口一行都不用改。
+  暂存副本**三层收拾**：导入成功后服务层删、用户取消 / 关窗 / 换包时前端调
+  `/packages/staged/discard`（**只认暂存区里的路径**，指到别处一律拒绝——磁盘上那份包是用户
+  自己的东西），都漏了还有每次上传前按 TTL 扫一遍。「写进后端机器上某个目录 / 读那台机器上
+  某个路径」那条老路**降级成第二条、但不许删**：桌面版里两台机器就是同一台，几个 G 的包不必
+  自己传给自己一遍。**导出的入口只在工程里**（标题栏 / 命令面板 / 概览页 / 幕检查器），
+  项目列表页只有导入——那一页上根本没有打开的工程。
 - **包里不带预设图，只带一份环境要求清单**（`manifest.env`）。图属于用户那台 ComfyUI，
   本工具从来不维护它（见上面的 provider 适配层那段），带走一份只会在目标机器上和那边真正
   装了什么打架。清单里 `presets[].markers` 是从导出机上那份预设数出来的**入口标题**，
