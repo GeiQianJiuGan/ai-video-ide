@@ -72,13 +72,16 @@ def _require_kind(kind: str) -> str:
 
 
 def preset_of(kind: str, override: str | None = None) -> str:
-    """这次用哪份图。顺序 **显式指定 → 二次处理专用预设 → 默认预设**。
+    """这次用哪份图。顺序 **显式指定 → 二次处理专用预设 → 出画面那份默认**。
 
     刻意允许退到默认预设：很多人就一份图，标了 `AIVS_SOURCE_VIDEO` 也能出画面。
+    最后那一级走 `presets.app_default("r2v")`（按角色那一格 → 共用那一格）而不是直接读
+    `settings.video_preset`：只按角色配了默认、共用那格留空的机器上，二次处理不该因此
+    变成「一份图都没有」。
     一份都没有时不在这里报错——`plan()` 会把它列成 `skipped` 并给出四要素错误，
     真入队时适配器也会再挡一次（`comfy_preset.submit` 的 `AIVS_SOURCE_VIDEO` 分支）。
     """
-    return str(override or settings.refine_preset or settings.video_preset or "")
+    return str(override or settings.refine_preset or presets.app_default("r2v") or "")
 
 
 def preset_ready(name: str) -> tuple[bool, str]:
@@ -171,7 +174,7 @@ class RefineService:
         _require_kind(kind)
         db = db_of(pid)
         #: **先解析这个工程走哪条路**，再决定「用什么处理」这句话怎么说。以前这里一律去数
-        #: 预设（`preset_of` → `settings.refine_preset` → `settings.video_preset`），于是走
+        #: 预设（`preset_of` → `settings.refine_preset` → 出画面那份默认），于是走
         #: 「通用 REST API」的工程被拦在「还没有选预设」上——那条路根本没有预设这回事。
         #: 与出画面那条链同一份口径（`services/route.py`），也同一个 `source`。
         resolved = await resolve_route(pid, kind)

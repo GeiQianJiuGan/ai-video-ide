@@ -100,6 +100,41 @@ def _submit_error(exc: AppError, name: str, removed: list[dict[str, str]]) -> Ap
     return detached_submit_error(exc, f"预设 {name}", removed)
 
 
+def _role_of(mode: str) -> str:
+    """这一次要的是哪一份**应用级默认预设**（`presets.app_default` 的两级里那一级）。
+
+    适配层只认 `VideoRequest.mode`（`i2v` / `flf` / `refine`）——「能力」是路由层的词汇，
+    这里不认识它（硬约束 1 的方向：业务层的名字不下沉，路由层的名字也不上浮）。
+    `refine` 的那份图由 `services/refine.py::preset_of` 解析好放进 `extra["preset"]`，
+    所以这里只需分出首尾帧与其余两种。
+    """
+    return "flf" if mode == "flf" else "r2v"
+
+
+def _preset_note(role: str, name: str, row: dict[str, Any] | None) -> str:
+    """一句「这一格默认能不能用」。**不可用要点名缺哪个入口**，只说「不可用」等于让用户猜。
+
+    判定一律读 `presets.listing()` 里那几个 `*_ready`（与设置页那份预设清单、
+    `route.preset_ready()` 同一份），这里只负责把它说成一句话。
+    """
+    label = presets.ROLE_LABEL.get(role, role)
+    if row is None:
+        return f"{label} {name} 读不到"
+    if row.get(f"{role}_ready"):
+        return f"{label} {name} 就绪"
+    #: 整份图连「至少能做一件事」都不成立（文件坏了、一个入口都填不进去）时，`listing()` 已经把
+    #: 原因写成 `impact` 了——这时按「缺哪个标题」去说会指错方向：真正的问题是这份图读不出来，
+    #: 而不是少标了一个 `AIVS_PROMPT`，照那句去改的人会在一份坏文件上白折腾一轮。
+    if not row.get("ready") and row.get("impact"):
+        return f"{label} {name} 不可用：{row['impact']}"
+    missing = [m for m in presets.ROLE_REQUIRED[role] if m not in (row.get("found") or [])]
+    if missing:
+        return f"{label} {name} 缺 {'、'.join(missing)}"
+    if row.get("declares_image"):
+        return f"{label} {name} 标了 {presets.DECLARE_IMAGE}（那是出图那份图）"
+    return f"{label} {name} 不可用"
+
+
 class ComfyPresetProvider(ComfyTasks):
     """按 `AIVS_*` 标题填参数。上传 / 轮询 / 取回那半条链在 `ComfyTasks` 里。"""
 
@@ -110,12 +145,13 @@ class ComfyPresetProvider(ComfyTasks):
     def ref_capacity(self) -> base.RefCapacity:
         """能收几个参考素材 = 默认预设里标了几个 `AIVS_REF_*` / `_VIDEO_` / `_AUDIO_`。
 
-        看的是**设置里的默认预设**，也就是「按当前应用级设置会怎样」这一问的答案。
-        **工程 + 能力**那一问（这个工程的首尾帧镜头到底数哪一份预设）由
+        看的是**应用级那份默认预设**（`presets.app_default`：按角色那一格 → 共用那一格），
+        也就是「按当前应用级设置会怎样」这一问的答案；这里没有能力上下文，所以按普通镜头
+        那个角色（`r2v`）数——**工程 + 能力**那一问（这个工程的首尾帧镜头到底数哪一份预设）由
         `services/route.py::capacity()` 回答：它先把路由与预设解析出来，再拿解析后的那个
         名字问 `presets.capacity_of()`——也就是下面这同一段话，两处不各写一遍。
         """
-        return presets.capacity_of(str(settings.video_preset or ""))
+        return presets.capacity_of(presets.app_default("r2v") or "")
 
     async def probe(self) -> dict[str, Any]:
         ping = await self._client.ping()
@@ -131,41 +167,66 @@ class ComfyPresetProvider(ComfyTasks):
                 ],
             )
         rows = presets.listing()
-        chosen = settings.video_preset
-        current = next((r for r in rows if r["name"] == chosen), None)
-        if chosen and current is None:
+        by_name = {str(row["name"]): row for row in rows}
+        # **应用级默认有两格**（R2V / 首尾帧，各自留空退回共用那份），所以「配没配好」这一问
+        # 也要按角色答。以前这里只读共用那一格，于是只按角色配了默认、共用那格留空的机器上，
+        # 「测试连接」会说「还没有选默认预设」——事实是配了，那是谎报（硬约束 4）。
+        chosen = {role: presets.app_default(role) for role in presets.PRESET_ROLES}
+        gone = sorted({name for name in chosen.values() if name and name not in by_name})
+        if gone:
             raise AppError(
                 ErrorCode.NOT_FOUND,
                 "选中的预设不存在",
-                f"设置里的默认预设是 {chosen}，但预设目录里没有它。",
-                ["在设置页重新上传这份预设", "或改选一个已有的预设"],
-                {"available": [r["name"] for r in rows]},
+                f"应用级默认预设里指到了 {'、'.join(gone)}，但预设目录里没有它。",
+                [
+                    "在「预设 Workflow」页重新上传这份预设",
+                    "或在那一页的另一份图上按「设为 R2V 默认」/「设为首尾帧默认」改选一份",
+                ],
+                {"available": [str(row["name"]) for row in rows], "missing": gone},
             )
+        r2v, flf = chosen["r2v"], chosen["flf"]
+        r2v_row, flf_row = by_name.get(r2v or ""), by_name.get(flf or "")
+        notes = [
+            _preset_note(role, name, by_name.get(name)) for role, name in chosen.items() if name
+        ]
+        # 两个角色跟的是同一份图（只有一份图的人是这一种）且两件事都能干：一句话说完，
+        # 不必把同一个名字念两遍。
+        if r2v and r2v == flf and r2v_row and r2v_row.get("r2v_ready") and r2v_row.get("flf_ready"):
+            notes = [f"预设 {r2v} 就绪（R2V / 首尾帧共用这一份）"]
         return {
             "ok": True,
             "target": self._client.base_url,
-            "preset": chosen or None,
-            "preset_ready": bool(current and current.get("ready")),
+            #: `preset` / `preset_ready` 说的是**普通镜头那一格**（绝大多数任务走它），
+            #: 首尾帧那一格另外给——两格折成一个 bool 的话，「首尾帧那份图不能用」就没了。
+            "preset": r2v or None,
+            "preset_ready": bool(r2v_row and r2v_row.get("r2v_ready")),
+            "preset_flf": flf or None,
+            "preset_flf_ready": bool(flf_row and flf_row.get("flf_ready")),
             "preset_count": len(rows),
             "detail": (
-                f"ComfyUI 已连接 · 预设 {chosen} 就绪"
-                if current and current.get("ready")
-                else f"ComfyUI 已连接 · 共 {len(rows)} 份预设"
-                + ("" if chosen else "，还没有选默认预设——生成时必须指定一份")
+                f"ComfyUI 已连接 · {' · '.join(notes)}"
+                if notes
+                else f"ComfyUI 已连接 · 共 {len(rows)} 份预设，还没有选默认预设——生成时必须指定一份"
             ),
         }
 
     # --- 生成 ---
 
     async def submit(self, req: VideoRequest, *, client_id: str) -> str:
-        name = str(req.extra.get("preset") or settings.video_preset or "")
+        # 正常路径上这个名字是**入队时解析并冻结**的那一份（`params["preset"]` →
+        # `extra["preset"]`，见 `services/route.py::preset_name_of`）。兜底那一级也走
+        # `presets.app_default(角色)` 而不是共用那一格：只按角色配了默认的机器上，
+        # 直接调适配层（测试 / 老任务）不该在「配了但共用格是空的」时报「还没有选预设」。
+        role = _role_of(req.mode)
+        name = str(req.extra.get("preset") or presets.app_default(role) or "")
         if not name:
             raise AppError(
                 ErrorCode.MISSING_CAPABILITY,
                 "还没有选生成预设",
                 "comfy_preset 方式需要一份模型端的图（API 格式）作为预设。",
                 [
-                    "在设置页上传一份预设并设为默认",
+                    f"到「预设 Workflow」页上传一份图并按「{presets.ROLE_ACTION[role]}」"
+                    "（也可以按「设为共用默认」，两个角色都跟着它）",
                     "或把调用方式改成 http_api",
                 ],
             )

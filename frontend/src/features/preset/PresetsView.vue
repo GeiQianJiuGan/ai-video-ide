@@ -7,6 +7,9 @@ import AppBadge from '@/shared/ui/AppBadge.vue'
 import StatusDot from '@/shared/ui/StatusDot.vue'
 import ErrorPanel from '@/shared/ui/ErrorPanel.vue'
 import FeatureHeader from '@/shared/ui/FeatureHeader.vue'
+import PresetDefaultBadges from '@/shared/ui/PresetDefaultBadges.vue'
+import PresetDefaultButtons from '@/shared/ui/PresetDefaultButtons.vue'
+import { IMAGE_PRESET_INERT } from '@/shared/lib/presets'
 import { useSettingsStore } from '@/stores/settings'
 
 const cfg = useSettingsStore()
@@ -27,21 +30,31 @@ onMounted(() => void cfg.load())
  * **前端不照节点标题再算一遍**：标题分不出 T2I 与 R2V，这件事只有声明说得清。
  * 同一个原因，`t2i_ready` / `r2v_ready` / `flf_ready` 三个徽标可以无条件画——
  * 声明过的图在后两个上必为假，没声明的图在第一个上必为假。
+ *
+ * **应用级默认也在这一页设**（`column` 直接就是分栏的 key，两颗共用件照它挑角色）：
+ * 出画面那一栏有 R2V / 首尾帧 / 共用三种，出图那一栏有出图默认。以前这几颗按钮只在设置页
+ * 有，而且只有共用那一格与出图那一格——于是「工程没绑就跟随设置页」在首尾帧上必然落到一份
+ * 不能用的图上，用户只能回到每个工程里各绑一次。
  */
 const groups = computed(() => {
   const items = cfg.presets?.items ?? []
+  // 出图那条链的调用方式不认预设时，这一栏的「设为出图默认」照旧能按（藏起来就等于没有入口），
+  // 但「暂时用不上」这句话要摆在明面上，而不是只藏在 tooltip 里。
+  const inert = cfg.draftImageProtocol?.wants_preset ? '' : IMAGE_PRESET_INERT
   return [
     {
       key: 'video',
       title: '出画面（R2V / 补转场）',
-      note: '没标 AIVS_IMAGE 的图都在这一栏：镜头生成、补转场、二次处理、出声音从这里选。',
+      note: '没标 AIVS_IMAGE 的图都在这一栏：镜头生成、补转场、二次处理、出声音从这里选。这里设的三种默认就是「工程没有单独绑预设时按哪一份出」——按角色那两项留空则退回共用那份。',
+      caveat: '',
       empty: '这一栏还没有图。出画面那份图不要标 AIVS_IMAGE。',
       rows: items.filter((row) => !row.declares_image),
     },
     {
       key: 'image',
       title: '出图（T2I / 图生图）',
-      note: '标了 AIVS_IMAGE 的图在这一栏：角色四视图 / 地点参考图 / 道具图 / 首末帧候选走它，设置页的「设为出图默认」只认这一栏。',
+      note: '标了 AIVS_IMAGE 的图在这一栏：角色四视图 / 地点参考图 / 道具图 / 首末帧候选走它。',
+      caveat: inert,
       empty:
         '还没有出图那份图，所以角色四视图 / 地点参考图只能手动上传。把出图那份 T2I 图里任意一个节点（例如 SaveImage）的标题改成 AIVS_IMAGE，用「Save (API Format)」导出后上传到这里。',
       rows: items.filter((row) => row.declares_image),
@@ -111,12 +124,19 @@ async function save(): Promise<void> {
               <span class="text-fg-4">· {{ group.rows.length }} 份</span>
             </div>
             <p class="text-fg-4 text-2xs">{{ group.note }}</p>
+            <!--
+              出图协议不认预设时那句话：藏在 tooltip 里等于没说（硬约束 4）。
+              用告警色而不是失败色——**指了也没坏**，只是这条链现在换了调用方式所以暂时用不上。
+            -->
+            <p v-if="group.caveat" class="text-st-review text-2xs">{{ group.caveat }}</p>
           </div>
           <ul class="divide-line-1 divide-y">
             <li v-for="row in group.rows" :key="row.name" class="px-3 py-2">
-              <div class="flex items-center gap-2">
+              <div class="flex flex-wrap items-center gap-2">
                 <StatusDot :status="row.ready ? 'completed' : 'failed'" />
                 <span class="text-fg-1 text-xs">{{ row.name }}</span>
+                <!-- 「这一份现在是哪几种默认」：只画这一栏的那几种（video 三种 / image 一种）。 -->
+                <PresetDefaultBadges :row="row" :column="group.key" />
                 <AppBadge v-if="row.ready" :tone="row.ref_slots ? 'neutral' : 'warn'">
                   参考图 {{ row.ref_slots }} 槽
                 </AppBadge>
@@ -143,6 +163,11 @@ async function save(): Promise<void> {
                 <span class="text-fg-4 min-w-0 flex-1 truncate text-2xs">
                   {{ row.ready ? row.ref_hint : row.impact }}
                 </span>
+                <!--
+                  「设为某种默认」就在这一行末尾：以前只在设置页有，于是这一页认得出哪份是出图那份，
+                  却没有任何入口把它设成默认（用户报的就是这件事）。`column` 决定画哪几颗。
+                -->
+                <PresetDefaultButtons :row="row" :column="group.key" />
                 <AppButton
                   size="sm"
                   variant="danger"
@@ -160,8 +185,8 @@ async function save(): Promise<void> {
         </section>
       </template>
       <p v-else class="text-fg-4 px-3 py-3 text-2xs">
-        还没有预设 Workflow。请从 ComfyUI 导出 API 格式 json 后导入——出画面那份图与出图那份
-        T2I 图各存一份，后者要给图里任意一个节点加 AIVS_IMAGE 标题。
+        还没有预设 Workflow。请从 ComfyUI 导出 API 格式 json 后导入——出画面那份图与出图那份 T2I
+        图各存一份，后者要给图里任意一个节点加 AIVS_IMAGE 标题。
       </p>
       <div class="border-line-1 space-y-1 border-t p-2">
         <input

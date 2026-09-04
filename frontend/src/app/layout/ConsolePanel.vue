@@ -12,8 +12,10 @@
  *      实时通道就断了；控制台常驻，订阅挂在这里，收起来也照样在收事件——
  *      状态条上的计数才可能是真的。切 / 关工程时 `queue.reset()`，绝不把上一个
  *      工程的任务列表留在界面上。
- *   2. **任务框按「要不要管」排序**，不按入队顺序：正在跑 → 排队 / 等上游 → 失败
- *      → 其余。控制台只有两百来像素高，最该看见的必须在最上面。
+ *   2. **任务框按入队时间倒序，位置不随状态变**（口径在 `stores/queue.ts::rows`）：
+ *      跑完的、失败的都停在原地，只是状态点变色。按「要不要管」重排会让刚失败的那条
+ *      从眼前挪走，于是每次找报错都得重新扫一遍列表——队列页那侧同一个道理，
+ *      后端 `list_jobs` 的排序里也没有状态这一项。
  *   3. **失败不静默**：`queue.lastError` 用 `ErrorPanel` 显示四要素；每一行失败任务
  *      旁边就是「重试」——沿用原参数重跑，一条旧版本都不会被覆盖（硬约束 3）。
  *   4. **日志框最新在最上面**。事件是环形缓冲（最近 200 条）且**可丢失**，
@@ -169,14 +171,20 @@ function batchElapsed(members: Job[]): string {
   return sec < 60 ? `${sec}s` : `${Math.floor(sec / 60)}m${sec % 60}s`
 }
 
-/** 提到队首：比当前最小 priority 再小 1（后端按 priority 升序取）。 */
+/**
+ * 提到队首：比当前最大 priority 再大 1。
+ *
+ * **后端按 priority 降序取**（`_claim` 里的 `-j.priority`，默认值 100），所以「队首」
+ * 是数字最大的那一条。这里以前算的是 `min - 1`，点下去反而把它排到了所有任务后面。
+ */
 async function bump(job: Job): Promise<void> {
-  const min = Math.min(...queue.jobs.map((j) => j.priority), job.priority)
-  await queue.setPriority(pid.value, job.id, min - 1)
+  const max = Math.max(...queue.jobs.map((j) => j.priority), job.priority)
+  await queue.setPriority(pid.value, job.id, max + 1)
 }
 
-function goShot(shotId: string): void {
-  if (!pid.value) return
+/** 跳到那个镜头。**出图任务没有镜头**（`shot_id` 是空的），此时这一下什么都不做。 */
+function goShot(shotId: string | null): void {
+  if (!pid.value || !shotId) return
   void router.push({ name: 'shot', params: { pid: pid.value, sid: shotId } })
 }
 
@@ -455,9 +463,14 @@ function startResize(e: PointerEvent): void {
                   </AppBadge>
                 </td>
                 <td class="border-line-1 text-fg-2 min-w-0 border-b py-0.5 pr-1 align-top">
-                  <button class="hover:text-accent truncate text-left" @click="goShot(m.shot_id)">
+                  <button
+                    class="truncate text-left"
+                    :class="m.shot_id ? 'hover:text-accent' : 'cursor-default'"
+                    :disabled="!m.shot_id"
+                    @click="goShot(m.shot_id)"
+                  >
                     <span class="text-fg-4 tnum mr-1">{{ m.batch_seq ?? '·' }}.</span>
-                    {{ m.shot_index_no ?? '?' }}. {{ m.shot_title ?? m.shot_id }}
+                    {{ m.label }}
                   </button>
                   <p v-if="m.wait_reason" class="text-st-review">{{ m.wait_reason }}</p>
                   <p v-else-if="m.error" class="text-st-failed" :title="m.error.detail">
@@ -501,11 +514,12 @@ function startResize(e: PointerEvent): void {
                 </td>
                 <td class="border-line-1 text-fg-2 min-w-0 border-b py-1 pr-1 align-top">
                   <button
-                    class="hover:text-accent truncate text-left"
+                    class="truncate text-left"
+                    :class="row.job.shot_id ? 'hover:text-accent' : 'cursor-default'"
+                    :disabled="!row.job.shot_id"
                     @click="goShot(row.job.shot_id)"
                   >
-                    {{ row.job.shot_index_no ?? '?' }}.
-                    {{ row.job.shot_title ?? row.job.shot_id }}
+                    {{ row.job.label }}
                   </button>
                   <p v-if="row.job.wait_reason" class="text-st-review">{{ row.job.wait_reason }}</p>
                   <p v-else-if="row.job.error" class="text-st-failed" :title="row.job.error.detail">

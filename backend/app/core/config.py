@@ -75,6 +75,14 @@ class Settings(BaseSettings):
     video_base_url: str = ""  # 留空时 comfy_preset 用 comfy_base_url
     video_api_key: str = ""
     video_preset: str = ""  # comfy_preset 用哪一份图（presets 目录里的文件名）
+    # 应用级默认再**按角色分一层**：工程没有单独绑预设时，普通镜头按前者、衔接与转场按后者。
+    # 为什么不能只有上面那一个格子：两个角色要的入口本来就不一样（R2V 只要 AIVS_PROMPT，
+    # 首尾帧还要两头的帧），所以一台机器上常常是两份不同的图。只有一个格子时「工程没绑就
+    # 跟随设置页」在首尾帧上必然落到一份不能用的图上，用户只能回到每个工程里各绑一次。
+    # 留空 = 退回上面那份共用的（只有一份图的人什么都不用配），照 refine_preset 的老作风。
+    # **解析顺序只有 services/route.py::preset_name_of 一份**，这里不做第二处判断。
+    video_r2v_preset: str = ""
+    video_flf_preset: str = ""
     video_timeout: int = 900  # 单次生成的等待上限（秒）
     # 参考图**没有应用级上限**：能收几张是模型端那份图的事实（comfy_preset 数
     # AIVS_REF_* 槽位），由适配层的 ref_capacity() 回答。这里再配一个数字只会和它打架，
@@ -83,7 +91,8 @@ class Settings(BaseSettings):
     # 标签，只能靠这句话让模型知道哪张是主角；不想让它动 prompt 就关掉。
     video_ref_labels: bool = True
     # 二次处理（超分 / 插帧 / 重做）用哪一份图：它必须标了 AIVS_SOURCE_VIDEO。
-    # 留空时退回 video_preset——很多人就一份图，那份图上标了源视频入口也能处理。
+    # 留空时退回**出画面那份默认**（presets.app_default("r2v")：按角色那一格 → 共用那一格）
+    # ——很多人就一份图，那份图上标了源视频入口也能处理。
     # **不给它单独的地址 / 密钥**：处理与出画面跑在同一台 ComfyUI 上是常态，
     # 真要分开时改 video_base_url 那一套即可，多一套配置只会多一处对不上。
     refine_preset: str = ""
@@ -138,6 +147,19 @@ class Settings(BaseSettings):
     # 模型的上下文撑爆」的护栏：字节数挡住误传的整部片子，字符数挡住三百页的文档。
     director_attach_max_mb: int = 20
     director_attach_max_chars: int = 20000
+
+    # --- AI 导演的自动化程度：默认「逐条审阅」，因为提案不是改动 ---
+    #: 免确认模式。开着时一轮协作产出的提案**在同一个请求里直接落库**（走的还是那个
+    #: `apply()`，不是第二份写路径），「一键全流程」也要它开着才允许跑——那一步要连着
+    #: 拆四轮，中途每一批都得真落进库里，下一批才有 scene_id 可用。
+    #: 关着是默认：数据库是用户的，改它该由用户点头。
+    director_auto_apply: bool = False
+    #: 全自动拆解时顺带给新建的角色 / 地点 / 道具排一张参考图（要先配好图片生成 API）。
+    #: 关掉就只建素材——素材照旧建成，图那一项如实写进回执里的 `image_skipped`。
+    director_auto_image: bool = True
+    #: 一次「一键全流程」最多拆几幕。它同时就是这一次要烧多少 token 的上限：
+    #: 分镜那一步是**按幕各来一轮**的。剩下的部分照旧可以再跑一次。
+    director_max_scenes: int = 6
 
     # --- 系统提示词：空字符串表示「用内置默认」（内置文本在 app/ai/prompts.py）---
     # 「AI 拆出来的场景不够好」多半是这段话不够好，所以它必须可改。

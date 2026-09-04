@@ -12,7 +12,12 @@ depends_on = None
 def upgrade() -> None:
     with op.batch_alter_table("project") as batch_op:
         batch_op.add_column(
-            sa.Column("generation_mode", sa.String(length=20), nullable=False, server_default="comfy_preset")
+            sa.Column(
+                "generation_mode",
+                sa.String(length=20),
+                nullable=False,
+                server_default="comfy_preset",
+            )
         )
 
 

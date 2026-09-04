@@ -250,6 +250,47 @@ HOW_TO = [
 
 NAME_OK = re.compile(r"^[\w一-鿿][\w一-鿿 .-]{0,63}$")
 
+#: 预设那条路上只有两个角色：首尾帧那一份图（两头都要给帧），与其余那一份（R2V / 补声音之外的）。
+#: 能力 → 角色的对照表在 `services/route.py::preset_role`——**能力名是路由层的词汇**，
+#: 适配层只认 `VideoRequest.mode`，所以这里收的是角色名而不是能力名。
+PRESET_ROLES = ("r2v", "flf")
+
+#: 角色 → 应用级设置里的那一格。加一个角色只改这张表。
+ROLE_SETTING: dict[str, str] = {"r2v": "video_r2v_preset", "flf": "video_flf_preset"}
+
+#: 角色 → 界面上那颗按钮的说法（「预设 Workflow」页上是「设为 R2V 默认」/「设为首尾帧默认」）。
+#: `services/route.py::preset_error` 那几句话更长（要点名 FL2VA），刻意不共用这一格。
+ROLE_LABEL: dict[str, str] = {"r2v": "R2V 默认", "flf": "首尾帧默认"}
+
+#: 角色 → 「预设 Workflow」页上那颗按钮的**原字**（前端 `shared/lib/presets.ts` 那张角色表）。
+#: 错误建议里让用户「去按哪颗按钮」时一律引这里：说成别的字，用户在页面上就找不到那颗按钮。
+ROLE_ACTION: dict[str, str] = {"r2v": "设为 R2V 默认", "flf": "设为首尾帧默认"}
+
+#: 角色 → 这份图要能干这件事必须标齐的入口。**能不能用只认 `inspect()` 的 `*_ready`**，
+#: 这张表只用来在「不可用」那句话里点名缺了哪一个。
+ROLE_REQUIRED: dict[str, tuple[str, ...]] = {"r2v": REQUIRED, "flf": FLF_REQUIRED}
+
+
+def app_default(role: str) -> str | None:
+    """**应用级默认预设那两级**：按角色那一格 → 共用那一格（`video_preset`）。
+
+    「工程没绑预设就跟随设置页」跟的就是这个，全应用**只有这一份口径**：
+    路由层的入口是 `services/route.py::app_preset_of(capability)`（它只多做一件事：
+    把能力名折成角色名），适配层三处只读路径（`comfy_preset.probe` /
+    `ref_capacity` / `submit` 的兜底）直接问这里。以前那三处只读共用那一格，于是
+    只按角色配了默认、共用那格留空的机器上，设置页「测试连接」会说
+    「还没有选默认预设」——事实是配了，这属于谎报（硬约束 4）。
+
+    留空退回共用那份，与 `refine_preset` 那条同一个作风：只有一份图的人什么都不用配。
+    认不出的角色名只看共用那一格（读路径绝不抛：问它的全是只读页面）。
+    """
+    role_default = getattr(settings, ROLE_SETTING[role], "") if role in ROLE_SETTING else ""
+    for candidate in (role_default, settings.video_preset):
+        name = str(candidate or "").strip()
+        if name:
+            return name
+    return None
+
 
 def presets_dir() -> Path:
     path = settings.runtime_dir / "presets"

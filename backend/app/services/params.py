@@ -21,6 +21,7 @@ from typing import Any
 
 from app.persistence.models import Project
 from app.persistence.models_story import Scene, Shot
+from app.services import route
 from app.services.base import db_of, fetch, fetch_all, load_json
 
 #: **一幕要算「信息齐了」得有什么**，按它是怎么来的分。照 `models_gen.REQUIRED_SLOTS`
@@ -97,7 +98,12 @@ def scene_issues(scene: Scene) -> list[str]:
 def resolve_rows(
     shot: Shot, scene: Scene, project: Project, *, capability: str = "image2video"
 ) -> dict[str, Any]:
-    """一张账单：每一项的值 + 它来自哪一级。**只读，不碰库**，所以谁都能调。"""
+    """一张账单：每一项的值 + 它来自哪一级。**只读，不碰库**，所以谁都能调。
+
+    `level` 是 `shot` / `scene` / `project` / `app` / `default`：`app` 只出现在预设那一格
+    （工程没绑预设时跟随设置页的那一份，见 `route.app_preset_of`），它读的是应用级设置
+    而不是库，所以「不碰库」照旧成立。
+    """
     sp = scene_params(scene)
     flf = capability in ("first_last_frame", "transition", "fl2va")
     preset_default = (project.flf_preset_name if flf else project.r2v_preset_name) or None
@@ -124,6 +130,11 @@ def resolve_rows(
                 (sp.get("preset"), "scene"),
                 (preset_default, "project"),
                 (project.preset_name, "project"),
+                #: **账单不能比事实少一级。** 工程那三列为空 = 跟随设置页
+                #: （`route.app_preset_of`：按角色那一项 → 共用那一项），新建工程刻意不再把
+                #: 当时的应用级默认物化进库，所以这一级现在是绝大多数工程真正用的那一份。
+                #: 少了它，界面会说「没选预设」而按下生成却成功——那正是硬约束 4 要防的。
+                (route.app_preset_of(capability), "app"),
             )
         ),
         #: 幕级追加的参考素材（`Asset.id` 列表）。镜头自己的出场表照旧由

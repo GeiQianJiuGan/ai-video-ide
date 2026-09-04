@@ -563,12 +563,133 @@ def test_preset_listing_shows_broken_files_instead_of_hiding_them() -> None:
     assert rows["坏的"]["impact"], "坏文件要写清为什么用不了"
 
 
-async def test_preset_submit_without_a_chosen_preset_points_at_the_settings_page() -> None:
+async def test_preset_submit_without_a_chosen_preset_points_at_the_button_by_role() -> None:
+    """一份预设都没选时那句建议要**点名到角色那颗按钮**，而不是「去设置页选一份」。
+
+    应用级默认有三格（R2V / 首尾帧 / 共用），只说「选一份默认预设」的话，用户在共用那一格里
+    配了一份 R2V 图，首尾帧照旧报同一句错；按钮的原字来自 `presets.ROLE_ACTION`
+    （与「预设 Workflow」页上那几颗按钮同一份字，说成别的字用户在页面上就找不到它）。
+    """
+    provider = ComfyPresetProvider(client=FakeComfy())  # type: ignore[arg-type]
+    for mode, action in (("i2v", "设为 R2V 默认"), ("flf", "设为首尾帧默认")):
+        with pytest.raises(AppError) as caught:
+            await provider.submit(VideoRequest(mode=mode), client_id="aivs-test")
+        assert caught.value.code == "MISSING_CAPABILITY"
+        assert any(action in s for s in caught.value.suggestions), f"{mode} 那句建议要点名按钮"
+        assert any("预设 Workflow" in s for s in caught.value.suggestions), "要说清去哪一页按"
+
+
+async def test_preset_app_default_falls_back_from_role_slot_to_the_shared_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """应用级默认那两级只有一份口径 `presets.app_default`：角色那一格 → 共用那一格。
+
+    `services/route.py::app_preset_of` 与适配层三处只读路径（`probe` / `ref_capacity` /
+    `submit` 的兜底）问的都是它——各写一遍的话，「工程没绑就跟随设置页」在不同的页面上
+    会给出不同的答案。
+    """
+    monkeypatch.setattr(settings, "video_preset", "共用那份")
+    monkeypatch.setattr(settings, "video_r2v_preset", "")
+    monkeypatch.setattr(settings, "video_flf_preset", "")
+    assert presets.app_default("r2v") == "共用那份"
+    assert presets.app_default("flf") == "共用那份"
+
+    monkeypatch.setattr(settings, "video_flf_preset", "转场那份")
+    assert presets.app_default("flf") == "转场那份"
+    assert presets.app_default("r2v") == "共用那份", "只填首尾帧那格不该影响普通镜头"
+
+    monkeypatch.setattr(settings, "video_preset", "")
+    assert presets.app_default("flf") == "转场那份"
+    assert presets.app_default("r2v") is None, "共用格空着又没填 R2V 那格就是真的没选"
+
+
+async def test_preset_submit_falls_back_to_the_role_slot_not_only_the_shared_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """没有冻结的预设名时，兜底也走角色那一格。
+
+    以前这里只读共用那一格（`settings.video_preset`），于是只按角色配了默认、共用那格留空的
+    机器上，直接调适配层会报「还没有选生成预设」——事实是配了。
+    """
+    write_preset("转场专用", GRAPH)
+    monkeypatch.setattr(settings, "video_preset", "")
+    monkeypatch.setattr(settings, "video_flf_preset", "转场专用")
+    comfy = FakeComfy()
+    provider = ComfyPresetProvider(client=comfy)  # type: ignore[arg-type]
+    await provider.submit(VideoRequest(mode="flf", prompt="雨夜"), client_id="aivs-test")
+    assert comfy.submitted, "提交的就是首尾帧那一格指的那份图"
+    assert comfy.submitted["3"]["inputs"]["text"] == "雨夜"
+
+
+async def test_preset_probe_reads_both_role_slots_not_only_the_shared_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """「测试连接」按角色答，**不能在配了角色默认时说「还没有选默认预设」**（硬约束 4）。
+
+    两个角色跟同一份图且两件事都能干时收成一句话；不可用要点名缺哪个入口，
+    只说「不可用」等于让用户自己去数标题。
+    """
+    write_preset("全能那份", GRAPH)
+    write_preset("只出正片", {k: v for k, v in GRAPH.items() if k != "2"})
+    provider = ComfyPresetProvider(client=FakeComfy())  # type: ignore[arg-type]
+
+    monkeypatch.setattr(settings, "video_preset", "")
+    monkeypatch.setattr(settings, "video_r2v_preset", "只出正片")
+    monkeypatch.setattr(settings, "video_flf_preset", "全能那份")
+    out = await provider.probe()
+    assert (out["preset"], out["preset_ready"]) == ("只出正片", True)
+    assert (out["preset_flf"], out["preset_flf_ready"]) == ("全能那份", True)
+    assert "还没有选默认预设" not in out["detail"], "配了角色默认还这么说就是谎报"
+    assert "R2V 默认 只出正片 就绪" in out["detail"]
+    assert "首尾帧默认 全能那份 就绪" in out["detail"]
+
+    # 只有一份 R2V 图的人（共用那一格）：首尾帧那一格跟着它，而它缺末帧入口——这件事要说出来，
+    # 不然用户要等到补转场失败才知道。
+    monkeypatch.setattr(settings, "video_r2v_preset", "")
+    monkeypatch.setattr(settings, "video_flf_preset", "")
+    monkeypatch.setattr(settings, "video_preset", "只出正片")
+    out = await provider.probe()
+    assert out["preset_ready"] is True and out["preset_flf_ready"] is False
+    assert "首尾帧默认 只出正片 缺 AIVS_LAST_FRAME" in out["detail"]
+
+    # 两个角色跟同一份图、两件事都能干：一句话说完，不必把同一个名字念两遍。
+    monkeypatch.setattr(settings, "video_preset", "全能那份")
+    assert "共用这一份" in (await provider.probe())["detail"]
+
+    # 一格都没填：照旧说「还没有选默认预设」——那是这句话唯一该出现的时候。
+    monkeypatch.setattr(settings, "video_preset", "")
+    assert "还没有选默认预设" in (await provider.probe())["detail"]
+
+
+async def test_preset_probe_says_the_real_reason_when_the_default_graph_is_broken(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """默认那份图坏了：说「这份图读不出来」，**不要说「缺 AIVS_PROMPT」**。
+
+    文件坏了时一个入口都找不到，照「缺哪个标题」那句去说会让用户在一份坏文件上改标题白折腾。
+    """
+    presets.presets_dir().joinpath("坏掉的.json").write_text("{ 这不是 json", encoding="utf-8")
+    monkeypatch.setattr(settings, "video_preset", "坏掉的")
+    out = await ComfyPresetProvider(client=FakeComfy()).probe()  # type: ignore[arg-type]
+    assert out["preset_ready"] is False
+    assert "R2V 默认 坏掉的 不可用：" in out["detail"]
+    assert "缺 AIVS_PROMPT" not in out["detail"]
+
+
+async def test_preset_probe_names_the_missing_default_and_the_button_to_fix_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """默认指到一份已经被删掉的图：点名是哪一份，并说清去哪儿改选（绝不静默失败）。"""
+    write_preset("还在的", GRAPH)
+    monkeypatch.setattr(settings, "video_preset", "还在的")
+    monkeypatch.setattr(settings, "video_flf_preset", "被删了的")
     provider = ComfyPresetProvider(client=FakeComfy())  # type: ignore[arg-type]
     with pytest.raises(AppError) as caught:
-        await provider.submit(VideoRequest(mode="i2v"), client_id="aivs-test")
-    assert caught.value.code == "MISSING_CAPABILITY"
-    assert any("设置页" in s for s in caught.value.suggestions)
+        await provider.probe()
+    assert caught.value.code == "NOT_FOUND"
+    assert "被删了的" in caught.value.detail
+    assert caught.value.related_ids["missing"] == ["被删了的"]
+    assert any("设为首尾帧默认" in s for s in caught.value.suggestions)
 
 
 async def test_preset_poll_reports_comfy_execution_errors_in_plain_words() -> None:

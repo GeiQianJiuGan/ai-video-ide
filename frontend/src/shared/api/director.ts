@@ -6,6 +6,9 @@
  * 三个形状上的要点：
  *   1. **提案不是改动**——`chat()` 回来的 `ops` 只是提案，数据库一行没变；
  *      只有 `apply()` 才落库，而且只落 `op !== 'reject'` 的条目。
+ *      **唯一的例外是免确认模式**（`history().auto.apply`）：那时 `chat()` 在同一个请求里
+ *      接着走了 `apply()`，所以回来的 `auto_applied` 是 true、`applied` / `failed` 一起给——
+ *      右栏那几条这一刻已经在库里了，界面必须改口，不能再摆一颗「采用」。
  *   2. **`before` / `after` 成对给**，前端才能画出真正的 Diff：`before` 是库里现在的样子
  *      （新增时是 null），`after` 是提案要改成什么（删除时是 null）。
  *   3. **`llm.configured === false` 不是错误**——协作栏据此显示去设置页的引导，
@@ -175,14 +178,43 @@ export interface DirectorAttachment {
   notes: string[]
 }
 
+/**
+ * 免确认与一键全流程的当前口径。**唯一真源是设置页那一组**（后端 `director.auto_status()`），
+ * 前端不记第二份默认值——所以 `autopilot()` 的 `auto_image` / `max_scenes` 一律不传。
+ */
+export interface DirectorAuto {
+  /** true = 这一栏产出的提案在同一个请求里就落库了，右栏不再有待审的卡。 */
+  apply: boolean
+  /** 一键全流程新建素材时顺带排一张参考图。 */
+  image: boolean
+  max_scenes: number
+  /** 出图服务配没配。false = 素材照旧建，图那一项写进回执里的 `image_skipped`。 */
+  image_configured: boolean
+  /** 四步各自叫什么（回执里的 `stages[].stage` 对得上）。 */
+  stages: { stage: string; label: string }[]
+  hint: string
+}
+
 export interface DirectorHistory {
   turns: DirectorTurn[]
   llm: DirectorLlm
   attach: DirectorAttachInfo
+  auto: DirectorAuto
   note: string
 }
 
-export interface DirectorChat {
+/**
+ * 免确认模式落库的那一份回执。**`chat` / `chat/stream` 两条路都可能带它**——
+ * 关着时只有 `auto_applied: false`，那不是失败，只是「没落库不是因为出错」。
+ */
+export interface DirectorAutoApplied {
+  auto_applied: boolean
+  applied?: Record<string, unknown>[]
+  failed?: DirectorApplyFail[]
+  count?: number
+}
+
+export interface DirectorChat extends DirectorAutoApplied {
   turns: DirectorTurn[]
   ops: DirectorOp[]
   /** true = 这个端不支持工具调用，走的是一次性产出提案的退化路径。 */
@@ -211,12 +243,60 @@ export interface DirectorToolStep {
 }
 
 /** 流式正常收尾。`turns` 是刚落下的记录（assistant + 有提案时的 proposal）。 */
-export interface DirectorDone {
+export interface DirectorDone extends DirectorAutoApplied {
   turns: DirectorTurn[]
   ops: DirectorOp[]
   degraded: boolean
   /** 这一轮和模型往返了几次。转满 `MAX_ROUNDS` 会走 error 那条。 */
   rounds: number
+}
+
+/** 一键全流程里的一步。`error` 只出现在被打断的那一步上（前面几步照旧落好了）。 */
+export interface DirectorAutopilotStage {
+  /** digest / materials / scenes / shots */
+  stage: string
+  label: string
+  /** AI 这一步说的话。第一步只说话、不提提案，所以那一步 `ops` 是 0。 */
+  reply: string
+  ops: number
+  applied: Record<string, unknown>[]
+  failed: DirectorApplyFail[]
+  count: number
+  /** `auto_image=false` 时这一步被摘掉了几句 image_prompt。 */
+  images_dropped: number
+  degraded?: boolean
+  /** 「转满轮数，这一步可能没做完」这类话。 */
+  warning?: string
+  error?: { code: string; title: string; detail: string; suggestions: string[] }
+}
+
+/**
+ * 一键全流程的回执。**四步都真落库了**，所以它不是提案：`stages` / `warnings` /
+ * `images.skipped` 必须原样显示出来（跳过不是失败，但必须说出来）。
+ *
+ * `halted: true` = 某一步断了，但前面几步已经落库、一条都不回滚——回执里写着走到哪一步。
+ */
+export interface DirectorAutopilot {
+  auto_apply: boolean
+  /** 这一趟读的是哪一份原文：多少字、有没有存进工程、有没有替换掉原来那份。 */
+  script: { chars: number; saved: boolean; replaced: boolean }
+  stages: DirectorAutopilotStage[]
+  applied: Record<string, unknown>[]
+  failed: DirectorApplyFail[]
+  count: number
+  /** 这一趟给哪几幕拆了分镜。 */
+  scenes: { id: string; title: string | null }[]
+  warnings: string[]
+  images: {
+    configured: boolean
+    auto: boolean
+    queued: number
+    /** 每条都是一句完整的中文原因，前端不改写。 */
+    skipped: string[]
+    dropped: number
+  }
+  halted: boolean
+  note: string
 }
 
 /**
@@ -259,6 +339,19 @@ export const directorApi = {
   ): AsyncGenerator<DirectorStreamEvent> => stream(pid, message, scope, signal),
   apply: (pid: string, ops: DirectorOp[]) =>
     api.post<DirectorApply>(`/projects/${pid}/director/apply`, { ops }),
+  /**
+   * 一键全流程：核心剧本 → 人物 / 地点 / 道具 → 拆幕 → 按幕拆分镜，**四步都直接落库**。
+   *
+   * 四条与 `chat()` 不同的规矩：
+   *   1. **要免确认模式开着**（`history().auto.apply`）：关着时后端拒，`VALIDATION_ERROR`
+   *      + 「去设置页打开」；界面上那颗按钮也该照它先禁用；
+   *   2. **`text` 留空就用工程里那份原文**。带来的原文与库里那份不一样时后端**不覆盖**，
+   *      报错并给两条出路（不带文字直接跑 / 勾 `replace_script`）；
+   *   3. **`auto_image` / `max_scenes` 不传**——跟随设置页那一组，前端不记第二份默认值；
+   *   4. **半路断了照样回 201**（`halted: true`），已经落的一条都不回滚。
+   */
+  autopilot: (pid: string, body: { text?: string; replace_script?: boolean }) =>
+    api.post<DirectorAutopilot>(`/projects/${pid}/director/autopilot`, body),
   /**
    * 一份 .docx / .xlsx / … → 一段纯文本，**只填进输入框**。
    *

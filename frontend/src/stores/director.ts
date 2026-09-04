@@ -24,6 +24,13 @@
  *      `draft`**，没落库、没落盘、没出网，也不要求配好 LLM。抽出来什么用户先看得见、
  *      改得动，按下发送才跟着那句话一起走；`attached` 留着「按 gb18030 读的」
  *      「太长截断了」这些话，界面必须显示出来。
+ *   8. **免确认模式改的只是「谁按下那一下」**（`auto.apply`，来自设置页）：开着时
+ *      `send()` 收到的 `done` 里已经带着落库回执，所以这里**立刻把落成了的那几条移出
+ *      `pending`**——留着它们等于给用户一颗会把同样的东西再落一遍的「采用」。
+ *      失败的那几条照旧留下显示原因。口径只有后端一份，前端不猜开没开。
+ *   9. **一键全流程（`autopilot()`）不是 chat 的一种**：它自己就是四步落库，回来的
+ *      `stages` / `warnings` / `images.skipped` 必须原样显示（跳过不是失败，但必须说出来），
+ *      半路断了也是 201 + `halted`——已经落的一条都不回滚，所以照样要重拉历史与流程图。
  */
 
 import { defineStore } from 'pinia'
@@ -33,6 +40,8 @@ import {
   directorApi,
   type DirectorApply,
   type DirectorAttachment,
+  type DirectorAutoApplied,
+  type DirectorAutopilot,
   type DirectorHistory,
   type DirectorOp,
   type DirectorScope,
@@ -61,6 +70,10 @@ export const useDirectorStore = defineStore('director', () => {
   const pending = ref<DirectorOp[]>([])
   /** 最近一次落库的结果，含失败的每一条与四要素错误。 */
   const lastApply = ref<DirectorApply | null>(null)
+  /** 最近一次「一键全流程」的回执。四步都真落库了，所以它一直显示到下一次开口说话。 */
+  const lastAutopilot = ref<DirectorAutopilot | null>(null)
+  /** true = 一键全流程正在跑。与 `busy` 分开：那一趟要好几分钟，界面得说清在跑哪一步。 */
+  const autopiloting = ref(false)
   /** true = 这一轮走的是不支持工具调用的退化路径（提案形状一样，只是提示一句）。 */
   const degraded = ref(false)
 
@@ -96,6 +109,13 @@ export const useDirectorStore = defineStore('director', () => {
   const configured = computed(() => Boolean(history.value?.llm.configured))
   const note = computed(() => history.value?.note ?? '')
   const hasPending = computed(() => pending.value.length > 0)
+  /**
+   * 免确认与一键全流程的当前口径（设置页那一组）。**唯一真源在后端**——前端既不猜
+   * 开没开，也不记 `max_scenes` 的默认值。历史还没拉回来时是 null，此时那颗按钮 disabled。
+   */
+  const auto = computed(() => history.value?.auto ?? null)
+  /** true = 提案会在产出的同一个请求里落库。这一栏的措辞与按钮都得跟着改。 */
+  const autoApply = computed(() => Boolean(history.value?.auto.apply))
   /**
    * 附件能收什么。**后端那一份是唯一口径**（`core/doctext.py::KINDS`）——
    * 界面上的 `accept` 与「最大 N MB」都读它，前端不写死第二张后缀清单。
@@ -159,7 +179,26 @@ export const useDirectorStore = defineStore('director', () => {
   }
 
   /**
+   * 免确认模式的落库回执（`chat` / `done` 都可能带它）。
+   *
+   * **`auto_applied === false` 不是失败**，只是「没落库不是因为出错」，此时什么都不用做。
+   * 开着时这几条**这一刻已经在库里了**，所以必须立刻把它们从 `pending` 里拿掉——留着
+   * 等于给用户一颗会把同样的东西再落一遍的「采用」。失败的那几条留下继续显示原因，
+   * 和手动按「采用」之后的口径完全一样（`apply()`）。
+   */
+  function noteAutoApplied(done: DirectorAutoApplied): void {
+    if (!done.auto_applied) return
+    const failed = done.failed ?? []
+    lastApply.value = { applied: done.applied ?? [], failed, count: done.count ?? 0 }
+    const keep = new Set(failed.map((f) => f.temp_id ?? ''))
+    pending.value = pending.value.filter((op) => keep.has(op.temp_id))
+  }
+
+  /**
    * 说一句话，一边收一边显示。**不落业务库**——回来的只是提案。
+   *
+   * **免确认模式开着时是唯一的例外**：`done` 里带着落库回执，那几条这一刻已经在库里了，
+   * 交给 `noteAutoApplied()` 把它们移出待审列表。口径只有后端一份，这里不猜开没开。
    *
    * `scope` 只透传给后端拼系统提示词（剧本页 / 流程图页），不落库：两页共用同一个会话。
    * 「转了太多轮」「半路断线」都是 `ApiError`，但**提案照旧保留**：后端在报错之前
@@ -170,13 +209,14 @@ export const useDirectorStore = defineStore('director', () => {
     message: string,
     scope: DirectorScope = 'flow',
   ): Promise<boolean> {
-    if (streaming.value) return false
+    if (streaming.value || autopiloting.value) return false
     const ctl = new AbortController()
     running = ctl
     streaming.value = true
     busy.value = true
     lastError.value = null
     lastApply.value = null
+    lastAutopilot.value = null
     degraded.value = false
     unsaved.value = false
     live.value = ''
@@ -192,6 +232,7 @@ export const useDirectorStore = defineStore('director', () => {
         else if (event.event === 'op') pending.value = [...pending.value, event.data]
         else if (event.event === 'done') {
           degraded.value = event.data.degraded
+          noteAutoApplied(event.data)
           ok = true
         }
       }
@@ -283,6 +324,51 @@ export const useDirectorStore = defineStore('director', () => {
     return apply(pid, [...pending.value])
   }
 
+  /**
+   * 一键全流程：核心剧本 → 人物 / 地点 / 道具 → 拆幕 → 按幕拆分镜，**四步都真落库**。
+   *
+   * 与 `send()` 的四处不同：
+   *   1. **它不产提案**：回来的是落库回执（`lastAutopilot`），右栏不会多出待审的卡；
+   *   2. **`autopiloting` 与 `busy` 分开**：那一趟要好几分钟，界面得说清在跑什么，
+   *      而不是整栏灰掉却不说为什么；
+   *   3. **半路断了也是成功的响应**（201 + `halted`）：已经落的一条都不回滚，所以
+   *      `stages[].error` / `warnings` / `images.skipped` 必须原样显示，不能当成一次失败；
+   *   4. **`auto_image` / `max_scenes` 不传**——跟随设置页那一组，前端不记第二份默认值。
+   *
+   * 无论成败都重拉历史并**照服务器那份重算 `pending`**：这一趟落了 `applied` 记录，
+   * 手上那几张陈旧的待审卡于是正确地归零——界面绝不拿着一份对不上库的 Diff。
+   * 干净的失败（免确认没开 / 与库里的原文冲突 / 一行都没落就断了）走 `lastError`，
+   * 四要素连 suggestions 一起显示。
+   */
+  async function autopilot(
+    pid: string,
+    body: { text?: string; replace_script?: boolean } = {},
+  ): Promise<DirectorAutopilot | null> {
+    if (autopiloting.value || streaming.value) return null
+    autopiloting.value = true
+    lastError.value = null
+    lastApply.value = null
+    lastAutopilot.value = null
+    degraded.value = false
+    live.value = ''
+    trace.value = []
+    try {
+      const out = await directorApi.autopilot(pid, body)
+      lastAutopilot.value = out
+      // 那段原文已经跟着这一趟走了（也存进了工程），输入框会被清空——附件那几条提示就过期了。
+      attached.value = []
+      return out
+    } catch (err) {
+      lastError.value = err instanceof ApiError ? err : null
+      return null
+    } finally {
+      autopiloting.value = false
+      history.value = await directorApi.history(pid).catch(() => history.value)
+      restorePending()
+      unsaved.value = false
+    }
+  }
+
   /** 清空协作记录。已经落库的改动不受影响——那是库里的数据，不是聊天记录。 */
   async function clear(pid: string): Promise<void> {
     await guarded(async () => {
@@ -290,6 +376,7 @@ export const useDirectorStore = defineStore('director', () => {
       history.value = await directorApi.history(pid)
       pending.value = []
       lastApply.value = null
+      lastAutopilot.value = null
       live.value = ''
       trace.value = []
       unsaved.value = false
@@ -307,6 +394,10 @@ export const useDirectorStore = defineStore('director', () => {
     pending,
     hasPending,
     lastApply,
+    auto,
+    autoApply,
+    lastAutopilot,
+    autopiloting,
     degraded,
     live,
     trace,
@@ -327,6 +418,7 @@ export const useDirectorStore = defineStore('director', () => {
     apply,
     accept,
     acceptAll,
+    autopilot,
     clear,
     clearError,
   }

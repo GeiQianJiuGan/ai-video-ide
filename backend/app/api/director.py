@@ -1,15 +1,20 @@
 """AI 导演接口（全局协作栏的后端）。
 
-五个端点，界线就是「提案」与「落库」的界线：
+六个端点，界线就是「提案」与「落库」的界线：
 
-  - `POST /director/chat`        说一句话 → 拿回一份提案，**数据库一行不动**；
+  - `POST /director/chat`        说一句话 → 拿回一份提案，**数据库一行不动**
+    （免确认模式开着时是唯一的例外：那时同一个请求里接着走 `apply()`）；
   - `POST /director/chat/stream` 同一件事，边跑边吐（SSE）。上面那条原样保留：
     不支持 SSE 的调用方与后端自己的测试都还走它；
   - `POST /director/apply`       把审阅通过的条目落库，只落 `op != "reject"` 的；
+  - `POST /director/autopilot`   一键全流程：核心剧本 → 素材 → 幕 → 分镜，四步都直接落库，
+    **要求免确认模式开着**（关着时是四要素错误，不会偷偷写几十行数据）；
   - `POST /director/attach`      一份 .docx / .xlsx / … → 一段纯文本，**只填输入框**：
     不落库、不落盘、不出网，也**不要求配好 LLM**（用户得先看见抽出来什么）；
   - `GET  /director`             历史对话与提案（刷新页面不丢）+ LLM 状态
-    （未配置时前端据此显示去配置页的引导，而不是一个红叉）+ 附件能收什么。
+    （未配置时前端据此显示去配置页的引导，而不是一个红叉）+ 附件能收什么
+    + **免确认那一组的当前口径**（`auto`：开没开、顺带出图的服务配没配、最多拆几幕）——
+    协作栏照它改口并禁用「一键全流程」，前端不记第二份默认值。
 
 这一层照旧极薄：SSE 那条也只是**把 service 给的事件按 `event:` / `data:` 写出去**，
 一个业务判断都不做。
@@ -83,9 +88,43 @@ async def chat_stream(pid: str, body: ChatBody) -> StreamingResponse:
     )
 
 
+class AutopilotBody(BaseModel):
+    text: str = Field(
+        default="",
+        description="这一章的剧本原文。留空就用工程里已经存着的那份；非空且与库里不同时"
+        "会被拒绝，除非勾上 replace_script",
+    )
+    replace_script: bool = Field(
+        default=False, description="确实要用带来的这份原文替换工程里已有的那份"
+    )
+    #: 这两项留空 = 跟随设置页的「AI 导演」那一组，不在前端记第二份默认值。
+    auto_image: bool | None = Field(
+        default=None, description="新建素材时顺带出参考图；留空跟随设置页"
+    )
+    max_scenes: int | None = Field(
+        default=None, ge=1, description="这一趟最多拆几幕；留空跟随设置页"
+    )
+
+
 @router.post("/projects/{pid}/director/apply", status_code=201)
 async def apply(pid: str, body: ApplyBody) -> dict[str, Any]:
     return await director.apply(pid, body.ops)
+
+
+@router.post("/projects/{pid}/director/autopilot", status_code=201)
+async def autopilot(pid: str, body: AutopilotBody) -> dict[str, Any]:
+    """一键全流程。**四步都真落库**，所以要求免确认模式开着（否则四要素错误）。
+
+    某一步失败时：一行业务数据都还没落就抛错，已经落过就回 200 + `stages[].error`
+    与 `warnings`——跳过不是失败，但必须说出来。
+    """
+    return await director.autopilot(
+        pid,
+        body.text,
+        replace_script=body.replace_script,
+        auto_image=body.auto_image,
+        max_scenes=body.max_scenes,
+    )
 
 
 @router.post("/projects/{pid}/director/attach")

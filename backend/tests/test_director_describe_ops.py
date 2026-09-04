@@ -152,10 +152,7 @@ def test_every_target_kind_lands_on_the_column_the_prompt_reads(
     assert landed["appearance"] == "traits", "形象上没有 description 列，写 notes 到不了模型手上"
     assert landed["asset"] == "description"
 
-    assert (
-        client.get(f"{API}/projects/{pid}/assets").json()[0]["description"]
-        == "asset 的那一句"
-    )
+    assert client.get(f"{API}/projects/{pid}/assets").json()[0]["description"] == "asset 的那一句"
     chars = client.get(f"{API}/projects/{pid}/characters").json()
     assert chars[0]["description"] == "character 的那一句"
     appearance = client.get(f"{API}/projects/{pid}/appearances/{ids['appearance']}").json()

@@ -38,8 +38,8 @@ AI Video Studio（`aivs`）：桌面端优先的 AI 原生长视频制作工作�
   26 个 service（cast / world / assets / workflows / story / context / generation / timeline /
   overview / projects / library / adopt / fsbrowse / appsettings / frames / sequence / director /
   packages / ingest / dub / refine / audio / images / describe / onboarding / **route**；`base` /
-  `params` / `global_registry` 是公共件不算）+ 25 个 router（含 `/ws`），480 passed（1 skipped：
-  没跑过 `fetch_ffmpeg.py` 的机器上跳过「用的是内置那份」那条正向断言）。
+  `params` / `global_registry` 是公共件不算）+ 25 个 router（含 `/ws`），552 passed（没跑过
+  `fetch_ffmpeg.py` 的机器上会多 1 skipped：「用的是内置那份」那条正向断言）。
 - **前端也全部接上了后端**：`app/features.ts` 里 15 个功能都是 `ready: true`，
   `/p/:pid` 下不再有外壳页。`shared/ui/FeatureView.vue`（按注册表画工作区骨架与能力锁）
   暂时没人用，留给下一个「登记了但还没接后端」的功能——那种情况先挂它，绝不给假界面。
@@ -333,6 +333,11 @@ Ctrl + \` 开合，高度记在 localStorage）。控制台常驻，所以 **WS 
 （`queue.connect` / `disconnect` / 切工程时 `reset()`），队列页只 `load()`——以前订阅挂在队列页上，
 一离开页面实时通道就断了。`features/generation/QueueView.vue` 还在，但是 `advanced: true`、
 不进 `PROJECT_NAV`，只从命令面板或控制台的「队列页」按钮进，看失败现场与冻结参数。
+**任务的位置不跟状态走**：`list_jobs` 只按「优先级 → 入队时间」排（与 pump 取任务的 `_claim`
+同一份口径），一条任务失败或跑完都停在原地——排序第一个键曾经是状态，于是刚失败的那条会在
+那一瞬间跳到列表最底下，每次找报错都得滚到底再从一堆做完的任务里认出它。
+「只看失败的」是过滤，不是排序。同一个道理，「提到队首」是把 `priority` **调大**
+（`_claim` 按 `-priority` 取），前端两处入口都算 `max + 1`。
 
 **Context Resolver**（`services/context.py`）：把「到底喂了什么给模型」变成一张账单——每条带
 kind / priority / included / reason / **media**（`image` / `video` / `audio`，只看后缀）；
@@ -517,9 +522,41 @@ kind / priority / included / reason / **media**（`image` / `video` / `audio`，
     `_wire_pending` 一处），绝不让一条被丢弃的提案带走整个镜头。
     **前端必须把这几句显示出来**（`DirectorPanel.vue::appliedRows`）：落成了的那张提案卡会
     走掉，只给一行「已落库 N 条」等于把降级藏起来（硬约束 4）。
+  - **免确认模式是「chat 也落库」的唯一例外**（设置项 `director.auto_apply`，口径只有
+    `director.auto_status()` 一份 → `GET /director` 的 `auto` 块 → 前端不记第二份默认值）：
+    开着时 `chat` / `chat/stream` 在**产出提案的同一个请求里**接着走 `apply()`，响应
+    （流式是最后那条 `done`）多带一份落库回执 `{auto_applied, applied, failed, count}`。
+    **它只改「谁按下那一下」，一条边界都没动**——写工具照旧永不落库，落库照旧只走 `apply()`
+    那一份实现，所以 `_wire_pending` 那几句降级说明照样要显示。三处措辞跟着换口：
+    `history().note`（「提案只是提案」在这个模式下是假话）、协作栏空态与标题、那颗按钮的
+    tooltip 直接用后端的 `auto.hint`。**`auto_applied: false` 不是失败**，只是「没落库不是因为
+    出错」；开着时前端必须**立刻把落成了的那几条移出待审列表**（留着等于给一颗会把同样的
+    东西再落一遍的「采用」），`failed` 那几条留下继续显示原因。
+  - **一键全流程**（`POST /director/autopilot`，前端是协作栏底部那颗按钮）：核心剧本 →
+    人物 / 地点 / 道具 → 拆幕 → **按幕**拆分镜，`AUTO_STAGES` 四步**每一步都是「产出提案 →
+    立刻 `apply()`」**，所以后一步用得上前一步真落进库的 id。它不是 `chat` 的一种模式：
+    回来的不是提案而是落库回执，里面的 `stages` / `warnings` / `images.skipped` 前端
+    **原样显示**（跳过不是失败，但必须说出来）——没配出图服务时素材照旧建成、图那一项走手动
+    那条路（硬约束 2），跳过的原因照抄 `_maybe_image()` 那句话，**不在回执里重写一份措辞**。
+    六条不许绕的：
+    - **要免确认模式开着**（`_require_auto_apply()`，在写第一行数据之前就说）：关着时那四批
+      只会变成右栏几十张待审的卡、第四步拿不到 `scene_id`，整条链断在中间——那种半成品比一个
+      清楚的 `VALIDATION_ERROR` 糟得多。前端那颗按钮也照 `auto.apply` 先禁用；
+    - **`text` 留空就用工程里那份原文**；给了原文而库里已经有**不一样**的一份时
+      **不覆盖**，报错并给两条出路（不带文字直接跑 / 勾 `replace_script`）——`Story.raw_text`
+      是这个工程的源头，不该被一次「一键全流程」悄悄换掉；
+    - **`auto_image` / `max_scenes` 不由前端传**（跟随设置页 `director.auto_image` /
+      `director.max_scenes`，前端不记第二份默认值）。分镜那一步一幕一轮，所以 `max_scenes`
+      同时就是这一次要烧多少 token 的上限；超出的部分**不会被悄悄丢掉**，进 `warnings`；
+    - **半路断了照样 201 + `halted: true`**：已经落进库的一条都不回滚（硬约束 3），
+      被打断那一步补一行只有 `stage` / `label` / `error` 的 stage row。只有「一行业务数据都
+      还没落就断了」才抛干净的 4xx / 503——回一张空回执让用户自己猜是最糟的那种；
+    - **转满 16 轮不算这一步失败**（提案已经落好了），只写成那一步的 `warning` 接着走下一步；
+    - **每一步在调模型之前就写 `DirectorTurn`**，所以无论成败前端都要重拉历史；最后那一步落完
+      写的是 `role="applied"`，于是 `restorePending()` 天然归零——界面绝不拿着一份对不上库的 Diff。
 - **工程路由**（`services/route.py` + `GET /projects/{pid}/route`，迁移 `0022_project_route`）：
   「**这个工程 + 这个能力 → 走哪条路、这条路要绑什么、绑没绑上、缺什么**」全应用只有这一份口径，
-  概览页、Workflow 管理页那条横幅、二次处理弹窗、入队守卫读的都是它。六条不许绕的：
+  概览页、Workflow 管理页那条横幅、二次处理弹窗、入队守卫读的都是它。七条不许绕的：
   - **调用方式是工程级可继承的一列**（`project.generation_mode`）：**空串 `''` = 跟随设置页**
     （绝大多数工程是这一种，改设置页就跟着变），显式选一条之后就不再跟。所以
     `summary()` 同时给 `provider`（最终走哪条）与 `source`（`project` / `settings` / `default`，
@@ -543,6 +580,30 @@ kind / priority / included / reason / **media**（`image` / `video` / `audio`，
     冻进去只会让半年后翻参数的人把它当成这次任务的失败原因。**地址进档，密钥永不进档。**
   - 老任务里没有这一项，所以前端 `shared/api/projects.ts::frozenRoute()` 回 `null` 而不是替它
     编一条「ComfyUI 预设」——谎报走了哪条路正是这次要修的 bug 的形状。
+  - **预设同样是「工程那几列留空 = 跟随设置页」**，解析口径只有 `preset_name_of` 一份：
+    场景覆写 → 工程的角色默认（`flf_preset_name` / `r2v_preset_name`）→ 工程共用那份
+    （`preset_name`）→ **应用级那两级**（`app_preset_of`：按角色的 `video.flf_preset` /
+    `video.r2v_preset` → 共用的 `video.preset`）。应用级要按角色分一层是因为两个角色要的入口
+    本来就不一样（R2V 只要 `AIVS_PROMPT`，首尾帧还要两头的帧），一台机器上常常是两份不同的图
+    ——只有共用那一格时，「工程没绑就跟随设置页」在首尾帧上必然落到一份不能用的图上。
+    **新建 / 打开工程都不许把应用级默认物化进那三列**（`projects.create` 建空、`projects.open`
+    只把工程自己那一列抄进两个角色列）：物化过一次，这个工程从此再也跟不上设置页。
+    账单侧 `params.resolve_rows` 因此在预设那一格多一级 `level="app"`——**账单不能比事实少一级**，
+    不然界面说「没选预设」而按下生成却成功了。这四格默认的入口在**「预设 Workflow」页**每一行
+    的按钮上（出画面那一栏三颗 / 出图那一栏一颗；设置页的预设清单里是同一组按钮，
+    前端共用 `shared/lib/presets.ts` 那张角色表），缺预设的四要素错误也点名到角色。
+    **应用级那两级本身下沉在 `providers/presets.py::app_default(role)`**（不在服务层）：
+    适配层的三处只读路径（`comfy_preset.probe()` 那颗「测试连接」/ `ref_capacity()` /
+    `submit()` 没有冻结预设名时的兜底）与 `refine.preset_of()` 的最后一级也要问同一个问题，
+    而它们不认识「能力」这个词、更不该反过来 import 服务层——`app_preset_of(capability)` 于是
+    只剩「把能力名折成角色名」这一件事。以前那几处只读共用那一格，于是**只按角色配了默认、
+    共用那格留空的机器上**，「测试连接」会说「还没有选默认预设」（谎报，硬约束 4），
+    兜底也落不到用户真正选的那份图上。角色那几张表（`PRESET_ROLES` / `ROLE_SETTING` /
+    `ROLE_LABEL` / `ROLE_ACTION` / `ROLE_REQUIRED`）同在那一处，**建议里让用户去按哪颗按钮
+    一律引 `ROLE_ACTION`**：说成别的字，用户在页面上就找不到那颗按钮。
+    「测试连接」因此**按角色各答一句**（`preset` / `preset_ready` 是普通镜头那一格，
+    `preset_flf` / `preset_flf_ready` 是首尾帧那一格，不可用要点名缺哪个入口），
+    只有三格全空才说「还没有选默认预设」。
 - **provider 适配层**（`app/generation/providers/`）：`base.py` 定义与模型无关的 `VideoRequest`
   （`mode` = `i2v` / `flf`、prompt、首尾帧、**参考素材 `refs`**（`RefAsset`，带 `media` =
   `image` / `video` / `audio`）、时长、seed、透传 `extra`、降级说明 `notes`）与 `VideoProvider`
@@ -602,8 +663,12 @@ kind / priority / included / reason / **media**（`image` / `video` / `audio`，
     那几句是系统追加的，模型与用户都改不到。`read_skill` 一个工具同时查视频与图片两张表。
   - **不新造队列**：图片任务就是一行 `Job`（`kind` ∈ `t2i` / `i2i`），靠 `0020_image_jobs`
     的可空 `shot_id` + `target_kind` / `target_id` 挂到出图对象上，轮询 / 取消 / 重试 / 优先级
-    全部继承 `generation._await_task()`。底部控制台靠 `list_jobs()` 多回的 `target_label`
-    显示「角色 · 阿岚 四视图」，不是空白。
+    全部继承 `generation._await_task()`。**队列里那一行显示成哪句话只有一份口径**
+    （`generation.job_label` → `list_jobs()` 回的 `label`，`batches_of().running_label` 读同一个）：
+    镜头任务「3. 雨夜追车」、出图任务「生成图片素材：角色 · 阿岚 · 默认形象 四视图」，
+    对象已经删掉时照实说「这个素材已经不在了」。前端（底部控制台、队列页列表行与详情）
+    **只渲染 `label`**——四处各拿 `shot_index_no` / `shot_title` / `shot_id` 拼一遍的时候，
+    出图任务那三个字段全是空的，整行只剩一个 `?.`（用户说的「名字都是符号」）。
   - **落地全部转调已有写方法**（`cast.add_sheet` / `world.add_variant_reference` /
     `world.add_prop_reference`，都是 append-only，旧版本一条不删），`services/images.py` 自己
     不碰 ORM。**镜头首末帧只进素材库、绝不写槽位**——「哪一张是首帧」只认用户按下去的那一下。

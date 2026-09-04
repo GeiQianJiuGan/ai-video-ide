@@ -8,7 +8,7 @@
  *
  * 队列页要回答的只有三个问题：谁在跑、谁在等（等谁）、失败的为什么失败。
  *
- * 四个刻意的设计：
+ * 五个刻意的设计：
  *   1. **WS 订阅不归它**。订阅挂在常驻的控制台上，这一页只 `load()` 做一次对齐——
  *      以前是这里 `onUnmounted` 时 disconnect，于是一离开页面实时通道就断了。
  *   2. **等待要能解释**。`waiting` 的任务把 `wait_reason` 写在行里——
@@ -16,6 +16,9 @@
  *   3. **失败现场是一整块，不是一行红字**。右栏放选中任务的结构化错误四要素，
  *      建议一条条列出来，旁边就是「重试」——看见原因的地方就能动手。
  *   4. **暂停不等于取消**。工具栏那句提示写明：已经在跑的照常跑完。
+ *   5. **顺序原样用后端那一份，这一页不再排第二遍**：`list_jobs` 按「优先级 → 入队时间」
+ *      给，里面没有状态这一项，所以一条任务失败之后还在原来的位置上，
+ *      不必每次都滚到最底下找报错。
  */
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
@@ -83,14 +86,21 @@ function elapsed(job: Job): string {
   return sec < 60 ? `${sec}s` : `${Math.floor(sec / 60)}m${sec % 60}s`
 }
 
-function goShot(shotId: string): void {
+/** 跳到那个镜头。**出图任务没有镜头**（`shot_id` 是空的），此时这一下什么都不做。 */
+function goShot(shotId: string | null): void {
+  if (!shotId) return
   void router.push({ name: 'shot', params: { pid: pid.value, sid: shotId } })
 }
 
-/** 提到队首：比当前最小 priority 再小 1（后端按 priority 升序取）。 */
+/**
+ * 提到队首：比当前最大 priority 再大 1。
+ *
+ * **后端按 priority 降序取**（`_claim` 里的 `-j.priority`，默认值 100），所以「队首」
+ * 是数字最大的那一条。这里以前算的是 `min - 1`，点下去反而把它排到了所有任务后面。
+ */
 async function bump(job: Job): Promise<void> {
-  const min = Math.min(...queue.jobs.map((j) => j.priority), job.priority)
-  await queue.setPriority(pid.value, job.id, min - 1)
+  const max = Math.max(...queue.jobs.map((j) => j.priority), job.priority)
+  await queue.setPriority(pid.value, job.id, max + 1)
 }
 </script>
 
@@ -229,8 +239,13 @@ async function bump(job: Job): Promise<void> {
                   </span>
                 </td>
                 <td class="border-line-1 text-fg-2 border-b py-1 pr-1 align-top">
-                  <button class="hover:text-accent text-left" @click.stop="goShot(job.shot_id)">
-                    {{ job.shot_index_no ?? '?' }}. {{ job.shot_title ?? job.shot_id }}
+                  <button
+                    class="text-left"
+                    :class="job.shot_id ? 'hover:text-accent' : 'cursor-default'"
+                    :disabled="!job.shot_id"
+                    @click.stop="goShot(job.shot_id)"
+                  >
+                    {{ job.label }}
                   </button>
                   <p v-if="job.wait_reason" class="text-st-review">{{ job.wait_reason }}</p>
                 </td>
@@ -301,9 +316,7 @@ async function bump(job: Job): Promise<void> {
           />
           <template v-else>
             <div>
-              <p class="text-fg-1 text-2xs">
-                {{ selected.shot_index_no ?? '?' }}. {{ selected.shot_title ?? selected.shot_id }}
-              </p>
+              <p class="text-fg-1 text-2xs">{{ selected.label }}</p>
               <p class="text-fg-4 text-2xs">
                 {{ JOB_STATUS_LABEL[selected.status] ?? selected.status }} · {{ selected.kind }} ·
                 第 {{ selected.attempt }} 次尝试
@@ -365,6 +378,7 @@ async function bump(job: Job): Promise<void> {
                 入队 {{ selected.created_at.slice(0, 16) }}
               </p>
               <AppButton
+                v-if="selected.shot_id"
                 size="sm"
                 variant="ghost"
                 class="mt-1"

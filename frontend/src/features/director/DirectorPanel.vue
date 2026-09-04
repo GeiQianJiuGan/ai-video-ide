@@ -7,10 +7,13 @@
  * 以前它内嵌在剧本页与幕流程图页上，一离开那两页就卸载，正在写的那段话与手上那几条待审提案
  * 跟着一起消失；现在那两页只负责把这一栏叫出来（`shell.showDirector()`）。
  *
- * 这一栏的全部意义是**把「加一幕雨夜追车」变成一份可逐条审阅的 Diff**。十个刻意的设计：
+ * 这一栏的全部意义是**把「加一幕雨夜追车」变成一份可逐条审阅的 Diff**。十二个刻意的设计：
  *
  *   1. **提案不是改动**。这里列出来的每一条，数据库里都还没有发生。只有按下「采用」
  *      才落库，所以每条都要给出 `before → after`——不是「AI 说它要改点东西」。
+ *      **唯一的例外是免确认模式**（设置页那一组，口径只有后端一份 `auto.apply`）：那时提案在
+ *      产出的同一个请求里就落了库，所以标题上要挂「免确认」徽标、底下那句话也跟着改口——
+ *      让用户自己发现待审的卡都不见了是最糟的一种。
  *   2. **提案产出即可审**。流式那条路把 `op` 夹在过程里给（见 `stores/director.ts`），
  *      所以第一条提案出来时就能看，不用等这一轮说完；一轮拆解常常是 1 幕 + 8 镜，
  *      所以按对象分组，每组能一起采用。
@@ -33,6 +36,12 @@
  *  10. **落库回执里那几句话必须显示出来**。落成了的那张提案卡会走掉，于是「同一批新建的
  *      角色接上了没有」「参考图排上没排上」「哪个名字对不上」只剩这里能说了。只给一行
  *      「已落库 N 条」等于把降级藏起来（硬约束 4）——少接一个人不该让用户等到成片才发现。
+ *  11. **一键全流程是另一件事，不是「发送」的一种**。它自己就是四步落库（核心剧本 →
+ *      人物 / 地点 / 道具 → 拆幕 → 按幕拆分镜），所以入口刻意分开，而且免确认模式关着时
+ *      是禁用的——**禁用的原因写在 tooltip 里**（那句话来自后端的 `auto.hint`，前端不写第二份）。
+ *  12. **那一趟的回执照原样摊开**。`stages` 每一步做了什么、被打断的那一步的四要素错误、
+ *      参考图排了几张 / 为什么没排、超出上限的幕——跳过不是失败，但必须说出来。
+ *      `halted` 也不是失败：前面几步落进库的数据一条都没回滚。
  *
  * 宽度由**调用方**给（停靠栏是拖出来的像素宽度，见 `DirectorDock.vue`）。
  */
@@ -49,6 +58,8 @@ import {
   Settings,
   Sparkles,
   Square,
+  TriangleAlert,
+  Wand,
   Wrench,
   X,
 } from '@lucide/vue'
@@ -96,6 +107,11 @@ const emit = defineEmits<{ applied: []; close: [] }>()
 const router = useRouter()
 const director = useDirectorStore()
 const draft = ref('')
+/**
+ * 一键全流程要不要用输入框里这段话**替换掉**工程里已经存着的剧本原文。**默认不换**：
+ * 剧本原文是这个工程的源头，不该被一次「一键全流程」悄悄换掉（后端也会先拦一次）。
+ */
+const replaceScript = ref(false)
 /** 只看变化的字段。整幕覆盖那种提案 before/after 大半是同值，全列出来反而看不清。 */
 const onlyChanged = ref(true)
 /** 展开了哪几处长文本，键是 `${temp_id}:${字段}`。 */
@@ -231,8 +247,40 @@ const failByTemp = computed(() => {
   for (const f of director.lastApply?.failed ?? []) if (f.temp_id) map.set(f.temp_id, f)
   return map
 })
-/** 认不回哪张卡的失败（没带 temp_id）还是要显示——绝不静默丢掉。 */
-const orphanFails = computed(() => (director.lastApply?.failed ?? []).filter((f) => !f.temp_id))
+/**
+ * 认不回哪张卡的失败还是要显示——绝不静默丢掉。
+ *
+ * **一键全流程那一份全部走这里**：那一趟落完就写了 `applied` 记录，待审列表已经归零，
+ * 没有卡可以贴，不显示在这里就等于没发生过（硬约束 4）。
+ */
+const orphanFails = computed(() => [
+  ...(director.lastApply?.failed ?? []).filter((f) => !f.temp_id),
+  ...(director.lastAutopilot?.failed ?? []),
+])
+/** 一键全流程跑动时那几步各自叫什么。**口径只有后端一份**，前端不写第二张阶段表。 */
+const stageLine = computed(() => (director.auto?.stages ?? []).map((s) => s.label).join(' → '))
+/**
+ * 「一键全流程」那颗按钮上的整句话。**禁用的原因必须写在上面**，不能只灰掉一颗按钮
+ * ——那句话来自后端的 `auto.hint`（免确认关着时它说的就是「去设置页打开」）。
+ */
+const autopilotHint = computed(() => {
+  if (!director.auto) return '还在读这一栏的配置'
+  const source = draft.value.trim()
+    ? '这一次用输入框里那段原文（会一并存进这个工程）。'
+    : '这一次用工程里已经存着的剧本原文。'
+  return director.autoApply ? `${director.auto.hint}${source}` : director.auto.hint
+})
+/** 一键全流程跑着时别让人同时按「采用」：那一趟正在一批批落库。 */
+const locked = computed(() => director.busy || director.autopiloting)
+/**
+ * 空态那段话。**免确认模式开着时默认那句是假话**（「按下采用之前，库里什么都不会变」），
+ * 所以那时换成这个模式下真正会发生的事——空态往往是新用户唯一会读完的一段字。
+ */
+const emptyText = computed(() =>
+  director.autoApply
+    ? '免确认模式开着：它想好之后会直接落库，右栏不会有待审的卡，落了什么在这里逐条说明。要逐条审就去设置页的「AI 导演」里关掉它。整章剧本可以直接按底下那颗「一键全流程」：核心剧本 → 人物 / 地点 / 道具 → 拆幕 → 拆分镜一趟走完。'
+    : props.emptyBody,
+)
 
 /**
  * 落库回执里**有话要说**的那几个键。`scene_id` / `shot_id` 那些给人看没有意义，
@@ -262,10 +310,17 @@ interface AppliedRow {
 /**
  * 这一次落库里有话要说的那几条。**没话说的不列**——一轮拆解常常是「1 幕 + 8 镜」，
  * 全列出来只会把真正该看的那两句埋掉，条数本身由下面那行「已落库 N 条」交代。
+ *
+ * **手动采用与一键全流程两份回执共用这一块**（`apply()` 与 `autopilot()` 落的是同一份实现，
+ * 所以每一条的形状逐字相同）：免确认模式下右栏没有卡，这几句话只剩这里能说。
  */
 const appliedRows = computed<AppliedRow[]>(() => {
   const out: AppliedRow[] = []
-  ;(director.lastApply?.applied ?? []).forEach((row, i) => {
+  const rows = [
+    ...(director.lastApply?.applied ?? []),
+    ...(director.lastAutopilot?.applied ?? []),
+  ]
+  rows.forEach((row, i) => {
     const label = String(row.target_label ?? '')
     const headline = String(row.title ?? row.name ?? '') || label
     const notes: { text: string; tone: 'done' | 'warn' }[] = []
@@ -316,12 +371,33 @@ watch(() => director.live, follow)
 watch(() => director.trace.length, follow)
 watch(() => director.pending.length, follow)
 watch(() => director.messages.length, follow)
+watch(() => director.autopiloting, follow)
+watch(() => director.lastAutopilot, follow)
 
 async function send(): Promise<void> {
   const text = draft.value.trim()
   if (!text) return
   draft.value = ''
   await director.send(props.pid, text, props.scope)
+}
+
+/**
+ * 一键全流程。**它不产提案，四步都直接落库**，所以入口与「发送」刻意分开。
+ *
+ * 输入框里那段话就是这一章的原文（附件抽出来的文字也在里面）；**空着就用工程里已经存的那份**。
+ * 落成之后才清输入框——那段话已经进 `Story.raw_text` 了，留着只会让人以为还没发出去；
+ * 被拦下来时（与库里那份不一样、免确认没开）**一个字都不动**，用户接着勾那颗替换再来一次。
+ */
+async function autopilot(): Promise<void> {
+  const text = draft.value.trim()
+  const out = await director.autopilot(props.pid, {
+    text,
+    replace_script: replaceScript.value,
+  })
+  if (!out) return
+  if (text) draft.value = ''
+  replaceScript.value = false
+  if (out.count) emit('applied')
 }
 
 function pickFile(): void {
@@ -387,6 +463,18 @@ function discardGroup(ops: DirectorOp[]): void {
 <template>
   <AppPanel :title="title" :scroll="false">
     <template #actions>
+      <!--
+        免确认模式开着 = 提案在产出的同一个请求里就落了库。**这一栏的第一条设计
+        （提案不是改动）在这个模式下不成立**，所以必须在标题上说出来——让用户自己去发现
+        待审的卡都不见了是最糟的一种。
+      -->
+      <AppBadge
+        v-if="director.autoApply"
+        tone="warn"
+        title="设置页的「AI 导演」里开着免确认模式：这一栏产出的提案会在同一个请求里直接落库，右栏不再有待审的卡。要逐条审就去那里关掉它"
+      >
+        免确认
+      </AppBadge>
       <AppBadge
         v-if="director.degraded"
         tone="warn"
@@ -448,8 +536,12 @@ function discardGroup(ops: DirectorOp[]): void {
         <div ref="feed" class="min-h-0 flex-1 space-y-1.5 overflow-auto p-2">
           <EmptyState
             v-if="!director.messages.length && !director.live && !director.streaming"
-            title="说一句话，它先看清现状再提一份提案"
-            :body="emptyBody"
+            :title="
+              director.autoApply
+                ? '说一句话，它先看清现状再动手'
+                : '说一句话，它先看清现状再提一份提案'
+            "
+            :body="emptyText"
           />
 
           <!-- 落了库的对话。提案不在这里，走下面那份可逐条审阅的 Diff -->
@@ -523,6 +615,23 @@ function discardGroup(ops: DirectorOp[]): void {
             </p>
           </div>
           <!--
+            一键全流程跑着。这一趟**不流式**（四步各自要先落库，后一步要用前一步真落进去的
+            id），所以中间不会有字一个个出来——那更需要说清「在跑什么、大概多久」，
+            静静灰掉几分钟是最糟的那种等待。
+          -->
+          <div
+            v-if="director.autopiloting"
+            class="border-accent/30 bg-base-1 border px-2 py-1.5 space-y-0.5"
+          >
+            <p class="text-fg-2 text-2xs flex items-center gap-1">
+              <Wand :size="10" class="text-accent animate-pulse" />一键全流程正在跑
+            </p>
+            <p v-if="stageLine" class="text-fg-4 text-2xs break-words">{{ stageLine }}</p>
+            <p class="text-fg-4 text-2xs">
+              每一步都要落库，所以中间没有字一个个出来，通常要几分钟。跑完这里会列出每一步做了什么。
+            </p>
+          </div>
+          <!--
             提案。**这里列出来的每一条，库里都还没有发生**——按下「采用」才落库。
             一轮拆解常常是「1 幕 + 8 镜」，所以按对象分组，每组能一起采用。
           -->
@@ -533,7 +642,7 @@ function discardGroup(ops: DirectorOp[]): void {
                 <AppButton
                   size="sm"
                   variant="primary"
-                  :disabled="director.busy"
+                  :disabled="locked"
                   title="这一组一起落库。哪条失败了就留在原位显示原因，不影响其余几条"
                   @click="acceptGroup(g.ops)"
                 >
@@ -560,7 +669,7 @@ function discardGroup(ops: DirectorOp[]): void {
                 <AppButton
                   size="sm"
                   variant="primary"
-                  :disabled="director.busy"
+                  :disabled="locked"
                   title="落库这一条"
                   @click="accept(op)"
                 >
@@ -663,14 +772,115 @@ function discardGroup(ops: DirectorOp[]): void {
             这一次落了什么。落库是不可见的，不说一句就等于没发生——而**落成了的那张提案卡
             已经走掉了**，所以「同一批新建的角色接上了没有」「图排上没排上」只剩这里能说。
           -->
-          <div v-if="director.lastApply && director.lastApply.count" class="space-y-1">
-            <p class="text-st-done text-2xs">
-              已落库 {{ director.lastApply.count }} 条{{
-                director.lastApply.failed.length
-                  ? `，另有 ${director.lastApply.failed.length} 条没落成（原因贴在对应那张卡上）`
-                  : ''
-              }}。
+          <p v-if="director.lastApply && director.lastApply.count" class="text-st-done text-2xs">
+            已落库 {{ director.lastApply.count }} 条{{
+              director.lastApply.failed.length
+                ? `，另有 ${director.lastApply.failed.length} 条没落成（原因贴在对应那张卡上）`
+                : ''
+            }}。
+          </p>
+
+          <!--
+            一键全流程的回执。**四步都真落库了**，所以这不是提案：跳过、断掉、少排的图全部
+            原样显示（硬约束 4）。`halted` 也不是失败——前面几步落进库的数据一条都没回滚。
+          -->
+          <div
+            v-if="director.lastAutopilot"
+            class="border-line-1 bg-base-2 space-y-1 border px-2 py-1.5"
+          >
+            <div class="flex flex-wrap items-center gap-1.5">
+              <AppBadge :tone="director.lastAutopilot.halted ? 'warn' : 'ok'">
+                <Wand :size="10" />一键全流程{{
+                  director.lastAutopilot.halted ? ' · 断在半路' : ''
+                }}
+              </AppBadge>
+              <span class="text-st-done text-2xs">
+                已落库 {{ director.lastAutopilot.count }} 条
+              </span>
+              <span v-if="director.lastAutopilot.failed.length" class="text-st-failed text-2xs">
+                · {{ director.lastAutopilot.failed.length }} 条没落成（原因单独列在上面）
+              </span>
+            </div>
+            <p class="text-fg-4 text-2xs">
+              读的是 {{ director.lastAutopilot.script.chars }} 字的剧本原文<template
+                v-if="director.lastAutopilot.script.saved"
+                >（已存进这个工程{{
+                  director.lastAutopilot.script.replaced ? '，替换了原来那份' : ''
+                }}）</template
+              >。
             </p>
+            <!-- 四步各自做了什么。被打断的那一步带四要素错误，前面几步照旧算落成了 -->
+            <div
+              v-for="(st, i) in director.lastAutopilot.stages"
+              :key="`${st.stage}-${i}`"
+              class="border-line-1 space-y-0.5 border-l pl-1.5"
+            >
+              <p class="text-fg-2 text-2xs break-words">
+                {{ i + 1 }}. {{ st.label }}
+                <span class="text-fg-4">· 提案 {{ st.ops }} 条 / 落库 {{ st.count }} 条</span>
+              </p>
+              <p v-if="st.reply" class="text-fg-3 text-2xs leading-relaxed break-words">
+                {{ st.reply }}
+              </p>
+              <p v-if="st.images_dropped" class="text-fg-4 text-2xs">
+                按设置摘掉了 {{ st.images_dropped }} 句「长什么样」：这一趟不出参考图。
+              </p>
+              <p v-if="st.warning" class="text-st-review text-2xs break-words">· {{ st.warning }}</p>
+              <div
+                v-if="st.error"
+                class="border-st-failed/40 bg-st-failed/5 border px-1.5 py-1 space-y-0.5"
+              >
+                <p class="text-st-failed text-2xs">{{ st.error.title }}</p>
+                <p class="text-fg-2 text-2xs break-words">{{ st.error.detail }}</p>
+                <ul class="text-fg-3 space-y-px">
+                  <li v-for="s in st.error.suggestions" :key="s" class="text-2xs">· {{ s }}</li>
+                </ul>
+                <p class="text-fg-4 font-mono text-2xs">{{ st.error.code }}</p>
+              </div>
+            </div>
+            <!-- 参考图：排了几张，或者为什么没排。**跳过不是失败，但必须说出来** -->
+            <p class="text-fg-4 text-2xs">
+              参考图：<template v-if="director.lastAutopilot.images.queued"
+                >已排 {{ director.lastAutopilot.images.queued }} 张进队列，进度在底部控制台的任务框里看</template
+              >
+              <template v-else-if="!director.lastAutopilot.images.auto"
+                >这一趟按设置没让它出图</template
+              >
+              <template v-else-if="!director.lastAutopilot.images.configured"
+                >还没配出图服务，素材照旧建好了</template
+              >
+              <template v-else>这一趟没有要出的图</template>。
+            </p>
+            <ul v-if="director.lastAutopilot.images.skipped.length" class="space-y-px">
+              <li
+                v-for="(s, i) in director.lastAutopilot.images.skipped"
+                :key="`img-skip-${i}`"
+                class="text-st-review text-2xs break-words"
+              >
+                · {{ s }}
+              </li>
+            </ul>
+            <p v-if="director.lastAutopilot.scenes.length" class="text-fg-4 text-2xs break-words">
+              这一趟拆了分镜的幕：{{
+                director.lastAutopilot.scenes.map((s) => s.title || s.id).join('、')
+              }}
+            </p>
+            <!-- 超出上限的幕、转满轮数的那一步、断掉的那一步都在这里 -->
+            <ul v-if="director.lastAutopilot.warnings.length" class="space-y-px">
+              <li
+                v-for="w in director.lastAutopilot.warnings"
+                :key="w"
+                class="text-st-review text-2xs flex items-start gap-1"
+              >
+                <TriangleAlert :size="10" class="mt-px shrink-0" />
+                <span class="min-w-0 break-words">{{ w }}</span>
+              </li>
+            </ul>
+            <p class="text-fg-4 text-2xs leading-relaxed">{{ director.lastAutopilot.note }}</p>
+          </div>
+
+          <!-- 「顺带发生了什么」——手动采用与一键全流程两份回执共用这一块 -->
+          <div v-if="appliedRows.length" class="space-y-1">
             <div
               v-for="row in appliedRows"
               :key="row.key"
@@ -704,7 +914,10 @@ function discardGroup(ops: DirectorOp[]): void {
           </p>
 
           <!-- chip 只把话填进输入框，不直接发送：发出去之前用户还能改 -->
-          <div v-if="quickActions.length && !director.streaming" class="flex flex-wrap gap-1">
+          <div
+            v-if="quickActions.length && !director.streaming && !director.autopiloting"
+            class="flex flex-wrap gap-1"
+          >
             <button
               v-for="q in quickActions"
               :key="q"
@@ -754,7 +967,7 @@ function discardGroup(ops: DirectorOp[]): void {
             v-model="draft"
             rows="3"
             :placeholder="placeholder"
-            :disabled="director.streaming"
+            :disabled="director.streaming || director.autopiloting"
             class="border-line-1 bg-base-2 text-fg-1 placeholder:text-fg-4 w-full resize-none border px-1.5 py-1 text-2xs leading-relaxed outline-none focus:border-accent/50 disabled:opacity-50"
             @keydown.enter.exact.prevent="send()"
           />
@@ -776,7 +989,12 @@ function discardGroup(ops: DirectorOp[]): void {
             <AppButton
               size="sm"
               variant="ghost"
-              :disabled="!director.attachInfo || director.attaching || director.streaming"
+              :disabled="
+                !director.attachInfo ||
+                director.attaching ||
+                director.streaming ||
+                director.autopiloting
+              "
               :title="
                 director.attachInfo
                   ? `一份 Word / Excel / PPT / 文本 → 一段文字填进输入框（最大 ${director.attachInfo.max_mb} MB，最多 ${director.attachInfo.max_chars} 字）。${director.attachInfo.note}`
@@ -793,6 +1011,18 @@ function discardGroup(ops: DirectorOp[]): void {
               <input v-model="onlyChanged" type="checkbox" class="accent-accent h-3 w-3" />
               只看变化的
             </label>
+            <!--
+              一键全流程会把输入框里那段原文存进工程。工程里已经有一份而且不一样时后端
+              **不覆盖**，报错并给两条出路——这颗勾就是其中一条，所以只在真有话要发时才出现。
+            -->
+            <label
+              v-if="director.autoApply && draft.trim()"
+              class="text-fg-4 flex items-center gap-1 text-2xs"
+              title="工程里已经存着一份剧本原文时，一键全流程默认不动它（报错并让你选）。勾上就用输入框里这段替换掉"
+            >
+              <input v-model="replaceScript" type="checkbox" class="accent-accent h-3 w-3" />
+              用这段替换工程里的剧本原文
+            </label>
             <AppButton
               v-if="director.hasPending"
               size="sm"
@@ -806,13 +1036,31 @@ function discardGroup(ops: DirectorOp[]): void {
               v-if="director.hasPending"
               size="sm"
               variant="primary"
-              :disabled="director.busy"
+              :disabled="locked"
               title="把待审的每一条都落库。失败的留在原位显示原因"
               @click="acceptAll()"
             >
               <Check :size="10" />全部采用
             </AppButton>
             <div class="ml-auto flex items-center gap-1.5">
+              <!--
+                一键全流程：核心剧本 → 人物 / 地点 / 道具 → 拆幕 → 按幕拆分镜，**四步都真落库**。
+                所以它和「发送」是两件事，且免确认模式关着时禁用——**为什么禁用写在 tooltip 里**
+                （那句话来自后端的 `auto.hint`，前端不写第二份文案）。
+              -->
+              <AppButton
+                size="sm"
+                :disabled="
+                  !director.autoApply ||
+                  director.autopiloting ||
+                  director.streaming ||
+                  director.busy
+                "
+                :title="autopilotHint"
+                @click="autopilot()"
+              >
+                <Wand :size="10" />{{ director.autopiloting ? '全流程跑着…' : '一键全流程' }}
+              </AppButton>
               <AppButton
                 v-if="director.streaming"
                 size="sm"
@@ -825,7 +1073,7 @@ function discardGroup(ops: DirectorOp[]): void {
                 v-else
                 size="sm"
                 variant="primary"
-                :disabled="!draft.trim() || director.busy"
+                :disabled="!draft.trim() || locked"
                 @click="send()"
               >
                 <Send :size="10" />发送

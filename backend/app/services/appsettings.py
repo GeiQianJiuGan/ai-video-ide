@@ -59,6 +59,7 @@ class FieldSpec:
 #: 分组只影响配置页怎么摆，不影响存储结构。
 GROUPS: tuple[tuple[str, str], ...] = (
     ("llm", "LLM（AI 协作）"),
+    ("director", "AI 导演（免确认与一键全流程）"),
     ("prompt", "AI 提示词"),
     ("video", "视频生成 API"),
     ("audio", "音源生成（配音 / 环境音）"),
@@ -103,6 +104,43 @@ FIELDS: tuple[FieldSpec, ...] = (
             "地址与密钥沿用上面那一套。"
         ),
         fetch="llm",
+    ),
+    # --- AI 导演的自动化程度。**这三项只改「谁按下那一下」，不改任何边界**：
+    # 写工具照旧永不落库，落库照旧只走 `services/director.py::apply()` 那一份实现。
+    FieldSpec(
+        "director.auto_apply",
+        "director_auto_apply",
+        "director",
+        "免确认模式（提案直接落库）",
+        "bool",
+        impact=(
+            "开着时协作栏一轮产出的提案**在同一个请求里直接落库**，不再逐条审阅——"
+            "落成了什么照旧一条条显示出来，接不上的名字与没排上的图也照旧说明。"
+            "「一键全流程」要它开着才能跑（那一步要连着拆四轮，下一轮得用上一轮真落进库的 id）。"
+            "关着是默认：数据库是你的，改它由你点头。"
+        ),
+    ),
+    FieldSpec(
+        "director.auto_image",
+        "director_auto_image",
+        "director",
+        "全自动时顺带出参考图",
+        "bool",
+        impact=(
+            "「一键全流程」新建角色 / 地点 / 道具时顺带排一张参考图（要先配好下面的"
+            "「图片生成 API」）。关掉就只建素材——素材照旧建成，图这一项会写进回执。"
+        ),
+    ),
+    FieldSpec(
+        "director.max_scenes",
+        "director_max_scenes",
+        "director",
+        "一键全流程最多拆几幕",
+        "int",
+        impact=(
+            "它同时就是这一次要烧多少 token 的上限：分镜那一步**按幕各来一轮**。"
+            "超出的部分不会被悄悄丢掉，会在回执里写明「这一次只拆了前 N 幕」。"
+        ),
     ),
     FieldSpec(
         "prompt.breakdown",
@@ -163,8 +201,32 @@ FIELDS: tuple[FieldSpec, ...] = (
         "video.preset",
         "video_preset",
         "video",
-        "默认预设",
-        impact="comfy_preset 时指哪一份图；缺它无法生成。",
+        "默认预设（两个角色共用）",
+        impact="comfy_preset 时指哪一份图；下面两项留空的角色按这一份出。缺它无法生成。",
+    ),
+    # 按角色再分一层：**工程没有单独绑预设时按这两项走**。R2V 与首尾帧要的入口本来就不一样，
+    # 一台机器上常常是两份不同的图；只有上面那一个格子时，「工程没绑就跟随设置页」在首尾帧上
+    # 必然落到一份不能用的图上。留空 = 退回上面那份共用的（照 refine.preset 的老作风）。
+    FieldSpec(
+        "video.r2v_preset",
+        "video_r2v_preset",
+        "video",
+        "默认预设 · 普通镜头（R2V）",
+        impact=(
+            "工程没有单独绑预设时，普通镜头（图生视频）按这一份出。"
+            "留空则退回上面那份共用的默认预设。"
+        ),
+    ),
+    FieldSpec(
+        "video.flf_preset",
+        "video_flf_preset",
+        "video",
+        "默认预设 · 衔接与转场（首尾帧）",
+        impact=(
+            "工程没有单独绑预设时，首尾帧 / 转场 / FL2VA 按这一份出。它要的入口比 R2V 多两个"
+            "（AIVS_FIRST_FRAME、AIVS_LAST_FRAME），所以常常是另一份图。"
+            "留空则退回上面那份共用的默认预设。"
+        ),
     ),
     FieldSpec("video.timeout", "video_timeout", "video", "单次超时（秒）", "int"),
     # 这里刻意**没有**「参考图上限」这一项：能收几张是模型端那份图的事实

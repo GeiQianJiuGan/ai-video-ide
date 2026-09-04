@@ -218,6 +218,11 @@ def preset_error(name: str | None, capability: str) -> AppError:
     """
     role = preset_role(capability)
     which = "首尾帧 / FL2VA" if role == "flf" else "R2V"
+    # 「去哪儿设那份默认」**点名到角色**：应用级默认不再只有一格（见 `app_preset_of`），
+    # 只说「选一份默认预设」的话，用户在共用那一格里配了一份 R2V 图，首尾帧照旧报同一句错。
+    # 按钮的原字在 `presets.ROLE_ACTION`（前端那张角色表的同一份字）——说成别的字，
+    # 用户在「预设 Workflow」页上就找不到那颗按钮。
+    role_default = presets.ROLE_ACTION[role]
     if not name:
         return AppError(
             ErrorCode.MISSING_CAPABILITY,
@@ -225,7 +230,8 @@ def preset_error(name: str | None, capability: str) -> AppError:
             f"这个工程（以及设置页）都没有指定{which}要用哪一份预设。",
             [
                 "在概览页的「这个工程怎么出片」里选一份预设",
-                "或在设置页选一份默认预设——不单独指定的工程会跟着它",
+                f"或到「预设 Workflow」页在那份图上按「{role_default}」——不单独指定的工程会跟着它"
+                "（这几颗按钮在设置页的预设清单里也有；按角色那两项都留空时跟「设为共用默认」那份）",
                 "预设要先在「预设 Workflow」里导入并校验通过",
             ],
             {"capability": capability, "role": role},
@@ -239,7 +245,7 @@ def preset_error(name: str | None, capability: str) -> AppError:
             f"{presets.DECLARATIONS[presets.DECLARE_IMAGE]}，所以不出现在{which}的候选里。",
             [
                 f"{which}请另选一份没标 {presets.DECLARE_IMAGE} 的预设",
-                "这份图要用在「图片生成 API」那一栏（设置页 → 设为出图默认）",
+                "这份图要用在出图那条链上——到「预设 Workflow」页的「出图」那一栏按「设为出图默认」",
                 f"如果它其实是出画面那份图，把节点上的 {presets.DECLARE_IMAGE} 标题去掉",
             ],
             {"preset": name, "role": role, "capability": capability, "declares_image": True},
@@ -264,19 +270,40 @@ def preset_error(name: str | None, capability: str) -> AppError:
     )
 
 
+def app_preset_of(capability: str) -> str | None:
+    """应用级那一层：这个能力的默认预设。**「工程没绑就跟着设置页」跟的就是这个。**
+
+    两级：**按角色那一项**（`video_flf_preset` / `video_r2v_preset`）→ **共用那一项**
+    （`video_preset`）。按角色分一层是因为两个角色要的入口本来就不一样（R2V 只要
+    `AIVS_PROMPT`，首尾帧还要两头的帧），一台机器上常常是两份不同的图；以前应用级只有
+    一个格子，于是工程没绑时首尾帧必然落到一份不能用的图上，用户只能回到每个工程里各绑一次。
+
+    留空退回共用那份，与 `refine_preset` 那条（`refine_preset or video_preset`）同一个作风：
+    只有一份图的人什么都不用配。
+
+    **那两级本身下沉在 `providers/presets.py::app_default`**，这里只把能力名折成角色名
+    （`preset_role`）：适配层的只读路径（设置页「测试连接」那颗按钮、`ref_capacity()`）
+    也要问同一个问题，而它们不认识「能力」这个词、更不该反过来 import 服务层。
+    """
+    return presets.app_default(preset_role(capability))
+
+
 def preset_name_of(project: Project, capability: str, override: str | None = None) -> str | None:
     """这个工程这个能力最终会提交哪一份预设。
 
-    继承顺序与 `services/params.py::resolve_rows` 那张账单**逐格相同**：
-    场景参数覆写 → 角色默认（`flf_preset_name` / `r2v_preset_name`）→ 工程唯一那份
-    （`preset_name`）→ 设置页那份（`video_preset`）。最后一级是 `params.py` 上没有的
-    （那张表只算工程内的继承），但真正提交时 `comfy_preset` 就是这么退的——
-    **账单不能比事实少一级**，不然界面说「没选预设」而生成却成功了。
+    继承顺序：**场景参数覆写 → 工程的角色默认**（`flf_preset_name` / `r2v_preset_name`）
+    **→ 工程唯一那份**（`preset_name`）**→ 应用级那两级**（`app_preset_of`）。
+    前三级与 `services/params.py::resolve_rows` 那张账单逐格相同，最后一级在账单上并成
+    一格（`level="app"`）——**账单不能比事实少一级**，不然界面说「没选预设」而生成却成功了。
+
+    **工程那三列为空 = 跟随设置页**，与 `generation_mode` 空串同一个口径。新建工程时刻意
+    不把当时的应用级默认物化进去（`services/projects.py::create`）：物化过一次之后，
+    以后在这一页换默认预设，那些工程就再也跟不上了。
     """
     role_default = (
         project.flf_preset_name if capability in FLF_CAPABILITIES else project.r2v_preset_name
     )
-    for candidate in (override, role_default, project.preset_name, settings.video_preset):
+    for candidate in (override, role_default, project.preset_name, app_preset_of(capability)):
         name = (candidate or "").strip()
         if name:
             return name

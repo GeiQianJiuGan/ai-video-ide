@@ -114,15 +114,19 @@ def auto_bindings(
         inputs = node.get("inputs") or {}
         upper_title = title.upper()
 
-        if class_type in (
-            "CLIPTextEncode",
-            "CLIPTextEncodeSDXL",
-            "ShowText",
-            "PrimitiveNode",
-            "CR Prompt Text",
-            "Text Multiline",
-            "Text",
-        ) or "text" in inputs:
+        if (
+            class_type
+            in (
+                "CLIPTextEncode",
+                "CLIPTextEncodeSDXL",
+                "ShowText",
+                "PrimitiveNode",
+                "CR Prompt Text",
+                "Text Multiline",
+                "Text",
+            )
+            or "text" in inputs
+        ):
             if "text" in inputs and not isinstance(inputs["text"], list):
                 target = f"{node_id}.text"
                 if any(w in upper_title for w in ("NEG", "负", "NEGATIVE", "反向")):
@@ -145,21 +149,44 @@ def auto_bindings(
         if "Sampler" in class_type or "KSampler" in class_type:
             samplers.append((node_id, inputs))
 
-        if any(w in class_type for w in ("Latent", "EmptyLatentImage", "EmptyHunyuan", "EmptyWan", "EmptyLTXV")):
+        if any(
+            w in class_type
+            for w in ("Latent", "EmptyLatentImage", "EmptyHunyuan", "EmptyWan", "EmptyLTXV")
+        ):
             latents.append((node_id, inputs))
 
     if "prompt" not in bindings and prompt_candidates:
         bindings["prompt"] = prompt_candidates[0]
-        if len(prompt_candidates) > 1 and "negative_prompt" not in bindings and not neg_prompt_candidates:
+        if (
+            len(prompt_candidates) > 1
+            and "negative_prompt" not in bindings
+            and not neg_prompt_candidates
+        ):
             bindings["negative_prompt"] = prompt_candidates[1]
 
     if "negative_prompt" not in bindings and neg_prompt_candidates:
         bindings["negative_prompt"] = neg_prompt_candidates[0]
 
     if load_images:
-        first_img = next((tgt for _, _, t, tgt in load_images if any(w in t for w in ("FIRST", "首", "START", "起始"))), None)
-        last_img = next((tgt for _, _, t, tgt in load_images if any(w in t for w in ("LAST", "末", "尾", "END", "结束"))), None)
-        ref_img = next((tgt for _, _, t, tgt in load_images if any(w in t for w in ("REF", "参考"))), None)
+        first_img = next(
+            (
+                tgt
+                for _, _, t, tgt in load_images
+                if any(w in t for w in ("FIRST", "首", "START", "起始"))
+            ),
+            None,
+        )
+        last_img = next(
+            (
+                tgt
+                for _, _, t, tgt in load_images
+                if any(w in t for w in ("LAST", "末", "尾", "END", "结束"))
+            ),
+            None,
+        )
+        ref_img = next(
+            (tgt for _, _, t, tgt in load_images if any(w in t for w in ("REF", "参考"))), None
+        )
 
         if capability == "first_last_frame":
             if "first_frame" not in bindings:
@@ -188,16 +215,32 @@ def auto_bindings(
         s_id, s_inputs = samplers[0]
         if "seed" not in bindings and "seed" in s_inputs and not isinstance(s_inputs["seed"], list):
             bindings["seed"] = f"{s_id}.seed"
-        elif "seed" not in bindings and "noise_seed" in s_inputs and not isinstance(s_inputs["noise_seed"], list):
+        elif (
+            "seed" not in bindings
+            and "noise_seed" in s_inputs
+            and not isinstance(s_inputs["noise_seed"], list)
+        ):
             bindings["seed"] = f"{s_id}.noise_seed"
-        if "steps" not in bindings and "steps" in s_inputs and not isinstance(s_inputs["steps"], list):
+        if (
+            "steps" not in bindings
+            and "steps" in s_inputs
+            and not isinstance(s_inputs["steps"], list)
+        ):
             bindings["steps"] = f"{s_id}.steps"
 
     if latents:
         l_id, l_inputs = latents[0]
-        if "width" not in bindings and "width" in l_inputs and not isinstance(l_inputs["width"], list):
+        if (
+            "width" not in bindings
+            and "width" in l_inputs
+            and not isinstance(l_inputs["width"], list)
+        ):
             bindings["width"] = f"{l_id}.width"
-        if "height" not in bindings and "height" in l_inputs and not isinstance(l_inputs["height"], list):
+        if (
+            "height" not in bindings
+            and "height" in l_inputs
+            and not isinstance(l_inputs["height"], list)
+        ):
             bindings["height"] = f"{l_id}.height"
         if "duration" not in bindings:
             for f in ("length", "num_frames", "frames", "duration"):
@@ -278,6 +321,7 @@ class WorkflowService:
         project = (await fetch_all(db_of(pid), Project))[0]
         global_db = await self._global_db()
         async with global_db.read() as session:
+
             async def valid_id(wid: str | None) -> str | None:
                 if not wid:
                     return None
@@ -309,9 +353,7 @@ class WorkflowService:
         #: `route.normalize()` 收别名（`workflow_api` → `comfy_workflow`）、把未知值报成
         #: 四要素 `VALIDATION_ERROR`（写入侧该挡就挡），空串 = 跟随设置页。
         mode = (
-            route.normalize(bindings["generation_mode"])
-            if "generation_mode" in bindings
-            else None
+            route.normalize(bindings["generation_mode"]) if "generation_mode" in bindings else None
         )
         valid_bindings: dict[str, str | None] = {}
         for capability, wid in bindings.items():

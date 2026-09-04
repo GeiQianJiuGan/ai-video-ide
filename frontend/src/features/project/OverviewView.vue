@@ -207,7 +207,9 @@ function capOf(capability: string): RouteCapability | null {
 
 /**
  * 两个预设下拉显示的是**真正会提交的那一份**（`route` 已经按继承顺序解析过），所以工程没指定
- * 时这里显示的是设置页那一份。写只写被改动的那一个角色（见 `setVideoPreset`）。
+ * 时这里显示的是应用级那一份——**按角色各一份**（「预设 Workflow」页上的 R2V 默认 / 首尾帧
+ * 默认），两个角色要的入口本来就不一样，一台机器上常常是两份不同的图。
+ * 写只写被改动的那一个角色（见 `setVideoPreset`）。
  */
 const r2vPreset = computed(() => capOf('image2video')?.preset ?? '')
 const flfPreset = computed(() => capOf('first_last_frame')?.preset ?? '')
@@ -620,7 +622,7 @@ function duration(sec: number): string {
                       :disabled="presetBusy"
                       @change="selectPreset('r2v', ($event.target as HTMLSelectElement).value)"
                     >
-                      <option value="">未选择 R2V 预设</option>
+                      <option value="">跟随设置页的 R2V 默认</option>
                       <option
                         v-for="preset in presets.filter((row) => row.r2v_ready ?? row.ready)"
                         :key="preset.name"
@@ -638,7 +640,7 @@ function duration(sec: number): string {
                       :disabled="presetBusy"
                       @change="selectPreset('flf', ($event.target as HTMLSelectElement).value)"
                     >
-                      <option value="">未选择 FL2VA 预设</option>
+                      <option value="">跟随设置页的首尾帧默认</option>
                       <option
                         v-for="preset in presets.filter((row) => row.flf_ready)"
                         :key="preset.name"
@@ -650,7 +652,9 @@ function duration(sec: number): string {
                   </label>
                   <p class="text-fg-4 mt-1 text-2xs">
                     两项可以选择同一份预设；普通 Shot 只用 R2V，明确生成衔接时才用 FL2VA。
-                    这里显示的是真正会提交的那一份——工程没指定时它来自设置页那份默认预设。
+                    这里显示的是真正会提交的那一份——这个工程没有单独指定时，它跟着
+                    「预设 Workflow」页上设的 R2V / 首尾帧默认走，在那儿换一份，
+                    所有没单独指定的工程跟着变。
                   </p>
                   <RouterLink :to="{ name: 'presets' }" class="text-accent mt-1 inline-block text-2xs">
                     管理预设 Workflow

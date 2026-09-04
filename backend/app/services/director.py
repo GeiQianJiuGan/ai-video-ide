@@ -24,6 +24,20 @@
   · **半路挂了也不白干**：已经说过的话与已经攒出的提案先落成记录，再吐 `error`
     事件——和「转满轮数」那条老规矩同一个理由；
   · **`error` 之后没有 `done`**：两者互斥，前端收到任一个都该重拉一次历史。
+
+**免确认模式（设置项 `director.auto_apply`）改的只是「谁按下那一下」。** 开着时 `chat()` /
+`chat_stream()` 在**同一个请求里**接着调那一个 `apply()`——不是第二条写路径，写工具照旧
+永不落库。所以上面第 2 条边界一个字都没松，松的是「改动要等用户点一次」。落成了什么照旧
+一条条回（`applied` / `failed`），接不上的名字与没排上的图也照旧写在各自那条里。
+
+**一键全流程（`autopilot()`）是把免确认模式连成四步**：核心剧本 → 人物 / 地点 / 道具 →
+拆幕 → 按幕拆分镜（`AUTO_STAGES`）。顺序不能换，因为后一步要用前一步**真落进库**的 id
+（拆分镜要 `scene_id`，按名字接线要形象 id），所以它**以免确认开着为前提**——关着时抛四要素
+错误，绝不偷偷写几十行数据。每一步都是「一句话 → `agent.propose()` → `_persist()` →
+`apply()`」，与 `chat()` 逐字同构（阶段提示词是**普通 user message**，不新增第二层系统提示词），
+于是整条链一行新的写库逻辑都没有，前几步的结论也靠 `_llm_history()` 自然带到后面几步。
+某一步失败时**已经落的不回滚**：还什么都没写就直接抛，写过东西之后一律 200 +
+`stages[].error`（跳过不是失败，但必须说出来）。
 """
 
 from __future__ import annotations
@@ -60,6 +74,95 @@ HISTORY_TURNS = 10
 #: 三种「等这一批新建的素材」的接线各自叫什么。落库结果里的
 #: `<kind>_wired` / `<kind>_skipped` 两个键就是拿它拼的，前端照键显示，不猜。
 _WIRE_WORD = {"cast": "角色", "props": "道具", "location": "地点"}
+
+#: 「一键全流程」的四步与它们在界面上的名字。**顺序不能换**：后一步要用前一步真落进库的
+#: id（拆分镜要 `scene_id`，按名字接线要形象 id），所以每一步都得先落库再走下一步。
+AUTO_STAGES: tuple[tuple[str, str], ...] = (
+    ("digest", "核心剧本"),
+    ("materials", "人物 / 地点 / 道具"),
+    ("scenes", "拆幕"),
+    ("shots", "拆分镜"),
+)
+
+#: 第一步只出文字、不出提案：先把这一章读完并说清主线。它同时是后面三步的上下文
+#: （`_llm_history()` 会把它带过去），所以要它把人名 / 地名 / 道具名按**原文**列出来。
+_AUTO_DIGEST = """现在开始「一键全流程」的第一步：把剧本读完，只说结论，先不要提任何提案。
+
+这样做：
+1. 用 read_script 从 offset=0 开始分段读，每次 limit 尽量给大（比如 6000），
+   一直读到返回里的 done 是 true。原文已经在这个工程里，不用问我要。
+2. 读完写一份中文「核心剧本」：一句话主线、按时间顺序的关键情节（不超过 12 条）、
+   出场人物名单、出现的地点名单、有戏份的关键道具名单。
+
+人名、地名、道具名一律用剧本里的原文，不要改写也不要音译，更不要编原文里没有的。
+这一步**只说话**：add_scene / add_shot / add_character 这类写工具一个都不要调。"""
+
+#: 第二步：素材。出图那一句按三种情况分岔（`_image_hint`），其余一个字不变。
+_AUTO_MATERIALS = """第二步：把上面那份核心剧本里的人物、地点、道具建成素材。
+
+先用 list_characters、list_locations、list_props 看库里已经有什么，**已经有的不要再建一遍**
+（同名或明显是同一个就跳过，并在回答里说跳过了谁）。还缺的每个提一条：
+
+· 人物 → add_character：name 用原文，description 写年龄段、外貌、气质、常穿什么
+· 地点 → add_location：name 是地点本身，variant 是它的一种样子（「雨夜」「清晨」…），
+  time_of_day 填时间，description 写环境与光线
+· 关键道具 → add_prop：只建真的有戏份的，别把布景里每样东西都建成道具
+{image_hint}
+这一步只提这三种提案：先不要拆幕，也不要加镜头。"""
+
+#: 第三步：拆幕。**只提 `add_scene`**——`set_link` 要真的幕 id，而这时候幕还没落库。
+_AUTO_SCENES = """第三步：把核心剧本拆成幕（一幕 = 一个连续的时空段落）。
+
+用 add_scene 提，每一幕：title 一句话说清这一幕发生了什么、summary 写剧情要点、
+time_of_day 填时间、location_name 用剧本里的地点原文（上一步刚建的那些按名字就能对上）。
+
+最多 {max_scenes} 幕。这一章的内容多于这个数时，只拆最重要的前 {max_scenes} 幕，
+并在回答里说明剩下的还没拆。
+
+**只提 add_scene**：不要带 shots，也不要提 set_link——幕之间默认硬切，衔接等幕真的建好了
+再单独配（现在还没有幕 id 可用）。"""
+
+#: 第四步：**按幕各来一轮**。一次把所有幕的镜头都拆完必然超时或被截断，
+#: 所以这一步在 `autopilot()` 里循环，每一幕一句话、一次 `propose()`、一次 `apply()`。
+_AUTO_SHOTS = """第四步（第 {index}/{total} 幕）：给这一幕拆分镜。
+
+这一幕的 scene_id 是 {scene_id}，标题「{title}」。先用 get_scene 看它现在什么样，
+再用 read_skill 取一份镜头提示词的写法（这一轮的镜头还没有指定首尾帧，取 ref 那一份）。
+
+然后用 add_shot 提 {hint} 个镜头，每一镜：
+
+· scene_id 一律填 {scene_id}
+· title 一句话说清这一镜拍什么，description 写画面内容
+· duration 2~8 秒
+· camera 写景别（近景 / 中景 / 全景…），movement 写运镜（推 / 摇 / 固定…）
+· character_names 用剧本里的人名原文列出这一镜谁出场（刚建好的角色会自动接上）
+· camera_motion / visual_prompt / audio_dialogue 三段照 SKILL 的写法写，skill 填你取的那份
+
+镜头按时间顺序提，不用填 position。这一幕有关键道具出场时，最后再提一条
+set_scene_props（道具是挂在幕上的，镜头上没有这一项）。
+
+**别提 set_scene_prompt**（它会把这一幕每个镜头的 prompt 覆盖成同一段），也别改别的幕。"""
+
+#: 一幕拆几个镜头。给的是范围而不是定数：一幕本来就有长有短，钉死一个数只会逼模型
+#: 把两镜的内容硬塞进一镜，或者为了凑数编出没有的画面。
+_AUTO_SHOT_HINT = "3~6"
+
+
+def _drop_image_prompts(ops: list[dict[str, Any]]) -> int:
+    """把这一批提案里的「顺带出一张参考图」摘掉，回摘了几条。
+
+    **确定性地做，不靠提示词自觉**：提示词里那句「不要写 image_prompt」是建议，
+    模型照旧可能写；而这里摘掉之后 `_maybe_image()` 就一定不会入队
+    （它认的就是 `after["image_prompt"]`）。素材照旧建成——关掉的是图，不是素材。
+    """
+    dropped = 0
+    for op in ops:
+        after = op.get("after")
+        if isinstance(after, dict) and str(after.get("image_prompt") or "").strip():
+            after["image_prompt"] = ""
+            after["generate_image"] = False
+            dropped += 1
+    return dropped
 
 
 @dataclass(slots=True)
@@ -145,11 +248,40 @@ class DirectorService:
     async def history(self, pid: str) -> dict[str, Any]:
         db = db_of(pid)
         rows = await fetch_all(db, DirectorTurn, order_by=DirectorTurn.created_at)
+        auto = self.auto_status()
         return {
             "turns": [{**as_dict(row), "content": load_json(row.content_json, {})} for row in rows],
             "llm": llm.status(),
             "attach": self.attach_limits(),
-            "note": "提案只是提案：没点「采用」之前，数据库里什么都没变。",
+            "auto": auto,
+            "note": (
+                "免确认模式开着：这一栏产出的提案会在同一个请求里直接落库。"
+                if auto["apply"]
+                else "提案只是提案：没点「采用」之前，数据库里什么都没变。"
+            ),
+        }
+
+    @staticmethod
+    def auto_status() -> dict[str, Any]:
+        """免确认与一键全流程现在是什么口径。**只有设置页那一份**（`appsettings` 的
+        `director` 组），前端不记第二份默认值。
+
+        协作栏要用它改口：免确认开着时「提案不是改动」这句话就不成立了，界面必须先把这件事
+        说出来（硬约束 4）；「一键全流程」那颗按钮也照 `apply` 禁用并写清为什么——后端本来
+        就会拒（`_require_auto_apply()`），但让用户点一下才知道不如一开始就说明白。
+        `image_configured` 跟着 `registry.image_configured()` 那一份口径，不在前端判第二遍。
+        """
+        return {
+            "apply": settings.director_auto_apply,
+            "image": settings.director_auto_image,
+            "max_scenes": max(1, int(settings.director_max_scenes)),
+            "image_configured": registry.image_configured(),
+            "stages": [{"stage": stage, "label": label} for stage, label in AUTO_STAGES],
+            "hint": (
+                "一键全流程会照这四步连着落库：核心剧本 → 人物 / 地点 / 道具 → 拆幕 → 按幕拆分镜。"
+                if settings.director_auto_apply
+                else "一键全流程要先在设置页的「AI 导演」里打开免确认模式——它要连着落四批数据。"
+            ),
         }
 
     def attach_limits(self) -> dict[str, Any]:
@@ -229,16 +361,20 @@ class DirectorService:
 
         这是不流式那条路（兼容 + 不支持 SSE 的调用方）。流式那条见 `chat_stream()`，
         两条共用 `_persist()` 与 `_over_limit()`。
+
+        **免确认模式开着时，产出的提案在这同一个请求里就落库**（`_auto_applied()`，走的还是
+        `apply()` 那一份实现）。返回体里因此多 `auto_applied` / `applied` / `failed` / `count`。
         """
         text = await self.stream_precheck(pid, message)
         await self._add_turn(pid, "user", {"text": text})
         history = await self._llm_history(pid)
         out = await agent.propose(pid, text, history, scope=scope)
         turns = await self._persist(pid, out)
+        auto = await self._auto_applied(pid, out["ops"])
         if out["over_limit"]:
             # 提案已经落好了才报错：转够了轮数不代表这几条不能用。
-            raise self._over_limit(len(out["ops"]))
-        return {"turns": turns, "ops": out["ops"], "degraded": out["degraded"]}
+            raise self._over_limit(len(out["ops"]), auto["auto_applied"])
+        return {"turns": turns, "ops": out["ops"], "degraded": out["degraded"], **auto}
 
     async def stream_precheck(self, pid: str, message: str) -> str:
         """能在开流之前报的错，就别等到流里再报。返回收拾干净的那句话。
@@ -327,8 +463,14 @@ class DirectorService:
             out = self._salvage(said, ops)
             out["over_limit"] = True
         turns = await self._persist(pid, out)
+        auto = await self._auto_applied(pid, out["ops"])
         if out["over_limit"]:
-            yield {"event": "error", "data": {"error": self._over_limit(len(out["ops"])).to_dict()}}
+            yield {
+                "event": "error",
+                "data": {
+                    "error": self._over_limit(len(out["ops"]), auto["auto_applied"]).to_dict()
+                },
+            }
             return
         yield {
             "event": "done",
@@ -337,8 +479,28 @@ class DirectorService:
                 "ops": out["ops"],
                 "degraded": out["degraded"],
                 "rounds": out["rounds"],
+                **auto,
             },
         }
+
+    async def _auto_applied(self, pid: str, ops: list[dict[str, Any]]) -> dict[str, Any]:
+        """免确认模式：把刚产出的提案在**同一个请求里**落库。
+
+        **走的还是 `apply()` 那一份实现**——不是第二条写路径，所以校验、按名字接线、
+        「素材建好了顺带排一张图」那些行为与用户手点「全部采用」逐字相同。
+        关着（默认）或这一轮没有提案时什么都不做，只回一个 `auto_applied: False`
+        让前端知道「没落库不是因为出错」。
+        """
+        if not settings.director_auto_apply or not ops:
+            return {"auto_applied": False}
+        done = await self.apply(pid, ops)
+        log.info(
+            "director.auto_applied",
+            project_id=pid,
+            count=done["count"],
+            failed=len(done["failed"]),
+        )
+        return {"auto_applied": True, **done}
 
     @staticmethod
     def _salvage(said: list[str], ops: list[dict[str, Any]]) -> dict[str, Any]:
@@ -375,14 +537,23 @@ class DirectorService:
         return turns
 
     @staticmethod
-    def _over_limit(count: int) -> AppError:
-        """转满轮数：提案已经落好了才报这个错——转够了轮数不代表这几条不能用。"""
+    def _over_limit(count: int, auto_applied: bool = False) -> AppError:
+        """转满轮数：提案已经落好了才报这个错——转够了轮数不代表这几条不能用。
+
+        第一条建议按免确认开没开分岔：自动落库之后还说「仍在右栏可以审阅」是句假话
+        （右栏那几张卡这一刻已经落进库了），用户会去点一个不存在的按钮。
+        """
+        first = (
+            f"已产出的 {count} 条提案**已经落库了**（免确认模式开着），到流程图上核对一下"
+            if auto_applied
+            else f"已产出的 {count} 条提案仍在右栏，可以照常审阅采用"
+        )
         return AppError(
             ErrorCode.LLM_INVALID_OUTPUT,
             "AI 转了太多轮还没收尾",
             f"已经跑满 {agent.MAX_ROUNDS} 轮工具调用，这一轮就此停下。",
             [
-                f"已产出的 {count} 条提案仍在右栏，可以照常审阅采用",
+                first,
                 "把要求说得更具体一点再试（比如指明是哪一幕）",
                 "或直接在流程图上手动改——手动路径不依赖 LLM",
             ],
@@ -400,6 +571,308 @@ class DirectorService:
             if text:
                 out.append({"role": row.role, "content": text})
         return out
+
+    # --- 一键全流程（免确认模式下把四步连起来） ---
+
+    async def autopilot(
+        self,
+        pid: str,
+        text: str = "",
+        *,
+        replace_script: bool = False,
+        auto_image: bool | None = None,
+        max_scenes: int | None = None,
+    ) -> dict[str, Any]:
+        """一趟跑完四步：核心剧本 → 人物 / 地点 / 道具 → 拆幕 → 按幕拆分镜。
+
+        `text` 是这一章的原文：非空就先存进 `Story.raw_text`（库里已经有**不同**的一份时
+        绝不覆盖，报错并给出路）；空就用工程里已经有的那一份。`auto_image` / `max_scenes`
+        留空表示跟随设置页那两项。
+
+        **每一步都真落库**（所以要求免确认模式开着，见 `_require_auto_apply()`）：后一步要用
+        前一步的 id——拆分镜要 `scene_id`，镜头里那几个人要接到刚建出来的形象上。
+
+        **只在一行业务数据都还没落的时候抛错**：已经落过之后一律 200 + 回执里的
+        `stages[].error` 与 `warnings`，照 `sequence.plan` / `packages.plan` 的老规矩
+        「跳过不是失败，但必须说出来」。已经落的一律不回滚。
+
+        拆分镜那几轮**不指望聊天记录记得住前面的结论**（`HISTORY_TURNS` 就 10 条），
+        每一轮都让模型自己 `get_scene` 读现状，与用户手动一句一句说时走的是同一条路。
+        """
+        llm.require_configured()
+        db_of(pid)  # 工程没打开就在这里 404，别等写到一半才发现
+        self._require_auto_apply()
+        want_image = settings.director_auto_image if auto_image is None else bool(auto_image)
+        cap = max(1, int(settings.director_max_scenes if max_scenes is None else max_scenes))
+        configured = registry.image_configured()
+        source = await self._autopilot_source(pid, text, replace_script)
+
+        stages: list[dict[str, Any]] = []
+        applied: list[dict[str, Any]] = []
+        failed: list[dict[str, Any]] = []
+        warnings: list[str] = []
+        targets: list[dict[str, Any]] = []
+        current = AUTO_STAGES[0]
+        fail: AppError | None = None
+        plan = [
+            (AUTO_STAGES[0], _AUTO_DIGEST, False),
+            (
+                AUTO_STAGES[1],
+                _AUTO_MATERIALS.format(image_hint=self._image_hint(configured, want_image)),
+                not want_image,
+            ),
+            (AUTO_STAGES[2], _AUTO_SCENES.format(max_scenes=cap), False),
+        ]
+
+        def absorb(row: dict[str, Any]) -> None:
+            stages.append(row)
+            applied.extend(row["applied"])
+            failed.extend(row["failed"])
+            if row.get("warning"):
+                warnings.append(f"{row['label']}：{row['warning']}")
+
+        try:
+            for (stage, label), prompt, strip in plan:
+                current = (stage, label)
+                absorb(await self._auto_step(pid, stage, label, prompt, strip_images=strip))
+            made = [
+                str(e["scene_id"])
+                for e in stages[-1]["applied"]
+                if e.get("op") == "add_scene" and e.get("scene_id")
+            ]
+            targets, why, total = await self._auto_shot_targets(pid, made, cap)
+            if total > len(targets):
+                warnings.append(
+                    f"这一次只给前 {len(targets)} 幕拆了分镜（{why}一共 {total} 幕，上限 {cap}）："
+                    "剩下的再点一次「一键全流程」就接着拆。"
+                )
+            for index, lane in enumerate(targets, 1):
+                title = str(lane.get("title") or "")
+                current = ("shots", f"拆分镜 · 第 {index} 幕「{title}」")
+                absorb(
+                    await self._auto_step(
+                        pid,
+                        "shots",
+                        current[1],
+                        _AUTO_SHOTS.format(
+                            index=index,
+                            total=len(targets),
+                            scene_id=lane["id"],
+                            title=title,
+                            hint=_AUTO_SHOT_HINT,
+                        ),
+                    )
+                )
+        except AppError as exc:
+            fail = exc
+        except Exception as exc:  # noqa: BLE001 —— 归一成四要素，绝不静默
+            log.warning("director autopilot failed: %s", exc)
+            fail = AppError(
+                ErrorCode.LLM_UNAVAILABLE,
+                "一键全流程中断了",
+                f"{type(exc).__name__}: {exc}",
+                [
+                    "重试一次（多半是连接或超时）",
+                    "已经落进库的那几步不会消失：回执里写着走到哪一步",
+                    "或在流程图上接着手动做——手动路径不依赖 LLM",
+                ],
+            )
+        if fail is not None:
+            if not applied:
+                # 一行业务数据都还没落：给一个干净的四要素错误，别回一张空回执让用户自己猜
+                raise fail
+            stages.append(
+                {
+                    "stage": current[0],
+                    "label": current[1],
+                    "reply": "",
+                    "ops": 0,
+                    "applied": [],
+                    "failed": [],
+                    "count": 0,
+                    "images_dropped": 0,
+                    "error": fail.to_dict(),
+                }
+            )
+            warnings.append(f"{current[1]}：这一步没做完（{fail.title}），前面几步已经落库了。")
+        queued, skipped = self._image_tally(applied)
+        log.info(
+            "director.autopilot",
+            project_id=pid,
+            stages=len(stages),
+            applied=len(applied),
+            failed=len(failed),
+            halted=fail is not None,
+        )
+        return {
+            "auto_apply": True,
+            "script": source,
+            "stages": stages,
+            "applied": applied,
+            "failed": failed,
+            "count": len(applied),
+            "scenes": [{"id": r["id"], "title": r.get("title")} for r in targets],
+            "warnings": warnings,
+            "images": {
+                "configured": configured,
+                "auto": want_image,
+                "queued": queued,
+                "skipped": skipped,
+                "dropped": sum(int(r.get("images_dropped") or 0) for r in stages),
+            },
+            "halted": fail is not None,
+            "note": (
+                "这四步是照免确认模式直接落库的：流程图上现在就能看到幕与镜头。"
+                "参考图（如果排了）在底部控制台的任务框里跑；画面还没生成，"
+                "要你自己在场景工作台上按下那一下。"
+            ),
+        }
+
+    @staticmethod
+    def _require_auto_apply() -> None:
+        """一键全流程**以免确认模式开着为前提**，而且这句话必须在写第一行数据之前说。
+
+        不是「顺便检查一下」：这一趟要连着落四批数据，拆分镜那一步得用前一步真落进库的
+        幕 id。关着免确认时那几批只会变成右栏里几十张待审的卡，第四步拿不到 `scene_id`，
+        整条链就断在中间——那种半成品比一个清楚的错误糟得多。
+        """
+        if settings.director_auto_apply:
+            return
+        raise AppError(
+            ErrorCode.VALIDATION_ERROR,
+            "一键全流程要先开免确认模式",
+            "这一趟会连着落四批数据（核心剧本 → 素材 → 幕 → 分镜），"
+            "拆分镜那一步要用前一步真落进库的幕 id，所以不能只出提案。",
+            [
+                "去设置页的「AI 导演」打开「免确认模式（提案直接落库）」再点一次",
+                "或照旧一句一句说——逐条审阅那条路一直都在，不依赖这个开关",
+            ],
+        )
+
+    async def _autopilot_source(self, pid: str, text: str, replace: bool) -> dict[str, Any]:
+        """确定这一趟读的是哪一份原文，**绝不悄悄盖掉工程里已经有的那份**。
+
+        四种情况：给了原文而库里是空的（或显式勾了替换）→ 存进去；给了原文但库里已经有
+        **不一样**的一份 → 报错并给两条出路（不带文字直接跑 / 勾替换）；没给而库里有 →
+        就用库里那份；两边都空 → 报错说清剧本从哪里来。
+        """
+        fresh = str(text or "").strip()
+        stored = str((await story.get_story(pid)).get("raw_text") or "").strip()
+        if fresh and (not stored or replace or fresh == stored):
+            if fresh != stored:
+                await story.save_story(pid, {"raw_text": fresh})
+            return {"chars": len(fresh), "saved": fresh != stored, "replaced": bool(stored)}
+        if fresh:
+            raise AppError(
+                ErrorCode.VALIDATION_ERROR,
+                "工程里已经有一份剧本原文",
+                f"库里那份 {len(stored)} 字，这次带来的是 {len(fresh)} 字，两份不一样。"
+                "剧本原文是这个工程的源头，不该被一次「一键全流程」悄悄换掉。",
+                [
+                    "不带文字直接跑：就按工程里那份原文拆",
+                    "确实要换掉：勾上「替换工程里的剧本原文」再跑一次",
+                ],
+                {"stored_chars": len(stored), "given_chars": len(fresh)},
+            )
+        if not stored:
+            raise AppError(
+                ErrorCode.VALIDATION_ERROR,
+                "这个工程还没有剧本原文",
+                "一键全流程的第一步是把剧本读完，没有原文就无从开始。",
+                [
+                    "把这一章的原文贴进输入框再点一次（会一并存进这个工程）",
+                    "或在协作栏里一句一句说你想拍什么——那条路不需要原文",
+                ],
+            )
+        return {"chars": len(stored), "saved": False, "replaced": False}
+
+    @staticmethod
+    def _image_hint(configured: bool, want: bool) -> str:
+        """第二步那段提示词里关于「顺带出图」的一句话，按三种情况各说一种。
+
+        没配出图服务时**照旧让模型把那句「长什么样」写出来**：素材照旧建成，图那一项在
+        落库回执里写成 `image_skipped`（硬约束 2 的老作风）——用户配好服务之后在素材页
+        点一下就能出，不必让 AI 再想一遍这张图该长什么样。
+        """
+        if not want:
+            return "\n这一轮**不要**写 image_prompt：只建素材，参考图之后单独出。"
+        head = (
+            "\n每一条都带上 image_prompt（一句「长什么样」：外形、服装配色、材质、光线），"
+            "skill 按素材类型选（人物 char_sheet / 地点 scene_simple / 道具 prop_ref）。"
+        )
+        if configured:
+            return head + "落库时会顺带排一张参考图。"
+        return head + "现在还没配出图服务，图这一次不会真出来——素材照旧建成，这句话先留着。"
+
+    @staticmethod
+    def _image_tally(rows: list[dict[str, Any]]) -> tuple[int, list[str]]:
+        """数一遍「顺带排图」这件事的结果：排上了几张、跳过的原因各是什么。
+
+        跳过的原文照抄 `_maybe_image()` 那句话——**不在这里重写一份措辞**，
+        不然回执上那句和素材卡上那句会分叉。
+        """
+        queued = sum(1 for row in rows if row.get("job_id"))
+        skipped = [str(row["image_skipped"]) for row in rows if row.get("image_skipped")]
+        return queued, skipped
+
+    async def _auto_step(
+        self, pid: str, stage: str, label: str, prompt: str, *, strip_images: bool = False
+    ) -> dict[str, Any]:
+        """一步 = 一句话 → `propose()` → `_persist()` → `apply()`，与 `chat()` 逐字同构。
+
+        阶段提示词是**普通 user message**（不是第二层系统提示词），所以它照样进
+        `DirectorTurn`：用户回头能看到这一趟到底跟 AI 说了什么，刷新也不丢。
+
+        **直接调 `apply()` 而不是 `_auto_applied()`**：进这个方法之前
+        `_require_auto_apply()` 已经确认过意图，而用户完全可能在这一趟跑到一半时去把那个
+        开关关掉——那会让第四步拿不到幕 id，整条链断在中间。
+
+        转满轮数（`over_limit`）**不算这一步失败**：提案已经落好了，只把这件事写成
+        `warning` 带回去，接着走下一步。
+        """
+        await self._add_turn(pid, "user", {"text": prompt, "autopilot": stage})
+        history = await self._llm_history(pid)
+        out = await agent.propose(pid, prompt, history, scope="flow")
+        await self._persist(pid, out)
+        ops: list[dict[str, Any]] = out["ops"]
+        dropped = _drop_image_prompts(ops) if strip_images else 0
+        done = await self.apply(pid, ops)
+        row = {
+            "stage": stage,
+            "label": label,
+            "reply": out["reply"],
+            "ops": len(ops),
+            "images_dropped": dropped,
+            "degraded": out["degraded"],
+            **done,
+        }
+        if out["over_limit"]:
+            row["warning"] = (
+                f"AI 在这一步转满了 {agent.MAX_ROUNDS} 轮工具调用才停下，"
+                "已经产出的提案照旧落库了，但这一步可能没做完。"
+            )
+        return row
+
+    async def _auto_shot_targets(
+        self, pid: str, created: list[str], cap: int
+    ) -> tuple[list[dict[str, Any]], str, int]:
+        """第四步要给哪几幕拆分镜。**绝不动已经排过镜头的幕。**
+
+        主路是「这一趟新建的那几幕」。上一步一幕都没新建时（比如剧本已经拆过了，用户只是
+        想把分镜补齐）退到「库里还没有镜头的幕」——那也是用户点这一下时想要的东西，
+        而已经有镜头的幕再拆一遍只会得到两套重复的分镜。
+        """
+        lanes = await story.storyboard(pid)
+        rows = [lane for lane in lanes if lane["id"] in set(created)]
+        why = "这一趟新建的幕"
+        if not rows:
+            rows = [
+                lane
+                for lane in lanes
+                if not [s for s in lane.get("shots", []) if s.get("kind") != "transition"]
+            ]
+            why = "库里还没有镜头的幕"
+        return rows[:cap], why, len(rows)
 
     # --- 落库（逐条审阅之后） ---
 

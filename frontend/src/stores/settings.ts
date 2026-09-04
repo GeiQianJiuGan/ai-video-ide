@@ -15,6 +15,7 @@
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import { ApiError } from '@/shared/api/client'
+import { PRESET_DEFAULT_ROLES } from '@/shared/lib/presets'
 import {
   settingsApi,
   type ImageProtocolRow,
@@ -254,13 +255,20 @@ export const useSettingsStore = defineStore('settings', () => {
     })
   }
 
+  /**
+   * 删一份预设图，顺手把指着它的那几个应用级默认清掉。
+   *
+   * 键从 `PRESET_DEFAULT_ROLES` 读（前端那张唯一的表），**不在这里另抄一份**：这里以前只清
+   * `video.preset` / `image.preset` 两格，于是应用级默认从一格变成三格之后，删掉一份图会留下
+   * 一个指着不存在的名字的 `video.r2v_preset`——按下生成才报「预设不存在」，而设置里看着是配好的。
+   */
   async function removePreset(name: string): Promise<void> {
     await guarded(async () => {
       await settingsApi.removePreset(name)
       await loadPresets()
-      if (byKey.value['video.preset']?.value === name) await clear('video.preset')
-      // 出图那份预设指的是同一个目录里的图，删掉之后同样不能再留着一个悬空的名字。
-      if (byKey.value['image.preset']?.value === name) await clear('image.preset')
+      for (const role of PRESET_DEFAULT_ROLES) {
+        if (byKey.value[role.key]?.value === name) await clear(role.key)
+      }
     })
   }
 

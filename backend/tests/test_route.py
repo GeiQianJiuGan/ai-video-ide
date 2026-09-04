@@ -224,6 +224,84 @@ def test_the_options_list_offers_follow_the_settings_page_first(
     )
 
 
+def test_the_app_level_default_preset_has_one_grid_per_role(client: TestClient, pid: str) -> None:
+    """「跟随设置页」跟的是**按角色那一格**，留空才退回共用那一格。
+
+    以前应用级只有一个格子（`video.preset`），而两个角色要的入口本来就不一样（R2V 只要
+    `AIVS_PROMPT`，首尾帧还要两头的帧），一台机器上常常是两份不同的图——于是「工程没绑就
+    跟随设置页」在首尾帧上必然落到一份不能用的图上，用户只能回到每个工程里各绑一次。
+    """
+    shared = write_preset("共用那份", preset_graph())
+    r2v = write_preset("只有提示词那份", preset_graph(flf=False))
+    flf = write_preset("首尾帧那份", preset_graph())
+
+    # 只有共用那一格：两条能力都跟它
+    patch_settings(client, {"video.preset": shared})
+    assert route.app_preset_of("image2video") == shared
+    assert route.app_preset_of("first_last_frame") == shared
+    caps = caps_of(client, pid)
+    assert [c["preset"] for c in caps.values()] == [shared, shared]
+
+    # 按角色各指一份：两条能力分别落到自己那一格，共用那一格不再参与
+    patch_settings(client, {"video.r2v_preset": r2v, "video.flf_preset": flf})
+    caps = caps_of(client, pid)
+    assert caps["image2video"]["preset"] == r2v
+    assert caps["first_last_frame"]["preset"] == flf
+    assert [c["ready"] for c in caps.values()] == [True, True]
+    assert [c["source"] for c in caps.values()] == ["default", "default"], (
+        "工程那一列一个字都没动：这几项是预设名，不是调用方式"
+    )
+    for cap in route.FLF_CAPABILITIES:
+        assert route.app_preset_of(cap) == flf, "转场与 FL2VA 与首尾帧同一格"
+
+    # 按角色那一项留空 = 退回共用那份（只有一份图的人什么都不用配）
+    patch_settings(client, {"video.flf_preset": ""})
+    assert route.app_preset_of("first_last_frame") == shared
+    assert caps_of(client, pid)["first_last_frame"]["preset"] == shared
+
+    # 三格全空 = 真的没有默认，这时候才是那句四要素错误
+    patch_settings(client, {"video.preset": "", "video.r2v_preset": ""})
+    assert route.app_preset_of("image2video") is None
+    caps = caps_of(client, pid)
+    assert [c["ready"] for c in caps.values()] == [False, False]
+    assert four_elements(caps["image2video"]["issues"][0])["title"] == "还没有选生成预设"
+
+
+def test_a_new_project_does_not_materialize_the_app_default(client: TestClient, pid: str) -> None:
+    """新建工程时**不把当时的应用级默认抄进库**——抄过一次就再也跟不上了。
+
+    账单上那一格于是必须有 `app` 这一级：少了它界面会说「没选预设」而按下生成却成功，
+    那正是硬约束 4 要防的形状。
+    """
+    name = write_preset("设置页那份", preset_graph())
+    patch_settings(client, {"video.preset": name})
+
+    bindings = client.get(f"{API}/projects/{pid}/workflow-bindings")
+    assert bindings.status_code == 200, bindings.text
+    body = dict(bindings.json())
+    assert body["generation_mode"] == "", "调用方式那一列：空 = 跟随设置页"
+
+    shot_id = make_shot(client, pid)
+    resp = client.get(f"{API}/projects/{pid}/shots/{shot_id}/params")
+    assert resp.status_code == 200, resp.text
+    cell = resp.json()["fields"]["preset"]
+    assert (cell["value"], cell["level"]) == (name, "app"), (
+        "账单不能比事实少一级：这一格现在是绝大多数工程真正用的那一份"
+    )
+
+    # 换一份默认，同一个工程跟着变（物化进库的话这里还会是上面那份）
+    other = write_preset("换成这份", preset_graph())
+    patch_settings(client, {"video.r2v_preset": other})
+    cell = client.get(f"{API}/projects/{pid}/shots/{shot_id}/params").json()["fields"]["preset"]
+    assert (cell["value"], cell["level"]) == (other, "app")
+
+    # 工程自己绑一份之后就不再跟：那一级在账单上是 `project`
+    mine = write_preset("这个工程自己那份", preset_graph())
+    assert client.put(f"{API}/projects/{pid}/preset", json={"r2v_name": mine}).status_code == 200
+    cell = client.get(f"{API}/projects/{pid}/shots/{shot_id}/params").json()["fields"]["preset"]
+    assert (cell["value"], cell["level"]) == (mine, "project")
+
+
 # --- 二、一条路只有一个名字 ---
 
 
@@ -277,6 +355,12 @@ def test_the_preset_route_names_which_preset_is_missing(client: TestClient, pid:
     assert err["title"] == "还没有选生成预设"
     assert any("概览页" in s for s in err["suggestions"])
     assert any("设置页" in s for s in err["suggestions"]), "跟随设置页那条出路也要写出来"
+    assert any("设为 R2V 默认" in s for s in err["suggestions"]), (
+        "「去哪儿设那份默认」要点名到角色：只说「选一份默认预设」的话，用户在共用那一格里"
+        "配了一份 R2V 图，首尾帧照旧报同一句错"
+    )
+    flf_err = four_elements(caps["first_last_frame"]["issues"][0])
+    assert any("设为首尾帧默认" in s for s in flf_err["suggestions"])
 
     # 只标了 AIVS_PROMPT 的那种图：普通镜头能跑，补转场跑不了
     name = write_preset("只有提示词", preset_graph(flf=False))

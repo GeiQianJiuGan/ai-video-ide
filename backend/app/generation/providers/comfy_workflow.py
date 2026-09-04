@@ -169,8 +169,7 @@ class ComfyWorkflowProvider(ComfyTasks):
             raise AppError(
                 ErrorCode.MISSING_CAPABILITY,
                 "这个能力还没有绑定工作流",
-                "「ComfyUI 工作流绑定」这条路要求先给这个能力指定一份已校验的图，"
-                "本次任务上没有。",
+                "「ComfyUI 工作流绑定」这条路要求先给这个能力指定一份已校验的图，本次任务上没有。",
                 [
                     "在 Workflow 管理页给这个能力选一份图并校验通过",
                     "或把调用方式改成「ComfyUI 预设」（模型端那份图由模型端维护，不用绑）",

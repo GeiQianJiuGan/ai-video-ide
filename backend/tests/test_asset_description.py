@@ -35,9 +35,12 @@ def test_patch_sets_and_clears_the_description(client: TestClient, pid: str) -> 
     assert rows[0]["description"] == "褪色军绿夹克，短发，左颊一道旧疤"
 
     # 空字符串 = 清掉。`null` 走 exclude_none，是「这次不改」
-    assert client.patch(f"{API}/projects/{pid}/assets/{aid}", json={"description": ""}).json()[
-        "description"
-    ] == ""
+    assert (
+        client.patch(f"{API}/projects/{pid}/assets/{aid}", json={"description": ""}).json()[
+            "description"
+        ]
+        == ""
+    )
     keep = client.patch(f"{API}/projects/{pid}/assets/{aid}", json={"description": None})
     assert keep.status_code == 200, keep.text
 
@@ -82,8 +85,6 @@ def test_undescribed_skips_transient_frames(client: TestClient, pid: str) -> Non
     """抽出来的首尾帧是可再生的临时文件，不进这张清单（照 `TRANSIENT_KINDS`）。"""
     frame = upload_png(client, pid, kind="frame", name="tail.png")
     normal = upload_png(client, pid, name="normal.png")
-    ids = [
-        i["id"] for i in client.get(f"{API}/projects/{pid}/assets/undescribed").json()["items"]
-    ]
+    ids = [i["id"] for i in client.get(f"{API}/projects/{pid}/assets/undescribed").json()["items"]]
     assert normal in ids
     assert frame not in ids

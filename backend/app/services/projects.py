@@ -250,9 +250,14 @@ class ProjectService:
                         fps=fps,
                         aspect_ratio=aspect_ratio(width, height),
                         duration_unit=duration_unit,
-                        preset_name=settings.video_preset or None,
-                        r2v_preset_name=settings.video_preset or None,
-                        flf_preset_name=settings.video_preset or None,
+                        # **三列都留空 = 跟随设置页**（与 `generation_mode` 空串同一个口径，
+                        # 解析口径只有 `services/route.py::preset_name_of`）。这里以前把
+                        # 当时的 `settings.video_preset` 物化进去，于是「工程未绑定就以应用级
+                        # 默认为主」对新工程从一开始就不成立：以后在设置页换一份默认预设，
+                        # 这些工程还指着建它那天那一份，用户只能一个个工程回去改。
+                        preset_name=None,
+                        r2v_preset_name=None,
+                        flf_preset_name=None,
                         schema_version=settings.schema_version,
                         created_at=now,
                         updated_at=now,
@@ -368,15 +373,18 @@ class ProjectService:
                 )
 
             migrated_from = stored if stored < settings.schema_version else None
-            inherited_preset = row.preset_name or settings.video_preset or None
-            missing_r2v = row.r2v_preset_name is None
-            missing_flf = row.flf_preset_name is None
-            if (row.preset_name is None or missing_r2v or missing_flf) and inherited_preset:
+            # 老库只有 `preset_name` 一列（角色那两列是后来加的）：把它抄进两个角色，
+            # 于是概览页那两个下拉一打开就显示着这个工程本来在用的那一份。
+            #
+            # **只从工程自己那一列抄，绝不抄应用级默认。** 这里以前是
+            # `row.preset_name or settings.video_preset`：一打开工程就把设置页当时那份默认
+            # 预设写死进库，从此这个工程再也跟不上设置页——而「工程未绑定则以应用级为主」
+            # 正是靠这三列留空实现的（解析口径见 `services/route.py::preset_name_of`）。
+            inherited_preset = row.preset_name or None
+            if inherited_preset and (row.r2v_preset_name is None or row.flf_preset_name is None):
                 async with db.write() as session:
                     fresh = await session.get(Project, row.id)
                     if fresh is not None:
-                        if fresh.preset_name is None:
-                            fresh.preset_name = inherited_preset
                         if fresh.r2v_preset_name is None:
                             fresh.r2v_preset_name = inherited_preset
                         if fresh.flf_preset_name is None:

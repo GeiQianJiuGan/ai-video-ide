@@ -204,7 +204,11 @@ export const JOB_STATUS_LABEL: Record<string, string> = {
 
 export interface Job {
   id: string
-  shot_id: string
+  /**
+   * 出图任务**不属于任何镜头**（`t2i` / `i2i`，它挂在一个素材对象上），所以这里是空的。
+   * 想显示「这是在做什么」请一律用 `label`，不要拿这个 id 当兜底文案。
+   */
+  shot_id: string | null
   kind: string
   status: string
   priority: number
@@ -217,6 +221,15 @@ export interface Job {
   version_id: string | null
   shot_index_no: number | null
   shot_title: string | null
+  /** 出图任务的对象（「角色 · 阿岚 · 默认形象 四视图」）；镜头任务是空的。 */
+  target_label: string | null
+  /**
+   * 这一行显示的那一句话，后端一份口径算好的
+   * （`services/generation.py::job_label`：镜头任务「3. 雨夜追车」/
+   * 出图任务「生成图片素材：角色 · 阿岚 · 默认形象 四视图」）。
+   * **前端只渲染它**，不要拿上面那几个字段再拼一遍——出图任务那三个字段全是空的。
+   */
+  label: string
   params: Record<string, unknown>
   /**
    * 这条任务属于哪一次编排（「单线程续接」/「并发生成」/「整幕配音」…）。
@@ -259,6 +272,7 @@ export interface JobBatch {
   /** 正在做第几步（1 起）；跑完之后停在 total 上，不回到 0。 */
   step: number
   running_job_id: string | null
+  /** 正在做的那一条显示成哪句话（与 `Job.label` 同一份口径）。 */
   running_label: string | null
   error: Job['error']
   failed_count: number

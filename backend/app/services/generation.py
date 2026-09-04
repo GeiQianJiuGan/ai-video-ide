@@ -174,6 +174,29 @@ def _batch_fields(batch: dict[str, Any] | None) -> dict[str, Any]:
     }
 
 
+def job_label(job: Job, shot: Shot | None, target_label: str | None) -> str:
+    """队列里这一行任务显示成哪句话。**全应用只有这一份口径。**
+
+    队列里有两类任务，「这是在做什么」根本不是同一个形状：镜头任务属于某个镜头
+    （「3. 雨夜追车」），出图任务**不属于任何镜头**（`shot_id` 是空的，见迁移
+    `0020_image_jobs`），它属于一个素材对象（某个形象的四视图 / 某个地点变体的参考图）。
+
+    以前没有这个字段，界面四处（控制台的批次成员与零散任务、队列页的列表行与详情）
+    各自拼 `{shot_index_no}. {shot_title ?? shot_id}`：出图任务那三个字段全是空的，
+    整行于是渲染成一个孤零零的 `?.`——用户看到的「名字都是符号」就是它。
+    `target_label` 后端早就算好了（`images.target_label`），只是没人把两类折成一句话。
+
+    **对象没了要照实说**，不要回落成一个原始 id（`sht_01J…` 对用户不是信息）：
+    素材被删掉之后那行任务还在（版本只增不改、任务也不回收），此时它就该说
+    「这个素材已经不在了」。
+    """
+    if job.target_kind:
+        return f"生成图片素材：{target_label or '这个素材已经不在了'}"
+    if shot is not None:
+        return f"{shot.index_no}. {shot.title or '未命名镜头'}"
+    return "这个镜头已经不在了"
+
+
 def _provider_of(params: dict[str, Any]) -> str:
     """这个任务当时要走哪条路。**只读入队时冻结的那一份，绝不重新解析。**
 
@@ -468,6 +491,17 @@ class GenerationService:
     # --- 队列视图与控制 ---
 
     async def list_jobs(self, pid: str, status: str | None = None) -> list[dict[str, Any]]:
+        """队列视图。**顺序里没有状态这一项，所以一条任务失败不会挪位置。**
+
+        以前排序的第一个键是状态（活跃的在前、了结的一律垫底），于是同一条任务在自己
+        跑完的一瞬间跳到列表最底下：想看它为什么失败得先滚到底，而那一路上全是已经
+        做完的任务。任务列表回答的是「我刚才让它做的那些事现在怎么样了」，位置得跟着
+        **入队顺序**走，不跟着状态走。
+
+        剩下的两个键就是 pump 真正取任务的那个顺序（`_claim`）：优先级高的在前、
+        同优先级按入队时间。于是「提到队首」在界面上看得见，而不是一个只改了数字、
+        列表纹丝不动的按钮。
+        """
         db = db_of(pid)
         rows = await fetch_all(db, Job, order_by=Job.created_at)
         shots = {s.id: s for s in await fetch_all(db, Shot)}
@@ -489,17 +523,14 @@ class GenerationService:
                     "shot_index_no": shot.index_no if shot else None,
                     "shot_title": shot.title if shot else None,
                     "target_label": labels.get(key),
+                    #: 界面直接显示的那一句（两类任务折成一句话，口径见 `job_label`）。
+                    #: 前端**只渲染这一个字段**，不要拿上面三个再拼第二遍。
+                    "label": job_label(row, shot, labels.get(key)),
                     "params": load_json(row.params_json, {}),
                     "error": load_json(row.error_json, None),
                 }
             )
-        out.sort(
-            key=lambda j: (
-                ACTIVE.index(j["status"]) if j["status"] in ACTIVE else 9,
-                -int(j["priority"]),
-                str(j["created_at"]),
-            )
-        )
+        out.sort(key=lambda j: (-int(j["priority"]), str(j["created_at"])))
         return out
 
     async def queue_state(self, pid: str) -> dict[str, Any]:
@@ -570,12 +601,10 @@ class GenerationService:
                     #: 于是界面上那句「第 N/M 步」在跑完之后停在 M 上，而不是回到 0。
                     "step": (members.index(running) + 1) if running else settled,
                     "running_job_id": running["id"] if running else None,
-                    "running_label": (
-                        f"{running.get('shot_index_no') or '?'}. "
-                        f"{running.get('shot_title') or running['shot_id']}"
-                        if running
-                        else None
-                    ),
+                    #: 「正在做哪一步」照 `list_jobs` 那一句（`job_label`），不在这里
+                    #: 拼第二遍：以前这儿是 `shot_title or shot_id`，出图任务两个都空时
+                    #: 露出的是原始 `sht_…` / 空白。
+                    "running_label": running.get("label") if running else None,
                     #: 第一条失败的四要素直接给出来：合并之后不展开也得看得见失败原因
                     "error": failed[0]["error"] if failed else None,
                     "failed_count": len(failed),

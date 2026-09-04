@@ -279,6 +279,25 @@ async def test_generate_enqueues_one_job(client: TestClient, pid: str) -> None:
     # 底部控制台那份清单认得出它是什么（否则 shot_title 一片空白）
     listed = client.get(f"{API}/projects/{pid}/queue").json()
     assert [row["target_label"] for row in listed["jobs"]] == ["道具 · 旧铜钥匙 参考图"]
+    # 界面真正渲染的是 `label` 这一个字段：出图任务没有镜头，四处模板各按镜头拼一遍
+    # 的时候整行只剩一个「?.」。
+    assert [row["label"] for row in listed["jobs"]] == ["生成图片素材：道具 · 旧铜钥匙 参考图"]
+
+
+async def test_job_label_names_the_asset_even_after_it_is_gone(
+    client: TestClient, pid: str
+) -> None:
+    """出图对象被删掉之后那行任务还在——此时照实说，不要露出一个原始 id。"""
+    pause(client, pid)
+    prop = await world.create_prop(pid, {"name": "旧铜钥匙"})
+    client.post(
+        f"{API}/projects/{pid}/images/generate",
+        json={"target_kind": "prop", "target_id": prop["id"], "prompt": "黄铜"},
+    )
+    client.delete(f"{API}/projects/{pid}/props/{prop['id']}")
+
+    listed = client.get(f"{API}/projects/{pid}/queue").json()
+    assert [row["label"] for row in listed["jobs"]] == ["生成图片素材：这个素材已经不在了"]
 
 
 def test_generate_without_service_says_how_to_go_on(client: TestClient, pid: str) -> None:

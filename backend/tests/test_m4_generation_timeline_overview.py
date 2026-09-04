@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.core import ffmpeg as ffmpeg_tool
+from app.persistence.models_gen import Job
+from app.services.base import db_of
 from tests.conftest import error_of, ready_workflow, upload_png
 
 # --- 公共脚手架 ---
@@ -266,6 +269,22 @@ def enqueue(client: TestClient, pid: str, shot_id: str, **body: Any) -> dict[str
     return dict(resp.json())
 
 
+def force_status(pid: str, job_id: str, status: str) -> None:
+    """把一条任务按到某个状态上。
+
+    队列在这一批测试里是暂停的（pump 一看到暂停就返回，绝不去敲 ComfyUI），所以
+    「跑完」和「失败」只能这样造出来——真去跑一遍等于把测试绑在一个外部服务上。
+    """
+
+    async def apply() -> None:
+        async with db_of(pid).write() as session:
+            row = await session.get(Job, job_id)
+            assert row is not None, job_id
+            row.status = status
+
+    asyncio.run(apply())
+
+
 def test_cancel_and_retry_state_machine(client: TestClient, pid: str, video_preset: str) -> None:
     pause(client, pid)
     ready_workflow(client, pid, "image2video")
@@ -330,6 +349,30 @@ def test_priority_reorders_the_queue_and_resume_clears_the_pause(
     assert client.post(f"/api/v1/projects/{pid}/queue/retry-failed").json() == {"retried": []}
 
 
+def test_failed_job_keeps_its_place_in_the_queue_list(
+    client: TestClient, pid: str, video_preset: str
+) -> None:
+    """一条任务失败之后**位置一条都不动**。
+
+    以前排序的第一个键是状态，于是失败的那条掉到列表最底下——要看它为什么失败，
+    得先滚过前面所有已经做完的任务。顺序现在只由「优先级 → 入队时间」决定。
+    """
+    pause(client, pid)
+    ready_workflow(client, pid, "image2video")
+    scene = make_scene(client, pid)
+    order = [
+        enqueue(client, pid, make_shot(client, pid, scene["id"], title=t)["id"])["id"]
+        for t in ("A", "B", "C")
+    ]
+    assert [j["id"] for j in client.get(f"/api/v1/projects/{pid}/jobs").json()] == order
+
+    force_status(pid, order[0], "done")
+    force_status(pid, order[1], "failed")
+    listed = client.get(f"/api/v1/projects/{pid}/jobs").json()
+    assert [j["id"] for j in listed] == order, "状态不该决定位次"
+    assert [j["status"] for j in listed] == ["done", "failed", "queued"]
+
+
 def test_cancel_all_and_clear_failed_and_delete_job(
     client: TestClient, pid: str, video_preset: str
 ) -> None:
@@ -358,17 +401,7 @@ def test_cancel_all_and_clear_failed_and_delete_job(
 
     # 3. 产生一个失败任务并一键清空失败记录
     j3 = enqueue(client, pid, s1["id"])
-    # 模拟失败
-    from app.services.base import db_of
-    from app.persistence.models_gen import Job
-    import asyncio
-    async def set_failed():
-        db = db_of(pid)
-        async with db.write() as session:
-            job = await session.get(Job, j3["id"])
-            if job:
-                job.status = "failed"
-    asyncio.run(set_failed())
+    force_status(pid, j3["id"], "failed")
 
     clear_res = client.post(f"/api/v1/projects/{pid}/queue/clear-failed")
     assert clear_res.status_code == 200, clear_res.text
