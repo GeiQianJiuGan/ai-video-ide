@@ -22,7 +22,8 @@
 一段一段地提案，于是每一轮 chat 的输入输出都是有界的——不再需要一次吐出整部片子。
 
 **素材描述这一支多一条边界：看不了图就不编。** 素材上那一句回答的是「**这张图**长什么样」，
-它会被当成画面事实拼进每一个引用它的镜头（`providers/base.py::ref_hint`）。所以
+它会被当成画面事实带进每一个引用它的镜头——提示词里 `<Subject n>` 那一行说的就是它
+（`providers/base.py::render_video_prompt`）。所以
 `look_at_image` 默认 `allow_text=False`——端看不了图时它一个字都不写，只回
 `source="blocked"` + 该问用户的那句话（`describe.NO_VISION_ASK`）；用户同意「按剧本与设定
 推断着写」之后才带 `allow_text=true` 再调一次。`set_description` 那边靠 `to_op(looked_at=…)`

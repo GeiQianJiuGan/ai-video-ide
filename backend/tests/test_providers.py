@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -22,6 +23,8 @@ import pytest
 
 from app.core.config import settings
 from app.core.errors import AppError, ErrorCode
+from app.generation.comfy import rejection
+from app.generation.comfy.graph import feed_order
 from app.generation.providers import presets, registry
 from app.generation.providers.base import RefAsset, VideoRequest, WorkflowSpec
 from app.generation.providers.comfy_preset import ComfyPresetProvider
@@ -239,10 +242,11 @@ async def test_each_media_goes_into_its_own_family_of_slots(tmp_path: Path) -> N
     assert graph["21"]["inputs"]["video"] == "aivs/动作.mp4", "视频进 AIVS_REF_VIDEO_1 那个输入键"
     assert graph["31"]["inputs"]["audio"] == "aivs/对白.wav"
     assert fake.uploaded == ["first.png", "ref1.png", "动作.mp4", "对白.wav"]
-    # 序号按媒体各自从 1 数：和真正填进去的槽位一一对应
     text = graph["3"]["inputs"]["text"]
-    assert "参考图1=林小雨（常服）" in text
+    # 图能编进 `<Picture n>`（首帧也占一个号），视频 / 音频编不进去，只能靠 summary 那句点名
+    assert "<Subject 1> is the visible subject shown in <Picture 2>: 林小雨（常服）" in text
     assert "参考视频1=推门的动作" in text and "参考音频1=林小雨的台词" in text
+    assert "<Picture 3>" not in text, "把一段 .mp4 编进图册会让它后面所有序号都指错人"
 
 
 async def test_one_media_without_slots_does_not_drop_the_others(tmp_path: Path) -> None:
@@ -309,11 +313,23 @@ async def test_preset_feeds_reference_images_into_the_ref_slots(tmp_path: Path) 
     assert graph["11"]["inputs"]["image"] == "aivs/ref1.png"
     assert graph["12"]["inputs"]["image"] == "aivs/ref2.png"
     assert fake.uploaded == ["first.png", "ref1.png", "ref2.png"]
-    # 顺序即语义：ComfyUI 那类图收不到标签，只能把对应关系写进 prompt
-    assert graph["3"]["inputs"]["text"].startswith("雨夜推门")
-    assert "参考图1=林小雨（常服）" in graph["3"]["inputs"]["text"]
-    assert "参考图2=雨夜巷口" in graph["3"]["inputs"]["text"]
-    assert any("参考素材对应关系" in n for n in req.notes)
+    # 顺序即语义：ComfyUI 那类图收不到标签，所以提交出去的那段 prompt 本身就是六段格式，
+    # 每张图一个 `<Picture n>`、每个出场的人一个 `<Subject n>`
+    text = graph["3"]["inputs"]["text"]
+    assert "subject_definitions:" in text and "retention_analysis:" in text
+    assert "<Subject 1> is the visible subject shown in <Picture 2>: 林小雨（常服）" in text
+    assert "<Subject 2> is the visible subject shown in <Picture 3>: 雨夜巷口" in text
+    assert "<Picture 1> is the first frame of the target video." in text, "首帧也占一个编号"
+    assert "雨夜推门" in text, "用户手写的自由文本原样进 detailed_description"
+    assert "are different people" in text, "两个人就必须说清别把他们画成同一个人"
+    assert req.sent_prompt == text, "真正发出去的那段话要冻结进版本参数"
+    assert any("提示词已按参考生成格式重排" in n for n in req.notes)
+    book = req.book.to_dict() if req.book else {"items": []}
+    assert [(p["index"], p["subject"], p["name"]) for p in book["items"]] == [
+        (1, 0, "首帧"),
+        (2, 1, "林小雨（常服）"),
+        (3, 2, "雨夜巷口"),
+    ], "图册是提示词与那几张图之间唯一的对号表"
 
 
 async def test_ref_labels_can_be_turned_off(
@@ -337,6 +353,11 @@ async def test_ref_labels_can_be_turned_off(
     graph = fake.submitted or {}
     assert graph["11"]["inputs"]["image"] == "aivs/ref1.png", "关掉标签不影响图照样喂进去"
     assert graph["3"]["inputs"]["text"] == "雨夜推门", "关掉了就绝不动 prompt"
+    assert req.sent_prompt == "雨夜推门", "没重排过就照实说"
+    # **关掉是一次降级，不是「什么都没发生」**（硬约束 4）：图册照记（界面要说得清那几张图
+    # 按什么顺序喂进去的），只是模型收不到编号——这件事必须写进 notes 冻进版本参数。
+    assert req.book is not None and len(req.book.items) == 2, "首帧 + 那张参考图照旧编号"
+    assert any("关掉了「参考素材说明」" in n for n in req.notes)
 
 
 async def test_preset_with_too_few_ref_slots_degrades_and_says_which_were_dropped(
@@ -787,6 +808,55 @@ async def test_http_api_carries_the_asset_description_in_the_refs_body(
     assert [r["label"] for r in seen["refs"]] == ["林小雨（常服）", "雨夜巷口"]
 
 
+async def test_http_api_numbers_the_pictures_in_a_field_and_leaves_the_prompt_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """「第几张图是谁」这条路走 `pictures[]`，**prompt 一个字节都不重排**。
+
+    三件事各自都能单独出错，所以一起盯：
+
+      · **首尾帧一起编号**：它们照旧是模型看到的那一串图片里的一张，编号从 1 起，
+        但它们不是「谁出场」，所以 `subject` 是 0；
+      · **非图片素材编不上号但照旧送出去**：一段音频占了 `<Picture n>` 就会让它后面所有
+        序号指错人，所以 `picture` / `subject` 都是 0——而 `refs[]` 里那一项必须还在，
+        「送没送出去」与「模型知不知道它是谁」是两件事；
+      · **prompt 原样送出**：两条 ComfyUI 路只能把图册拼进提示词，这条收得到结构化字段，
+        再拼一遍只会让服务端解析两遍、两处措辞必然分叉。`sent_prompt` 也保持原样——
+        说成重排过就是谎报（硬约束 4）。
+    """
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/submit"):
+            seen.update(json.loads(request.content))
+            return httpx.Response(200, json={"task_id": "t-11"})
+        return httpx.Response(404, json={"error": "no"})
+
+    stub_transport(monkeypatch, handler)
+    monkeypatch.setattr(settings, "video_base_url", "http://127.0.0.1:9100")
+    first = tmp_path / "first.png"
+    first.write_bytes(b"A")
+    (sheet,) = make_refs(tmp_path, "阿岚 默认形象")
+    voice = media_ref(tmp_path, "line.wav", "audio", "对白")
+    req = VideoRequest(
+        mode="i2v", prompt="雨夜推门", first_frame=first, refs=[replace(sheet, desc="短发"), voice]
+    )
+
+    await HttpApiProvider().submit(req, client_id="aivs-test")
+
+    assert [(p["index"], p["subject"], p["role"], p["name"]) for p in seen["pictures"]] == [
+        (1, 0, "first_frame", "首帧"),
+        (2, 1, "reference", "阿岚 默认形象"),
+    ], seen["pictures"]
+    assert [(r["label"], r["picture"], r["subject"]) for r in seen["refs"]] == [
+        ("阿岚 默认形象", 2, 1),
+        ("对白", 0, 0),
+    ], "音频编不上号，但那一项必须还在 refs 里"
+    assert seen["prompt"] == "雨夜推门", "结构化字段那条路不动提示词"
+    assert req.sent_prompt == "雨夜推门", "没重排过就照实说"
+    assert req.book is not None and req.book.order_source == "contract"
+
+
 async def test_http_api_refine_carries_the_source_video_itself(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -962,10 +1032,23 @@ async def test_workflow_route_submits_by_bindings_and_says_what_it_dropped(
     submitted = fake.submitted or {}
     assert submitted["10"]["inputs"]["image"] == "aivs/head.png", "首帧按绑定表进它那个节点"
     assert submitted["11"]["inputs"]["image"] == "aivs/sheet.png", "第一张参考图进唯一那个槽位"
-    assert submitted["6"]["inputs"]["text"] == "雨夜推门"
     assert fake.uploaded == ["head.png", "sheet.png", "extra.png"], "音频连上传都不该发生"
     assert any("对白" in note and "只能喂图片" in note for note in req.notes)
     assert any("城南旧宅 雨夜" in note and "1 个" in note for note in req.notes)
+
+    # 六段格式**两条 ComfyUI 路一字不差**（`comfy_base._retold` 一份实现）：这条路收到的
+    # 同样只是「一串图片 + 一段文字」，绑定表那一行的行号和 AIVS_REF_2 一样只是入口名
+    text = submitted["6"]["inputs"]["text"]
+    assert "<Subject 1> is the visible subject shown in <Picture 2>: 阿岚 默认形象" in text
+    assert "<Picture 1> is the first frame of the target video." in text, "首帧也占一个编号"
+    assert "雨夜推门" in text, "用户手写的自由文本原样进 detailed_description"
+    assert "参考音频1=对白" in text, "喂不进去的那段音频照旧要在 summary 里点名"
+    assert req.sent_prompt == text
+    book = req.book.to_dict() if req.book else {"items": []}
+    assert [(p["index"], p["subject"], p["name"]) for p in book["items"]] == [
+        (1, 0, "首帧"),
+        (2, 1, "阿岚 默认形象"),
+    ]
 
 
 async def test_workflow_route_without_a_bound_graph_names_the_way_out() -> None:
@@ -1157,7 +1240,8 @@ async def test_unused_ref_slots_do_not_leave_their_placeholder_images_behind(
     note = next(n for n in req.notes if "没有用到" in n)
     assert "末帧" in note and "2 个参考图槽位" in note, "九个槽位逐个点名会把真正要紧的那句埋掉"
     text = graph["3"]["inputs"]["text"]
-    assert "参考图1=林小雨（常服）" in text and "参考图2" not in text, "描述只说真喂进去的那几张"
+    assert "<Subject 1> is the visible subject shown in <Picture 2>: 林小雨（常服）" in text
+    assert "<Picture 3>" not in text, "摘掉的槽位不占编号——图册只数真喂进去的那几张"
 
 
 class RejectingComfy(FakeComfy):
@@ -1279,7 +1363,15 @@ async def test_workflow_route_detaches_the_slots_this_take_has_nothing_for(
     assert submitted["10"]["inputs"]["image"] == "aivs/head.png"
     assert submitted["11"]["inputs"]["image"] == "aivs/sheet.png"
     assert submitted["5"]["inputs"] == {"seed": 7, "steps": 20}, "标量槽位保持图里原来的值"
-    assert submitted["6"]["inputs"]["text"] == "雨夜推门"
+
+    # **摘掉的槽位不占编号**：图册在 `_detach_idle` 之后才数，所以末帧与第二个参考图槽位
+    # 既不在 `<Picture n>` 里，也不会让后面那张图的序号往后串。
+    text = submitted["6"]["inputs"]["text"]
+    assert "<Picture 1> is the first frame of the target video." in text
+    assert "<Subject 1> is the visible subject shown in <Picture 2>: 阿岚 默认形象" in text
+    assert "<Picture 3>" not in text, "摘掉的那两个槽位一个编号都不占"
+    assert "final frame" not in text, "末帧被摘掉了，对齐句不许再说它"
+    assert "雨夜推门" in text
     note = next(n for n in req.notes if "没有用到" in n)
     assert "末帧" in note and "参考图槽位" in note
     assert "示例文件一个都没有送进 ComfyUI" in note
@@ -1321,3 +1413,402 @@ async def test_workflow_route_never_detaches_a_node_another_slot_filled(tmp_path
     submitted = fake.submitted or {}
     assert submitted["11"]["inputs"]["image"] == "aivs/sheet.png", "参考图那一行填上了，节点必须留"
     assert not any("没有用到" in note for note in req.notes), "什么都没摘就别说摘了东西"
+
+    # **同一张图占两个入口只编一个号**（`base.picture_book` 按文件去重）：这条路上
+    # `source_image` / `reference_image` 那两个单槽常常与 `__ref_0` 指着同一个 LoadImage，
+    # 编成两个号就等于告诉模型「这是两张不同的图」，后面所有序号跟着指错人。
+    items = (req.book.to_dict() if req.book else {"items": []})["items"]
+    numbered = [(p["index"], p["subject"], p["name"]) for p in items]
+    assert numbered == [(1, 1, "阿岚 默认形象")], numbered
+
+
+async def test_workflow_route_leaves_the_prompt_alone_when_no_row_binds_it(tmp_path: Path) -> None:
+    """绑定表里**没有 `prompt` 那一行**是合法的（提示词写死在图里，用户只绑了首尾帧）。
+
+    那种图上我们本来就改不到提示词，所以 `_retold` 的 `write` 回 False——图册照记，
+    `sent_prompt` 保持原样，**绝不假装重排过**（谎报正是硬约束 4 要修的那件事）。
+    """
+    graph = {
+        "11": {"class_type": "LoadImage", "inputs": {"image": "参考示例1.png"}},
+        "6": {"class_type": "CLIPTextEncode", "inputs": {"text": "图里写死的提示词"}},
+    }
+    sheet = tmp_path / "sheet.png"
+    sheet.write_bytes(b"PNG_SHEET")
+    fake = FakeComfy()
+    req = VideoRequest(
+        mode="i2v",
+        prompt="雨夜推门",
+        refs=[RefAsset(path=sheet, label="阿岚 默认形象", kind="character_sheet", media="image")],
+        workflow=WorkflowSpec(
+            id="wf_1",
+            name="绑定图",
+            api_json=json.dumps(graph),
+            bindings={"reference_image_slots": ["11.image"]},
+        ),
+    )
+
+    await ComfyWorkflowProvider(client=fake).submit(req, client_id="aivs-test")  # type: ignore[arg-type]
+
+    submitted = fake.submitted or {}
+    assert submitted["6"]["inputs"]["text"] == "图里写死的提示词", "改不到就一个字节都不动"
+    assert req.sent_prompt == "雨夜推门", "没重排过就照实说，sent_prompt 保持原样"
+    assert req.book is not None and len(req.book.items) == 1, "图册照记（界面要说清喂了哪几张）"
+    assert not any("重排" in note for note in req.notes)
+
+
+# --- `<Picture n>` 的编号来自接线，不来自 AIVS_REF_n 那个 n ---
+#
+# 用户那句需求原文：「我是可以人工这样配置，但是能不能代码逻辑识别 workflow 自动识别 Picture
+# 序号呢？这样我就不用严格的约束了」。`AIVS_REF_1` / `AIVS_REF_2` 只说明「这一格由本工具填」，
+# 没有任何东西保证 1 号那个 LoadImage 真接在合批节点的 `image1` 上——图是用户自己维护的
+# （硬约束 1），在 ComfyUI 里把两根线互换一下编号就反了，而队列里一条错误都没有，
+# 只有成片里两个角色互相串味。这一组盯的就是 `comfy/graph.py::feed_order` 从接线上把顺序
+# **测出来**，以及测不出来的时候如实说「这一份是按入口名排的」。
+
+
+def batch_graph(image1: str, image2: str) -> dict[str, Any]:
+    """两个 LoadImage 合批进 ImageBatch——「谁是第一张」的事实就在这两个输入键上。"""
+    return {
+        "11": {"class_type": "LoadImage", "inputs": {"image": "a.png"}},
+        "12": {"class_type": "LoadImage", "inputs": {"image": "b.png"}},
+        "13": {
+            "class_type": "ImageBatch",
+            "inputs": {"image1": [image1, 0], "image2": [image2, 0]},
+        },
+        "14": {"class_type": "WanImageToVideo", "inputs": {"reference": ["13", 0]}},
+    }
+
+
+def test_feed_order_follows_the_wiring_not_the_entry_names() -> None:
+    """`AIVS_REF_2` 接在 `image1` 上时，实际先喂的就是它。"""
+    order = feed_order(batch_graph("12", "11"), {"AIVS_REF_1": "11", "AIVS_REF_2": "12"})
+    assert order.order == ["AIVS_REF_2", "AIVS_REF_1"], "按接线测：image1 收到的是 12 号那张"
+    assert (order.source, order.traced) == ("graph", True)
+    assert order.moved(["AIVS_REF_1", "AIVS_REF_2"]), "与入口名的顺序不一致，必须能报出来"
+
+
+def test_feed_order_agrees_with_the_entry_names_when_the_wiring_agrees() -> None:
+    """线是顺着接的：顺序与入口名一致，此时不该报「实测顺序不一样」。"""
+    order = feed_order(batch_graph("11", "12"), {"AIVS_REF_1": "11", "AIVS_REF_2": "12"})
+    assert order.order == ["AIVS_REF_1", "AIVS_REF_2"]
+    assert order.source == "graph"
+    assert not order.moved(["AIVS_REF_1", "AIVS_REF_2"])
+
+
+def test_feed_order_counts_the_frames_in_the_same_series_as_the_refs() -> None:
+    """首尾帧与参考图挤在同一串编号里，谁是第一张完全取决于这份图怎么接的。
+
+    `WanImageToVideo` 的 `start_image` 声明在 `reference` 后面，所以这份图先喂的是那张
+    合批过的参考图——把首帧当成 `<Picture 1>` 正是老 SKILL 写死的那个假设。
+    """
+    graph = batch_graph("11", "12")
+    graph["1"] = {"class_type": "LoadImage", "inputs": {"image": "first.png"}}
+    graph["14"]["inputs"]["start_image"] = ["1", 0]
+    order = feed_order(
+        graph,
+        {"AIVS_FIRST_FRAME": "1", "AIVS_REF_1": "11", "AIVS_REF_2": "12"},
+    )
+    assert order.order == ["AIVS_REF_1", "AIVS_REF_2", "AIVS_FIRST_FRAME"]
+    assert order.source == "graph"
+
+
+def test_feed_order_ignores_entries_whose_node_is_already_gone() -> None:
+    """`detach()` 之后才数：这一次没喂的槽位已经不在图里，不该占一个号。"""
+    graph = batch_graph("11", "12")
+    graph.pop("12")
+    graph["13"]["inputs"].pop("image2")
+    order = feed_order(
+        graph,
+        {"AIVS_REF_1": "11", "AIVS_REF_2": "12", "AIVS_REF_3": "13"},
+    )
+    assert order.order == ["AIVS_REF_1", "AIVS_REF_3"], "摘掉的那个入口连编号一起消失"
+
+
+def test_feed_order_says_so_when_nothing_converges() -> None:
+    """一排孤立的 LoadImage（谁都没接线）：测不出顺序就如实说这一份是按入口名排的。"""
+    graph = {
+        "11": {"class_type": "LoadImage", "inputs": {"image": "a.png"}},
+        "12": {"class_type": "LoadImage", "inputs": {"image": "b.png"}},
+    }
+    order = feed_order(graph, {"AIVS_REF_1": "11", "AIVS_REF_2": "12"})
+    assert order.order == ["AIVS_REF_1", "AIVS_REF_2"], "退回约定顺序，而不是随便排一个"
+    assert (order.source, order.traced) == ("title", False)
+    assert order.groups == [["AIVS_REF_1"], ["AIVS_REF_2"]]
+
+
+def test_feed_order_traces_the_group_it_can_and_admits_the_rest() -> None:
+    """一半接进了合批节点、一半是孤立的：组内实测、组间按约定，`source` 说清是混的。"""
+    graph = batch_graph("12", "11")
+    graph["15"] = {"class_type": "LoadImage", "inputs": {"image": "c.png"}}
+    order = feed_order(
+        graph,
+        {"AIVS_REF_1": "11", "AIVS_REF_2": "12", "AIVS_REF_3": "15"},
+    )
+    assert order.order == ["AIVS_REF_2", "AIVS_REF_1", "AIVS_REF_3"]
+    assert order.source == "mixed"
+    assert order.groups == [["AIVS_REF_2", "AIVS_REF_1"], ["AIVS_REF_3"]]
+
+
+# --- ComfyUI 拒收这份图：那个 400 得说清「哪个节点的哪个输入、填的是什么」 ---
+#
+# 用户手里那条报错以前长这样：`HTTP 400: {"error": {"type": "prompt_outputs_...` 截在 800 字，
+# 决定性的那一截（ComfyUI 那边到底有哪些候选）恰好被截掉，第一条建议还是「在流程页重新校验
+# 绑定」——走预设的人照着它一步都走不了。下面前三条盯 `comfy/rejection.py` 的翻译，
+# 后两条盯用户那句需求原文：「多参数的工作流，图片不足就跳过多余的参数图，可是跳过后目前是
+# 400」——**跳过之后那个必填输入自己接回去**（`comfy_base.ComfyTasks._submit_graph`）。
+
+#: 用户那台机器上真装着的 7 个 UNET。ComfyUI 用 `os.path.relpath` 拼候选名，所以 Windows 上
+#: 带的是 `\`——这正是「名字看着一样却不在清单里」的常见来源。
+INSTALLED_UNETS = [
+    "hunyuan\\hunyuan_video_image_to_video_720p_bf16.safetensors",
+    "krea2\\krea2TurboOfficialComfy_krea2TurboInt8.safetensors",
+    "krea2\\krea2_turbo_fp8_scaled.safetensors",
+    "minimax\\int4\\minimaxH3INT4Convrot_fl2vaPrunedInt4.safetensors",
+    "minimax\\int8\\minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+    "minimax\\量化\\minimaxH3INT8INT4_fl2vaINT8Pruned.safetensors",
+    "minimax\\量化\\minimaxH3INT8INT4_ref2vaINT8Pruned.safetensors",
+]
+
+#: 图里存着、而那台机器上并没有的那个名字（用户贴来的那条 400 里的原值）。
+MISSING_UNET = "minimax/minimax_h3_hybrid_fl2va_ref2va_b25-49-int8.safetensors"
+
+
+def rejected_body(
+    node_id: str,
+    error: dict[str, Any],
+    *,
+    class_type: str = "UNETLoader",
+    kind: str = "prompt_outputs_failed_validation",
+) -> str:
+    """照 ComfyUI `/prompt` 被拒时的原样拼一份响应体（形状抄自用户贴来的那条）。"""
+    return json.dumps(
+        {
+            "error": {
+                "type": kind,
+                "message": "Prompt outputs failed validation",
+                "details": "",
+                "extra_info": {},
+            },
+            "node_errors": {
+                node_id: {
+                    "errors": [error],
+                    "dependent_outputs": ["9"],
+                    "class_type": class_type,
+                }
+            },
+        },
+        ensure_ascii=False,
+    )
+
+
+def not_in_list(
+    name: str, value: str, candidates: list[str], *, with_extra: bool = True
+) -> dict[str, Any]:
+    """一条 `value_not_in_list`。
+
+    `details` 照 ComfyUI 那句 f-string 拼（候选清单是 Python repr，反斜杠是双写的）；
+    `with_extra=False` 造的是**候选只能从 details 里抠出来**的那种响应——候选超过 20 个时
+    ComfyUI 自己就会把 `input_config` 置空，那条回退路径必须有人盯着。
+    """
+    err: dict[str, Any] = {
+        "type": "value_not_in_list",
+        "message": "Value not in list",
+        "details": f"{name}: '{value}' not in {candidates}",
+        "extra_info": {},
+    }
+    if with_extra:
+        err["extra_info"] = {
+            "input_name": name,
+            "received_value": value,
+            "input_config": [candidates, {}],
+        }
+    return err
+
+
+def test_rejected_prompt_names_the_node_the_input_and_the_value() -> None:
+    """用户贴来的那条 400：节点 236 的 `unet_name` 在 ComfyUI 那边对不上。
+
+    **它与「跳过多余的参考图」无关**——模型名是图里存着的值，本工具从不改写它（只填
+    `AIVS_*` 那几个入口）。以前这条错误被截在 800 字，用户只能猜是跳过槽位闯的祸。
+    """
+    body = rejected_body("236", not_in_list("unet_name", MISSING_UNET, INSTALLED_UNETS))
+
+    err = rejection.to_error(400, body, {"236": {"class_type": "UNETLoader", "inputs": {}}})
+
+    assert err.code == ErrorCode.WORKFLOW_ERROR
+    assert "节点 236（UNETLoader）" in err.detail and "unet_name" in err.detail
+    assert MISSING_UNET in err.detail, "填的是什么必须原样说出来，用户才认得出是哪一行"
+    assert "共 7 个候选，最像的是" in err.detail
+    assert "只差路径分隔符" not in err.detail, "这一次真的不是分隔符——替他认定一个会让他改错地方"
+    assert any("在 ComfyUI 里把这个节点的模型重选一次" in s for s in err.suggestions)
+    assert any("本工具从不改写它" in s for s in err.suggestions), "得说清这一格不是我们填的"
+    assert not any("重新校验绑定" in s for s in err.suggestions), "那是绑定那条路的话，预设路走不通"
+    assert err.related_ids["raw"] == body, "原文完整留档：「展开原始报错」看的就是它"
+    assert err.related_ids["kind"] == "prompt_outputs_failed_validation"
+    fault = rejection.faults_of(err)[0]
+    assert (fault.node_id, fault.input, fault.kind) == ("236", "unet_name", "value_not_in_list")
+    assert len(fault.candidates) == 7, "候选清单一个都不能丢——它就是这条错误里最有用的东西"
+
+
+def test_a_model_name_that_only_differs_by_a_separator_says_exactly_that() -> None:
+    """`/` 与 `\\` 在 ComfyUI 那边是两个字符串，在用户眼里是同一个文件。
+
+    不点出来的话，他会盯着两行长得一模一样的名字找差别。这一条同时走「响应里没有
+    `input_config`、候选只能从 details 里抠」那条回退路径。
+    """
+    installed = "minimax\\int8\\minimax_h3_ref2va_pruned_int8_convrot.safetensors"
+    typed = installed.replace("\\", "/")
+    body = rejected_body(
+        "236", not_in_list("unet_name", typed, [installed, *INSTALLED_UNETS[:2]], with_extra=False)
+    )
+
+    err = rejection.to_error(400, body)
+
+    assert f"ComfyUI 上那个叫「{installed}」，只差路径分隔符或大小写" in err.detail
+    assert any("只差路径分隔符 / 大小写" in s for s in err.suggestions)
+    assert rejection.faults_of(err)[0].candidates[0] == installed, "候选从 details 里也抠得出来"
+
+
+def test_a_prompt_with_no_outputs_left_says_which_kind_of_rejection_it_is() -> None:
+    """摘节点摘到只剩没有输出的一支时 ComfyUI 回的是这一种，得按它自己的名字说。"""
+    body = json.dumps(
+        {
+            "error": {
+                "type": "prompt_no_outputs",
+                "message": "Prompt has no outputs",
+                "details": "",
+                "extra_info": {},
+            },
+            "node_errors": {},
+        },
+        ensure_ascii=False,
+    )
+
+    err = rejection.to_error(400, body)
+
+    assert "prompt_no_outputs" in err.detail and "这份图里没有任何输出节点" in err.detail
+    assert any("摘掉了几个节点" in s for s in err.suggestions)
+    assert err.related_ids["kind"] == "prompt_no_outputs"
+    assert rejection.faults_of(err) == [], "这一种没有点到具体节点，别硬造一条"
+
+
+#: 合批那份图：两个参考图槽位汇进一个 `ImageBatch`，而它的 `image1` 在 ComfyUI 那边是**必填**的。
+#: 「参考图不够就跳过多余的槽位」正是在这种图上变成 400 的——我们把 image1 那一根线切了。
+BATCH_GRAPH: dict[str, Any] = {
+    **with_ref_slots(2),
+    "13": {"class_type": "ImageBatch", "inputs": {"image1": ["12", 0], "image2": ["11", 0]}},
+}
+
+#: 与上面只差一处：第二个槽位先过一个缩放节点再汇进合批节点。于是被切掉的那一根原来接的是
+#: `ImageScale`，而这一版真在喂的入口是 `LoadImage`——接过去只会换来一条更难懂的错误。
+SCALED_BATCH_GRAPH: dict[str, Any] = {
+    **with_ref_slots(2),
+    "62": {
+        "class_type": "ImageScale",
+        "inputs": {"image": ["12", 0], "width": 832, "height": 480},
+    },
+    "13": {"class_type": "ImageBatch", "inputs": {"image1": ["62", 0], "image2": ["11", 0]}},
+}
+
+
+def missing_input_body(node_id: str, field: str, class_type: str = "ImageBatch") -> str:
+    """ComfyUI 那句「Required input is missing」的原样形状。"""
+    return rejected_body(
+        node_id,
+        {
+            "type": "required_input_missing",
+            "message": "Required input is missing",
+            "details": field,
+            "extra_info": {"input_name": field},
+        },
+        class_type=class_type,
+    )
+
+
+class BatchRejectingComfy(FakeComfy):
+    """第一次提交被「image1 是必填的」拒掉，第二次收下。
+
+    错误一律用 `rejection.to_error` 造：`related_ids` 里那几个键名只写在 `rejection.py` 一处，
+    测试跟着它走而不是自己猜一份——猜的那份哪天对不上，`_missing_cuts` 会静默地不再修复。
+    """
+
+    def __init__(self, node_id: str = "13", field: str = "image1") -> None:
+        super().__init__()
+        self.calls: list[dict[str, Any]] = []
+        self._node_id = node_id
+        self._field = field
+
+    async def submit(self, graph: dict[str, Any], client_id: str) -> str:
+        #: 提交出去的那一刻的样子——接回去这件事改的是同一个 dict，不留快照就看不出改了什么。
+        self.calls.append(copy.deepcopy(graph))
+        if len(self.calls) == 1:
+            raise rejection.to_error(400, missing_input_body(self._node_id, self._field), graph)
+        self.submitted = graph
+        return "pid-1"
+
+
+async def test_a_required_input_left_empty_by_skipping_reconnects_and_resubmits(
+    tmp_path: Path,
+) -> None:
+    """用户那句需求原文：图片不足就跳过多余的参数图——**而跳过之后不该以一个 400 收场**。
+
+    幸存的那个 `ImageBatch` 上 `image1` 是必填的，我们刚把它那一根线切了，于是 ComfyUI 直接
+    拒收整份图。这一层认出「它点名的正是我们切的那一根」，把那一格接到本次真在喂的参考图上
+    再提交一次：同一份素材喂两遍，而不是把图里那张示例图喂进去，更不是整个任务失败。
+    """
+    write_preset("合批图", BATCH_GRAPH)
+    first = tmp_path / "first.png"
+    first.write_bytes(b"PNG_HEAD")
+    fake = BatchRejectingComfy()
+    provider = ComfyPresetProvider(client=fake)  # type: ignore[arg-type]
+    req = VideoRequest(
+        mode="i2v",
+        prompt="雨夜推门",
+        first_frame=first,
+        refs=make_refs(tmp_path, "林小雨（常服）"),
+        extra={"preset": "合批图"},
+    )
+
+    task_id = await provider.submit(req, client_id="aivs-test")
+
+    assert task_id == "pid-1", "跳过多余的槽位不该让整个任务失败"
+    assert len(fake.calls) == 2, "只重试一次"
+    assert "image1" not in fake.calls[0]["13"]["inputs"], "第一次提交里那一格确实是空的"
+    assert fake.calls[1]["13"]["inputs"]["image1"] == ["11", 0], "接到本次真在喂的那个参考图上"
+    assert fake.calls[1]["13"]["inputs"]["image2"] == ["11", 0]
+    assert "12" not in fake.calls[1], "接回去不等于把示例图放回来——那个节点照旧不在图里"
+    note = next(n for n in req.notes if "必填" in n)
+    assert "节点 13 的 image1" in note and "AIVS_REF_2" in note
+    assert "同一份素材喂了两遍" in note, "重复喂一张是降级，绝不静默"
+
+
+async def test_a_cut_that_cannot_be_reconnected_names_the_exact_input(tmp_path: Path) -> None:
+    """接不上只有一种原因：图里没有第二个同类节点（`reconnect` 只认 class_type 相等）。
+
+    这时唯一诚实的回答是「这份图要求这一格必须有素材」，并点名到「节点.输入」——绝不拿一个
+    `LoadImage` 去凑 `ImageScale` 那一格，那只会换来一条更难懂的错误。
+    """
+    write_preset("缩放合批图", SCALED_BATCH_GRAPH)
+    first = tmp_path / "first.png"
+    first.write_bytes(b"PNG_HEAD")
+    fake = BatchRejectingComfy()
+    provider = ComfyPresetProvider(client=fake)  # type: ignore[arg-type]
+    req = VideoRequest(
+        mode="i2v",
+        prompt="雨夜推门",
+        first_frame=first,
+        refs=make_refs(tmp_path, "林小雨（常服）"),
+        extra={"preset": "缩放合批图"},
+    )
+
+    with pytest.raises(AppError) as caught:
+        await provider.submit(req, client_id="aivs-test")
+
+    err = caught.value
+    assert len(fake.calls) == 1, "接不上就别再提交一次——那只会换来同一个 400"
+    assert "节点 13 的 image1" in err.detail and "ImageScale" in err.detail
+    assert "ComfyUI 因此拒收整份图" in err.detail
+    assert any("给这个镜头补上对应的素材" in s for s in err.suggestions)
+    assert any("改成不依赖它的接法" in s for s in err.suggestions)
+    assert err.suggestions[-1].startswith("展开原始报错"), "ComfyUI 自己那几条建议照旧留在后面"
+    assert not any("必填" in note for note in req.notes), "没接上就别在账单里说接上了"

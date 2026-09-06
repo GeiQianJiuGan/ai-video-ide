@@ -17,6 +17,7 @@ from typing import Any
 
 from sqlalchemy import select
 
+from app.ai import prompts as ai_prompts
 from app.core import ffmpeg as ffmpeg_tool
 from app.core.config import settings
 from app.core.errors import AppError, ErrorCode
@@ -1039,9 +1040,10 @@ class GenerationService:
                 ],
                 {"shot_id": job.shot_id},
             )
+        prompt = str(params.get("prompt") or "")
         req = VideoRequest(
             mode=mode,
-            prompt=str(params.get("prompt") or ""),
+            prompt=prompt,
             negative=str(params.get("negative_prompt") or ""),
             first_frame=first,
             last_frame=last,
@@ -1052,6 +1054,12 @@ class GenerationService:
             ),
             seed=params.get("seed"),
             workflow=spec,
+            #: 四段格式拆回来的那几段 + 镜号。**解析只有 `ai/prompts.py` 一处**：
+            #: 适配层不 import `app.ai`（分层方向是 ai → generation），自己再解析一遍必然
+            #: 与拼 prompt 的那一处分叉。拆不出来（用户手写的自由文本）就是空 dict，
+            #: 适配器照原样送，不替他重写。
+            segments=ai_prompts.shot_segments(prompt),
+            shot_no=ai_prompts.shot_no_of(prompt),
             extra={**(params.get("extra") or {}), "preset": params.get("preset")},
         )
         task_id = await provider.submit(req, client_id=f"aivs-{pid}")
@@ -1061,15 +1069,28 @@ class GenerationService:
         params["refs"] = [
             {
                 "label": r.label,
+                #: 那个「只有名字」的字段（账单的 `name`）。`label` 带台账字样，
+                #: 复盘「模型当时以为这张图是谁」要看的是这一格。
+                "name": r.name,
                 "kind": r.kind,
                 "media": r.media,
                 "file": r.path.name,
-                #: 当时喂进 prompt 的那句说明（全文，`ref_hint` 里才截断）。素材描述
+                #: 当时喂给模型的那句说明（全文，只有 `clip_desc` 那一处会截断）。素材描述
                 #: 事后能改，所以「这一版到底带了哪句话」只有冻结下来才回答得了。
                 "desc": r.desc,
             }
             for r in refs
         ]
+        #: **真正提交出去的那段话**。入队时冻结的 `params.prompt` 是拼装前的四段格式，
+        #: 而适配器会按图册把它重排成参考生成那六段（`base.render_video_prompt`）——
+        #: 「当时到底喂了哪段话给模型」以前在任何地方都查不到（硬约束 4）。
+        if req.sent_prompt and req.sent_prompt != prompt:
+            params["prompt_sent"] = req.sent_prompt
+        #: 图册：`<Picture n>` / `<Subject n>` 当时分别指谁、这个编号是从接线上测出来的还是
+        #: 退回了入口名的顺序（`order_source`）。「模型把两个角色画成同一个人」这类事故要靠它
+        #: 复盘——`refs` 只说喂了哪几个文件，说不出模型看到的是第几张。
+        if req.book is not None and req.book.items:
+            params["pictures"] = req.book.to_dict()
 
         if req.notes:
             params["ref_notes"] = list(req.notes)
@@ -1447,8 +1468,14 @@ class GenerationService:
                     kind=str(item["kind"]),
                     media=media,
                     #: 那句「长什么样」，来自账单（`context._desc_of`）。它最终由
-                    #: `providers/base.py::ref_hint()` 渲染进 prompt——空就只剩一个名字。
+                    #: `providers/base.py::render_video_prompt()` 渲染进 prompt——
+                    #: 空就只剩一个名字。
                     desc=str(item.get("desc") or ""),
+                    #: **只有名字的那一份**（`context._name_of`）：`label` 里带着台账字样
+                    #: （`· Character Sheet v1`、`（本幕人物）`），那些字进了提示词就是噪声，
+                    #: 而模型要靠这个名字把台词对上 `<Subject n>`。老账单里没有这一项，
+                    #: 此时 `RefAsset.who` 自然退回 `label`。
+                    name=str(item.get("name") or ""),
                 )
             )
         return await resolve(explicit_first), await resolve(explicit_last), refs

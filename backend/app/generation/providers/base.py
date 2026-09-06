@@ -28,8 +28,8 @@ T2V 暂不做——没有首帧的镜头在编排时就会被账单挡下来，�
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from dataclasses import dataclass, field
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -46,7 +46,8 @@ MEDIA = ("image", "video", "audio")
 #: `base` 不该反向依赖某一个适配器的模块。
 MEDIA_LABEL = {"image": "参考图", "video": "参考视频", "audio": "参考音频"}
 
-#: 一条素材说明最多带多少字进 prompt。**截断规则只有这一处**（`ref_hint` 用它）：
+#: 一条素材说明最多带多少字进 prompt。**截断规则只有这一处**（`clip_desc`，三个调用点：
+#: 图册那一行 `subject_definitions`、`ref_hint` 里编不上号的那几个、REST 合同的 `refs[].desc`）：
 #: 素材描述是自由文本，用户可以写一整段设定，几条加起来就能把正向 prompt 顶掉；
 #: 而截断在两处各写一遍的话，界面上提示的字数与真正送出去的必然分叉。
 #: 前端从 `GET /projects/{pid}/assets/undescribed` 的账单里读这个数，不写死第二份。
@@ -62,7 +63,6 @@ def clip_desc(text: str, limit: int = DESC_MAX) -> str:
     return one if len(one) <= limit else f"{one[:limit]}…"
 
 
-
 @dataclass(frozen=True, slots=True)
 class RefAsset:
     """一个参考素材：文件在哪 + 它是谁 + 它是什么媒体。
@@ -75,8 +75,14 @@ class RefAsset:
 
     `desc` 是这张素材**长什么样**（`Asset.description`，用户手填或 AI 看图补的那一句），
     与 `label` 分开是刻意的：`label` 要短，它还要显示在上下文检查器、`dropped_labels`
-    与底部控制台里；`desc` 只服务于提示词，由 `ref_hint()` 截断后单独渲染。
-    空 = 用户没写，此时那句说明与升级前逐字相同。
+    与底部控制台里；`desc` 只服务于提示词，由 `clip_desc()` 截断后单独渲染
+    （图册里那一行 `subject_definitions`，或 REST 合同的 `refs[].desc`）。
+    空 = 用户没写，此时那一行只剩一个名字。
+
+    `name` 是**只有名字**的那一份（`阿岚（默认形象）` / `阴曹试院 · 廊下考场`），空 = 没给。
+    它与 `label` 分开是因为 `label` 里带着台账字样（`· Character Sheet v1`、`（本幕人物）`
+    这类给人看的来源标注）——那些字进了 prompt 就是噪声，而模型要靠这个名字把
+    `overall_soundscape` 里那句「宋焘说：…」对上 `<Subject 1>`（见 `render_video_prompt`）。
     """
 
     path: Path
@@ -84,10 +90,16 @@ class RefAsset:
     kind: str = ""
     media: str = "image"
     desc: str = ""
+    name: str = ""
 
     @property
     def media_label(self) -> str:
         return MEDIA_LABEL.get(self.media, "参考素材")
+
+    @property
+    def who(self) -> str:
+        """进提示词的那个名字：干净的名字 → 台账标签 → 文件名。**只有这一处口径。**"""
+        return self.name or self.label or self.path.name
 
 
 #: 旧名字。参考素材支持视频 / 音频之前它只可能是图，改名后留一个别名给外部引用
@@ -189,6 +201,22 @@ class VideoRequest:
     #: service 层原样冻结进版本，不解释内容——「绝不静默失败」在这里的样子是
     #: 「降级也要说出来并留档」，而不是抛错让整个任务失败。
     notes: list[str] = field(default_factory=list)
+    #: `prompt` 拆回来的那几段（`camera_motion` / `visual_prompt` / `audio_dialogue`）。
+    #: **由 service 层拆好传下来**（`ai/prompts.py::shot_segments`，全应用只有那一个解析器）：
+    #: 适配层不 import `app.ai`，自己再解析一遍必然与拼 prompt 的那一处分叉。
+    #: 空 dict = 这条 prompt 不是四段格式（用户手写的自由文本），此时整段原样进
+    #: `detailed_description`（见 `render_video_prompt`）。
+    segments: dict[str, str] = field(default_factory=dict)
+    #: 这是第几个镜头（`[SHOT n]` 里那个 n）。入队参数里没有 `index_no`，所以它同样由
+    #: service 层从 prompt 上解析（`prompts.shot_no_of`）。渲染成 `[Shot n]`。
+    shot_no: int = 1
+    #: **真正提交出去的那段正向 prompt**（六段格式的全文）。适配器填，service 层冻结进
+    #: `params.prompt_sent`：入队时冻结的 `params.prompt` 是拼装前的四段格式，
+    #: 「当时到底喂了哪段话」以前在任何地方都查不到（硬约束 4）。
+    sent_prompt: str = ""
+    #: 这一次的图册（`<Picture n>` / `<Subject n>` 到底指谁）。适配器填，service 层冻结进
+    #: `params.pictures`。`None` = 这条路不编号（通用 REST 那类收得到结构化字段的端）。
+    book: PictureBook | None = None
 
 
 def refs_by_media(refs: Sequence[RefAsset]) -> dict[str, list[RefAsset]]:
@@ -204,15 +232,18 @@ def refs_by_media(refs: Sequence[RefAsset]) -> dict[str, list[RefAsset]]:
 
 
 def ref_hint(refs: Sequence[RefAsset]) -> str:
-    """把「第几个参考素材是谁」写成一句话。
+    """把「第几个参考素材是谁」写成一句话。**现在只服务于编不进 `<Picture n>` 的那些。**
 
-    给**只按顺序收素材、不接收标签**的模型端用（ComfyUI 那类图就是这样）：不说清楚的话，
-    模型只知道多了几个输入，不知道哪个是主角。空列表回空串，调用方照此决定要不要拼。
+    图片走图册（`picture_book` → `render_video_prompt` 的 `subject_definitions`）：那条路的
+    编号是按这份图的接线实测出来的，而这里的序号只是「账单里的第几个」——两者对不上时，
+    照这句话认人会让模型把角色互相串味，这正是当初那个 bug 的形状。
+    参考视频 / 参考音频没有 `<Picture n>` 可给（模型收到的那一串编号说的是图片），
+    所以它们仍然只能靠这句话点名，`render_video_prompt` 在 `summary` 里引它。
 
-    序号**按媒体各自从 1 数**，因为槽位就是按媒体分开的：图片进 `AIVS_REF_1`、
-    视频进 `AIVS_REF_VIDEO_1`，混在一起连续编号的话这句说明会和真正填进去的槽位错位。
+    序号**按媒体各自从 1 数**，因为槽位就是按媒体分开的：视频进 `AIVS_REF_VIDEO_1`、
+    音频进 `AIVS_REF_AUDIO_1`，混在一起连续编号的话这句说明会和真正填进去的槽位错位。
 
-    有描述的素材多一个括号：`参考图1=阿岚（默认形象）（褪色军绿夹克，短发）`。
+    有描述的素材多一个括号：`参考音频1=对白（三十岁男声，压低）`。
     **没有描述时输出与升级前逐字相同**——老工程的 prompt 不该因为多了一列而变样。
     """
     parts: list[str] = []
@@ -220,11 +251,391 @@ def ref_hint(refs: Sequence[RefAsset]) -> str:
         label = MEDIA_LABEL.get(media, "参考素材")
         for i, r in enumerate(group, 1):
             desc = clip_desc(r.desc)
-            who = r.label or r.path.name
+            who = r.who
             parts.append(f"{label}{i}={who}（{desc}）" if desc else f"{label}{i}={who}")
     if not parts:
         return ""
     return f"参考素材说明：{'；'.join(parts)}。"
+
+
+#: 图册里那两个「决定画面第一 / 最后一格」的角色（角色名来自上下文账单
+#: `services/context.py::_assign_roles`）。其余角色说的是「谁出场、长什么样」，
+#: 也就是会变成一个 `<Subject n>` 的那些。
+FRAME_ROLES = frozenset({"first_frame", "last_frame"})
+
+#: 那两张帧在图册里给人看的说法。各条路的入口名不一样（预设是 `AIVS_FIRST_FRAME`、绑定是
+#: `first_frame`），但**落到图册上的这两个名字只有这一份**——它会进 `params.pictures`
+#: 与界面上那张对号表，两处写成不同的字会让人以为是两回事。
+FRAME_LABEL = {"first_frame": "首帧", "last_frame": "末帧"}
+
+#: 「这张图定义的是什么」→ 定义句里那半句英文。**措辞只有这一份表**，键是账单里的 `kind`。
+_DEFINES = {
+    "character_sheet": "the visible subject shown in",
+    "appearance": "the visible subject shown in",
+    "location_reference": "the environment shown in",
+    "prop_reference": "the object shown in",
+}
+_DEFINES_ELSE = "the visible subject shown in"
+
+#: 「这张图必须保住什么」→ `retention_analysis` 里那半句。同上，只有这一份。
+_RETAIN = {
+    "character_sheet": "keep the exact face, hair, build and costume shown in",
+    "appearance": "keep the exact face, hair, build and costume shown in",
+    "location_reference": "keep the exact layout, architecture, materials and lighting shown in",
+    "prop_reference": "keep the exact shape, material, colour and markings shown in",
+}
+_RETAIN_ELSE = "keep the exact appearance shown in"
+
+#: 「这张图上是个人」的那几种 kind：只有它们之间需要那句「这是两个不同的人，别互相串」。
+_PEOPLE = frozenset({"character_sheet", "appearance"})
+
+
+@dataclass(frozen=True, slots=True)
+class Picture:
+    """图册里的一张图：**这一次它是第几张**、是谁、从哪个入口喂进去的。
+
+    `index` 是 `<Picture n>` 里那个 n，**1 起、把首尾帧一起数进去**——模型看到的就是一串
+    图片，首帧不会因为我们在代码里分了两个字段就自动排到编号之外。顺序来自
+    `comfy/graph.py::feed_order()` 实测的接线，不是 `AIVS_REF_*` 的标题序号。
+
+    `subject` 是 `<Subject n>` 里那个 n，**只有非首尾帧的那些图才有**（首尾帧说的是「画面
+    从哪一格开始」，不是「谁出场」）：0 = 这张图不定义任何 subject。
+    """
+
+    index: int = 0
+    role: str = "reference"
+    kind: str = ""
+    media: str = "image"
+    name: str = ""
+    desc: str = ""
+    #: 喂它的那个入口名（`AIVS_REF_2` / `first_frame` / `__ref_0`）。排查时要的就是这一格。
+    entry: str = ""
+    #: 上传到模型端之后的文件名。**去重按它**（见 `picture_book`）。
+    file: str = ""
+    subject: int = 0
+
+    @property
+    def tag(self) -> str:
+        return f"<Picture {self.index}>"
+
+    @property
+    def subject_tag(self) -> str:
+        return f"<Subject {self.subject}>"
+
+    @property
+    def is_frame(self) -> bool:
+        return self.role in FRAME_ROLES
+
+    @property
+    def is_person(self) -> bool:
+        return self.kind in _PEOPLE
+
+    def to_dict(self) -> dict[str, Any]:
+        """冻结进 `params.pictures`、也显示在界面上的那一行。"""
+        return {
+            "index": self.index,
+            "subject": self.subject,
+            "role": self.role,
+            "kind": self.kind,
+            "media": self.media,
+            "name": self.name,
+            "desc": self.desc,
+            "entry": self.entry,
+            "file": self.file,
+        }
+
+
+@dataclass(frozen=True)
+class PictureBook:
+    """这一次提交的图册：`<Picture n>` / `<Subject n>` 分别指谁。
+
+    **它是提示词与那几张图之间唯一的对号表**：`render_video_prompt()` 照它写那六段，
+    service 层照它冻结 `params.pictures`，界面照它显示「这一版的第 3 张图是张秀才」。
+    两处各编一遍号必然分叉，而分叉的样子恰好是「模型把两个角色画成同一个人」。
+    """
+
+    items: list[Picture] = field(default_factory=list)
+    #: 编不进号的那些参考素材（参考视频 / 参考音频）：ComfyUI 那类图收不到标签，
+    #: 只能在 `summary` 里用 `ref_hint()` 那句话点一下，没有 `<Picture n>` 可给。
+    others: list[RefAsset] = field(default_factory=list)
+    #: 编号顺序是怎么来的（`graph` / `mixed` / `title`，见 `comfy/graph.py::FeedOrder`；
+    #: 另有 `contract`——收得到结构化字段的那条路由我们定顺序，没有图可测也无需降级说明）。
+    order_source: str = "title"
+    #: 说明与降级（顺序是实测的还是退回了约定）。调用方并进 `req.notes` → 冻结 → 界面。
+    notes: list[str] = field(default_factory=list)
+
+    def __bool__(self) -> bool:
+        """一张图都没有时为假——调用方照此决定要不要走六段格式。"""
+        return bool(self.items)
+
+    @property
+    def subjects(self) -> list[Picture]:
+        """会变成 `<Subject n>` 的那几张（首尾帧不算）。"""
+        return [p for p in self.items if p.subject]
+
+    @property
+    def listing(self) -> str:
+        """`<Picture 1>=宋焘；<Picture 2>=张秀才`——给人看的对号表。
+
+        note、日志、界面共用这一句。**它不是提示词的一部分**：模型收到的对号表是
+        `subject_definitions` 那一段（`render_video_prompt`），两处措辞刻意不同——
+        一处给人排查用，一处要让模型认得住。
+        """
+        return _listing(self.items)
+
+    def of_role(self, role: str) -> Picture | None:
+        return next((p for p in self.items if p.role == role), None)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "order_source": self.order_source,
+            "items": [p.to_dict() for p in self.items],
+            "others": [
+                {"name": r.who, "media": r.media, "kind": r.kind, "file": r.path.name}
+                for r in self.others
+            ],
+            "notes": list(self.notes),
+        }
+
+
+def frame_seed(role: str, file: str) -> Picture:
+    """首帧 / 末帧那一张的图册种子。**三条路共用这一处**（措辞见 `FRAME_LABEL`）。
+
+    它照旧占一个 `<Picture n>` 号：模型看到的是一串图片，首尾帧不会因为我们在代码里分成了
+    两个字段就自动排到编号之外。以前几份 SKILL 写死「参考图 1 是首帧」，而首帧到底排第几
+    完全取决于这份图怎么接的线——那正是「`<Picture 1>` 指错人」的来源。
+    """
+    return Picture(
+        role=role, kind=role, media="image", name=FRAME_LABEL.get(role, role), file=str(file)
+    )
+
+
+def picture_book(
+    seeds: Mapping[str, Picture],
+    order: Sequence[str] = (),
+    *,
+    order_source: str = "title",
+    others: Sequence[RefAsset] = (),
+) -> PictureBook:
+    """把「入口 → 这张图是谁」按**实际喂入顺序**编成图册。**编号口径只有这一处。**
+
+    `seeds` 的键是入口名（`AIVS_FIRST_FRAME` / `AIVS_REF_2` / `__ref_0`…），**它的顺序就是
+    调用方的约定顺序**（标题序号 / 绑定表行号）；`order` 是 `feed_order()` 从接线上实测出来的
+    那一串，只用来定序、不做筛选——不在 `order` 里的入口照旧按约定顺序排在后面。
+
+    **按文件去重**：同一个文件出现在两个入口上是常态（绑定那条路的「参考图（单槽）」与
+    `__ref_0` 常常指着同一个 LoadImage，`reconnect()` 还会把同一张图接给必填的那一格），
+    编成两个号就等于告诉模型「这是两张不同的图」。
+    """
+    keys = [key for key in order if key in seeds]
+    keys += [key for key in seeds if key not in keys]
+    items: list[Picture] = []
+    kept: list[str] = []
+    seen: set[str] = set()
+    index = 0
+    subject = 0
+    for key in keys:
+        seed = seeds[key]
+        #: 非图片不编号（模型看到的那一串 `<Picture n>` 说的就是图）。
+        if seed.media != "image":
+            continue
+        mark = seed.file or key
+        if mark in seen:
+            continue
+        seen.add(mark)
+        kept.append(key)
+        index += 1
+        frame = seed.role in FRAME_ROLES
+        if not frame:
+            subject += 1
+        items.append(
+            replace(seed, index=index, subject=0 if frame else subject, entry=seed.entry or key)
+        )
+    notes = _book_notes(items, kept, seeds, order_source)
+    return PictureBook(items, list(others), order_source, notes)
+
+
+def _listing(items: Sequence[Picture]) -> str:
+    """图册的对号表（`PictureBook.listing` 与 `_book_notes` 共用，两处不各写一遍）。"""
+    return "；".join(f"{p.tag}={p.name or p.file or p.entry}" for p in items)
+
+
+def _book_notes(
+    items: Sequence[Picture],
+    kept: Sequence[str],
+    seeds: Mapping[str, Picture],
+    order_source: str,
+) -> list[str]:
+    """这一份编号是怎么来的——**与约定顺序不一致时必须说出来**（硬约束 4）。
+
+    这条 note 一路进 `req.notes` → 版本参数 `ref_notes` → 界面。它是这次改造里最要紧的一句话：
+    图里两根线接反了的时候，用户在 ComfyUI 界面上看不出来，而喂给模型的「`<Picture 1>` 是宋焘」
+    会指错人——画面里两个角色互相串味，队列里一条错误都没有。
+    """
+    if len(items) < 2:
+        return []
+    listing = _listing(items)
+    if order_source == "title":
+        return [
+            "这份图里这几个媒体入口没有汇合到同一个节点，`<Picture n>` 的编号只能按入口名的"
+            f"顺序排（不是从接线上测出来的）：{listing}。"
+        ]
+    if list(kept) != [key for key in seeds if key in set(kept)]:
+        return [
+            "按这份图的接线，实际喂入顺序与入口名的顺序不一致，图册按**实测**的这一份编号："
+            f"{listing}。"
+        ]
+    return []
+
+
+def render_video_prompt(req: VideoRequest, book: PictureBook) -> str:
+    """把这次要提交的正向 prompt 渲染成**参考生成那套六段格式**。全应用只有这一处拼装。
+
+    **为什么不是「四段格式 + 末尾一句参考素材说明」**（老的 `ref_hint` 那条路）：那句说明挤在
+    prompt 末尾时，模型读到的仍然是一段散文，`<Picture n>` 与画面里的人没有任何显式绑定；
+    而分镜里「保持两人服饰与面容一致」这类话在缺少 `retention_analysis` 的形状下会被字面执行成
+    「把这两个人画成同一个人」——那正是「张秀才长成了宋焘」的形状。六段格式给每张图一个
+    `<Subject n>`、给每个 subject 一句「保住它自己、别与别人混」，这两句话在四段格式里
+    压根没有地方落。
+
+    **段名与 `<Subject n>` / `<Picture n>` 一律英文**（模型端认的是这套结构），段里的内容照
+    原文的语言写——分镜是中文的，在这里翻译一遍只会丢细节。
+
+    `req.segments` 是空的（用户手写的自由文本 prompt）时不硬套三段，整段原样进
+    `detailed_description`：不替用户重写他自己写的 prompt。
+    """
+    shot = f"[Shot {max(1, int(req.shot_no or 1))}]"
+    seconds = f"{max(0.0, float(req.duration or 0)):.2f}"
+    parts: list[str] = []
+    align = _align_line(book, shot, seconds)
+    if align:
+        parts.append(align)
+    parts.append(f"subject_definitions:\n{_definitions(book)}")
+    parts.append(f"summary:\n{_summary(book, shot, seconds)}")
+    parts.append(f"retention_analysis:\n{_retention(book, shot)}")
+    parts.append(f"detailed_description:\n{_detail(req, shot)}")
+    parts.append(f"overall_soundscape:\n{_soundscape(req)}")
+    #: 无配乐是产品级硬约束（`ai/skills/video_prompt.py::AUDIO_RULE`），这一格永远是 none。
+    parts.append("non_diegetic_music:\nnone")
+    return "\n\n".join(parts)
+
+
+def _and_join(parts: Sequence[str]) -> str:
+    """`A` / `A and B` / `A, B and C`。这几段是英文句子，中文顿号会被读成一个词。"""
+    items = [p for p in parts if p]
+    if len(items) < 2:
+        return items[0] if items else ""
+    return f"{', '.join(items[:-1])} and {items[-1]}"
+
+
+def _align_line(book: PictureBook, shot: str, seconds: str) -> str:
+    """首尾帧与目标视频的对齐句（措辞照 `ai/skills/video_prompt.py` 那三份 SKILL 的第一行）。
+
+    **由图册里真有哪几张帧决定，不由 SKILL 名字决定**：适配器看不到 SKILL 名，而「这一次到底
+    喂了首帧还是末帧」它知道得最准。两处各说一遍的话，图册说两张、这句话说一张。
+    """
+    first = book.of_role("first_frame")
+    last = book.of_role("last_frame")
+    head = "How the reference pictures align with the target video — "
+    if first is not None and last is not None:
+        return (
+            f"{head}{first.tag} (from {shot}) aligns with the 0.00-second mark of the target "
+            f"video; {last.tag} (from {shot}) aligns with the {seconds}-second mark of the "
+            "target video."
+        )
+    if first is not None:
+        return (
+            f"For the target video, at 0.00 seconds into the target video, {first.tag} "
+            f"(from {shot}) is fully referenced."
+        )
+    if last is not None:
+        return (
+            f"{head}{last.tag} (from {shot}) aligns with the {seconds}-second mark of the "
+            "target video."
+        )
+    return ""
+
+
+def _definitions(book: PictureBook) -> str:
+    """`<Subject n> is … shown in <Picture n>: 名字。它长什么样`。
+
+    **名字必须进这一句**：`overall_soundscape` 里写的是「宋焘说：…」，模型要靠这里把那个名字
+    接到 `<Subject n>` 上。缺了它，台词落到谁头上全靠猜——「张三说了李四的台词」就是这么来的。
+    描述截断照旧只走 `clip_desc()`（`DESC_MAX`），图册与冻结参数里留的是全文。
+    """
+    lines = [
+        f"{p.subject_tag} is {_DEFINES.get(p.kind, _DEFINES_ELSE)} {p.tag}: "
+        + ("。".join(x for x in (p.name, clip_desc(p.desc)) if x) or p.file)
+        for p in book.subjects
+    ]
+    #: 一个 subject 都没有时写 none（照 `_REF` 那份 SKILL 的规定），不留一个空段。
+    return "\n".join(lines) or "none"
+
+
+def _summary(book: PictureBook, shot: str, seconds: str) -> str:
+    """`[reference generation] …`：这一次要出多长、有谁、哪几张图定义了他们、哪张是首尾帧。"""
+    subjects = book.subjects
+    line = f"[reference generation] Create a {seconds}-second target video"
+    who = _and_join([p.subject_tag for p in subjects])
+    line += f" featuring {who}." if who else "."
+    if subjects:
+        many = len(subjects) > 1
+        line += (
+            f" {_and_join([p.tag for p in subjects])} {'provide' if many else 'provides'} "
+            f"the visible identity of {'these subjects' if many else 'the subject'}."
+        )
+    first = book.of_role("first_frame")
+    last = book.of_role("last_frame")
+    if first is not None and last is not None:
+        line += f" {first.tag} is the first frame and {last.tag} is the final frame."
+    elif first is not None:
+        line += f" {first.tag} is the first frame of the target video."
+    elif last is not None:
+        line += f" {last.tag} is the final frame of the target video."
+    #: 参考视频 / 参考音频编不进 `<Picture n>`，只能靠这句话点一下它们是谁
+    #: （措辞借 `ref_hint()`，两处各写一遍必然分叉）。
+    hint = ref_hint(book.others)
+    return f"{line} {hint}" if hint else line
+
+
+def _retention(book: PictureBook, shot: str) -> str:
+    """每个 subject 一句「保住它自己」+ 两个人以上时那句「别把他们混成一个」。
+
+    最后那句是这次改造的正题：分镜里「保持两人服饰与面容一致」这种写法本意是「别在镜头里
+    忽然换装」，字面读却是「让两个人长得一样」。模型端只看字面，所以必须在这里说清楚。
+    """
+    lines: list[str] = []
+    for p in book.subjects:
+        head = f"{p.subject_tag}（{p.name}）" if p.name else p.subject_tag
+        lines.append(
+            f"{head} (appears in {shot}): fully_preserved - "
+            f"{_RETAIN.get(p.kind, _RETAIN_ELSE)} {p.tag} unchanged; "
+            "do not blend it with any other subject."
+        )
+    people = [p for p in book.subjects if p.is_person]
+    if len(people) > 1:
+        lines.append(
+            f"{_and_join([p.subject_tag for p in people])} are different people: never copy the "
+            "face, hair or costume of one onto another, and never merge two of them into one "
+            "person, even if the shot description asks for a consistent look."
+        )
+    return "\n".join(lines) or "none"
+
+
+def _detail(req: VideoRequest, shot: str) -> str:
+    """画面那一段：`[Shot n] 视觉描述 Camera Motion: 机位`。"""
+    if not req.segments:
+        #: 自由文本 prompt：原样送，不硬套三段（也不给它编一个 `[Shot n]` 前缀）。
+        return str(req.prompt or "").strip() or shot
+    visual = str(req.segments.get("visual_prompt") or "").strip()
+    camera = str(req.segments.get("camera_motion") or "").strip()
+    body = f"{shot} {visual}".strip()
+    return f"{body} Camera Motion: {camera}" if camera else body
+
+
+def _soundscape(req: VideoRequest) -> str:
+    """声音那一段：只有对白、同期环境声与必要动作音效（`AUDIO_RULE` 的口径）。"""
+    return str(req.segments.get("audio_dialogue") or "").strip() or "none"
 
 
 @dataclass(slots=True)

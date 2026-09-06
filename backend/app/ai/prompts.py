@@ -18,6 +18,8 @@
 
 from __future__ import annotations
 
+import re
+
 from app.core.config import settings
 
 #: 剧本拆解（分镜师）——可改的那一段。
@@ -121,6 +123,12 @@ add_shot / update_shot（以及 add_scene 里的 shots[]）**不要自己拼那�
 
 另外给一个 skill 字段，写你照的是哪一份（flf / i2v / l2v / ref），方便用户核对。
 
+**一个 `<Picture n>` / `<Subject n>` 都不要自己编**，那几段结构性的话（对齐说明 /
+subject_definitions / summary / retention_analysis）也不要写：这一次哪张图排第几，取决于用户
+那份生成图实际怎么接的线，系统在提交那一刻才数得出来。你只写「首帧」「末帧」以及角色的名字
+（与素材库里逐字一致），系统会照本次图册接到正确的编号上。自己编一个编号十有八九指错人，
+而这种错在队列里一条报错都没有——成片能出来，只是两个角色互相串味、台词落到别人头上。
+
 声音硬约束：本项目不生成背景音乐 / 配乐 / BGM / 配乐轨。SKILL 里的 non_diegetic_music 一节
 固定写 none；正向 prompt 末尾的「声音设计：」与负向里的 background music, BGM, soundtrack,
 musical score 由系统自动补齐，你不用重复写。"""
@@ -168,8 +176,10 @@ DIRECTOR_MATERIAL_SWEEP = """拆完一段之后对一遍账（list_missing_mater
 #: 于是人物形象在几秒里就丢了。用户看不出这是「缺一句话」造成的。
 DIRECTOR_DESCRIBE_CONTRACT = """素材的那一句描述（引用它时模型唯一看得到的说明）：
 
-引用一个素材，最终只变成 prompt 末尾的一句「参考图1=阿岚（褪色军绿夹克，短发，左颊一道旧疤）」。
-括号里那一段就是这个素材的描述——**空的话模型只拿到一个文件名**，画面里的人是谁全靠它猜。
+引用一个素材，最终变成提示词里点名它的那一句——
+「<Subject 1> is the visible subject shown in <Picture 2>: 阿岚（默认形象）。褪色军绿夹克，
+短发，左颊一道旧疤」。冒号后面那一段就是这个素材的名字与描述——**描述空的话模型只拿到一个
+文件名**，画面里的人是谁全靠它猜。
 
 **这一句回答的是「这张图长什么样」，不是「这个角色的设定是什么」。** 两者常常不一样：
 剧本里写「阿岚穿军绿夹克」，而这张图里他可能背对镜头、或者是童年那一版。所以照剧本编一句
@@ -228,7 +238,8 @@ def _custom(raw: str) -> str:
 
 #: 「照着这张素材写一句描述」的可改部分。
 #: 这句话的用处很具体：素材没有描述时，模型引用它只看到一个文件名
-#: （`providers/base.py::ref_hint`），于是「参考图1=阿岚」后面那个括号是空的。
+#: （`providers/base.py::render_video_prompt` 那句 `<Subject n> is …: 名字。描述`
+#: 里，冒号后面只剩一个名字，跟着它的那一段是空的）。
 DESCRIBE_TASK = """你在给一个视频工程里的素材写「它长什么样」。
 
 这句描述唯一的用途是：这张素材被某个镜头引用时，把它拼进喂给视频生成模型的提示词里。
@@ -312,6 +323,47 @@ def parse_shot_prompt(prompt: str) -> dict[str, str]:
             value = hit[len(label) :].strip()
             if value:
                 out[key] = value
+    return out
+
+
+#: `format_shot_prompt` 的第一行。镜号不在 `parse_shot_prompt` 的三段里，所以单独认一次。
+_SHOT_NO = re.compile(r"^\[SHOT\s+(\d+)\]", re.IGNORECASE)
+
+
+def shot_no_of(prompt: str, fallback: int = 1) -> int:
+    """从四段格式的第一行读回镜号。认不出就回 `fallback`，**不抛**。
+
+    重排成参考生成那种形状时 `detailed_description` 里要写 `[Shot n]`，那个 n 必须与
+    prompt 里原来那一行是同一个数——库里的 `shot.index_no` 事后可能被拖动改过，
+    而这一段 prompt 是当时冻结下来的。
+    """
+    for ln in str(prompt or "").splitlines():
+        hit = _SHOT_NO.match(ln.strip())
+        if hit:
+            return max(1, int(hit.group(1)))
+    return max(1, int(fallback))
+
+
+def shot_segments(prompt: str) -> dict[str, str]:
+    """给生成层用的分段：`parse_shot_prompt` 那三段，但**摘掉无配乐那一句**。
+
+    `with_shot_audio_policy` 把约束追加在整段 prompt 的最后，于是它落在
+    `Audio / Dialogue:` 这一行里，`parse_shot_prompt` 会把它当成对白的一部分带出来。
+    重排成六段形状之后「无配乐」由 `non_diegetic_music: none` 那一段表达
+    （`generation/providers/base.py::render_video_prompt`），同一句话再进
+    `overall_soundscape` 就成了两处口径——所以在这里摘一次，且只有这一处摘。
+
+    为什么摘除放在服务层这一侧而不是渲染那一侧：分层方向是 ai → generation，
+    `app/generation/**` 不能 import `app.ai`，那边认不出这句话是谁追加的。
+    """
+    out = parse_shot_prompt(prompt)
+    audio = out.get("audio_dialogue", "")
+    if audio and SHOT_AUDIO_PROMPT_SUFFIX in audio:
+        audio = audio.replace(SHOT_AUDIO_PROMPT_SUFFIX, "").strip()
+        if audio:
+            out["audio_dialogue"] = audio
+        else:
+            out.pop("audio_dialogue", None)
     return out
 
 

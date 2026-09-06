@@ -304,8 +304,9 @@ class AssetService:
         所以这里刻意只放一个字段过去（`assign` 的 `allowed` 就是那道门）。
 
         描述是**模型唯一看得到的素材说明**：上下文账单把它当 `desc` 冻结进版本，最后由
-        `providers/base.py::ref_hint()` 渲染成「参考图1=<名字>（<这一句>）」。所以它不是
-        备注栏——写不写直接决定引用这张图时 prompt 里有没有内容。
+        `providers/base.py::render_video_prompt()` 渲染成 `subject_definitions` 里那一行
+        （`<Subject 1> is … <Picture 2>: <名字>。<这一句>`），收得到结构化字段的那条路走
+        `pictures[].desc`。所以它不是备注栏——写不写直接决定引用这张图时模型知不知道它长什么样。
 
         **清空传 `''`**：`None` 在 `assign` 里是「这次不改」（与 `ShotPatch` 同一条口径）。
         """

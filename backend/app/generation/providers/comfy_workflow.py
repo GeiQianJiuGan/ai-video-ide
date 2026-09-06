@@ -21,6 +21,15 @@
 （`_detach_idle`，理由整段写在 `comfy/graph.py::detach()`）：绑了末帧却没有末帧、绑了 9 个
 参考图槽位而这个镜头只有 2 张时，那些格子里留着的是用户存图时挂着的示例文件——留着就等于
 把不相干的图真喂进模型，而队列里一条错误都没有。摘了什么照旧写进 `req.notes`。
+**而被摘掉的那一格在图里是必填的时候**（`ImageBatch.image1` 那种合批节点），提交那一步会把它
+接回这一次真在喂的那个槽位再提交一次（`comfy_base.ComfyTasks._submit_graph`）：
+「参考图不够就跳过多余的槽位」不该以一个 400 收场。
+
+**「第几张图是谁」这件事这条路与预设那条一字不差**（`_book_of` → `comfy_base._retold`）：
+两边收到的都只是「一串图片 + 一段文字」，绑定表里那一行的行号和预设的 `AIVS_REF_2` 一样
+只是入口名，真实喂入顺序要顺着接线数（`comfy/graph.py::feed_order`）。这条路上尤其容易分叉：
+`source_image` 与 `reference_image` 两个单槽常常绑在同一个节点上，所以图册按文件去重——
+同一张图占两个编号会让它后面所有序号都指错人。
 """
 
 from __future__ import annotations
@@ -29,16 +38,27 @@ from typing import Any
 
 from app.core.errors import AppError, ErrorCode
 from app.core.logging import get_logger
-from app.generation.comfy.graph import MEDIA_SLOTS, apply_bindings, detach, parse_graph
+from app.generation.comfy.graph import (
+    MEDIA_SLOTS,
+    Detached,
+    apply_bindings,
+    detach,
+    feed_order,
+    parse_graph,
+)
 from app.generation.providers import base
 from app.generation.providers.base import VideoRequest
-from app.generation.providers.comfy_base import ComfyTasks, detached_submit_error
+from app.generation.providers.comfy_base import ComfyTasks
 
 log = get_logger("provider.comfy_workflow")
 
 #: 绑定表里那个「参考图槽位」的键名。它是一个数组（`["12.image", "13.image"]`），
 #: 与其余「一个槽位一行字符串」的键形状不同，所以到处都要把它单独摘出来。
 REF_SLOTS_KEY = "reference_image_slots"
+
+#: `reference_image_slots` 展开之后那几个内部槽位名的前缀（`__ref_0`…）。写成常量是因为
+#: 「哪些槽位是参考图」这件事在填值、摘节点、接回去三处都要问一遍。
+REF_PREFIX = "__ref_"
 
 #: `MEDIA_SLOTS` 里那几个槽位给人看的说法。note 里得说人话，用途同预设那条路的
 #: `presets.MARKER_LABEL`——两份表分别对着两套入口，但话都只写一遍。
@@ -57,7 +77,7 @@ def _detach_idle(
     values: dict[str, Any],
     unused_refs: list[str],
     req: VideoRequest,
-) -> list[dict[str, str]]:
+) -> Detached:
     """把这一版没有素材可填的**媒体**槽位连节点一起从提交的副本里摘掉。
 
     与 `comfy_preset._detach_idle` 是同一件事、同一个理由（整段写在
@@ -68,6 +88,9 @@ def _detach_idle(
 
     标量槽位（seed / steps / 宽高 / 时长）没给值时照旧保持图里原来的值，那是用户有意
     存进去的默认参数。这条分界只有一张表：`comfy/graph.py::MEDIA_SLOTS`。
+
+    回的 `Detached` 里还带着「切断了哪些留下来的输入」，提交那一步要用它
+    （`ComfyTasks._submit_graph`：那一格是必填的话，接回本次真在喂的入口再提交一次）。
     """
     keep: set[str] = set()
     idle: dict[str, str] = {}
@@ -84,13 +107,13 @@ def _detach_idle(
         idle.setdefault(target.split(".", 1)[0], "参考图槽位")
     idle = {node_id: label for node_id, label in idle.items() if node_id not in keep}
     if not idle:
-        return []
+        return Detached()
     removed = detach(payload, list(idle), keep=keep)
     counts: dict[str, int] = {}
     for label in idle.values():
         counts[label] = counts.get(label, 0) + 1
     which = "、".join(f"{n} 个{label}" if n > 1 else label for label, n in counts.items())
-    cascade = len(removed) - len(idle)
+    cascade = len(removed.nodes) - len(idle)
     req.notes.append(
         f"工作流 {name} 这一版没有用到这几个槽位：{which}。它们已经从提交的那份图里摘掉"
         + (f"（连带 {cascade} 个只为它们服务的中间节点）" if cascade > 0 else "")
@@ -100,9 +123,97 @@ def _detach_idle(
         "provider.entries_detached",
         workflow=name,
         idle=len(idle),
-        removed=len(removed),
+        removed=len(removed.nodes),
+        cuts=len(removed.cuts),
     )
     return removed
+
+
+def _pics_of(
+    bindings: dict[str, str],
+    values: dict[str, Any],
+    images: list[base.RefAsset],
+) -> dict[str, base.Picture]:
+    """入口 → 图册种子（这一格喂的是谁）。**键的顺序就是绑定表的约定顺序**，
+    真实编号由接线实测的那一串定（`_book_of`）。
+
+    这条路上有两个「单张入口」（`source_image` / `reference_image`）会重复指向已经在别处
+    喂过的同一个文件——`values` 里它们就是这么算出来的（首帧或第一张参考图）。它们照旧
+    进这份表：图册按文件去重（`base.picture_book`），去重放在那一处才不会两边分叉。
+
+    首尾帧的 `role` 与参考图不同：它说的是「画面从哪一格开始 / 结束」而不是「谁出场」，
+    所以不会变成一个 `<Subject n>`。分界表只有 `base.FRAME_ROLES` 一张。
+    """
+    by_file: dict[str, base.RefAsset] = {}
+    for index, ref in enumerate(images):
+        file = values.get(f"{REF_PREFIX}{index}")
+        if file:
+            by_file[str(file)] = ref
+    pics: dict[str, base.Picture] = {}
+    for slot in bindings:
+        if slot not in MEDIA_SLOTS and not slot.startswith(REF_PREFIX):
+            continue
+        file = values.get(slot)
+        if not file:
+            continue
+        ref = by_file.get(str(file))
+        if slot in base.FRAME_ROLES:
+            #: 首尾帧那一张与预设那条路造的是同一个种子（`base.frame_seed`），所以图册上
+            #: 那两个名字两条路一字不差——绑定表的槽位名恰好与图册的角色名同字。
+            pics[slot] = base.frame_seed(slot, str(file))
+            continue
+        if ref is None:
+            #: 首帧被 `source_image` / `reference_image` 那两个单槽重复喂了一遍时走这里。
+            #: 图册按文件去重，所以它只会与上面那条首帧记录合并，不会多出一个编号。
+            pics[slot] = base.Picture(
+                role="reference", kind="reference", media="image", file=str(file)
+            )
+            continue
+        pics[slot] = base.Picture(
+            role=ref.kind if ref.kind in base.FRAME_ROLES else "reference",
+            kind=ref.kind,
+            media=ref.media,
+            name=ref.who,
+            desc=ref.desc,
+            file=str(file),
+        )
+    return pics
+
+
+def _book_of(
+    payload: dict[str, Any],
+    bindings: dict[str, str],
+    pics: dict[str, base.Picture],
+    others: list[base.RefAsset],
+) -> base.PictureBook:
+    """按**这份图的接线**给这一次喂进去的图编号。绑定表里那一行的行号只是入口名。
+
+    与 `comfy_preset._book_of` 是同一件事、同一个时机（在 `_detach_idle` 之后数——这一次没喂
+    的槽位已经从图里摘掉了，不该占一个号；在提交之前数——重试那条路接回去的是本次已经在喂的
+    同一个文件，图册按文件去重，所以编号不会因此多出一张）。差别只有入口名从哪来：
+    这条路是绑定表的键（`first_frame` / `__ref_0`…），预设那条是节点标题。
+    """
+    entries = {slot: bindings[slot].split(".", 1)[0] for slot in pics if slot in bindings}
+    order = feed_order(payload, entries)
+    return base.picture_book(pics, order.order, order_source=order.source, others=others)
+
+
+def _filled_media(bindings: dict[str, str], values: dict[str, Any]) -> list[str]:
+    """这一次真填了素材的那几个媒体槽位的节点 id，**参考图排在前面**。
+
+    与预设那条路的同名函数是同一件事（「被切断的那一格接回到哪儿」的候选清单，见
+    `ComfyTasks._submit_graph`），只是槽位名来自绑定表：`__ref_0`… 是展开后的参考图槽位，
+    其余是 `MEDIA_SLOTS` 里那几个单槽。接到另一张参考图上最贴近原意，所以它们排在前面。
+    """
+    filled = [
+        slot
+        for slot, target in bindings.items()
+        if "." in target
+        and (slot in MEDIA_SLOTS or slot.startswith(REF_PREFIX))
+        and values.get(slot) not in (None, "")
+    ]
+    filled.sort(key=lambda slot: (not slot.startswith(REF_PREFIX), slot))
+    return list(dict.fromkeys(bindings[slot].split(".", 1)[0] for slot in filled))
 
 
 class ComfyWorkflowProvider(ComfyTasks):
@@ -183,13 +294,15 @@ class ComfyWorkflowProvider(ComfyTasks):
         }
         # 只喂图片：跳过的每一个都要说出来（绝不静默失败）。
         images = [r for r in req.refs if r.media == "image"]
-        for ref in req.refs:
-            if ref.media != "image":
-                req.notes.append(
-                    f"工作流绑定这条路只能喂图片，{ref.media_label}"
-                    f"「{ref.label or ref.path.name}」没有送出去"
-                    "（要喂它请把调用方式改成「ComfyUI 预设」或「通用 REST API」）。"
-                )
+        #: 编不进 `<Picture n>` 的那些（参考视频 / 参考音频）。这条路一张都喂不进去，但它们
+        #: 仍然要在 summary 里点一句名——「送没送出去」和「模型知不知道它是谁」是两件事。
+        others = [r for r in req.refs if r.media != "image"]
+        for ref in others:
+            req.notes.append(
+                f"工作流绑定这条路只能喂图片，{ref.media_label}"
+                f"「{ref.label or ref.path.name}」没有送出去"
+                "（要喂它请把调用方式改成「ComfyUI 预设」或「通用 REST API」）。"
+            )
         first_name = await self._upload(req.first_frame) if req.first_frame else None
         last_name = await self._upload(req.last_frame) if req.last_frame else None
         ref_names = [await self._upload(ref.path) for ref in images]
@@ -217,8 +330,8 @@ class ComfyWorkflowProvider(ComfyTasks):
                 if index >= len(ref_names):
                     unused_refs.append(target)
                     continue
-                values[f"__ref_{index}"] = ref_names[index]
-                bindings[f"__ref_{index}"] = target
+                values[f"{REF_PREFIX}{index}"] = ref_names[index]
+                bindings[f"{REF_PREFIX}{index}"] = target
             if len(ref_names) > len(slots):
                 dropped = "、".join(r.label or r.path.name for r in images[len(slots) :])
                 req.notes.append(
@@ -237,12 +350,19 @@ class ComfyWorkflowProvider(ComfyTasks):
                 f"账单里 {len(ref_names)} 张参考图只有第一张按「参考图」那个单槽送了出去"
                 "——人物形象容易跑偏。"
             )
+        pics = _pics_of(bindings, values, images)
         payload = apply_bindings(graph, bindings, values)
         removed = _detach_idle(payload, spec.name, bindings, values, unused_refs, req)
-        try:
-            prompt_id = await self._client.submit(payload, client_id=client_id)
-        except AppError as exc:
-            raise detached_submit_error(exc, f"工作流 {spec.name}", removed) from exc
+        self._retell(req, payload, bindings, pics, others, spec.name)
+        prompt_id = await self._submit_graph(
+            payload,
+            client_id=client_id,
+            source=f"工作流 {spec.name}",
+            detached=removed,
+            #: 被切断的必填输入接回哪儿：这一次真填了素材的那几个槽位（参考图优先）。
+            refill=_filled_media(bindings, values),
+            notes=req.notes,
+        )
         self._used[prompt_id] = spec.name
         log.info(
             "provider.submitted",
@@ -251,6 +371,37 @@ class ComfyWorkflowProvider(ComfyTasks):
             prompt_id=prompt_id,
             mode=req.mode,
             refs=len(ref_names),
-            detached=len(removed),
+            detached=len(removed.nodes),
         )
         return prompt_id
+
+    def _retell(
+        self,
+        req: VideoRequest,
+        payload: dict[str, Any],
+        bindings: dict[str, str],
+        pics: dict[str, base.Picture],
+        others: list[base.RefAsset],
+        name: str,
+    ) -> None:
+        """把正向 prompt 换成六段图册格式。**判断全在 `ComfyTasks._retold`**（与预设那条路
+        共用一份），这里只回答「这份图的正向提示词落在哪个节点的哪个字段」——绑定表里
+        `prompt` 那一行。
+
+        **绑定表里没有 `prompt` 那一行是可能的**（用户只绑了首尾帧、提示词写死在图里）。
+        那种图上我们本来就改不到提示词，所以回 False：图册照记，`sent_prompt` 保持原样，
+        绝不假装重排过。
+        """
+
+        def write(sent: str) -> bool:
+            target = bindings.get("prompt")
+            if not target:
+                return False
+            node_id, field_name = target.split(".", 1)
+            node = payload.get(node_id)
+            if not isinstance(node, dict):
+                return False
+            node.setdefault("inputs", {})[field_name] = sent
+            return True
+
+        self._retold(req, _book_of(payload, bindings, pics, others), f"工作流 {name}", write)

@@ -11,10 +11,13 @@
          refs 里 media=video 的那些**不是一回事**——那些是「动作长这样」的参考，
          这一条是「把它再过一遍」。混用的话超分出来的东西跟这个镜头无关
       —— refs 是**首尾帧之外的参考素材**，按优先级排好的数组，每项
-         {data: base64, name, label, kind, media, desc}：label 是「它是谁」（角色表 / 地点参考），
+         {data: base64, name, label, kind, media, desc, picture, subject}：
+         label 是「它是谁」（角色表 / 地点参考），
          desc 是「它长什么样」（`Asset.description`，没写就是空串），
          media 是 image | video | audio（**同一个数组里三种媒体混着来**，按 media 分流，
-         别拿后缀猜），模型端用不上可以忽略，但顺序必须当成语义——同一媒体里第 1 个最重要
+         别拿后缀猜），模型端用不上可以忽略，但顺序必须当成语义——同一媒体里第 1 个最重要；
+         picture / subject 是这一次的编号（`<Picture n>` / `<Subject n>`，见下面那段），
+         非图片素材与首尾帧之外的那些编不上号时是 0
       resp {task_id}
 
     GET {base}/tasks/{task_id}
@@ -25,6 +28,20 @@
     GET {base}/health     —— 「测试连接」用，非 2xx 就算不通
 
 字段缺失、状态字不认识、非 2xx，一律归一成带建议的 AppError——绝不静默当成「还在跑」。
+
+**「第几张图是谁」这条路给的是结构化字段，不塞进 prompt。** 两条 ComfyUI 路只能把图册
+写进正向提示词（那类图收不到标签，见 `comfy_base.ComfyTasks._retold`），而这条合同由我们定，
+所以同一件事走 `pictures[]` 那一项：
+
+    pictures: [{index, subject, role, kind, media, name, desc, entry, file}]
+      —— index 是 `<Picture n>` 里那个 n（**1 起、把首尾帧一起数进去**），
+         subject 是 `<Subject n>`（首尾帧没有 subject，是 0）
+      —— role ∈ first_frame | last_frame | reference；name / desc 就是「他是谁 / 长什么样」
+      —— 顺序与 refs 无关：refs 说的是「送了哪几个文件」，pictures 说的是「模型该按第几张认谁」
+
+**prompt 一个字节都不重排**：`req.prompt` 原样送出去，`sent_prompt` 也保持原样。
+服务端收到的是结构化的那一份，在提示词里再拼一遍只会让它解析两遍、两处措辞还必然分叉
+（描述属于素材本身，不属于提示词——同一条规矩 `refs[].desc` 已经走了一遍）。
 """
 
 from __future__ import annotations
@@ -67,6 +84,48 @@ def missing_base_error() -> AppError:
             "或把调用方式改回 comfy_preset（默认，直接连 ComfyUI）",
             *(f"服务端需要实现：{line}" for line in CONTRACT),
         ],
+    )
+
+
+#: `refs[i]` 在图册里的入口名。写成常量是因为两处要对上：造图册的时候按它编号，
+#: 拼 `refs[]` 的时候按它把编号取回来。
+REF_ENTRY = "ref_"
+
+
+def _book_of(req: VideoRequest) -> base.PictureBook:
+    """这一次的图册。**顺序由这条合同定**（首帧 → 末帧 → 账单顺序的参考图），所以
+    `order_source="contract"`：ComfyUI 那两条路要从接线上测顺序（图是别人维护的，
+    `comfy/graph.py::feed_order`），而这条路的顺序是我们自己发出去的那个数组，没有可测的东西、
+    也没有可降级的东西。
+
+    非图片素材照旧编不进 `<Picture n>`（`picture_book` 跳过它们），但它们仍然整组送出去
+    （`refs[]` 里 `media=video|audio` 那几项），所以进 `others`——界面与账单要说得出
+    「那段对白音频送出去了，只是没有编号」。
+    """
+    seeds: dict[str, base.Picture] = {}
+    for role, path in (("first_frame", req.first_frame), ("last_frame", req.last_frame)):
+        if path is not None:
+            seeds[role] = base.frame_seed(role, path.name)
+    for index, ref in enumerate(req.refs):
+        seeds[f"{REF_ENTRY}{index}"] = base.Picture(
+            #: 首帧降级成参考素材的那一张照旧是「帧」而不是 subject——它说的是「画面从哪一格
+            #: 开始」，不是「谁出场」。分界表只有 `base.FRAME_ROLES` 一张。
+            role=ref.kind if ref.kind in base.FRAME_ROLES else "reference",
+            kind=ref.kind,
+            media=ref.media,
+            name=ref.who,
+            desc=ref.desc,
+            #: **这条路刻意不填 `file`**：图册按 `file or 入口名` 去重（`base.picture_book`），
+            #: 而那条去重规则是为 ComfyUI 那两条路写的——那边同一个上传文件名就是模型端磁盘上
+            #: 同一个文件，一份素材占两个入口是常态。这条路上每一项都自带一份 `data`，
+            #: 两个同名不同目录的素材是实打实的两张图，按文件名并成一个号会把后面所有序号带偏。
+            #: 排查时按 `entry`（`ref_0`）对回 `refs[0]`，名字在 `name` 里。
+        )
+    return base.picture_book(
+        seeds,
+        list(seeds),
+        order_source="contract",
+        others=[r for r in req.refs if r.media != "image"],
     )
 
 
@@ -174,13 +233,21 @@ class HttpApiProvider:
                 continue
             body[key] = _encode(path)
             body[f"{key}_name"] = path.name
+        # **图册走结构化字段，不进 prompt**（理由整段写在模块开头）：这一族收得到字段，所以
+        # 「第几张图是谁」用 `pictures[]` 说；两条 ComfyUI 路只能把同一件事写进正向提示词
+        # （`comfy_base.ComfyTasks._retold`）。`sent_prompt` 保持原样——我们一个字节都没重排，
+        # 冻结参数里说成重排过就是谎报（硬约束 4）。
+        book = _book_of(req)
+        req.book = book
+        req.sent_prompt = req.prompt
+        if book:
+            body["pictures"] = [p.to_dict() for p in book.items]
         # 参考素材整组带过去：这条合同由我们定，所以它天生支持多个，不存在槽位不够的问题。
         # `media` 必须带上——服务端按它分流（图进图生视频那条、音频进 S2V 那条），
         # 让对方拿后缀去猜的话，一个没有后缀的临时文件就能把整条链路带偏。
-        # `desc`（这张素材长什么样）也带上：这一族收得到结构化字段，所以**不靠 prompt 里那句
-        # 「参考素材说明」对号**（`ref_hint` 只服务于按顺序收素材的 ComfyUI 那类图）。
-        # 用户没写描述时是空串，服务端可以照旧忽略这个键。
+        # `desc`（这张素材长什么样）也带上，用户没写时是空串，服务端可以照旧忽略这个键。
         if req.refs:
+            numbered = {p.entry: p for p in book.items}
             body["refs"] = [
                 {
                     "data": _encode(ref.path),
@@ -189,8 +256,12 @@ class HttpApiProvider:
                     "kind": ref.kind,
                     "media": ref.media,
                     "desc": clip_desc(ref.desc),
+                    #: 与 `pictures[]` 的对号（同一张图两处编号必须是同一个数，所以从图册取
+                    #: 而不是在这里再数一遍）。编不上号的（视频 / 音频）是 0。
+                    "picture": pic.index if (pic := numbered.get(f"{REF_ENTRY}{i}")) else 0,
+                    "subject": pic.subject if pic else 0,
                 }
-                for ref in req.refs
+                for i, ref in enumerate(req.refs)
             ]
         try:
             async with httpx.AsyncClient(timeout=self._timeout()) as http:

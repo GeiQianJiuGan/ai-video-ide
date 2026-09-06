@@ -87,8 +87,9 @@ class Settings(BaseSettings):
     # 参考图**没有应用级上限**：能收几张是模型端那份图的事实（comfy_preset 数
     # AIVS_REF_* 槽位），由适配层的 ref_capacity() 回答。这里再配一个数字只会和它打架，
     # 还得用户自己去对——超出槽位时改成生成前警告 + 确认（REF_OVER_CAPACITY）。
-    # 把「参考图1=林小雨（常服）」这句对应关系拼到 prompt 末尾。ComfyUI 那类图收不到
-    # 标签，只能靠这句话让模型知道哪张是主角；不想让它动 prompt 就关掉。
+    # 把「第几张图是谁」写进提示词（`providers/base.py::render_video_prompt` 那六段，
+    # `<Subject 1> is … <Picture 2>: 林小雨（常服）`）。ComfyUI 那类图收不到标签，只能靠
+    # 这几句让模型知道哪张是谁；关掉就原样发送用户手写的提示词，图册照旧记进版本参数。
     video_ref_labels: bool = True
     # 二次处理（超分 / 插帧 / 重做）用哪一份图：它必须标了 AIVS_SOURCE_VIDEO。
     # 留空时退回**出画面那份默认**（presets.app_default("r2v")：按角色那一格 → 共用那一格）

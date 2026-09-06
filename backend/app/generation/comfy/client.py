@@ -13,6 +13,7 @@ import httpx
 from app.core.config import settings
 from app.core.errors import AppError, ErrorCode
 from app.core.logging import get_logger
+from app.generation.comfy import rejection
 
 log = get_logger("comfy")
 TIMEOUT = httpx.Timeout(10.0, connect=3.0)
@@ -72,22 +73,23 @@ class ComfyClient:
         return set(data) if isinstance(data, dict) else set()
 
     async def submit(self, api_graph: dict[str, Any], client_id: str) -> str:
+        """提交这一份图，回 prompt_id。**被拒时那条错误由 `rejection.to_error` 翻译。**
+
+        以前这里是 `f"HTTP {status}: {resp.text[:800]}"` + 三条通用建议：ComfyUI 明明用
+        `node_errors` 说清了「哪个节点的哪个输入、填的是什么、它那边有哪些候选」，我们却把
+        最要紧的候选清单截在中间，第一条建议还是「在流程页重新校验绑定」——那是绑定那条路的
+        话，走预设的人照着它一步都走不了（硬约束 4 要的是说清）。翻译只认形状、不出网，
+        原文照旧完整地留在 `related_ids["raw"]` 里。
+        """
         try:
             async with httpx.AsyncClient(timeout=TIMEOUT) as http:
                 resp = await http.post(
                     f"{self._base}/prompt", json={"prompt": api_graph, "client_id": client_id}
                 )
                 if resp.status_code >= 400:
-                    raise AppError(
-                        ErrorCode.WORKFLOW_ERROR,
-                        "ComfyUI 拒绝了本次任务",
-                        f"HTTP {resp.status_code}: {resp.text[:800]}",
-                        [
-                            "在流程页重新校验绑定",
-                            "确认工作流所需的模型文件已就位",
-                            "展开原始报错查看 ComfyUI 侧的详细信息",
-                        ],
-                    )
+                    #: 传**这一次真提交出去的那份副本**（摘过节点之后的），错误里那句节点标题
+                    #: 才对得上；传原图的话会说出一个已经不在这次提交里的名字。
+                    raise rejection.to_error(resp.status_code, resp.text, api_graph)
                 return str(resp.json().get("prompt_id", ""))
         except httpx.HTTPError as exc:
             raise _offline(exc) from exc

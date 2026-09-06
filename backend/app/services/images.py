@@ -41,7 +41,7 @@ from app.persistence.models_gen import IMAGE_TARGETS, Job
 from app.persistence.models_story import Shot
 from app.persistence.models_world import Asset, Location, LocationVariant, Prop
 from app.services.assets import assets
-from app.services.base import as_dict, db_of, dump_json, fetch, project_of
+from app.services.base import as_dict, db_of, dump_json, fetch, load_json, project_of
 from app.services.cast import cast
 from app.services.world import world
 
@@ -238,6 +238,11 @@ class ImageService:
 
         素材图**自动追加一个版本**（append-only，旧版本一条不删）；镜头的首 / 末帧
         **只登记资产、槽位一律不动**——自动写槽位会覆盖用户原先指定的那张图。
+
+        落完顺手把**入队时冻结的那句「长什么样」**写成这张图的描述（`_describe`）：
+        我们自己生成的图，「它长什么样」这件事在入队那一刻就已经知道了，不写等于让用户
+        事后对着一张自己点出来的图再手敲一遍同样的话，而空描述的后果是静默的——
+        引用它的镜头里模型只看到一个文件名。
         """
         spec = _spec(job.target_kind or "")
         target_id = str(job.target_id or "")
@@ -245,6 +250,7 @@ class ImageService:
             pid, spec.asset_kind, filename, data, source="generated"
         )
         asset_id = str(asset["id"])
+        described = await self._describe(pid, job, asset)
         hint = ""
         if spec.kind == "appearance":
             landed = await cast.add_sheet(pid, target_id, asset_id, source="generated")
@@ -268,8 +274,27 @@ class ImageService:
             "asset_path": asset.get("path"),
             "target_kind": spec.kind,
             "target_id": target_id,
+            "described": described,
             "hint": hint,
         }
+
+    async def _describe(self, pid: str, job: Job, asset: dict[str, Any]) -> str:
+        """把入队时冻结的 `image_prompt` 写成这张图的描述。**只在它本来是空的时候写。**
+
+        为什么是 `params.image_prompt` 而不是 `params.prompt`：后者是 SKILL 拼完的全文
+        （四视图、纯背景、无文字那几句是给出图模型的指令，不是「这张图长什么样」），
+        当描述会把一堆构图指令喂进每一个引用它的镜头。`image_prompt` 恰好是用户 / AI
+        写的那句纯外形描述——`enqueue()` 冻结它就是为了这一步。
+
+        **不覆盖已有的描述**：`register_bytes` 对同内容的图会复用已有那一行，而那一行上
+        可能是用户自己改过的话；重出一版也不该把它盖回机器写的那句（同 `adopt` 那条规矩）。
+        """
+        text = str(load_json(job.params_json, {}).get("image_prompt") or "").strip()
+        if not text or str(asset.get("description") or "").strip():
+            return ""
+        await assets.update(pid, str(asset["id"]), {"description": text})
+        log.info("image.described", asset=str(asset["id"]), chars=len(text))
+        return text
 
     # --- 队列面板要的那句话 ---
 

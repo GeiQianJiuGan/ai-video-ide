@@ -7,7 +7,9 @@
   2. 按标题把首帧 / 末帧 / 参考素材 / prompt / 负向 / 时长 / 种子填进去；
   3. **把这一次没有值的媒体入口连节点一起摘掉**（`_detach_idle`）——标了标题却没填，
      图里留着的是存图时挂着的示例文件，不摘就等于把一张不相干的图真喂进模型；
-  4. 提交，拿 prompt_id 当 task_id；
+  4. 提交，拿 prompt_id 当 task_id（被摘掉的那一格在图里是**必填**的时候，
+     `ComfyTasks._submit_graph` 会把它接回这一次真在喂的入口再提交一次，不让「跳过多余的
+     参考图」变成一个 400）；
   5. 轮询 history，取最后一个产物。
 
 图里的 lora、加速节点、采样器我们不看也不校验——那是模型端的事。摘节点也只跟着连线走，
@@ -22,17 +24,59 @@
 from __future__ import annotations
 
 import copy
+from dataclasses import dataclass, field
 from typing import Any
 
-from app.core.config import settings
 from app.core.errors import AppError, ErrorCode
 from app.core.logging import get_logger
-from app.generation.comfy.graph import detach
+from app.generation.comfy.graph import Detached, detach, feed_order
 from app.generation.providers import base, presets
 from app.generation.providers.base import VideoRequest
-from app.generation.providers.comfy_base import ComfyTasks, detached_submit_error
+from app.generation.providers.comfy_base import ComfyTasks
 
 log = get_logger("provider.comfy_preset")
+
+
+@dataclass
+class _Fed:
+    """这一次真喂进去了什么。`_refs()` 的回值——三样东西一起回，别拆成三个返回值。
+
+    · `values`：入口 → 填进图里的那个文件名（ComfyUI 只认它自己 input 目录里的名字）；
+    · `pics`：入口 → 图册种子（这张图是谁）。**键的顺序就是入口名的约定顺序**
+      （首帧、末帧、`AIVS_REF_1`…），实际编号由接线实测的那一串定（`_book_of`）；
+    · `others`：编不进 `<Picture n>` 的那些（参考视频 / 参考音频）——模型收到的那一串
+      `<Picture n>` 说的是图，把一段 `.mp4` 编进去只会让后面所有序号都指错人。
+    """
+
+    values: dict[str, Any] = field(default_factory=dict)
+    pics: dict[str, base.Picture] = field(default_factory=dict)
+    others: list[base.RefAsset] = field(default_factory=list)
+
+
+#: 首尾帧那一张的图册种子。**造它的地方只有 `base.frame_seed()` 一处**（措辞见
+#: `base.FRAME_LABEL`）：三条路的入口名各不相同（这里是 `AIVS_FIRST_FRAME`，绑定那条是
+#: `first_frame`），但落到图册上的那两个名字必须是同一个字——它会进 `params.pictures`
+#: 与界面上那张对号表，两处写成不同的话会让人以为是两回事。
+_frame_pic = base.frame_seed
+
+
+def _book_of(
+    graph: dict[str, Any],
+    points: dict[str, dict[str, str]],
+    fed: _Fed,
+) -> base.PictureBook:
+    """按**这份图的接线**给这一次喂进去的图编号。`AIVS_REF_n` 里那个 n 只是入口名。
+
+    两个时机不能换：
+
+      · 在 `_detach_idle` **之后**数——这一次没喂的槽位已经从图里摘掉了，不该占一个号；
+      · 在提交**之前**数——`ComfyTasks._submit_graph` 只在 ComfyUI 拒收时才会
+        `reconnect()` 改接线，那条重试路径接回去的是本次已经在喂的同一个文件，
+        图册按文件去重，所以编号不会因此多出一张。
+    """
+    entries = {marker: points[marker]["node_id"] for marker in fed.pics if marker in points}
+    order = feed_order(graph, entries)
+    return base.picture_book(fed.pics, order.order, order_source=order.source, others=fed.others)
 
 
 def _idle_summary(idle: list[str]) -> str:
@@ -59,7 +103,7 @@ def _detach_idle(
     points: dict[str, dict[str, str]],
     idle: list[str],
     req: VideoRequest,
-) -> list[dict[str, str]]:
+) -> Detached:
     """把这一次没有值的**媒体**入口从提交的那份图里摘掉，并把摘了什么写进 `req.notes`。
 
     这是「多标几个入口不该有代价」这件事的落点，理由整段写在
@@ -68,9 +112,12 @@ def _detach_idle(
 
     只摘媒体入口。标量入口（种子 / 时长 / 宽高）没给值时保持图里原来的值——那是用户有意
     存进去的默认参数。这条分界只有一张表：`presets.MEDIA_MARKERS`。
+
+    回的 `Detached` 里除了「摘了谁」还有「切断了哪些还留着的输入」，提交那一步要用它
+    （`ComfyTasks._submit_graph`：被切的那一格是必填的话，接回本次真在喂的入口再提交一次）。
     """
     if not idle:
-        return []
+        return Detached()
     removed = detach(
         graph,
         [points[marker]["node_id"] for marker in idle],
@@ -78,7 +125,7 @@ def _detach_idle(
         #: 而不是把这次真正要跑的那条链摘断。
         keep=[spot["node_id"] for marker, spot in points.items() if marker not in idle],
     )
-    cascade = len(removed) - len(idle)
+    cascade = len(removed.nodes) - len(idle)
     req.notes.append(
         f"预设 {name} 这一版没有用到这几个入口：{_idle_summary(idle)}。"
         f"它们已经从提交的那份图里摘掉"
@@ -89,15 +136,33 @@ def _detach_idle(
         "provider.entries_detached",
         preset=name,
         idle=len(idle),
-        removed=len(removed),
+        removed=len(removed.nodes),
+        cuts=len(removed.cuts),
         markers=idle,
     )
     return removed
 
 
-def _submit_error(exc: AppError, name: str, removed: list[dict[str, str]]) -> AppError:
-    """提交被拒时那条「这一次摘过节点」的补充建议，口径与绑定那条路共用一份。"""
-    return detached_submit_error(exc, f"预设 {name}", removed)
+def _filled_media(
+    points: dict[str, dict[str, str]], values: dict[str, Any], idle: list[str]
+) -> list[str]:
+    """这一次真填了素材的那几个媒体入口的节点 id，**参考素材排在前面**。
+
+    它是「被切断的那一格接回到哪儿」的候选清单（`ComfyTasks._submit_graph` →
+    `graph.reconnect`）。**顺序即优先**：被切的那一格几乎总是某个 `AIVS_REF_n`，接到另一个
+    参考素材上最贴近原意；接到首帧上（图里只有首帧一个媒体入口时）也比整个任务失败好，
+    但要排在后面。
+    """
+    filled = [
+        marker
+        for marker in points
+        if marker in presets.MEDIA_MARKERS
+        and marker not in idle
+        and values.get(marker) not in (None, "")
+    ]
+    refs = {marker for group in presets.REF_MARKERS_BY_MEDIA.values() for marker in group}
+    filled.sort(key=lambda marker: (marker not in refs, marker))
+    return list(dict.fromkeys(points[marker]["node_id"] for marker in filled))
 
 
 def _role_of(mode: str) -> str:
@@ -240,8 +305,10 @@ class ComfyPresetProvider(ComfyTasks):
         }
         # 首帧**没有槽位就降级成参考图 1**（`_refs` 里插队）：出正片的 R2V 图往往只有
         # AIVS_REF_*，为此拒绝生成等于把这类模型整个挡在外面。
+        pics: dict[str, base.Picture] = {}
         if req.first_frame is not None and "AIVS_FIRST_FRAME" in points:
             values["AIVS_FIRST_FRAME"] = await self._upload(req.first_frame)
+            pics["AIVS_FIRST_FRAME"] = _frame_pic("first_frame", values["AIVS_FIRST_FRAME"])
         # 末帧相反，要的是**严格首尾帧**，图里没这个入口就只能换一份预设——这条不降级：
         # 悄悄丢掉末帧的话，补出来的转场接不上下一镜，而界面上会显示「已生成」。
         if req.last_frame is not None:
@@ -257,6 +324,7 @@ class ComfyPresetProvider(ComfyTasks):
                     {"preset": name, "found": sorted(points)},
                 )
             values["AIVS_LAST_FRAME"] = await self._upload(req.last_frame)
+            pics["AIVS_LAST_FRAME"] = _frame_pic("last_frame", values["AIVS_LAST_FRAME"])
         # 二次处理的源视频同样**不降级**：图里没有 AIVS_SOURCE_VIDEO 就说明它不是一份
         # 处理图。悄悄跳过的话，超分任务会变成「凭提示词重出一段」，而版本轨上写着
         # 「从 v1 超分而来」——血缘就是假的了。
@@ -277,7 +345,10 @@ class ComfyPresetProvider(ComfyTasks):
                     ],
                     {"preset": name, "found": sorted(points)},
                 )
-        values.update(await self._refs(req, name, points))
+        fed = await self._refs(req, name, points)
+        values.update(fed.values)
+        pics.update(fed.pics)
+        fed.pics = pics
         idle: list[str] = []
         for marker, spot in points.items():
             value = values.get(marker)
@@ -290,10 +361,16 @@ class ComfyPresetProvider(ComfyTasks):
                 continue
             graph[spot["node_id"]]["inputs"][spot["field"]] = value
         removed = _detach_idle(graph, name, points, idle, req)
-        try:
-            prompt_id = await self._client.submit(graph, client_id=client_id)
-        except AppError as exc:
-            raise _submit_error(exc, name, removed) from exc
+        self._retell(req, graph, points, _book_of(graph, points, fed), name)
+        prompt_id = await self._submit_graph(
+            graph,
+            client_id=client_id,
+            source=f"预设 {name}",
+            detached=removed,
+            #: 被切断的必填输入接回哪儿：这一次真填了素材的那几个入口（参考素材优先）。
+            refill=_filled_media(points, values, idle),
+            notes=req.notes,
+        )
         self._used[prompt_id] = name
         log.info(
             "provider.submitted",
@@ -301,14 +378,36 @@ class ComfyPresetProvider(ComfyTasks):
             prompt_id=prompt_id,
             mode=req.mode,
             refs=len(req.refs),
-            detached=len(removed),
+            detached=len(removed.nodes),
         )
         return prompt_id
 
-    async def _refs(
-        self, req: VideoRequest, name: str, points: dict[str, dict[str, str]]
-    ) -> dict[str, Any]:
-        """把账单里的参考素材按媒体、按序号填进 `AIVS_REF_*`，顺便把「谁是谁」告诉模型。
+    def _retell(
+        self,
+        req: VideoRequest,
+        graph: dict[str, Any],
+        points: dict[str, dict[str, str]],
+        book: base.PictureBook,
+        name: str,
+    ) -> None:
+        """把正向 prompt 换成六段图册格式。**判断全在 `ComfyTasks._retold`**（两条路共用），
+        这里只回答「这份预设的正向提示词落在哪个节点的哪个字段」。
+
+        `AIVS_PROMPT` 是必需入口（入队那道门早就拦下了没有它的图），所以写不进去正常走不到；
+        真到了那里也不假装重排过——回 False 让共用那层把 `sent_prompt` 留成原样。
+        """
+
+        def write(sent: str) -> bool:
+            spot = points.get("AIVS_PROMPT")
+            if spot is None or spot["node_id"] not in graph:
+                return False
+            graph[spot["node_id"]]["inputs"][spot["field"]] = sent
+            return True
+
+        self._retold(req, book, f"预设 {name}", write)
+
+    async def _refs(self, req: VideoRequest, name: str, points: dict[str, dict[str, str]]) -> _Fed:
+        """把账单里的参考素材按媒体、按序号填进 `AIVS_REF_*`，并记下每一格喂的是谁。
 
         五条取舍：
           · **按媒体分开填**：图片进 `AIVS_REF_n`、视频进 `AIVS_REF_VIDEO_n`、音频进
@@ -321,9 +420,10 @@ class ComfyPresetProvider(ComfyTasks):
             当第一张参考图送进去，并写一条 note——绝不静默丢掉那一张。
           · **一个槽位都没有时也照样跑**，但要留一条 note：那种图只能靠首帧带形象，
             这正是「人物形象丢失」的现场，用户得看得见原因。
-          · **顺序即语义**：账单已按优先级排好，每种媒体的 1 号槽放它那组里优先级最高的那个；
-            要不要在 prompt 末尾附一句「参考图1=林小雨」由设置里的 `video.ref_labels` 决定
-            （ComfyUI 这类图收不到标签，只能靠这句话对上号）。
+          · **顺序即语义**：账单已按优先级排好，每种媒体的 1 号槽放它那组里优先级最高的那个。
+            但**「1 号槽」不等于「模型看到的第 1 张」**——真实喂入顺序按这份图的接线实测
+            （`_book_of` → `comfy/graph.py::feed_order`），这里只负责把素材填进槽位并记下
+            每一格是谁（`_Fed.pics`），编号的事一概不在这里定。
         """
         by_slots = presets.ref_slots_by_media(points)
         refs = list(req.refs)
@@ -331,9 +431,8 @@ class ComfyPresetProvider(ComfyTasks):
         if first_as_ref and req.first_frame is not None:
             refs.insert(0, base.RefAsset(req.first_frame, "首帧", "first_frame", "image"))
         if not refs:
-            return {}
-        values: dict[str, Any] = {}
-        sent_all: list[base.RefAsset] = []
+            return _Fed()
+        fed = _Fed()
         for media, group in base.refs_by_media(refs).items():
             if not group:
                 continue
@@ -341,7 +440,7 @@ class ComfyPresetProvider(ComfyTasks):
             label = presets.MEDIA_LABEL.get(media, "参考素材")
             family = presets.MARKER_FAMILY.get(media, "AIVS_REF_*")
             if not slots:
-                names = "、".join(r.label or r.path.name for r in group)
+                names = "、".join(r.who for r in group)
                 if media == "image" and first_as_ref:
                     req.notes.append(
                         f"预设 {name} 既没有 AIVS_FIRST_FRAME 也没有 AIVS_REF_* 槽位，"
@@ -363,7 +462,7 @@ class ComfyPresetProvider(ComfyTasks):
                 )
             sent = group[: len(slots)]
             if len(group) > len(slots):
-                dropped = "、".join(r.label or r.path.name for r in group[len(slots) :])
+                dropped = "、".join(r.who for r in group[len(slots) :])
                 req.notes.append(
                     f"预设 {name} 只有 {len(slots)} 个{label}槽位，"
                     f"账单里这几个没喂进去：{dropped}。"
@@ -376,10 +475,21 @@ class ComfyPresetProvider(ComfyTasks):
                     refs=len(group),
                 )
             for marker, ref in zip(slots, sent, strict=False):
-                values[marker] = await self._upload(ref.path)
-            sent_all += sent
-        hint = base.ref_hint(sent_all) if settings.video_ref_labels else ""
-        if hint:
-            values["AIVS_PROMPT"] = f"{req.prompt}\n{hint}".strip()
-            req.notes.append(f"已把参考素材对应关系写进 prompt：{hint}")
-        return values
+                file = await self._upload(ref.path)
+                fed.values[marker] = file
+                if media == "image":
+                    fed.pics[marker] = base.Picture(
+                        #: 首帧降级进 1 号槽的那一张照旧是「帧」而不是 subject——它说的是
+                        #: 「画面从哪一格开始」，不是「谁出场」。`kind` 与角色名同字，
+                        #: 分界表只有 `base.FRAME_ROLES` 一张。
+                        role=ref.kind if ref.kind in base.FRAME_ROLES else "reference",
+                        kind=ref.kind,
+                        media=ref.media,
+                        name=ref.who,
+                        desc=ref.desc,
+                        file=str(file),
+                    )
+                else:
+                    #: 参考视频 / 参考音频编不进 `<Picture n>`，只能在 summary 里点一句它们是谁。
+                    fed.others.append(ref)
+        return fed

@@ -20,7 +20,8 @@ class CharacterBody(BaseModel):
     name: str | None = None
     alias: str | None = None
     #: 这个角色「长什么样」的那一句。素材本身没有描述时，账单退回读它
-    #: （`services/context.py`），最后由 `providers/base.py::ref_hint` 渲染进 prompt。
+    #: （`services/context.py`），最后进提示词里那一段 `subject_definitions`
+    #: （`providers/base.py::render_video_prompt`，收得到结构化字段的那条路走 `pictures[].desc`）。
     #: **清空传 `''`**——`None` 走 `exclude_none`，是「这次不改」。
     description: str | None = None
     gender: str | None = None

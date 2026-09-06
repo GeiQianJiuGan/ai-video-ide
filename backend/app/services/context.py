@@ -113,6 +113,20 @@ def _appearance_desc(app: Appearance | None, char: Character | None) -> str:
     return joined or str((char.description if char else "") or "").strip()
 
 
+def _name_of(item: dict[str, Any]) -> str:
+    """这一条**在提示词里叫什么**——只有名字，没有台账字样。
+
+    `label` 是给人看的那一行：`张秀才（默认形象） · Character Sheet v2`、`（本幕人物）`、
+    `阴曹试院 · 廊下考场 · 机位 侧`、文件名。那些字样进了提示词就是噪声——模型会把
+    「Character Sheet v2」当成画面里看得见的东西，而它真正要靠这个名字把台词与
+    `<Subject n>` 对上（`providers/base.py::render_video_prompt`）。
+
+    所以构造条目时另留一格 `name_hint` 只写名字，这里归一到 `name`：**与 `desc` 同一处
+    归一**，两边不各写一遍。给不出名字的那几类（上游末帧、人工添加的素材）留空，
+    此时 `RefAsset.who` 自然退回 `label`——照实说「不知道它叫什么」比编一个名字好。
+    """
+    return " ".join(str(item.pop("name_hint", "") or "").split())
+
 
 def ref_capacity(capacity: RefCapacity | None = None) -> RefCapacity:
     """模型端这一次能收几张参考图。**不是设置项**——问的是适配层。
@@ -316,6 +330,8 @@ class ContextService:
                     "key": f"{slot}:{slot_asset_id}",
                     "kind": slot,
                     "label": f"{slot_label} · {_asset_label(row, slot_asset_id)}",
+                    #: 首尾帧不是「谁」，它就是画面的第一 / 最后一格，所以名字就叫首帧 / 末帧。
+                    "name_hint": slot_label,
                     "priority": PRIORITY[slot],
                     "asset_id": slot_asset_id,
                     "source_id": None,
@@ -356,11 +372,13 @@ class ContextService:
                 char = chars.get(app.character_id)
                 mine = [s for s in sheets if s.appearance_id == app.id]
                 current = next((s for s in mine if s.is_current), mine[-1] if mine else None)
+                #: 名字只拼一次，台账那几个字样接在它后面——`label` 与 `name_hint` 同源，
+                #: 两处各拼一遍的话，界面上写「张秀才」而 prompt 里写的是另一个名字。
+                who = f"{char.name if char else '未知角色'}（{app.name}）"
                 label = (
-                    f"{char.name if char else '未知角色'}（{app.name}）"
-                    f" · Character Sheet v{current.version_no}"
+                    f"{who} · Character Sheet v{current.version_no}"
                     if current
-                    else f"{char.name if char else '未知角色'}（{app.name}） · 无角色表"
+                    else f"{who} · 无角色表"
                 )
                 duplicate = app.character_id in seen_char
                 seen_char.add(app.character_id)
@@ -369,6 +387,7 @@ class ContextService:
                         "key": f"character_sheet:{app.id}",
                         "kind": "character_sheet",
                         "label": label + ("（本幕人物）" if inherited else ""),
+                        "name_hint": who,
                         "priority": PRIORITY["character_sheet"] if not duplicate else 30,
                         "asset_id": current.asset_id if current else None,
                         "source_id": app.id,
@@ -408,6 +427,9 @@ class ContextService:
                 if variant is None:
                     continue
                 location = locations.get(variant.location_id)
+                #: 名字只拼一次（`label` 在它后面接机位那一格）：地点名与变体名在界面上和
+                #: 提示词里必须是同一个字。
+                spot = f"{location.name if location else '未知地点'} · {variant.name}"
                 same = chosen is not None and variant.id == chosen.id
                 extra = not same and variant.id in picked
                 sibling = (
@@ -422,8 +444,9 @@ class ContextService:
                     {
                         "key": f"location_reference:{ref.id}",
                         "kind": "location_reference",
-                        "label": f"{location.name if location else '未知地点'} · {variant.name}"
-                        + (f" · 机位 {ref.camera}" if ref.camera else ""),
+                        "label": spot + (f" · 机位 {ref.camera}" if ref.camera else ""),
+                        #: 机位是台账，不进名字：模型只需要知道这是哪个地点的哪一版。
+                        "name_hint": spot,
                         "priority": (
                             PRIORITY["location_reference"]
                             if same
@@ -505,13 +528,16 @@ class ContextService:
                 mine = [r for r in prop_refs if r.prop_id == row.prop_id]
                 current = next((r for r in mine if r.is_current), None)
                 present = row.state == "present"
+                #: 同上：名字只拼一次，版本号那一格是台账。
+                thing = prop.name if prop else "未知道具"
                 items.append(
                     {
                         "key": f"prop_reference:{row.prop_id}",
                         "kind": "prop_reference",
-                        "label": f"{prop.name if prop else '未知道具'} · 参考图 v{current.version_no}"
+                        "label": f"{thing} · 参考图 v{current.version_no}"
                         if current
-                        else f"{prop.name if prop else '未知道具'} · 无参考图",
+                        else f"{thing} · 无参考图",
+                        "name_hint": thing,
                         "priority": PRIORITY["prop_reference"] if present else 10,
                         "asset_id": current.asset_id if current else None,
                         "source_id": row.prop_id,
@@ -530,6 +556,9 @@ class ContextService:
                         "key": extra.get("key") or f"manual:{extra.get('asset_id')}",
                         "kind": "manual",
                         "label": extra.get("label") or "手动添加的参考素材",
+                        #: 人工条目上有名字就用（覆写里可以写），没有就留空——
+                        #: 此时提示词里显示的是 `label`，绝不替用户编一个名字。
+                        "name_hint": extra.get("name") or "",
                         "priority": PRIORITY["manual"],
                         "asset_id": extra.get("asset_id"),
                         "source_id": None,
@@ -553,6 +582,10 @@ class ContextService:
             #: 先认资产自己的描述，没有就退回构造时留下的实体设定（`desc_fallback`）。
             #: 账单里存全文，截断由 `providers/base.py::clip_desc` 在提交那一刻做。
             item["desc"] = _desc_of(asset, str(item.pop("desc_fallback", "") or ""))
+            #: 这一条在提示词里叫什么（`_name_of`：只有名字，没有台账字样）。**与 `desc`
+            #: 在同一处归一**，所以每条都有这一格；给不出名字时是空串，届时
+            #: `RefAsset.who` 退回 `label`。
+            item["name"] = _name_of(item)
             #: 空描述不是错误，但要显眼：没有它，模型引用这张素材时只看到一个文件名。
             #: 这句判断由后端给，不让两个前端渲染处各算一遍。
             item["desc_missing"] = not item["desc"]
@@ -724,9 +757,7 @@ class ContextService:
         账单数的是真正会提交的那份图上的槽位**——两边各判一次的时候，首尾帧镜头的账单数的是
         R2V 预设、提交的却是 FLF 那份，事后翻版本参数会看到两个对不上的数字。
         """
-        ctx = await self.resolve(
-            pid, shot_id, include_prev=include_prev, capability=capability
-        )
+        ctx = await self.resolve(pid, shot_id, include_prev=include_prev, capability=capability)
         return {
             "resolved_at": ctx["resolved_at"],
             #: 当时模型端能收几张、这次算出要丢几张。冻结它，事后才说得清

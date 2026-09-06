@@ -6,6 +6,14 @@
 这些话怎么写不是我们发明的，是模型端推荐的结构（`skill/*.txt`），所以把它们
 原样做成四份可读的 SKILL。
 
+**四份的差别只有一件事：那句锚定语怎么写。** 最终提交出去的六段格式由代码在提交那一刻拼
+（`generation/providers/base.py::render_video_prompt`），因为 `<Picture n>` 的编号取决于用户
+那份 ComfyUI 图实际怎么接的线（`generation/comfy/graph.py::feed_order`）——模型在写 prompt
+的时候压根不知道这个数。所以 SKILL 只管「这个形态下 visual_prompt 里要写哪句话」，
+**编号与段落结构一个字都不让模型写**（`PICTURE_RULE`）。以前这几份里写着「第 1 张就是
+`<Picture 1>`」「Picture 1 是首帧」，那是两个假设叠在一起：既假设首帧排第一，又假设标题序号
+就是喂入顺序。两个都不成立时模型会理直气壮地把台词分给错的人。
+
 **渐进披露是它的要点。** 系统提示词里**只放 `catalog()` 那几行**（名字 + 什么时候用），
 全文由 `read_skill` 工具按需取一份。四份全塞进系统提示词等于每一轮都多烧几千 token，
 也正是老的一次性拆解会超时的那个毛病。
@@ -32,6 +40,25 @@ AUDIO_RULE = (
     "没有对白不要编）；non_diegetic_music 固定写 none —— 本项目不生成配乐 / BGM / 配乐轨。"
 )
 
+#: 你给的是哪几段。四份共用，别各写一遍。
+FIELDS_RULE = """你只提供三段字段，六段格式由系统在提交时拼好：
+
+  - `camera_motion`：景别 + 运镜 + 幅度与速度（如「近景，固定机位，缓慢推近」）；
+  - `visual_prompt`：画面里看得见的东西 + 这一份 SKILL 要求的那句锚定语；
+  - `audio_dialogue`：对白与同期环境声、必要动作音效。"""
+
+#: 编号那件事怎么说。四份共用——写四遍必然分叉，而分叉的样子恰好是
+#: 「模型以为 `<Picture 1>` 是首帧，而这份图上第一张喂进去的是角色三视图」。
+PICTURE_RULE = """编号不由你写：**一个 `<Picture n>` / `<Subject n>` 都不要自己编**，
+那几段结构性的话（对齐说明 / subject_definitions / summary / retention_analysis）也不要写。
+
+这一次先喂哪一张图，取决于用户那份 ComfyUI 图是怎么接的线——本工具在提交那一刻才顺着接线
+数出来，你写 prompt 的时候还不知道这个数。所以 `visual_prompt` 里就用「首帧」「末帧」
+「这个角色」这样的说法，系统会照本次图册把它们接到正确的编号上。
+
+自己编一个 `<Picture 1>` 十有八九指错人，**而这种错在队列里一条报错都没有**：
+成片能出来，只是两个角色互相串味、台词落到别人头上。"""
+
 
 @dataclass(frozen=True)
 class Skill:
@@ -51,148 +78,144 @@ _FLF = Skill(
     name="flf",
     title="首帧 + 末帧 → 视频（FL2VA）",
     when="这个镜头同时指定了首帧与末帧（两张图都有）。",
-    guide="""四段，段落名固定英文，内容用中文写也可以：
+    guide="""这个形态的命门是**收敛那句话**。`visual_prompt` 按这个顺序写：
 
-1. 第一行是**对齐说明**（没有段落名）：写清哪张图对到目标视频的哪一秒，例如
-   「Picture 1 (from [Shot 1]) aligns with the 0.00-second mark of the target video;
-   Picture 2 (from [Shot 1]) aligns with the N.00-second mark.」N 用这个镜头的时长。
-2. `integrated_multimodal_description:` 以 `[Shot n]` 开头，依次写：影像风格 →
-   「画面从 Picture 1 建立的构图开始」→ 主体与它必须保持一致的属性 → 环境与光线 →
-   运镜（幅度 + 速度）→ 中间过程 → 结尾那句**必须**是「通过可观察的中间状态逐步收敛，
-   最终精确落回 Picture 2 建立的构图」。
-   **这一段是首尾帧模式的命门**：少了收敛那句话，模型会在末帧附近乱走。
-3. `overall_soundscape:`
-4. `non_diegetic_music:`
+影像风格 → 「画面从首帧建立的构图开始」→ 主体与它必须保持一致的属性 → 环境与光线 →
+中间过程 → 结尾**必须**是「通过可观察的中间状态逐步收敛，最终精确落回末帧建立的构图」。
+
+少了收尾那句，模型会在末帧附近乱走。首尾帧那两张图对到目标视频的哪一秒由系统写
+（它知道这一镜多长、也知道这一次两张帧各排第几），你只要把「从首帧开始 / 落回末帧」
+这两句话写进画面描述里。
 
 只写画面里看得见的东西：不写心理活动，不写「接上一镜」这类只有人看得懂的话。""",
-    example="""How the reference pictures align with the target video — Picture 1 (from Shot 1) \
-aligns with the 0.00-second mark of the target video; Picture 2 (from Shot 1) aligns with the \
-10.00-second mark of the target video.
+    example="""你给的三段：
 
-integrated_multimodal_description:
-[Shot 1] Live-action, cinematic, the video begins in the composition established by Picture 1. \
-A matte-red portable speaker remains geometrically consistent. Minimal dark studio, soft haze, \
-precise reflections and generous negative space. The camera performs a Push In with small \
-amplitude at slow speed. A rim light traces the silhouette, then the speaker settles into a clean \
-hero frame. The motion develops through observable intermediate states, progressively narrows \
-every visual difference, and settles into the exact composition established by Picture 2 at the \
-end of the shot.
+camera_motion: 近景，固定机位，正面缓慢推近，幅度小、速度慢
+visual_prompt: 实拍电影感。画面从首帧建立的构图开始：暗色极简影棚、薄雾、精确的反光与充足的
+负空间，一道轮廓光扫过主体边缘。运动通过可观察的中间状态逐步收敛，最终精确落回末帧建立的构图。
+audio_dialogue: 一声轻微的旋钮咔嗒，克制的室内底噪与一记同步的低频脉冲。
 
-overall_soundscape:
-One soft dial click, restrained room tone and a synchronized low-frequency pulse.
+系统提交时拼成（节选，编号来自这一次的图册）：
 
-non_diegetic_music:
-none""",
+How the reference pictures align with the target video — <Picture 1> (from [Shot 1]) aligns with \
+the 0.00-second mark of the target video; <Picture 2> (from [Shot 1]) aligns with the 4.00-second \
+mark of the target video.
+
+detailed_description:
+[Shot 1] 实拍电影感。画面从首帧建立的构图开始：…… Camera Motion: 近景，固定机位，正面缓慢推近
+
+其余几段（subject_definitions / summary / retention_analysis / overall_soundscape /
+non_diegetic_music）同样由系统拼好。""",
 )
 
 _I2V = Skill(
     name="i2v",
     title="首帧 → 视频（I2VA）",
     when="只指定了首帧（没有末帧）。最常见的一种。",
-    guide="""四段：
+    guide="""`visual_prompt` 按这个顺序写：
 
-1. 第一行是**对齐说明**：「For the target video, at 0.00 seconds into the target video,
-   <Picture 1> (from [Shot n]) is fully referenced.」
-2. `integrated_multimodal_description:` 以 `[Shot n]` 开头：影像风格 → 「<Picture 1> 里的
-   构图、主体外观与空间关系保持一致」→ 主体必须保持的属性 → 环境与光线 → 运镜（幅度 +
-   速度）→ 画面如何发展到结尾。
-   **不要**写「结束时回到某张图」——这个模式没有末帧，写了会把运动锁死。
-3. `overall_soundscape:`
-4. `non_diegetic_music:`""",
-    example="""For the target video, at 0.00 seconds into the target video, <Picture 1> \
-(from [Shot 1]) is fully referenced.
+影像风格 → 「首帧里的构图、主体外观与空间关系保持一致」→ 主体必须保持的属性 →
+环境与光线 → 画面如何发展到结尾。
 
-integrated_multimodal_description:
-[Shot 1] Live-action, cinematic, the composition, subject appearance and spatial relationships \
-in <Picture 1> remain consistent. A matte-red portable speaker remains geometrically consistent. \
-Minimal dark studio, soft haze, precise reflections and generous negative space. The camera \
-performs a Push In with small amplitude at slow speed. A rim light traces the silhouette, then \
-the speaker settles into a clean hero frame.
+**不要**写「结束时回到某张图」——这个模式没有末帧，写了会把运动锁死。
+「首帧对到 0.00 秒」那句对齐说明由系统写，你不用写。""",
+    example="""你给的三段：
 
-overall_soundscape:
-One soft dial click, restrained room tone and a synchronized low-frequency pulse.
+camera_motion: 中景，缓慢推进，幅度小、速度慢
+visual_prompt: 实拍电影感。首帧里的构图、主体外观与空间关系保持一致：暗色极简影棚、薄雾、
+精确的反光与充足的负空间。轮廓光扫过边缘，随后主体稳稳落进一个干净的主视觉画面。
+audio_dialogue: 一声轻微的旋钮咔嗒，克制的室内底噪与一记同步的低频脉冲。
 
-non_diegetic_music:
-none""",
+系统提交时拼成（节选，编号来自这一次的图册）：
+
+For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1]) is fully \
+referenced.
+
+detailed_description:
+[Shot 1] 实拍电影感。首帧里的构图、主体外观与空间关系保持一致：…… Camera Motion: 中景，缓慢推进
+
+其余几段由系统拼好。挂了角色三视图之类的参考素材时，`subject_definitions` 与
+`retention_analysis` 会把「谁是谁、别把两个人混成一个」一并写清楚。""",
 )
 
 _L2V = Skill(
     name="l2v",
     title="末帧 → 视频（L2VA）",
     when="只指定了末帧（没有首帧）。常见于「要接到下一幕那张图上」。",
-    guide="""四段：
+    guide="""`visual_prompt` 按这个顺序写：
 
-1. 第一行是**对齐说明**：「<Picture 1> (from [Shot n]) aligns with the N.00-second mark of
-   the target video.」N 用这个镜头的时长。
-2. `integrated_multimodal_description:` 以 `[Shot n]` 开头：影像风格 → 「画面从一个能合理
-   通向 <Picture 1> 的状态开始」（**不要**描述一张具体的首帧，那是模型自己生成的）→
-   主体必须保持的属性 → 环境与光线 → 运镜 → 结尾那句**必须**是「所有运动逐渐失去动量，
-   最终落到 <Picture 1> 建立的主体位置、机位、光线与构图」。
-3. `overall_soundscape:`
-4. `non_diegetic_music:`""",
-    example="""How the reference pictures align with the target video — <Picture 1> \
-(from [Shot 1]) aligns with the 10.00-second mark of the target video.
+影像风格 → 「画面从一个能合理通向末帧的状态开始」（**不要**描述一张具体的首帧，
+那是模型自己生成的）→ 主体必须保持的属性 → 环境与光线 → 结尾**必须**是
+「所有运动逐渐失去动量，最终落到末帧建立的主体位置、机位、光线与构图」。
 
-integrated_multimodal_description:
-[Shot 1] Live-action, cinematic, the scene begins in a plausible state that precedes \
-<Picture 1>. A matte-red portable speaker remains geometrically consistent. Minimal dark studio, \
-soft haze, precise reflections and generous negative space. The camera performs a Push In with \
-small amplitude at slow speed. A rim light traces the silhouette, then the speaker settles into \
-a clean hero frame. Every moving element gradually loses momentum and settles into the exact \
-subject position, camera angle, lighting and composition established by <Picture 1> at the end \
-of the shot.
+「末帧对到第几秒」那句对齐说明由系统写（它知道这一镜多长），你不用写。""",
+    example="""你给的三段：
 
-overall_soundscape:
-One soft dial click, restrained room tone and a synchronized low-frequency pulse.
+camera_motion: 中景，缓慢推进，幅度小、速度慢
+visual_prompt: 实拍电影感。画面从一个能合理通向末帧的状态开始：暗色极简影棚、薄雾、精确的
+反光与充足的负空间。所有运动逐渐失去动量，最终落到末帧建立的主体位置、机位、光线与构图。
+audio_dialogue: 一声轻微的旋钮咔嗒，克制的室内底噪与一记同步的低频脉冲。
 
-non_diegetic_music:
-none""",
+系统提交时拼成（节选，编号来自这一次的图册）：
+
+How the reference pictures align with the target video — <Picture 1> (from [Shot 1]) aligns with \
+the 4.00-second mark of the target video.
+
+detailed_description:
+[Shot 1] 实拍电影感。画面从一个能合理通向末帧的状态开始：…… Camera Motion: 中景，缓慢推进
+
+其余几段由系统拼好。""",
 )
 
 _REF = Skill(
     name="ref",
     title="参考素材 → 视频（Ref2VA）",
     when="没有首帧也没有末帧，只有参考素材（角色三视图、地点参考图、道具图）；一个都没有时也用这一份。",
-    guide="""六段。这一份与前三份形状不同：**它要先把「谁是谁」定义清楚**，因为模型端收不到
-参考图的标签（`AIVS_REF_*` 只是文件名），只能靠 `<Subject n>` 这套写法对号。
+    guide="""这一份没有帧可锚，所以 `visual_prompt` 里最要紧的是**按名字点人**：
+「宋焘与张秀才并排坐在几案后」这样写，系统会把这两个名字接到各自的 `<Subject n>` 上
+（名字来自素材本身，所以人名必须与素材库里逐字一致）。
 
-1. `subject_definitions:` 每个主体一行：「<Subject n> is the visible subject shown in
-   <Picture n>: …」后面写它必须保留的形状 / 材质 / 颜色 / 服装 / 标识。
-   `<Picture n>` 的编号与喂进去的参考图顺序一致（第 1 张就是 `<Picture 1>`）。
-2. `summary:` 一句话：要做一段几秒的视频、有哪些主体、哪张图提供了什么。
-3. `retention_analysis:` 每个主体一行：`fully_preserved` / `partially_preserved` + 具体保留什么。
-4. `detailed_description:` 先一句整体风格，再以 `[Shot n]` 开头写这一镜：主体带着被参考的
-   特征出现 → 环境与光线 → 运镜 → 画面如何发展。
-5. `overall_soundscape:`
-6. `non_diegetic_music:`
+`visual_prompt` 按这个顺序写：整体影像风格 → 主体带着被参考的特征出现 → 环境与光线 →
+画面如何发展。
 
-**一张参考图都没有时**：`subject_definitions` 与 `retention_analysis` 写 none，
-只留 summary / detailed_description / 两段声音——这时它就是一段纯文本描述。""",
-    example="""subject_definitions:
-<Subject 1> is the visible subject shown in <Picture 1>: A matte-red portable speaker remains \
-geometrically consistent. Preserve the exact product shape, material, color and logo.
+**这一份最容易写坏的一句是「保持两人服饰与面容一致」**：它本意是「别在镜头里忽然换装」，
+模型只看字面，读出来就是「让这两个人长得一样」——那正是「张秀才长成了宋焘」的来源。
+所以**不要**写这类跨人物的「保持一致」，谁保住谁的样子由系统在 `retention_analysis` 里
+逐个写清（还会补一句「他们是不同的人，绝不能把一个人的脸 / 发型 / 服装搬到另一个人身上」）。
+
+**一个参考素材都没有时**照样用这一份：系统会把 `subject_definitions` 与
+`retention_analysis` 写成 none，这时它就是一段纯文本描述。""",
+    example="""你给的三段：
+
+camera_motion: 近景，固定机位，正面缓慢推近
+visual_prompt: 实拍电影感，光线连贯、画面稳定。宋焘与张秀才并排坐在殿檐下的几案后，
+两人各自带着自己被参考的形象特征；廊下阴影深长，青砖地面泛着湿光。
+audio_dialogue: 宋焘低声道：「此题何解？」远处更漏滴答，纸页在风里轻响。
+
+系统提交时拼成（编号与人名来自这一次的图册）：
+
+subject_definitions:
+<Subject 1> is the visible subject shown in <Picture 1>: 宋焘。青灰长衫，方脸，短须……
+<Subject 2> is the visible subject shown in <Picture 2>: 张秀才。月白长衫，清瘦，二十上下……
 
 summary:
-[reference generation] Create a 10-second target video featuring <Subject 1>; <Picture 1> \
-provides the subject's visible identity and product attributes.
+[reference generation] Create a 4.00-second target video featuring <Subject 1> and <Subject 2>. \
+<Picture 1> and <Picture 2> provide the visible identity of these subjects.
 
 retention_analysis:
-<Subject 1> (appears in [Shot 1]): fully_preserved - preserve the exact product shape, material, \
-color and logo throughout the target video.
+<Subject 1>（宋焘）(appears in [Shot 1]): fully_preserved - keep the exact face, hair, build and \
+costume shown in <Picture 1> unchanged; do not blend it with any other subject.
+<Subject 2>（张秀才）(appears in [Shot 1]): fully_preserved - keep the exact face, hair, build \
+and costume shown in <Picture 2> unchanged; do not blend it with any other subject.
+<Subject 1> and <Subject 2> are different people: never copy the face, hair or costume of one \
+onto another, and never merge two of them into one person, even if the shot description asks for \
+a consistent look.
 
 detailed_description:
-The target video uses a cinematic product-film style with coherent lighting and stable visual \
-continuity.
-[Shot 1] <Subject 1> appears with the referenced characteristics clearly visible. Minimal dark \
-studio, soft haze, precise reflections and generous negative space. The camera performs a Push In \
-with small amplitude at slow speed. A rim light traces the silhouette, then the speaker settles \
-into a clean hero frame.
+[Shot 1] 实拍电影感，光线连贯、画面稳定。宋焘与张秀才并排坐在…… Camera Motion: 近景，固定机位，\
+正面缓慢推近
 
-overall_soundscape:
-One soft dial click, restrained room tone and a synchronized low-frequency pulse.
-
-non_diegetic_music:
-none""",
+overall_soundscape / non_diegetic_music 同样由系统拼好。""",
 )
 
 #: 四份内置 SKILL。名字就是 `read_skill` 的参数，也是提案里 `skill` 字段的值。
@@ -219,8 +242,10 @@ def render(name: str) -> str:
     return (
         f"# SKILL {skill.name} · {skill.title}\n\n"
         f"什么时候用：{skill.when}\n\n"
+        f"## 你写哪几段\n{FIELDS_RULE}\n\n"
         f"## 怎么写\n{skill.guide}\n\n{AUDIO_RULE}\n\n"
-        f"## 范例（照抄这个结构）\n{skill.example}"
+        f"## 编号不由你写\n{PICTURE_RULE}\n\n"
+        f"## 范例\n{skill.example}"
     )
 
 
