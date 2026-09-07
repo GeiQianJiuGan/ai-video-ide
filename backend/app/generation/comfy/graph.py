@@ -302,24 +302,38 @@ def _inflows(inputs: dict[str, Any]) -> list[str]:
     `image1` 排在 `image2` 前面、`WanImageToVideo` 的 `start_image` 排在 `end_image` 前面，
     这就是「第几张图」的事实来源。
 
-    带序号的输入名（`image1` / `image2` / …）**额外按数字排一遍**当保险：有些工具会把
-    JSON 的键按字典序重排一次，那样 `image10` 会跑到 `image2` 前面。前缀不一致
-    （`start_image` / `end_image`）或压根没有序号时照旧用键顺序，绝不自己猜。
+    带序号的输入名（`image1` / `image2` / …，或 `ref_images.ref_image_0` / …）**额外按数字排一遍**当保险：
+    有些工具会把 JSON 的键按字典序重排一次，那样 `image10` 会跑到 `image2` 前面。
+    按公共前缀对编号槽位独立按自然数大小重排，保证即使同节点包含 prompt、clip 等未带数字的输入，
+    编号槽位（如 image_0..7）也能精准自然排序。前缀不一致或压根没有序号时照旧用键顺序，绝不自己猜。
     """
     fields = [name for name, value in inputs.items() if _linked(value) is not None]
     if len(fields) < 2:
         return fields
-    marks = [_NUMBERED.match(name) for name in fields]
-    if not all(mark is not None for mark in marks):
+
+    prefix_groups: dict[str, list[tuple[int, str]]] = {}
+    for name in fields:
+        m = _NUMBERED.match(name)
+        if m:
+            prefix_groups.setdefault(m.group(1), []).append((int(m.group(2)), name))
+
+    sorted_replacements: dict[str, list[str]] = {}
+    for prefix, group in prefix_groups.items():
+        if len(group) >= 2:
+            sorted_replacements[prefix] = [name for _, name in sorted(group, key=lambda x: x[0])]
+
+    if not sorted_replacements:
         return fields
-    numbered = [
-        (mark.group(1), int(mark.group(2)), name)
-        for mark, name in zip(marks, fields, strict=True)
-        if mark is not None
-    ]
-    if len({prefix for prefix, _, _ in numbered}) != 1:
-        return fields
-    return [name for _, _, name in sorted(numbered, key=lambda item: item[1])]
+
+    out: list[str] = []
+    prefix_iters = {prefix: iter(names) for prefix, names in sorted_replacements.items()}
+    for name in fields:
+        m = _NUMBERED.match(name)
+        if m and m.group(1) in prefix_iters:
+            out.append(next(prefix_iters[m.group(1)]))
+        else:
+            out.append(name)
+    return out
 
 
 def feed_order(graph: dict[str, Any], entries: Mapping[str, str]) -> FeedOrder:

@@ -316,12 +316,13 @@ async def test_preset_feeds_reference_images_into_the_ref_slots(tmp_path: Path) 
     # 顺序即语义：ComfyUI 那类图收不到标签，所以提交出去的那段 prompt 本身就是六段格式，
     # 每张图一个 `<Picture n>`、每个出场的人一个 `<Subject n>`
     text = graph["3"]["inputs"]["text"]
+    assert text.startswith("For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1]) is fully referenced.")
+    assert "<Picture 1> ([Shot 1] first frame):" not in text, "首帧时间锚点不进入 retention_analysis 避免姿态构图被死锁至片尾"
     assert "subject_definitions:" in text and "retention_analysis:" in text
     assert "<Subject 1> is the visible subject shown in <Picture 2>: 林小雨（常服）" in text
     assert "<Subject 2> is the visible subject shown in <Picture 3>: 雨夜巷口" in text
     assert "<Picture 1> is the first frame of the target video." in text, "首帧也占一个编号"
-    assert "雨夜推门" in text, "用户手写的自由文本原样进 detailed_description"
-    assert "are different people" in text, "两个人就必须说清别把他们画成同一个人"
+    assert "雨夜推门" in text, "镜头描述本身还在 detailed_description 里"
     assert req.sent_prompt == text, "真正发出去的那段话要冻结进版本参数"
     assert any("提示词已按参考生成格式重排" in n for n in req.notes)
     book = req.book.to_dict() if req.book else {"items": []}
@@ -1812,3 +1813,61 @@ async def test_a_cut_that_cannot_be_reconnected_names_the_exact_input(tmp_path: 
     assert any("改成不依赖它的接法" in s for s in err.suggestions)
     assert err.suggestions[-1].startswith("展开原始报错"), "ComfyUI 自己那几条建议照旧留在后面"
     assert not any("必填" in note for note in req.notes), "没接上就别在账单里说接上了"
+
+
+def test_inflows_sorts_numbered_groups_with_mixed_inputs() -> None:
+    """带编号的槽位（如 ref_images.ref_image_0..7）即使与 prompt/clip/vae 混在一起，也必须按自然数大小排序。"""
+    from app.generation.comfy.graph import _inflows
+
+    inputs = {
+        "prompt": ["10", 0],
+        "clip": ["11", 0],
+        "ref_images.ref_image_2": ["5505", 0],
+        "ref_images.ref_image_0": ["5517", 0],
+        "ref_images.ref_image_1": ["5506", 0],
+        "vae": ["12", 0],
+    }
+    result = _inflows(inputs)
+    assert result == [
+        "prompt",
+        "clip",
+        "ref_images.ref_image_0",
+        "ref_images.ref_image_1",
+        "ref_images.ref_image_2",
+        "vae",
+    ]
+
+
+def test_location_reference_retention_adapts_to_first_frame() -> None:
+    """当存在首帧时，场景原图不得要求保持 exact layout，避免与首帧构图冲突。"""
+    from app.generation.providers import base
+
+    ff = base.Picture(role="first_frame", kind="first_frame", media="image", name="首帧", desc="", file="ff.png", index=1)
+    loc = base.Picture(role="reference", kind="location_reference", media="image", name="正屋", desc="民居正屋", file="loc.png", index=2, subject=1)
+
+    book_with_ff = base.PictureBook(items=[ff, loc])
+    retention_ff = base._retention(book_with_ff, "[Shot 2]")
+    assert "keep the architectural elements, materials, lighting and environment consistent across different camera angles" in retention_ff
+    assert "exact layout" not in retention_ff
+
+    book_without_ff = base.PictureBook(items=[loc])
+    retention_no_ff = base._retention(book_without_ff, "[Shot 1]")
+    assert "keep the exact layout, architecture, materials and lighting shown in" in retention_no_ff
+
+
+def test_detail_anchors_first_frame_when_not_in_prompt() -> None:
+    """当镜头挂了首帧但提示词没写「首帧」时，系统自动在 detailed_description 开头锚定首帧 tag。"""
+    from app.generation.providers import base
+
+    ff = base.Picture(role="first_frame", kind="first_frame", media="image", name="首帧", desc="", file="ff.png", index=1)
+    book = base.PictureBook(items=[ff])
+
+    req = base.VideoRequest(
+        mode="i2v",
+        prompt="官差迈步进屋",
+        segments={"visual_prompt": "官差迈步进屋", "camera_motion": "中景固定"},
+    )
+    detail = base._detail(req, "[Shot 2]", book)
+    assert "首帧（<Picture 1>）" in detail
+    assert detail.startswith("[Shot 2] 画面从首帧（<Picture 1>）建立的构图开始，官差迈步进屋")
+

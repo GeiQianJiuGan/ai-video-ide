@@ -432,7 +432,7 @@ def picture_book(
     items: list[Picture] = []
     kept: list[str] = []
     seen: set[str] = set()
-    index = 0
+    index = 1
     subject = 0
     for key in keys:
         seed = seeds[key]
@@ -444,13 +444,13 @@ def picture_book(
             continue
         seen.add(mark)
         kept.append(key)
-        index += 1
         frame = seed.role in FRAME_ROLES
         if not frame:
             subject += 1
         items.append(
             replace(seed, index=index, subject=0 if frame else subject, entry=seed.entry or key)
         )
+        index += 1
     notes = _book_notes(items, kept, seeds, order_source)
     return PictureBook(items, list(others), order_source, notes)
 
@@ -510,10 +510,10 @@ def render_video_prompt(req: VideoRequest, book: PictureBook) -> str:
     align = _align_line(book, shot, seconds)
     if align:
         parts.append(align)
-    parts.append(f"subject_definitions:\n{_definitions(book)}")
+    parts.append(f"subject_definitions:\n{_definitions(book, shot)}")
     parts.append(f"summary:\n{_summary(book, shot, seconds)}")
     parts.append(f"retention_analysis:\n{_retention(book, shot)}")
-    parts.append(f"detailed_description:\n{_detail(req, shot)}")
+    parts.append(f"detailed_description:\n{_detail(req, shot, book)}")
     parts.append(f"overall_soundscape:\n{_soundscape(req)}")
     #: 无配乐是产品级硬约束（`ai/skills/video_prompt.py::AUDIO_RULE`），这一格永远是 none。
     parts.append("non_diegetic_music:\nnone")
@@ -529,10 +529,12 @@ def _and_join(parts: Sequence[str]) -> str:
 
 
 def _align_line(book: PictureBook, shot: str, seconds: str) -> str:
-    """首尾帧与目标视频的对齐句（措辞照 `ai/skills/video_prompt.py` 那三份 SKILL 的第一行）。
-
-    **由图册里真有哪几张帧决定，不由 SKILL 名字决定**：适配器看不到 SKILL 名，而「这一次到底
-    喂了首帧还是末帧」它知道得最准。两处各说一遍的话，图册说两张、这句话说一张。
+    """首尾帧与目标视频的对齐句。符合 MiniMax H3 官方规范：
+    - I2VA（单首帧）：第一行写 For the target video, at 0.00 seconds into the target video, <Picture n> (from [Shot]) is fully referenced.
+    - FL2VA（首尾帧）：双端时间锚点：
+      How the reference pictures align with the target video — <Picture a> (from [Shot]) aligns with the 0.00-second mark of the target video; <Picture b> (from [Shot]) aligns with the S.SS-second mark of the target video.
+    - L2VA（单末帧）：单末端时间锚点：
+      How the reference pictures align with the target video — <Picture b> (from [Shot]) aligns with the {seconds}-second mark of the target video.
     """
     first = book.of_role("first_frame")
     last = book.of_role("last_frame")
@@ -544,54 +546,68 @@ def _align_line(book: PictureBook, shot: str, seconds: str) -> str:
             "target video."
         )
     if first is not None:
-        return (
-            f"For the target video, at 0.00 seconds into the target video, {first.tag} "
-            f"(from {shot}) is fully referenced."
-        )
+        return f"For the target video, at 0.00 seconds into the target video, {first.tag} (from {shot}) is fully referenced."
     if last is not None:
-        return (
-            f"{head}{last.tag} (from {shot}) aligns with the {seconds}-second mark of the "
-            "target video."
-        )
+        return f"{head}{last.tag} (from {shot}) aligns with the {seconds}-second mark of the target video."
     return ""
 
 
-def _definitions(book: PictureBook) -> str:
+def _definitions(book: PictureBook, shot: str = "") -> str:
     """`<Subject n> is … shown in <Picture n>: 名字。它长什么样`。
 
+    按 MiniMax H3 官方规范：
+    1. 首尾帧自身作为镜头关键帧起止锚点，拥有独立的 `<Picture n>` 声明（例如 `<Picture 1> is the first frame of [Shot 2], showing ...`）。
+    2. 角色 / 场景 / 道具等实体作为 `<Subject n>`，指明其来源图片 `<Picture n>`。
     **名字必须进这一句**：`overall_soundscape` 里写的是「宋焘说：…」，模型要靠这里把那个名字
     接到 `<Subject n>` 上。缺了它，台词落到谁头上全靠猜——「张三说了李四的台词」就是这么来的。
     描述截断照旧只走 `clip_desc()`（`DESC_MAX`），图册与冻结参数里留的是全文。
     """
-    lines = [
-        f"{p.subject_tag} is {_DEFINES.get(p.kind, _DEFINES_ELSE)} {p.tag}: "
-        + ("。".join(x for x in (p.name, clip_desc(p.desc)) if x) or p.file)
-        for p in book.subjects
-    ]
-    #: 一个 subject 都没有时写 none（照 `_REF` 那份 SKILL 的规定），不留一个空段。
+    lines: list[str] = []
+    first = book.of_role("first_frame")
+    if first is not None:
+        shot_ctx = f" of {shot}" if shot else ""
+        desc = clip_desc(first.desc) or first.name or "the initial scene composition"
+        lines.append(f"{first.tag} is the first frame{shot_ctx}, showing {desc}.")
+    last = book.of_role("last_frame")
+    if last is not None:
+        shot_ctx = f" of {shot}" if shot else ""
+        desc = clip_desc(last.desc) or last.name or "the final scene composition"
+        lines.append(f"{last.tag} is the final frame{shot_ctx}, showing {desc}.")
+
+    for p in book.subjects:
+        lines.append(
+            f"{p.subject_tag} is {_DEFINES.get(p.kind, _DEFINES_ELSE)} {p.tag}: "
+            + ("。".join(x for x in (p.name, clip_desc(p.desc)) if x) or p.file)
+        )
+    #: 一个定义都没有时写 none，不留一个空段。
     return "\n".join(lines) or "none"
 
 
 def _summary(book: PictureBook, shot: str, seconds: str) -> str:
     """`[reference generation] …`：这一次要出多长、有谁、哪几张图定义了他们、哪张是首尾帧。"""
     subjects = book.subjects
-    line = f"[reference generation] Create a {seconds}-second target video"
-    who = _and_join([p.subject_tag for p in subjects])
-    line += f" featuring {who}." if who else "."
-    if subjects:
-        many = len(subjects) > 1
-        line += (
-            f" {_and_join([p.tag for p in subjects])} {'provide' if many else 'provides'} "
-            f"the visible identity of {'these subjects' if many else 'the subject'}."
-        )
     first = book.of_role("first_frame")
     last = book.of_role("last_frame")
+    if first is not None and last is not None:
+        task_type = "[keyframe completion + reference generation]" if subjects else "[keyframe completion]"
+    else:
+        task_type = "[reference generation]"
+
+    line = f"{task_type} Create a {seconds}-second target video"
+    who = _and_join([p.subject_tag for p in subjects])
+    line += f" featuring {who}." if who else "."
     if first is not None and last is not None:
         line += f" {first.tag} is the first frame and {last.tag} is the final frame."
     elif first is not None:
         line += f" {first.tag} is the first frame of the target video."
     elif last is not None:
         line += f" {last.tag} is the final frame of the target video."
+    if subjects:
+        many = len(subjects) > 1
+        line += (
+            f" {_and_join([p.tag for p in subjects])} {'provide' if many else 'provides'} "
+            f"the visible identity of {'these subjects' if many else 'the subject'}."
+        )
     #: 参考视频 / 参考音频编不进 `<Picture n>`，只能靠这句话点一下它们是谁
     #: （措辞借 `ref_hint()`，两处各写一遍必然分叉）。
     hint = ref_hint(book.others)
@@ -599,17 +615,27 @@ def _summary(book: PictureBook, shot: str, seconds: str) -> str:
 
 
 def _retention(book: PictureBook, shot: str) -> str:
-    """每个 subject 一句「保住它自己」+ 两个人以上时那句「别把他们混成一个」。
+    """每个 subject 对应的保持规则 + 两个人以上时那句「别把他们混成一个」。
 
-    最后那句是这次改造的正题：分镜里「保持两人服饰与面容一致」这种写法本意是「别在镜头里
-    忽然换装」，字面读却是「让两个人长得一样」。模型端只看字面，所以必须在这里说清楚。
+    首尾帧是起止时间锚点（已由 top-line 对齐句、_definitions 与 summary 绑定），
+    绝不能在 retention_analysis 里写「keep the exact composition and pose unchanged」：
+    这会被扩散模型理解为整段视频或出现该主体时都要硬锁住首帧的静态姿态与构图，导致角色无法活动
+    或在画面演进过程中直接被拖至视频末尾。retention_analysis 严格留给角色和场景实体。
     """
     lines: list[str] = []
+    has_first_frame = book.of_role("first_frame") is not None
     for p in book.subjects:
         head = f"{p.subject_tag}（{p.name}）" if p.name else p.subject_tag
+        if p.kind == "location_reference" and has_first_frame:
+            retain_clause = (
+                "keep the architectural elements, materials, lighting and environment consistent "
+                "across different camera angles shown in"
+            )
+        else:
+            retain_clause = _RETAIN.get(p.kind, _RETAIN_ELSE)
         lines.append(
             f"{head} (appears in {shot}): fully_preserved - "
-            f"{_RETAIN.get(p.kind, _RETAIN_ELSE)} {p.tag} unchanged; "
+            f"{retain_clause} {p.tag} unchanged; "
             "do not blend it with any other subject."
         )
     people = [p for p in book.subjects if p.is_person]
@@ -622,13 +648,26 @@ def _retention(book: PictureBook, shot: str) -> str:
     return "\n".join(lines) or "none"
 
 
-def _detail(req: VideoRequest, shot: str) -> str:
+def _detail(req: VideoRequest, shot: str, book: PictureBook | None = None) -> str:
     """画面那一段：`[Shot n] 视觉描述 Camera Motion: 机位`。"""
     if not req.segments:
         #: 自由文本 prompt：原样送，不硬套三段（也不给它编一个 `[Shot n]` 前缀）。
-        return str(req.prompt or "").strip() or shot
-    visual = str(req.segments.get("visual_prompt") or "").strip()
-    camera = str(req.segments.get("camera_motion") or "").strip()
+        visual = str(req.prompt or "").strip() or shot
+    else:
+        visual = str(req.segments.get("visual_prompt") or "").strip()
+
+    if book:
+        first = book.of_role("first_frame")
+        last = book.of_role("last_frame")
+        if first and first.tag not in visual:
+            if "首帧" in visual:
+                visual = visual.replace("首帧", f"首帧（{first.tag}）", 1)
+            elif not visual.startswith(first.tag):
+                visual = f"画面从首帧（{first.tag}）建立的构图开始，{visual}"
+        if last and last.tag not in visual and "末帧" in visual:
+            visual = visual.replace("末帧", f"末帧（{last.tag}）", 1)
+
+    camera = str((req.segments or {}).get("camera_motion") or "").strip()
     body = f"{shot} {visual}".strip()
     return f"{body} Camera Motion: {camera}" if camera else body
 
