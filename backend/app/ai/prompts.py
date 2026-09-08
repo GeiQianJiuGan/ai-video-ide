@@ -88,6 +88,7 @@ DIRECTOR_TASK = """你是一部 AI 生成短片的助理导演，同时也是它
    一句话说清为什么要这么改。
 3. 宁少勿多：一次只提真正需要的几条。不要为了凑数改标题。
 4. 用中文。最后用一两句话总结你提了什么，不要罗列 id。
+5. **参数紧凑防截断**：工具调用参数必须是严格合法的标准 JSON。单次参数保持紧凑，如需添加较多分镜，请分批次调用 add_shot（每次 1~3 镜），切勿在单次调用中塞入过多分镜导致 token 上限截断。
 
 **把剧情拆成幕与镜头时，一段一段来，不要想一次拆完。** 一次完整的往返长这样：
 
@@ -108,29 +109,19 @@ DIRECTOR_TASK = """你是一部 AI 生成短片的助理导演，同时也是它
 
 #: SKILL 与镜头字段的契约。**代码始终追加，用户在设置页改不到**（照本文件开头那条 rule 1）：
 #: 形状被改坏了链路就落不了库。SKILL 清单只放这一行摘要，全文靠 `read_skill` 取。
-DIRECTOR_SKILL_CONTRACT_HEAD = """镜头 prompt 的写法（内置 SKILL，用 read_skill 取全文）：
+DIRECTOR_SKILL_CONTRACT_HEAD = """镜头 prompt 的写法（内置 MiniMax H3 官方 SKILL，用 read_skill 按名称或文件引用路径取全文）：
 """
 
 DIRECTOR_SKILL_CONTRACT_TAIL = """
-add_shot / update_shot（以及 add_scene 里的 shots[]）**不要自己拼那段完整 prompt**，
-分四个字段给，系统会按固定格式拼好并补上声音约束：
+在 add_shot / update_shot 中，请遵循 MiniMax H3 官方 prompt 结构（T2VA, I2VA, FL2VA, L2VA, Ref2VA）：
 
-  - camera_motion：机位、景别与运镜（如「中景，缓慢推进」）；若是某角色的主观视点（POV），画面中不得出现该角色自身；
-  - visual_prompt：只写画面里看得见的东西——主体与动作、环境、光线。有对白时必须明确指出谁在张嘴说话、谁在闭口倾听。挂了首帧且承接上一镜构图时写「画面从首帧建立的构图开始」（景别突变的硬切镜头直接描述新画面构图，不要硬套）；挂了末帧就写「结尾精确落回末帧」；
-  - audio_dialogue：同期环境声、必要动作音效与对白（对白必须标明说话人具体称谓与剧本原台词，严禁使用代词「他/她」，没有不要编）；
-  - negative_prompt：逗号分隔的模型规避项。
+- camera_motion: 机位、景别与运镜（运镜方式、幅度、速度）。
+- visual_prompt: 画面描述，包含影像风格、主体外观与动作演进、环境光线，以及根据 MiniMax H3 规范要求的起止锚定语。
+- audio_dialogue: 对白、同期声与动作音效（对白保留说话人姓名与原台词）。
+- negative_prompt: 逗号分隔的模型规避项（必须包含 background music, BGM, soundtrack, musical score）。
+- skill: 填写对应的 MiniMax H3 skill 名称或文件引用（如 h3-prompt-writing, h3-base, h3-ref, references/base-en.txt, references/ref-en.txt）。
 
-另外给一个 skill 字段，写你照的是哪一份（flf / i2v / l2v / ref），方便用户核对。
-
-**一个 `<Picture n>` / `<Subject n>` 都不要自己编**，那几段结构性的话（对齐说明 /
-subject_definitions / summary / retention_analysis）也不要写：这一次哪张图排第几，取决于用户
-那份生成图实际怎么接的线，系统在提交那一刻才数得出来。你只写「首帧」「末帧」以及角色的名字
-（与素材库里逐字一致），系统会照本次图册接到正确的编号上。自己编一个编号十有八九指错人，
-而这种错在队列里一条报错都没有——成片能出来，只是两个角色互相串味、台词落到别人头上。
-
-声音硬约束：本项目不生成背景音乐 / 配乐 / BGM / 配乐轨。SKILL 里的 non_diegetic_music 一节
-固定写 none；正向 prompt 末尾的「声音设计：」与负向里的 background music, BGM, soundtrack,
-musical score 由系统自动补齐，你不用重复写。"""
+请勿自行生成编号 (<Picture n> / <Subject n>) 或结构性对齐声明，这些由系统处理。系统会自动处理 overall_soundscape 和 non_diegetic_music (固定为 none)。"""
 
 #: 素材图那条链的契约（角色 / 地点 / 道具 / 镜头首尾帧候选）。**同样由代码始终追加**：
 #: 这几句写反了用户看不出来——图照样出得来，只是它当参考素材时会把环境、光影、

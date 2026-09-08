@@ -108,6 +108,51 @@ async def propose(
     return result
 
 
+def _safe_assistant_arguments(name: str, args: dict[str, Any]) -> str:
+    """确保回喂给大模型的 assistant.tool_calls.arguments 是合法 JSON，且包含该工具所需必填项。
+
+    当模型端工具参数截断或格式损坏时（带 __incomplete__ 标记），如果直接把 __incomplete__
+    塞进 arguments，Anthropic / Gemini 等上游端点会对历史工具调用重新校验，因缺少 required 字段
+    报 HTTP 400 导致整个对话中断。这里构造满足该工具最小 schema 要求的安全占位 JSON。
+    """
+    if not isinstance(args, dict) or not args.get("__incomplete__"):
+        clean = (
+            {k: v for k, v in args.items() if not k.startswith("__")}
+            if isinstance(args, dict)
+            else {}
+        )
+        return json.dumps(clean, ensure_ascii=False)
+
+    spec = TOOLS.get(name) or {}
+    required = spec.get("required") or []
+    safe: dict[str, Any] = {}
+    for req in required:
+        safe[req] = "(invalid_arguments)"
+    return json.dumps(safe, ensure_ascii=False)
+
+
+def _prune_messages_for_context(
+    messages: list[dict[str, Any]], max_chars: int = 24000
+) -> list[dict[str, Any]]:
+    """防止多轮工具调用时历史读工具返回（如 read_script、list_characters）
+    持续堆叠挤爆上下文窗口。对较早轮次的超大读工具返回进行安全折叠。"""
+    total = sum(len(str(m.get("content") or "")) for m in messages)
+    if total <= max_chars:
+        return messages
+
+    pruned: list[dict[str, Any]] = []
+    # 保护前两项（system 与初始 user）及最近两轮
+    threshold_idx = max(2, len(messages) - 6)
+    for idx, msg in enumerate(messages):
+        if idx < threshold_idx and msg.get("role") == "tool":
+            content = str(msg.get("content") or "")
+            if len(content) > 500:
+                folded_hint = "\n...（此前工具数据已折叠以节约上下文）..."
+                msg = {**msg, "content": content[:200] + folded_hint}
+        pruned.append(msg)
+    return pruned
+
+
 async def collaborate(
     pid: str,
     message: str,
@@ -149,10 +194,12 @@ async def collaborate(
     said: list[str] = []
     rounds = 0
     over_limit = True
+    consecutive_json_errors = 0
     while rounds < MAX_ROUNDS:
         rounds += 1
         out: dict[str, Any] = {"content": "", "tool_calls": []}
-        async for event in _one_round(messages, live):
+        pruned_msgs = _prune_messages_for_context(messages)
+        async for event in _one_round(pruned_msgs, live):
             if event["kind"] == "final":
                 out = event["out"]
             else:
@@ -166,6 +213,10 @@ async def collaborate(
             break
         if text:
             said.append(text)
+        for c in calls:
+            if isinstance(c.get("arguments"), str):
+                from app.ai.llm.protocols import _tool_args
+                c["arguments"] = _tool_args(c.get("name"), c["arguments"])
         messages.append(
             {
                 "role": "assistant",
@@ -176,13 +227,17 @@ async def collaborate(
                         "type": "function",
                         "function": {
                             "name": c["name"],
-                            "arguments": json.dumps(c["arguments"], ensure_ascii=False),
+                            "arguments": _safe_assistant_arguments(
+                                c["name"], c.get("arguments") or {}
+                            ),
                         },
                     }
                     for c in calls
                 ],
             }
         )
+        round_has_ok = False
+        round_had_json_err = False
         for call in calls:
             yield {"kind": "tool", "name": call["name"], "phase": "start"}
             done = await _run_one(pid, call, len(ops) + 1, looked)
@@ -197,6 +252,24 @@ async def collaborate(
                 "error": done["error"],
             }
             messages.append({"role": "tool", "tool_call_id": call["id"], "content": done["text"]})
+            if done["ok"]:
+                round_has_ok = True
+            if done["error"] == "INVALID_JSON_ARGS":
+                round_had_json_err = True
+
+        if round_had_json_err and not round_has_ok:
+            consecutive_json_errors += 1
+            if consecutive_json_errors >= 3:
+                warn_note = (
+                    "AI 连续多次生成的参数均因格式错误或截断未能解析，已保留已生成的提案。"
+                    "建议分批提出需求或在流程图上手动添加。"
+                )
+                said.append(warn_note)
+                yield {"kind": "delta", "text": f"\n\n{warn_note}"}
+                over_limit = False
+                break
+        elif round_has_ok:
+            consecutive_json_errors = 0
     yield {
         "kind": "result",
         "result": {
@@ -240,15 +313,52 @@ async def _run_one(
     提案能诚实地说清「这一句是不是看图看出来的」。
     """
     name = call["name"]
+    args = call.get("arguments")
+    if isinstance(args, str):
+        from app.ai.llm.protocols import _tool_args
+        args = _tool_args(name, args)
+    elif not isinstance(args, dict):
+        args = {}
+    if name not in TOOLS:
+        return {
+            "text": (
+                f"【未知工具】不存在名为「{name}」的工具。可用的工具包括：\n"
+                f"{'、'.join(TOOLS.keys())}。\n"
+                "请选用正确的工具重新发起调用。"
+            ),
+            "op": None,
+            "ok": False,
+            "error": "UNKNOWN_TOOL",
+        }
+    if isinstance(args, dict) and args.get("__incomplete__"):
+        err_msg = args.get("__error__") or "参数不符合标准 JSON 格式或在生成中途被截断"
+        raw_snippet = str(args.get("__raw__") or "")[:260]
+        return {
+            "text": (
+                f"【参数不完整 / 格式损坏】调用工具「{name}」失败："
+                "参数不符合标准 JSON 规范或输出中途被截断，该次损坏调用已直接丢弃（不予采纳）。\n"
+                f"错误原因：{err_msg}\n"
+                f"收到的残缺参数片段：{raw_snippet}\n"
+                "处理指引：\n"
+                f"1. 请直接为「{name}」重新生成完整且符合格式的参数，"
+                "确保所有字段、引号和括号完整闭合；\n"
+                "2. 若因镜头过多或提示词过长触发了模型输出 Token 截断，请拆分为小批量分批调用"
+                "（如每次调用只添加 1~2 个分镜）。\n"
+                "请根据上述原因重新生成完整调用，或说明情况。"
+            ),
+            "op": None,
+            "ok": False,
+            "error": "INVALID_JSON_ARGS",
+        }
     seen = looked if looked is not None else set()
     try:
         if name in WRITE_TOOLS:
-            op = await to_op(pid, name, call["arguments"], seq, looked_at=seen)
+            op = await to_op(pid, name, args, seq, looked_at=seen)
             note = "已记入提案，尚未写入数据库；用户会逐条审阅。"
             if op["warnings"]:
                 note += " 注意：" + "；".join(op["warnings"])
             return {"text": note, "op": op, "ok": True, "error": ""}
-        out = await run_read(pid, name, call["arguments"])
+        out = await run_read(pid, name, args)
         if name == "look_at_image" and isinstance(out, dict) and out.get("looked_at_image"):
             seen.add(str(out.get("asset_id") or ""))
         payload = json.dumps(out, ensure_ascii=False)
@@ -273,10 +383,31 @@ async def _without_tools(
     它没有中途的文字增量（一次调用就出全部），但 `op` 事件照旧一条条给——
     协作栏那一侧于是不用为两条路各写一份渲染。
     """
-    data = await llm.complete_json(
-        _fallback_system(scope),
-        f"工程现状：\n{await _snapshot(pid)}\n\n用户的要求：{message}",
-    )
+    try:
+        data = await llm.complete_json(
+            _fallback_system(scope),
+            f"工程现状：\n{await _snapshot(pid)}\n\n用户的要求：{message}",
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("without_tools complete_json failed: %s", exc)
+        err_title = getattr(exc, "title", type(exc).__name__)
+        err_detail = getattr(exc, "detail", str(exc))
+        reply = (
+            f"模型返回的 JSON 解析失败或因输出过长被截断（{err_title}："
+            f"{err_detail}）。建议分批提出需求，或直接在流程图上手动添加。"
+        )
+        yield {"kind": "delta", "text": reply}
+        yield {
+            "kind": "result",
+            "result": {
+                "reply": reply,
+                "ops": [],
+                "rounds": 1,
+                "over_limit": False,
+                "degraded": True,
+            },
+        }
+        return
     ops: list[dict[str, Any]] = []
     notes: list[str] = []
     for raw in data.get("ops") or []:

@@ -142,6 +142,8 @@ class Settings(BaseSettings):
     #: （Ollama / LM Studio）的主模型往往不认图，而地址与密钥是同一套。
     llm_vision_model: str = ""
     llm_api_key: str = ""
+    #: 单次生成最大输出 token 预算。默认 8192，调大可有效防止分镜参数长文本输出时被截断。
+    llm_max_tokens: int = 8192
 
     # --- AI 协作栏的附件：一份 Word 剧本 / Excel 分镜表 → 一段纯文本（core/doctext.py）---
     # 抽出来的文字只填进输入框，不落库、不落盘、不出网，所以这两个数只是「别把界面和

@@ -42,6 +42,15 @@ datas += [
 # alembic 自带的模板目录（`alembic revision` 用得到，缺了它 ScriptDirectory 会抱怨）
 datas += collect_data_files("alembic")
 
+# ---- 内置 SKILL：MiniMax H3 官方规范及参考文件 ----
+REPO_ROOT = BACKEND.parent
+SKILL_DIR = REPO_ROOT / "skill"
+if SKILL_DIR.exists():
+    for p in SKILL_DIR.rglob("*"):
+        if p.is_file():
+            rel_dir = p.relative_to(REPO_ROOT).parent
+            datas.append((str(p), str(rel_dir).replace("\\", "/")))
+
 if len(datas) < 4:  # 至少 ini + env + mako + 一个 revision
     raise SystemExit(
         "打包中止：backend/alembic 下没找到迁移脚本。\n"

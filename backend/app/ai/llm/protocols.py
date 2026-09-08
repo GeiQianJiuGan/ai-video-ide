@@ -40,7 +40,7 @@ Gemini 的 `streamGenerateContent?alt=sse`）各自在自己的适配器里拼�
 接图的形状完全不同，全部关在这一层：
 
   · `openai_compatible` —— `content: [{type:"text"}, {type:"image_url", image_url:{url:"data:…"}}]`
-  · `anthropic` —— `content: [{type:"image", source:{type:"base64", media_type, data}}, {type:"text"}]`
+  · `anthropic` —— `content: [{type:"image", source:{...}}, {type:"text"}]`
     （图排在文字前面，顺序反了它常常只答「我看到一张图片」）
   · `gemini` —— `contents[].parts: [{inline_data:{mime_type, data}}, {text}]`
   · `ollama` —— 图不在 content 里，而是 `messages[].images: ["<base64>"]`（**不带 `data:` 前缀**）
@@ -60,6 +60,7 @@ from typing import Any
 
 import httpx
 
+from app.ai.llm import json_repair
 from app.core.config import settings
 from app.core.errors import AppError, ErrorCode
 from app.core.logging import get_logger
@@ -72,8 +73,8 @@ log = get_logger("llm.protocols")
 TIMEOUT = httpx.Timeout(300.0, connect=5.0)
 #: 列模型是「点一下就该有反应」的动作，不能跟生成一样等几分钟。
 LIST_TIMEOUT = httpx.Timeout(20.0, connect=5.0)
-#: Anthropic 的 /messages 要求必填 max_tokens：给一个够写完一份提案的值。
-MAX_TOKENS = 4096
+#: Anthropic 的 /messages 要求必填 max_tokens：给一个够写完一份提案的值（默认提升至 8192）。
+MAX_TOKENS = 8192
 #: 每条 LLM 错误都要带上它——硬约束 2：AI 不可用不等于流程走不下去。
 MANUAL_WAY_OUT = "AI 不可用时手动路径仍能走完全程（手动加一幕 / 手动拆解）"
 #: provider = none 时的显示名。它不是一个协议，所以不进适配器表。
@@ -83,7 +84,7 @@ NONE_LABEL = "不使用（手动模式）"
 
 @dataclass(frozen=True, slots=True)
 class LlmConfig:
-    """一次调用要的四件事。
+    """一次调用要的四件事 + 最大输出 token 预算。
 
     刻意不让适配器自己去读 `settings`：设置页要能「先取模型再保存」，
     那一次调用用的是用户刚敲进输入框、还没落盘的地址与密钥。
@@ -93,6 +94,7 @@ class LlmConfig:
     base_url: str = ""
     model: str = ""
     api_key: str = ""
+    max_tokens: int = 8192
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,13 +127,20 @@ def config(
     base_url: str | None = None,
     api_key: str | None = None,
     model: str | None = None,
+    max_tokens: int | None = None,
 ) -> LlmConfig:
     """当前设置 + 可选覆盖。覆盖只为「保存之前先试一下」，不会被写回任何地方。"""
+    token_limit = (
+        max_tokens
+        if max_tokens is not None
+        else getattr(settings, "llm_max_tokens", 8192)
+    )
     return LlmConfig(
         provider=str(provider if provider is not None else settings.llm_provider).strip(),
         base_url=str(base_url if base_url is not None else settings.llm_base_url).strip(),
         model=str(model if model is not None else settings.llm_model).strip(),
         api_key=str(api_key if api_key is not None else settings.llm_api_key).strip(),
+        max_tokens=max(512, int(token_limit)) if token_limit else 8192,
     )
 
 
@@ -141,27 +150,23 @@ def _client(timeout: httpx.Timeout) -> httpx.AsyncClient:
 
 
 def parse_json_object(text: str) -> dict[str, Any]:
-    """模型爱在 JSON 外面裹一层解释文字，这里只截取最外层花括号。"""
+    """模型爱在 JSON 外面裹一层解释文字，支持容错清理与截断自动闭合修复。"""
+    parsed, err = json_repair.parse_lenient_json(text)
+    if isinstance(parsed, dict):
+        return parsed
+    # 二次兜底：截取最外层花括号再试
     start, end = text.find("{"), text.rfind("}")
     if start >= 0 and end > start:
-        text = text[start : end + 1]
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError as exc:
-        raise AppError(
-            ErrorCode.LLM_INVALID_OUTPUT,
-            "LLM 返回的不是合法 JSON",
-            f"{exc.msg}（截断预览：{text[:200]}）",
-            ["重试一次", "换一个更擅长结构化输出的模型", "或改用手动拆解"],
-        ) from exc
-    if not isinstance(data, dict):
-        raise AppError(
-            ErrorCode.LLM_INVALID_OUTPUT,
-            "LLM 返回的结构不对",
-            "期望一个 JSON 对象。",
-            ["重试一次", "或改用手动拆解"],
-        )
-    return data
+        candidate = text[start : end + 1]
+        sub, _ = json_repair.parse_lenient_json(candidate)
+        if isinstance(sub, dict):
+            return sub
+    raise AppError(
+        ErrorCode.LLM_INVALID_OUTPUT,
+        "LLM 返回的不是合法 JSON",
+        f"{err or '未知语法错误'}（截断预览：{text[:200]}）",
+        ["重试一次", "换一个更擅长结构化输出的模型", "或改用手动拆解"],
+    )
 
 
 def _snippet(resp: httpx.Response) -> str:
@@ -190,21 +195,21 @@ def _dig(data: Any, *path: Any) -> Any:
 
 
 def _tool_args(name: Any, raw: Any) -> dict[str, Any]:
-    """工具参数在不同端上有时是 dict、有时是一段 JSON 字符串。"""
+    """工具参数在不同端上有时是 dict、有时是一段 JSON 字符串。支持自动容错与截断闭合修复。"""
     if isinstance(raw, dict):
         return raw
     if raw in (None, ""):
         return {}
-    try:
-        parsed = json.loads(str(raw))
-    except json.JSONDecodeError as exc:
-        raise AppError(
-            ErrorCode.LLM_INVALID_OUTPUT,
-            "工具参数不是合法 JSON",
-            f"{name}: {exc.msg}（预览：{str(raw)[:200]}）",
-            ["重试一次", "换一个更擅长工具调用的模型", MANUAL_WAY_OUT],
-        ) from exc
-    return parsed if isinstance(parsed, dict) else {}
+    parsed, err = json_repair.parse_lenient_json(raw)
+    if parsed is not None:
+        if isinstance(parsed, dict):
+            return parsed
+        return {
+            "__incomplete__": True,
+            "__raw__": str(raw),
+            "__error__": f"期望 JSON 对象（dict），实际解析为 {type(parsed).__name__}",
+        }
+    return {"__incomplete__": True, "__raw__": str(raw), "__error__": err or "无法解析为有效 JSON"}
 
 
 def one_chunk(out: dict[str, Any]) -> list[dict[str, Any]]:
@@ -582,6 +587,8 @@ class OpenAiCompatible(LlmProtocol):
         self, cfg: LlmConfig, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
     ) -> dict[str, Any]:
         body: dict[str, Any] = {"model": cfg.model, "messages": messages}
+        if cfg.max_tokens:
+            body["max_tokens"] = cfg.max_tokens
         if tools:
             body["tools"] = tools
             body["tool_choice"] = "auto"
@@ -731,12 +738,20 @@ def _anthropic_messages(messages: list[dict[str, Any]]) -> tuple[str, list[dict[
             blocks: list[dict[str, Any]] = [{"type": "text", "text": text}] if text.strip() else []
             for call in msg.get("tool_calls") or []:
                 fn = call.get("function") or {}
+                t_name = str(fn.get("name") or "")
+                parsed = _tool_args(t_name, fn.get("arguments"))
+                # 清理内部错误标记，防止 Anthropic 端因未知字段或缺失 required 属性报错 400
+                clean_input = (
+                    {k: v for k, v in parsed.items() if not k.startswith("__")}
+                    if isinstance(parsed, dict)
+                    else {}
+                )
                 blocks.append(
                     {
                         "type": "tool_use",
                         "id": str(call.get("id") or ""),
-                        "name": str(fn.get("name") or ""),
-                        "input": _tool_args(fn.get("name"), fn.get("arguments")),
+                        "name": t_name,
+                        "input": clean_input,
                     }
                 )
             push("assistant", blocks)
@@ -812,7 +827,7 @@ class Anthropic(LlmProtocol):
         system, turns = _anthropic_messages(messages)
         body: dict[str, Any] = {
             "model": cfg.model,
-            "max_tokens": MAX_TOKENS,
+            "max_tokens": cfg.max_tokens or MAX_TOKENS,
             "messages": turns,
         }
         if system:
@@ -992,8 +1007,14 @@ def _gemini_body(messages: list[dict[str, Any]]) -> dict[str, Any]:
                 fn = call.get("function") or {}
                 name = str(fn.get("name") or "")
                 names[str(call.get("id") or "")] = name
+                parsed_args = _tool_args(name, fn.get("arguments"))
+                clean_args = (
+                    {k: v for k, v in parsed_args.items() if not k.startswith("__")}
+                    if isinstance(parsed_args, dict)
+                    else {}
+                )
                 parts.append(
-                    {"functionCall": {"name": name, "args": _tool_args(name, fn.get("arguments"))}}
+                    {"functionCall": {"name": name, "args": clean_args}}
                 )
             push("model", parts)
         elif role == "tool":
@@ -1068,19 +1089,20 @@ class Gemini(LlmProtocol):
         return f"{self.base(cfg)}/models/{cfg.model}:streamGenerateContent?alt=sse"
 
     def _generate_body(
-        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+        self, cfg: LlmConfig, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
     ) -> dict[str, Any]:
         body = _gemini_body(messages)
         if tools:
             body["tools"] = [{"functionDeclarations": [_gemini_tool(t) for t in tools]}]
+        if cfg.max_tokens:
+            body["generationConfig"] = {"maxOutputTokens": cfg.max_tokens}
         return body
 
     async def complete_tools(
         self, cfg: LlmConfig, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
     ) -> dict[str, Any]:
-        data = await self.request(
-            "POST", self._generate_url(cfg), cfg, json_body=self._generate_body(messages, tools)
-        )
+        body = self._generate_body(cfg, messages, tools)
+        data = await self.request("POST", self._generate_url(cfg), cfg, json_body=body)
         texts: list[str] = []
         calls: list[dict[str, Any]] = []
         for index, part in enumerate(_gemini_parts(data)):
@@ -1111,7 +1133,7 @@ class Gemini(LlmProtocol):
         texts: list[str] = []
         calls: list[dict[str, Any]] = []
         async for chunk in self.sse(
-            self._stream_url(cfg), cfg, self._generate_body(messages, tools)
+            self._stream_url(cfg), cfg, self._generate_body(cfg, messages, tools)
         ):
             if not isinstance(chunk, dict):
                 continue

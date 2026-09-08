@@ -196,8 +196,8 @@ TOOLS: dict[str, dict[str, Any]] = {
     "read_skill": {
         "kind": "read",
         "desc": (
-            "取一份内置 SKILL 的全文。**两族共用这一个工具**——写镜头 prompt 之前读对应的"
-            "那一份，出素材参考图之前读出图那一份：\n"
+            "取一份内置 SKILL 的全文。支持传入规范名称（如 h3-prompt-writing, h3-base, h3-ref）"
+            "或官方文件引用路径（如 references/base-en.txt, references/ref-en.txt, SKILL.md）。\n"
             + skills.catalog()
             + "\n"
             + skills.image_catalog()
@@ -206,7 +206,7 @@ TOOLS: dict[str, dict[str, Any]] = {
             "name": {
                 "type": "string",
                 "enum": list(skills.ALL_NAMES),
-                "description": "SKILL 名",
+                "description": "SKILL 规范名或官方文件引用路径（如 h3-base、references/base-en.txt）",
             }
         },
         "required": ["name"],
@@ -1074,14 +1074,15 @@ async def _shot_after(
 
     if args.get("skill") is not None:
         declared = str(args["skill"]).strip().lower()
-        if declared not in skills.NAMES:
-            warnings.append(f"skill「{declared}」不是内置的那四份，只当备注看")
+        canonical = skills.ALIASES.get(declared, declared)
+        if canonical not in skills.NAMES:
+            warnings.append(f"skill「{declared}」不是内置的 MiniMax H3 SKILL，只当备注看")
         after["skill"] = declared
         expected = skills.pick(
             bool((before or {}).get("first_frame_asset_id")),
             bool((before or {}).get("last_frame_asset_id")),
         )
-        if before is not None and declared in skills.NAMES and declared != expected:
+        if before is not None and canonical in skills.NAMES and canonical != expected:
             warnings.append(
                 f"这个镜头挂的图对应 {expected} 那一份，但 prompt 是照 {declared} 写的——"
                 "锚定语可能与实际首 / 末帧不符"

@@ -127,7 +127,7 @@ time_of_day 填时间、location_name 用剧本里的地点原文（上一步刚
 _AUTO_SHOTS = """第四步（第 {index}/{total} 幕）：给这一幕拆分镜。
 
 这一幕的 scene_id 是 {scene_id}，标题「{title}」。先用 get_scene 看它现在什么样，
-再用 read_skill 取一份镜头提示词的写法（这一轮的镜头还没有指定首尾帧，取 ref 那一份）。
+再用 read_skill 取一份镜头提示词的写法（这一轮的镜头还没有指定首尾帧，取 h3-ref 或 references/ref-en.txt 那一份）。
 
 然后用 add_shot 提 {hint} 个镜头，每一镜：
 

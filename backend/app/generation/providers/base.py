@@ -489,34 +489,40 @@ def _book_notes(
 
 
 def render_video_prompt(req: VideoRequest, book: PictureBook) -> str:
-    """把这次要提交的正向 prompt 渲染成**参考生成那套六段格式**。全应用只有这一处拼装。
+    """把这次要提交的正向 prompt 渲染成 MiniMax H3 官方结构。
 
-    **为什么不是「四段格式 + 末尾一句参考素材说明」**（老的 `ref_hint` 那条路）：那句说明挤在
-    prompt 末尾时，模型读到的仍然是一段散文，`<Picture n>` 与画面里的人没有任何显式绑定；
-    而分镜里「保持两人服饰与面容一致」这类话在缺少 `retention_analysis` 的形状下会被字面执行成
-    「把这两个人画成同一个人」——那正是「张秀才长成了宋焘」的形状。六段格式给每张图一个
-    `<Subject n>`、给每个 subject 一句「保住它自己、别与别人混」，这两句话在四段格式里
-    压根没有地方落。
-
-    **段名与 `<Subject n>` / `<Picture n>` 一律英文**（模型端认的是这套结构），段里的内容照
-    原文的语言写——分镜是中文的，在这里翻译一遍只会丢细节。
-
-    `req.segments` 是空的（用户手写的自由文本 prompt）时不硬套三段，整段原样进
-    `detailed_description`：不替用户重写他自己写的 prompt。
+    - 基础模式 (T2VA / I2VA / FL2VA / L2VA)：按 references/base-en.txt 输出对齐行 + 三段核心结构；
+    - 全参考模式 (Ref2VA)：按 references/ref-en.txt 输出 subject_definitions -> summary -> retention_analysis -> detailed_description -> soundscape -> music。
     """
     shot = f"[Shot {max(1, int(req.shot_no or 1))}]"
     seconds = f"{max(0.0, float(req.duration or 0)):.2f}"
+
+    raw_skill = str(req.extra.get("skill") or "").lower()
+    has_subjects = bool(book.subjects) or any(k in raw_skill for k in ("ref", "ref2va", "h3-ref"))
+
     parts: list[str] = []
+
+    # 1. 关键帧时间轴对齐行（I2VA / FL2VA / L2VA）
     align = _align_line(book, shot, seconds)
     if align:
         parts.append(align)
-    parts.append(f"subject_definitions:\n{_definitions(book, shot)}")
-    parts.append(f"summary:\n{_summary(book, shot, seconds)}")
-    parts.append(f"retention_analysis:\n{_retention(book, shot)}")
-    parts.append(f"detailed_description:\n{_detail(req, shot, book)}")
+
+    if has_subjects:
+        # 全参考模式 (Ref2VA)
+        parts.append(f"subject_definitions:\n{_definitions(book, shot)}")
+        parts.append(f"summary:\n{_summary(book, shot, seconds)}")
+        parts.append(f"retention_analysis:\n{_retention(book, shot)}")
+        parts.append(f"detailed_description:\n{_detail(req, shot, book)}")
+    else:
+        # 基础 / 纯关键帧模式 (T2VA / I2VA / FL2VA / L2VA)
+        parts.append(f"integrated_multimodal_description:\n{_detail(req, shot, book)}")
+
+    # 声音设计
     parts.append(f"overall_soundscape:\n{_soundscape(req)}")
-    #: 无配乐是产品级硬约束（`ai/skills/video_prompt.py::AUDIO_RULE`），这一格永远是 none。
+
+    # 背景音乐约束
     parts.append("non_diegetic_music:\nnone")
+
     return "\n\n".join(parts)
 
 

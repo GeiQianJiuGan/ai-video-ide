@@ -287,8 +287,25 @@ def test_read_skill_gives_the_full_text_and_rejects_unknown_names(
 
     for name in skills.NAMES:
         text = skills.render(name)
-        assert "## 怎么写" in text and "## 范例" in text
-        assert "non_diegetic_music" in text, "无配乐那条必须写在每一份里"
+        assert "non_diegetic_music" in text, "MiniMax H3 规范必须包含 non_diegetic_music 结构"
+
+    # 测试官方文件引用路径及别名直接读取
+    for ref_path in (
+        "references/base-en.txt",
+        "references/ref-en.txt",
+        "base-en.txt",
+        "ref-en.txt",
+        "SKILL.md",
+        "skill/h3-prompt-writing/references/base-en.txt",
+        ".agents/skills/h3-prompt-writing/references/ref-en.txt",
+    ):
+        ref_text = skills.render(ref_path)
+        assert ref_text and not ref_text.startswith("Error:"), f"文件引用 {ref_path} 必须正确解析"
+        assert "non_diegetic_music" in ref_text or "H3 Prompt Writing" in ref_text
+
+    # 验证 ALL_NAMES 中包含官方文件引用路径
+    for f in skills.FILE_REFERENCES:
+        assert f in skills.ALL_NAMES, f"{f} 必须在 ALL_NAMES 清单中供 read_skill 使用"
 
     with pytest.raises(AppError) as caught:
         skills.render("不存在的 skill")
@@ -299,29 +316,29 @@ def test_read_skill_gives_the_full_text_and_rejects_unknown_names(
     # 清单只有一行一份：它是唯一进系统提示词的部分
     assert len(skills.catalog().splitlines()) == len(skills.NAMES)
 
+    # 智能体直接调用官方文件引用路径（如 read_skill references/base-en.txt）
     use_fake_llm(
         monkeypatch,
         [
             {
                 "content": "",
-                # 不用 call()：这个工具的参数就叫 name，会和辅助函数的形参撞上
-                "tool_calls": [{"id": "c1", "name": "read_skill", "arguments": {"name": "flf"}}],
+                "tool_calls": [{"id": "c1", "name": "read_skill", "arguments": {"name": "references/base-en.txt"}}],
             },
-            {"content": "照 flf 写。", "tool_calls": []},
+            {"content": "照 references/base-en.txt 写。", "tool_calls": []},
         ],
     )
-    resp = client.post(f"{API}/projects/{pid}/director/chat", json={"message": "怎么写 prompt"})
+    resp = client.post(f"{API}/projects/{pid}/director/chat", json={"message": "怎么写 base prompt"})
     assert resp.status_code == 201, resp.text
 
 
 def test_skill_pick_covers_every_frame_combination() -> None:
     from app.ai import skills
 
-    assert skills.pick(True, True) == "flf"
-    assert skills.pick(True, False) == "i2v"
-    assert skills.pick(False, True) == "l2v"
-    assert skills.pick(False, False, True) == "ref"
-    assert skills.pick(False, False, False) == "ref", "一张参考图都没有也退化到 ref"
+    assert skills.pick(True, True) == "h3-base"
+    assert skills.pick(True, False) == "h3-base"
+    assert skills.pick(False, True) == "h3-base"
+    assert skills.pick(False, False, True) == "h3-ref"
+    assert skills.pick(False, False, False) == "h3-prompt-writing"
 
 
 # --- 镜头级写工具 ---

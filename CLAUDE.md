@@ -492,9 +492,10 @@ kind / priority / included / reason / **media**（`image` / `video` / `audio`，
     于是每一轮 chat 的输入输出都是有界的。老的一次性拆解（`POST /story/breakdown[/apply]` +
     `story.propose_breakdown`）**降级为兼容路径**：后端与它的测试原样保留，界面上已经没有入口
     了——一次调用要吐出全部幕 + 全部镜头 + 每镜的 prompt，长剧本必然超时或被截断。
-  - **镜头 prompt 照内置 SKILL 写**（`app/ai/skills/video_prompt.py`，四份 `flf` / `i2v` /
-    `l2v` / `ref` 对应四种首尾帧形态，详见 docs/05）：**渐进披露**——只有 `catalog()` 那几行
-    进系统提示词，全文由 `read_skill(name)` 按需取一份。写工具收的是三段字段
+  - **镜头 prompt 照内置 SKILL 写**（`app/ai/skills/video_prompt.py`，基于 MiniMax H3 官方规范
+    `skill/h3-prompt-writing/`，涵盖 `h3-prompt-writing`、`h3-base`、`h3-ref` 以及官方文件引用
+    `references/base-en.txt`、`references/ref-en.txt`，详见 docs/05）：**渐进披露**——只有 `catalog()`
+    那几行进系统提示词，全文由 `read_skill(name)` 按需取一份。写工具收的是三段字段
     （`camera_motion` / `visual_prompt` / `audio_dialogue` / `negative_prompt` + `skill`），
     最终那段正向 prompt 由**已有的** `prompts.format_shot_prompt()` 再过
     `with_shot_audio_policy()` 拼出来——**无配乐那条硬约束只有一处口径**，SKILL 里的

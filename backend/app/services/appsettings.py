@@ -105,6 +105,14 @@ FIELDS: tuple[FieldSpec, ...] = (
         ),
         fetch="llm",
     ),
+    FieldSpec(
+        "llm.max_tokens",
+        "llm_max_tokens",
+        "llm",
+        "最大输出 Token",
+        "int",
+        impact="单次生成的最大 token 上限，默认 8192。调大可有效防止长分镜或复杂提案参数在生成中途被截断。",
+    ),
     # --- AI 导演的自动化程度。**这三项只改「谁按下那一下」，不改任何边界**：
     # 写工具照旧永不落库，落库照旧只走 `services/director.py::apply()` 那一份实现。
     FieldSpec(
