@@ -119,3 +119,8 @@ async def list_sheets(pid: str, aid: str) -> list[dict[str, Any]]:
 @router.post("/projects/{pid}/appearances/{aid}/sheets", status_code=201)
 async def add_sheet(pid: str, aid: str, body: SheetBody) -> dict[str, Any]:
     return await cast.add_sheet(pid, aid, body.asset_id, body.source)
+
+
+@router.delete("/projects/{pid}/appearances/{aid}/sheets/{sheet_id}", status_code=204)
+async def delete_sheet(pid: str, aid: str, sheet_id: str) -> None:
+    await cast.delete_sheet(pid, sheet_id)

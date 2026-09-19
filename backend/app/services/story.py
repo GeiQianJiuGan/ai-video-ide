@@ -457,7 +457,7 @@ class StoryService:
         async with db.write() as session:
             row = await session.get(Story, current["id"])
             assert row is not None
-            for key in ("title", "raw_text", "mode"):
+            for key in ("title", "raw_text", "screenplay_md", "mode"):
                 if key in patch and patch[key] is not None:
                     setattr(row, key, patch[key])
             row.updated_at = utc_now()
@@ -938,9 +938,7 @@ class StoryService:
                 if ver is not None:
                     old_in = float(ver.in_point or 0.0)
                     old_out = (
-                        float(ver.out_point)
-                        if ver.out_point is not None
-                        else old_in + total_dur
+                        float(ver.out_point) if ver.out_point is not None else old_in + total_dur
                     )
                     cut = round(old_in + at, 3)
 
@@ -972,9 +970,7 @@ class StoryService:
                         )
 
                     first_version_id = new_id("generation_version")
-                    session.add(
-                        half(first_version_id, shot_id, next_no, old_in, cut, first_dur)
-                    )
+                    session.add(half(first_version_id, shot_id, next_no, old_in, cut, first_dur))
                     fresh_shot.current_version_id = first_version_id
 
                     new_version_id = new_id("generation_version")

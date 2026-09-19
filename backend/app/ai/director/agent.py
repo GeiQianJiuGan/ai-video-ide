@@ -26,13 +26,28 @@ from typing import Any
 from app.ai import prompts
 from app.ai.director.tools import TOOLS, WRITE_TOOLS, run_read, to_op, tool_specs
 from app.ai.llm import client as llm
+from app.core.config import settings
 from app.core.logging import get_logger
 
 log = get_logger("director")
 
-#: 转多少轮就停手。一轮正常的拆解是「read_script 读一段 → read_skill 取一份写法 →
-#: add_scene → 若干 add_shot → 说句话」，六轮根本不够；十六轮之后仍在绕圈就该停手了。
-MAX_ROUNDS = 16
+#: 转多少轮就停手的**默认值**（也是 `config.director_max_rounds` 的默认）。真正生效的上限
+#: 由 `max_rounds()` 从应用级设置里取——一部一百多幕的长剧本，一轮只推进一幕左右，本来就要
+#: 上百轮才拆得完，所以这个天花板定得高。它只是最后那道防线：真正拦住「转不动的死循环」的是
+#: 下面的**连续空转检测**（`STALL_LIMIT`），而不是这个数。
+MAX_ROUNDS = 150
+
+#: 连着这么多轮一次成功的工具调用都没有（既没攒出提案、也没读到东西，全是报错 / 未知工具 /
+#: 参数损坏）就判定它转不动了，提前收尾——把已经产出的提案照旧保留。有了它，把上面那个天花板
+#: 抬高就不再等于「多烧几十轮的错」：真在推进就一直走，真卡住了几轮就停。
+#: 连续 JSON 参数损坏另有一条更早的熔断（3 轮，见下面 `collaborate`），措辞不同、不改这条。
+STALL_LIMIT = 6
+
+
+def max_rounds() -> int:
+    """这一轮协作最多和模型往返几次。来自应用级设置，夹在 [1, 400] 之间防误配。"""
+    return max(1, min(400, int(settings.director_max_rounds)))
+
 
 #: 角色与规则那一段是**可配的**（设置页「AI 提示词」→「AI 导演」），内置默认在
 #: `app/ai/prompts.py::DIRECTOR_TASK`。这里只负责把它取出来用。
@@ -80,6 +95,9 @@ async def _snapshot(pid: str) -> str:
         "characters": await run_read(pid, "list_characters", {}),
         "locations": await run_read(pid, "list_locations", {}),
         "props": await run_read(pid, "list_props", {}),
+        #: 这条路没有 read_screenplay，把现有的剧本 MD 一起喂进去，它才能整份回填地维护
+        #: （update_screenplay 是整份替换，看不到现状就会把它冲成一行增量）。
+        "screenplay": await run_read(pid, "read_screenplay", {}),
     }
     try:
         head = await run_read(pid, "read_script", {"offset": 0, "limit": FALLBACK_SCRIPT_CHARS})
@@ -195,7 +213,10 @@ async def collaborate(
     rounds = 0
     over_limit = True
     consecutive_json_errors = 0
-    while rounds < MAX_ROUNDS:
+    #: 连着几轮一次成功的工具调用都没有。>= STALL_LIMIT 就判定转不动、提前收尾。
+    consecutive_stalls = 0
+    limit = max_rounds()
+    while rounds < limit:
         rounds += 1
         out: dict[str, Any] = {"content": "", "tool_calls": []}
         pruned_msgs = _prune_messages_for_context(messages)
@@ -216,6 +237,7 @@ async def collaborate(
         for c in calls:
             if isinstance(c.get("arguments"), str):
                 from app.ai.llm.protocols import _tool_args
+
                 c["arguments"] = _tool_args(c.get("name"), c["arguments"])
         messages.append(
             {
@@ -270,6 +292,23 @@ async def collaborate(
                 break
         elif round_has_ok:
             consecutive_json_errors = 0
+
+        # 空转检测：这一轮一次成功的工具调用都没有（全是报错 / 未知工具 / 换个 id 又错）。
+        # 连着几轮都这样就是转不动了，别再让抬高了的天花板陪它空烧几十轮。
+        if round_has_ok:
+            consecutive_stalls = 0
+        else:
+            consecutive_stalls += 1
+            if consecutive_stalls >= STALL_LIMIT:
+                warn_note = (
+                    f"AI 连续 {consecutive_stalls} 轮都没能成功执行任何一步（多为 id 用错或"
+                    "反复重试同一个失败的调用），已停下并保留此前产出的提案。"
+                    "建议把要求说得更具体，或直接在流程图上手动改。"
+                )
+                said.append(warn_note)
+                yield {"kind": "delta", "text": f"\n\n{warn_note}"}
+                over_limit = False
+                break
     yield {
         "kind": "result",
         "result": {
@@ -316,6 +355,7 @@ async def _run_one(
     args = call.get("arguments")
     if isinstance(args, str):
         from app.ai.llm.protocols import _tool_args
+
         args = _tool_args(name, args)
     elif not isinstance(args, dict):
         args = {}

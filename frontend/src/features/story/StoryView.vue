@@ -25,6 +25,7 @@ import {
   Bot,
   ChevronDown,
   ChevronUp,
+  FileText,
   Pencil,
   Plus,
   RefreshCw,
@@ -54,6 +55,13 @@ const pid = computed(() => String(route.params.pid ?? ''))
 
 const newSceneTitle = ref('')
 const newShotTitle = ref('')
+
+/**
+ * AI 维护的剧本 MD（工作流第一步的产物）。这一页**只读**——它由右侧 AI 编剧那栏的
+ * `update_screenplay` 提案落库，这里展示出来，是拆幕拆镜头的底本。空的就不显示这一条。
+ */
+const screenplay = computed(() => story.story?.screenplay_md ?? '')
+const screenplayOpen = ref(false)
 
 /**
  * 左右两栏同时看得见：幕与镜头（主）+ 场景属性（右）。
@@ -307,6 +315,29 @@ function fmtDuration(n: number): string {
       <AppButton size="sm" variant="ghost" :disabled="story.busy" @click="reload()">
         <RefreshCw :size="10" />刷新
       </AppButton>
+    </div>
+
+    <!-- AI 维护的剧本 MD（只读）：工作流第一步的产物，拆幕拆镜头的底本。空的不显示 -->
+    <div v-if="screenplay" class="border-line-1 bg-base-1 shrink-0 border-b">
+      <button
+        class="hover:bg-base-2 flex w-full items-center gap-1.5 px-2 py-1 text-left"
+        title="这份剧本由右侧 AI 编剧维护（update_screenplay），是拆幕拆镜头的底本；这一页只读"
+        @click="screenplayOpen = !screenplayOpen"
+      >
+        <FileText :size="10" class="text-fg-4 shrink-0" />
+        <span class="text-fg-2 text-2xs">AI 维护的剧本</span>
+        <span class="text-fg-4 truncate text-2xs">· 拆幕拆镜头的底本（只读，由 AI 编剧维护）</span>
+        <component
+          :is="screenplayOpen ? ChevronUp : ChevronDown"
+          :size="10"
+          class="text-fg-4 ml-auto shrink-0"
+        />
+      </button>
+      <pre
+        v-if="screenplayOpen"
+        class="border-line-1 text-fg-2 max-h-64 overflow-auto border-t px-3 py-2 text-2xs leading-relaxed whitespace-pre-wrap"
+        >{{ screenplay }}</pre
+      >
     </div>
 
     <ErrorPanel

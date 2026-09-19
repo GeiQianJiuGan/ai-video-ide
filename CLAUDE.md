@@ -477,16 +477,29 @@ kind / priority / included / reason / **media**（`image` / `video` / `audio`，
 - **AI 协作栏**（`app/ai/director/` + `app/ai/skills/` + `services/director.py` +
   `api/director.py`，前端 `features/director/DirectorPanel.vue`——**剧本页与幕流程图页共用这一个
   组件，也共用同一个会话**，所以它不在任何一个 feature 目录下面）：`ai/director/tools.py` 里那条
-  **读 / 写分界就是安全边界**——读工具（`list_*` / `get_scene` / `read_script` / `read_skill`）
-  立刻执行，写工具（幕级 `add_scene` / `set_link` / … + 镜头级 `add_shot` / `update_shot` /
-  `delete_shot` / `reorder_shots` / `set_shot_link`）**永不落库**，只翻译成一条提案
+  **读 / 写分界就是安全边界**——读工具（`list_*` / `get_scene` / `read_script` / `read_screenplay` / `read_skill`）
+  立刻执行，写工具（剧本级 `update_screenplay` + 幕级 `add_scene` / `set_link` / … + 镜头级
+  `add_shot` / `update_shot` / `delete_shot` / `reorder_shots` / `set_shot_link`）**永不落库**，只翻译成一条提案
   `{op, target, temp_id, before, after, why, warnings}`。`chat` 一行库都不改，
   只有 `POST /director/apply` 才落，且只落 `op != "reject"` 的条目（照
   `story.propose_breakdown` / `apply_breakdown` 的老规矩），逐条转调已有的 `story` / `sequence`
-  写方法——绝不另写一份写库逻辑。工具循环上限 `agent.MAX_ROUNDS = 16`；转满轮数时**先把提案落成
+  写方法——绝不另写一份写库逻辑。工具循环上限是应用级设置 `director.max_rounds`
+  （`agent.max_rounds()` 取值，默认 150、夹在 1~400 之间；`agent.MAX_ROUNDS` 只是那个默认值）
+  ——拆一部一百多幕的长剧本本来就要上百轮，定死在十几会把它拦在半路。真正拦「转不动的死循环」
+  的是**连续空转检测**（`agent.STALL_LIMIT = 6`：连着几轮一次成功的工具调用都没有就提前收尾，
+  另有连续 JSON 参数损坏的 3 轮熔断），而不是那个天花板。转满轮数 / 空转收尾时都**先把提案落成
   `DirectorTurn` 记录再报错**，已产出的提案照旧可审阅。不支持 function calling 的端（Ollama）
   退化成一次性 `complete_json()`，提案形状完全一样。会话与提案存 `DirectorTurn`（只增不改），
   审阅到一半刷新页面不丢。
+  - **分步写剧本工作流**（`read_screenplay` / `update_screenplay` + 镜头 `description` +
+    `read_skill`）：第一步维护一份 AI 攒出来的剧本 MD（`Story.screenplay_md`，迁移 `0023`——
+    与用户原文 `raw_text` 是两件事：那是源头、绝不覆盖，这是拆幕拆镜头的底本，「类似一份会随
+    对话更新的记忆」；`update_screenplay` 是**整份替换**不是增量）；第二步把剧情拆进幕与镜头，
+    **每一镜的剧情详情写在 `Shot.description` 里**（复用已有列，界面上本来就叫「剧情详情」），
+    **要连贯**——下一镜出场的人 / 道具，在上一镜的 description 里就交代好此刻的位置与动作；
+    第三步照 `read_skill` 取的写法把 description 转成 `camera_motion` / `visual_prompt` /
+    `audio_dialogue` 三段 prompt。三步都是提案，免确认模式下走同一条 `apply()` 直接落库，
+    不再要用户逐条点「采用」。一键全流程的第一步（digest）就是产出并落一条 `update_screenplay`。
   - **拆长剧本靠分段读，不靠一次吐完**：`read_script(offset, limit)` 回
     `{total, offset, next_offset, done, text}`，模型自己一段一段读、每次只就读到的那一段提案，
     于是每一轮 chat 的输入输出都是有界的。老的一次性拆解（`POST /story/breakdown[/apply]` +
@@ -523,6 +536,13 @@ kind / priority / included / reason / **media**（`image` / `video` / `audio`，
     `_wire_pending` 一处），绝不让一条被丢弃的提案带走整个镜头。
     **前端必须把这几句显示出来**（`DirectorPanel.vue::appliedRows`）：落成了的那张提案卡会
     走掉，只给一行「已落库 N 条」等于把降级藏起来（硬约束 4）。
+  - **每一轮的改动留一份只读 Diff**（`DirectorPanel.vue`：feed 按 `director.turns` 时间顺序摊开，
+    `stores/director.ts::livePendingTurnId`）：对话里每条 `proposal` 记录都画成一张可折叠的
+    「AI 改动 · N 处」卡，展开就是这一轮每一处的 before → after（复用 `rowsOf` / `visibleRows`）。
+    提案记录本来就冻结了完整的 `{ops:[{before, after, …}]}`，所以这纯是渲染——**免确认模式 /
+    一键全流程落库、右栏那份可操作的卡走掉之后，「这一轮动了哪里、改成什么样」照样翻得到**，
+    不是只剩「已落库 N 条」。正等审的那条（`livePendingTurnId`，判据同 `restorePending`）在历史区
+    跳过，只在底部那份可操作的分组卡里画一次，绝不两处都画；`applied` 记录顺手画个落库收尾标。
   - **免确认模式是「chat 也落库」的唯一例外**（设置项 `director.auto_apply`，口径只有
     `director.auto_status()` 一份 → `GET /director` 的 `auto` 块 → 前端不记第二份默认值）：
     开着时 `chat` / `chat/stream` 在**产出提案的同一个请求里**接着走 `apply()`，响应
@@ -764,7 +784,10 @@ kind / priority / included / reason / **media**（`image` / `video` / `audio`，
 - **新增表**：工程表必须在 `persistence/all_models.py` 里 import，否则 `Base.metadata` 漏表；
   素材库表相反——挂 `LibraryBase`，**不要**进 `all_models.py`（理由见上面的素材库段）。
 - **新增迁移**：`alembic/versions/` 加脚本 → 在 `persistence/migrate.py::REVISION_SCHEMA` 登记
-  它对应的 schema 版本 → 同步 `settings.schema_version`（当前 22，最新一条是
+  它对应的 schema 版本 → 同步 `settings.schema_version`（当前 23，最新一条是
+  `0023_story_screenplay`：`story.screenplay_md` 一列——AI 维护的剧本 MD，可空默认空串，
+  与 `raw_text` 是两件事，见上面 AI 协作栏那段的「分步写剧本工作流」；`shot` / `scene` 一列
+  不动，镜头剧情详情复用已有的 `shot.description`。上一条是
   `0022_project_route`：`project.generation_mode` 改**可空、默认 `''`**——空串 = 跟随设置页，
   同时把老库里的 `workflow_api` 归一成 `comfy_workflow`、把等于旧默认值 `comfy_preset` 的行清成
   空串（这一列在此之前从未被读过，所以不丢用户意图），见上面的「工程路由」段；

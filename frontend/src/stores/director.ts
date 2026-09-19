@@ -87,8 +87,9 @@ export const useDirectorStore = defineStore('director', () => {
   const unsaved = ref(false)
 
   /**
-   * 这一轮已经抽进输入框的附件。**它不是「待发送的文件」**——文字早就在 `draft` 里了，
-   * 这几条留着的是「按什么读的 / 有没有截断」这些必须显示出来的话。
+   * 待随下一条消息发送的附件。**它是真正会跟着消息走的东西**（不再灌进输入框）：
+   * 发送时一并交给 `chatStream`，成功收尾后清空。每条还带着「按什么读的 / 有没有截断」
+   * 这些必须显示出来的话。
    */
   const attached = ref<DirectorAttachment[]>([])
   /** true = 正在抽某一份附件。与 `busy` 分开：抽文字不该把整栏锁住。 */
@@ -105,6 +106,17 @@ export const useDirectorStore = defineStore('director', () => {
   const messages = computed(() =>
     turns.value.filter((t) => t.role === 'user' || t.role === 'assistant'),
   )
+  /**
+   * 还在等审的那条 `proposal` 记录的 id（没有就是空串）。判据与 `restorePending()` 完全一致
+   * ——**最后一条 `proposal`/`applied` 记录是 `proposal`**，说明它后面还没落库、正摆在右栏
+   * 等采用。协作栏据此把它**从历史 Diff 里跳过**：它作为可操作的分组卡在底部显示，历史区再
+   * 画一遍就成了两份。除它之外的每条 `proposal` 都是「这一轮 AI 改了什么」的只读留存
+   * （免确认 / 一键全流程落完的那几条正是这一种——待审列表已归零，但改动前后照样看得见）。
+   */
+  const livePendingTurnId = computed(() => {
+    const last = [...turns.value].reverse().find((t) => t.role === 'proposal' || t.role === 'applied')
+    return last && last.role === 'proposal' ? last.id : ''
+  })
   const llm = computed(() => history.value?.llm ?? null)
   const configured = computed(() => Boolean(history.value?.llm.configured))
   const note = computed(() => history.value?.note ?? '')
@@ -222,11 +234,12 @@ export const useDirectorStore = defineStore('director', () => {
     live.value = ''
     trace.value = []
     pending.value = []
-    // 那段文字已经跟着这句话走了，输入框空了——附件那几条提示也就过期了。
+    // 这几份附件要跟着这条消息一起走。抓一份快照再清空——发出去之后它们就归这条消息了。
+    const atts = [...attached.value]
     attached.value = []
     let ok = false
     try {
-      for await (const event of directorApi.chatStream(pid, message, scope, ctl.signal)) {
+      for await (const event of directorApi.chatStream(pid, message, scope, ctl.signal, atts)) {
         if (event.event === 'delta') live.value += event.data.text
         else if (event.event === 'tool') noteTool(event.data)
         else if (event.event === 'op') pending.value = [...pending.value, event.data]
@@ -260,7 +273,8 @@ export const useDirectorStore = defineStore('director', () => {
   }
 
   /**
-   * 一份附件 → 一段纯文本，交给调用方塞进输入框。**一行库都不动，也不出网。**
+   * 一份附件 → 一段纯文本，挂进待发送列表（`attached`）。**一行库都不动，也不出网。**
+   * 文字不再灌进输入框：它作为独立字段随下一条消息一起走（见 `send()`）。
    *
    * 抽不了（.pdf / .doc / 太大 / 整份都是图）时回 null，原因连 suggestions 一起进
    * `lastError`——和这一栏其它失败同一个显示位置。**刻意不走 `guarded()`**：
@@ -281,7 +295,7 @@ export const useDirectorStore = defineStore('director', () => {
     }
   }
 
-  /** 把某一条附件的提示从列表里去掉。**不动 `draft`**：那段文字是用户自己的了。 */
+  /** 把某一份附件从待发送列表里拿掉——拿掉之后它就不会跟着下一条消息走了。 */
   function forgetAttachment(filename: string): void {
     const at = attached.value.findIndex((row) => row.filename === filename)
     if (at >= 0) attached.value = attached.value.filter((_, i) => i !== at)
@@ -353,9 +367,10 @@ export const useDirectorStore = defineStore('director', () => {
     live.value = ''
     trace.value = []
     try {
-      const out = await directorApi.autopilot(pid, body)
+      // 附件随这一趟的原文一起走：后端会把它们的文字拼进这一章的剧本原文。
+      const out = await directorApi.autopilot(pid, { ...body, attachments: [...attached.value] })
       lastAutopilot.value = out
-      // 那段原文已经跟着这一趟走了（也存进了工程），输入框会被清空——附件那几条提示就过期了。
+      // 那段原文已经跟着这一趟走了（也存进了工程）——附件也归它了，清空待发送列表。
       attached.value = []
       return out
     } catch (err) {
@@ -388,6 +403,7 @@ export const useDirectorStore = defineStore('director', () => {
     history,
     turns,
     messages,
+    livePendingTurnId,
     llm,
     configured,
     note,

@@ -38,6 +38,13 @@ class Story(Base):
     id: Mapped[str] = mapped_column(String(40), primary_key=True)
     title: Mapped[str] = mapped_column(String(200), nullable=False, default="未命名剧本")
     raw_text: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    #: **AI 维护的剧本 MD 文档**（工作流第一步的产物）。它和 `raw_text` 是两件事：
+    #: `raw_text` 是用户贴进来的原文（源头，绝不悄悄覆盖）；`screenplay_md` 是 AI 根据用户
+    #: 那句话一段一段攒出来、随对话更新的一份 Markdown 剧本——「类似 AI 记忆，保持在项目里」。
+    #: 拆幕、拆镜头都以它为底本，于是「这部片子到底在讲什么」有一个持久、可读、可改的真源，
+    #: 而不是散落在几十条聊天气泡里。空 = 还没开始攒。它由 `update_screenplay` 提案落库
+    #: （免确认模式下同一个请求直接落），走的还是那条「写工具永不落库，只有 apply 落」的老路。
+    screenplay_md: Mapped[str] = mapped_column(Text, nullable=False, default="")
     #: manual / ai_assisted / ai_auto——记录这份结构是怎么来的，便于回溯。
     mode: Mapped[str] = mapped_column(String(20), nullable=False, default="manual")
     created_at: Mapped[str] = mapped_column(String(40), nullable=False, default=utc_now)

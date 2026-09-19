@@ -33,7 +33,7 @@ class Settings(BaseSettings):
 
     app_name: str = "AI Video Studio"
     version: str = "0.1.0"
-    schema_version: int = 22
+    schema_version: int = 23
 
     # --- 网络：只监听回环，绝不对外暴露工程数据 ---
     host: str = "127.0.0.1"
@@ -163,6 +163,13 @@ class Settings(BaseSettings):
     #: 一次「一键全流程」最多拆几幕。它同时就是这一次要烧多少 token 的上限：
     #: 分镜那一步是**按幕各来一轮**的。剩下的部分照旧可以再跑一次。
     director_max_scenes: int = 6
+    #: 协作栏一轮对话里，AI 最多和模型往返多少次工具调用就停手。
+    #: 拆一部长剧本是「读一段原文 → 取一份写法 → add_scene → 若干 add_shot」这样一轮
+    #: 一轮推进的，一百多幕的剧本本来就要上百轮才拆得完——所以这个上限不能定死在十几。
+    #: 真正拦住「转不动的死循环」的是**连续空转检测**（见 `agent.py`），不是这个天花板：
+    #: 只要每一轮都在产出提案或读到东西，就一直往下走；连着几轮一次成功的工具调用都没有
+    #: 才停手。这里只是最后那道防线，防止极端情况下无限烧 token。
+    director_max_rounds: int = 150
 
     # --- 系统提示词：空字符串表示「用内置默认」（内置文本在 app/ai/prompts.py）---
     # 「AI 拆出来的场景不够好」多半是这段话不够好，所以它必须可改。

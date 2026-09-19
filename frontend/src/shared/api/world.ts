@@ -116,6 +116,8 @@ export const worldApi = {
       asset_id: assetId,
       camera: camera || null,
     }),
+  removeVariantReference: (pid: string, vid: string, refId: string) =>
+    api.del<void>(`/projects/${pid}/variants/${vid}/references/${refId}`),
 
   props: (pid: string) => api.get<Prop[]>(`/projects/${pid}/props`),
   createProp: (pid: string, patch: PropCreatePatch) => api.post<Prop>(`/projects/${pid}/props`, patch),
@@ -130,4 +132,6 @@ export const worldApi = {
       asset_id: assetId,
       note: note || null,
     }),
+  removePropReference: (pid: string, propId: string, refId: string) =>
+    api.del<void>(`/projects/${pid}/props/${propId}/references/${refId}`),
 }

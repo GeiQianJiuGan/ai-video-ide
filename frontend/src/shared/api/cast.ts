@@ -174,4 +174,6 @@ export const castApi = {
       asset_id: assetId,
       source,
     }),
+  removeSheet: (pid: string, aid: string, sheetId: string) =>
+    api.del<void>(`/projects/${pid}/appearances/${aid}/sheets/${sheetId}`),
 }

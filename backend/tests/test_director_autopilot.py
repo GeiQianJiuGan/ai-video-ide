@@ -99,9 +99,22 @@ def fake_llm(
             asked.append(said)
         if stage and stage == boom:
             raise RuntimeError("模型这一步没答上来")
-        # 工具跑完那一轮只需收尾说一句话；第一步全程只说话，一条提案都不提。
-        if stage == STAGES[0] or any(m["role"] == "tool" for m in messages):
+        # 工具跑完那一轮只需收尾说一句话。
+        if any(m["role"] == "tool" for m in messages):
             return {"content": f"（{stage or '收尾'}）好了。", "tool_calls": []}
+        # 第一步：把剧本攒成一份 MD 存进工程（update_screenplay，整份替换）。
+        if stage == STAGES[0]:
+            return {
+                "content": "",
+                "tool_calls": [
+                    call(
+                        "update_screenplay",
+                        1,
+                        screenplay_md="# 主线\n雨夜的老码头，阿岚用旧铜钥匙打开三号仓库。",
+                        why="第一步：攒出剧本底本",
+                    )
+                ],
+            }
         if stage == STAGES[1]:
             return {"content": "", "tool_calls": materials()}
         if stage == STAGES[2]:
@@ -219,6 +232,52 @@ def test_auto_apply_lands_the_proposal_in_the_same_request(
     assert [s["title"] for s in client.get(f"{API}/projects/{pid}/scenes").json()] == ["雨夜追车"]
 
 
+# --- 剧本 MD（工作流第一步）：走提案，免确认时直接落 ---
+
+
+def test_update_screenplay_is_a_proposal_until_applied(
+    client: TestClient, pid: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """维护剧本 MD 照旧是提案：`chat` 一个字都不落，`apply` 才把它写进 story.screenplay_md。"""
+    md = "# 主线\n雨夜的老码头。\n\n## 关键情节\n1. 阿岚回到码头。"
+    one_op_llm(monkeypatch, call("update_screenplay", 1, screenplay_md=md, why="第一步：攒剧本"))
+
+    out = client.post(
+        f"{API}/projects/{pid}/director/chat",
+        json={"message": "把这段剧情记成剧本", "scope": "script"},
+    )
+    assert out.status_code == 201, out.text
+    body = out.json()
+    assert body["auto_applied"] is False
+    assert [op["op"] for op in body["ops"]] == ["update_screenplay"]
+    assert client.get(f"{API}/projects/{pid}/story").json()["screenplay_md"] == "", (
+        "提案阶段一个字都不许落"
+    )
+
+    applied = client.post(f"{API}/projects/{pid}/director/apply", json={"ops": body["ops"]})
+    assert applied.status_code == 201, applied.text
+    assert client.get(f"{API}/projects/{pid}/story").json()["screenplay_md"] == md
+
+
+def test_update_screenplay_lands_directly_under_auto_apply(
+    client: TestClient, pid: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """免确认模式开着时，剧本 MD 在同一个请求里就落进工程——不再要用户点一下。"""
+    md = "# 主线\n清晨的渔市。"
+    one_op_llm(monkeypatch, call("update_screenplay", 1, screenplay_md=md, why="攒剧本"))
+    auto_on(monkeypatch)
+
+    out = client.post(
+        f"{API}/projects/{pid}/director/chat",
+        json={"message": "记成剧本", "scope": "script"},
+    )
+    assert out.status_code == 201, out.text
+    body = out.json()
+    assert body["auto_applied"] is True and body["count"] == 1
+    assert [e["op"] for e in body["applied"]] == ["update_screenplay"]
+    assert client.get(f"{API}/projects/{pid}/story").json()["screenplay_md"] == md
+
+
 # --- 一键全流程：要免确认开着 ---
 
 
@@ -260,7 +319,11 @@ def test_autopilot_runs_the_four_stages_and_lands_them(
     assert body["auto_apply"] is True and body["halted"] is False
     assert [s["stage"] for s in body["stages"]] == ["digest", "materials", "scenes", "shots"]
     assert [s["label"] for s in body["stages"][:3]] == ["核心剧本", "人物 / 地点 / 道具", "拆幕"]
-    assert body["stages"][0]["count"] == 0, "第一步只读剧本说结论，一条提案都不提"
+    assert body["stages"][0]["count"] == 1, "第一步把剧本攒成一份 MD 落进工程"
+    assert [e["op"] for e in body["stages"][0]["applied"]] == ["update_screenplay"]
+    assert client.get(f"{API}/projects/{pid}/story").json()["screenplay_md"].strip(), (
+        "第一步的剧本 MD 要真的落进 story.screenplay_md"
+    )
     assert body["script"] == {"chars": len(CHAPTER), "saved": False, "replaced": False}
     assert body["failed"] == [] and body["warnings"] == []
 
@@ -433,8 +496,11 @@ def test_autopilot_keeps_what_landed_when_a_step_breaks(
 def test_autopilot_breaking_before_anything_lands_is_a_clean_error(
     client: TestClient, pid: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """一行业务数据都还没落就断了 → 干净的四要素错误，不回一张空回执让用户自己猜。"""
-    fake_llm(monkeypatch, boom=STAGES[1])
+    """一行业务数据都还没落就断了 → 干净的四要素错误，不回一张空回执让用户自己猜。
+
+    第一步（攒剧本 MD）就是最先落数据的那一步，所以「什么都还没落」= 断在第一步。
+    """
+    fake_llm(monkeypatch, boom=STAGES[0])
     auto_on(monkeypatch)
     store_script(client, pid, CHAPTER)
 
@@ -444,5 +510,6 @@ def test_autopilot_breaking_before_anything_lands_is_a_clean_error(
 
     assert err["code"] == "LLM_UNAVAILABLE"
     assert any("已经落进库" in s for s in err["suggestions"])
+    assert client.get(f"{API}/projects/{pid}/story").json()["screenplay_md"] == ""
     assert client.get(f"{API}/projects/{pid}/characters").json() == []
     assert client.get(f"{API}/projects/{pid}/scenes").json() == []

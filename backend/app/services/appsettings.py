@@ -151,6 +151,19 @@ FIELDS: tuple[FieldSpec, ...] = (
         ),
     ),
     FieldSpec(
+        "director.max_rounds",
+        "director_max_rounds",
+        "director",
+        "协作栏单轮最多往返几次",
+        "int",
+        impact=(
+            "协作栏一轮对话里 AI 最多和模型往返多少次工具调用。拆一部长剧本是「读一段原文 →"
+            "add_scene → 若干 add_shot」这样一轮一轮推进的，一百多幕本来就要上百轮才拆得完，"
+            "所以默认给到 150（夹在 1~400 之间）。真正拦住死循环的是连续空转检测，不是这个数——"
+            "只要还在产出提案就一直走；调大它只影响能跑多久，不会放过转不动的情况。"
+        ),
+    ),
+    FieldSpec(
         "prompt.breakdown",
         "prompt_breakdown",
         "prompt",

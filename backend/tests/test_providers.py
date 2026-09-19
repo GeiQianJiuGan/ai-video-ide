@@ -1871,3 +1871,48 @@ def test_detail_anchors_first_frame_when_not_in_prompt() -> None:
     assert "首帧（<Picture 1>）" in detail
     assert detail.startswith("[Shot 2] 画面从首帧（<Picture 1>）建立的构图开始，官差迈步进屋")
 
+
+def test_detail_binds_character_name_to_subject() -> None:
+    """画面描述里第一次出现的角色名被标成 `<Subject n>`——模型不用再拿裸名字去猜是谁。
+
+    账单里的名字是「角色名（形象名）」，AI 写描述时只用了角色名那一截，两个都要能对上。
+    """
+    from app.generation.providers import base
+
+    ff = base.Picture(
+        role="first_frame", kind="first_frame", media="image", name="首帧", file="ff.png", index=1
+    )
+    alan = base.Picture(
+        role="reference", kind="character_sheet", media="image",
+        name="阿岚（默认形象）", file="alan.png", index=2, subject=1,
+    )
+    book = base.PictureBook(items=[ff, alan])
+
+    req = base.VideoRequest(
+        mode="i2v",
+        segments={"visual_prompt": "阿岚在森林里缓步前行，四下张望", "camera_motion": "中景跟随"},
+    )
+    detail = base._detail(req, "[Shot 1]", book)
+    assert "阿岚（<Subject 1>）在森林里缓步前行" in detail, "裸名字要接回它的 <Subject n>"
+    assert detail.count("<Subject 1>") == 1, "只标第一次出现"
+
+
+def test_detail_does_not_bind_location_or_missing_names() -> None:
+    """地点 / 道具不标 `<Subject n>`（避免把环境交代当成要逐帧保真的实体），
+    描述里没提到的角色也不硬塞。"""
+    from app.generation.providers import base
+
+    spot = base.Picture(
+        role="reference", kind="location_reference", media="image",
+        name="雨夜巷口", file="alley.png", index=1, subject=1,
+    )
+    person = base.Picture(
+        role="reference", kind="character_sheet", media="image",
+        name="林小雨（常服）", file="lin.png", index=2, subject=2,
+    )
+    book = base.PictureBook(items=[spot, person])
+
+    req = base.VideoRequest(mode="i2v", segments={"visual_prompt": "雨夜巷口空无一人"})
+    detail = base._detail(req, "[Shot 3]", book)
+    assert "<Subject" not in detail, "地点名不标 subject，未出场的人物也不硬塞"
+

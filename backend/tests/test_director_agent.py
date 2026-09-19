@@ -194,6 +194,45 @@ def test_tool_failure_is_fed_back_not_thrown(
     assert "改用新增" in resp.json()["turns"][0]["content"]["text"]
 
 
+def test_stall_stops_early_without_burning_the_whole_ceiling(
+    client: TestClient, pid: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """模型连着几轮都在编不存在的 id：一次成功都没有，别陪它转满上百轮。
+
+    空转检测（`STALL_LIMIT`）在远低于 `max_rounds()` 的地方就收尾，且提案照旧保留。
+    """
+    calls = use_fake_llm(
+        monkeypatch,
+        [{"content": "", "tool_calls": [call("update_scene", scene_id="scn_没有", title="x")]}],
+    )
+    resp = client.post(f"{API}/projects/{pid}/director/chat", json={"message": "一直改错的幕"})
+    # 一步都没成功、也没产出提案 → 收尾在 201（无提案不报 over_limit 那条 error）
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["ops"] == []
+    # 真正的关键：远没跑满上限就停了
+    assert len(calls) == agent.STALL_LIMIT, "连续空转到阈值就该停，不该耗光整个上限"
+    assert len(calls) < agent.max_rounds()
+
+
+def test_max_rounds_follows_the_app_setting(
+    client: TestClient, pid: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """单轮往返上限是应用级设置，不是写死的常量。"""
+    monkeypatch.setattr(settings, "director_max_rounds", 4)
+    assert agent.max_rounds() == 4
+    # 每轮都产出提案（不触发空转），于是正好在这个上限处转满
+    calls = use_fake_llm(
+        monkeypatch,
+        [{"content": "", "tool_calls": [call("add_scene", title="又一幕", why="停不下来")]}],
+    )
+    resp = client.post(f"{API}/projects/{pid}/director/chat", json={"message": "一直加"})
+    assert resp.status_code == 400
+    assert len(calls) == 4
+    history = client.get(f"{API}/projects/{pid}/director").json()
+    proposal = next(t for t in history["turns"] if t["role"] == "proposal")
+    assert len(proposal["content"]["ops"]) == 4
+
+
 def test_degrades_to_one_shot_json_without_tool_support(
     client: TestClient, pid: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:

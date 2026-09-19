@@ -193,6 +193,43 @@ class WorldService:
         )
         return [as_dict(r) for r in rows]
 
+    async def delete_variant_reference(self, pid: str, reference_id: str) -> None:
+        """删一版地点参考图（默认场景的当前参考图不许删）。
+
+        只解引用，底层素材文件不动。删的若是当前版本，把兄弟里 `created_at` 最大的一条
+        提升为当前（`LocationReference` 没有 `version_no` 列，与素材库那侧同一个口径）。
+        """
+        db = db_of(pid)
+        reference = await fetch(db, LocationReference, reference_id, "地点参考图")
+        variant = await fetch(db, LocationVariant, reference.variant_id, "地点变体")
+        if variant.name == "默认场景" and reference.is_current:
+            raise AppError(
+                ErrorCode.CONFLICT,
+                "默认参考图不能删除",
+                "默认场景必须始终保留一张当前参考图；挂新图即可替换它。",
+                ["先给默认场景挂一张新参考图", "再删除旧的历史版本"],
+                {"protected_default": True},
+            )
+        siblings = await fetch_all(
+            db, LocationReference, where=LocationReference.variant_id == variant.id
+        )
+        if reference.asset_id:
+            await assets.unlink(pid, reference.asset_id, variant.id)
+        async with db.write() as session:
+            if reference.is_current:
+                previous = max(
+                    (item for item in siblings if item.id != reference.id),
+                    key=lambda item: item.created_at,
+                    default=None,
+                )
+                if previous is not None:
+                    held_previous = await session.get(LocationReference, previous.id)
+                    if held_previous is not None:
+                        held_previous.is_current = 1
+            fresh = await session.get(LocationReference, reference_id)
+            if fresh is not None:
+                await session.delete(fresh)
+
     # --- 道具 ---
 
     async def list_props(self, pid: str) -> list[dict[str, Any]]:
@@ -304,6 +341,29 @@ class WorldService:
             order_by=PropReference.version_no.desc(),
         )
         return [as_dict(r) for r in rows]
+
+    async def delete_prop_reference(self, pid: str, reference_id: str) -> None:
+        """删一版道具参考图（当前那一版不许删——挂新图即可替换它）。
+
+        只解引用，底层素材文件不动。道具必须始终保留一张当前参考图，所以当前版拒删，
+        也就不需要提升逻辑。
+        """
+        db = db_of(pid)
+        reference = await fetch(db, PropReference, reference_id, "道具参考图")
+        if reference.is_current:
+            raise AppError(
+                ErrorCode.CONFLICT,
+                "默认参考图不能删除",
+                "道具必须始终保留一张当前参考图；挂新图即可替换它。",
+                ["先给道具挂一张新参考图", "再删除旧的历史版本"],
+                {"protected_default": True},
+            )
+        if reference.asset_id:
+            await assets.unlink(pid, reference.asset_id, reference.prop_id)
+        async with db.write() as session:
+            fresh = await session.get(PropReference, reference_id)
+            if fresh is not None:
+                await session.delete(fresh)
 
 
 world = WorldService()

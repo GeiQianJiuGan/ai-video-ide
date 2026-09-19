@@ -493,6 +493,11 @@ def render_video_prompt(req: VideoRequest, book: PictureBook) -> str:
 
     - 基础模式 (T2VA / I2VA / FL2VA / L2VA)：按 references/base-en.txt 输出对齐行 + 三段核心结构；
     - 全参考模式 (Ref2VA)：按 references/ref-en.txt 输出 subject_definitions -> summary -> retention_analysis -> detailed_description -> soundscape -> music。
+
+    画面描述里的角色名会被 `_detail` → `_bind_subjects` 接回它的 `<Subject n>`（与首帧注入
+    `<Picture n>` 对称）：AI 照旧只写角色名（编号不由 AI 写，见 `ai/prompts.py`），渲染层做
+    硬绑，模型不用再拿裸名字去和 `subject_definitions` 那行对——名字对不上正是「认不出人物」
+    「台词安错人」的来源。
     """
     shot = f"[Shot {max(1, int(req.shot_no or 1))}]"
     seconds = f"{max(0.0, float(req.duration or 0)):.2f}"
@@ -654,6 +659,51 @@ def _retention(book: PictureBook, shot: str) -> str:
     return "\n".join(lines) or "none"
 
 
+def _name_variants(name: str) -> list[str]:
+    """一个主体名在画面描述里可能的写法，长的在前。
+
+    账单里的名字是「角色名（形象名）」（`services/context.py::_name_of`），而 AI 写画面
+    描述时几乎只用角色名那一截（「阿岚在森林里走」，不是「阿岚（默认形象）在…」）。所以除
+    全名外，再给出括号 / 空格前的那一段——两个都试，**长的先匹配**，免得裸名「阿岚」把
+    「阿岚（默认形象）」只标到一半。去重、按长度倒序。
+    """
+    full = " ".join(str(name or "").split())
+    variants = [full] if full else []
+    for sep in ("（", "(", " "):
+        head = full.split(sep, 1)[0].strip()
+        if head and head != full:
+            variants.append(head)
+    return sorted(dict.fromkeys(variants), key=len, reverse=True)
+
+
+def _bind_subjects(visual: str, book: PictureBook) -> str:
+    """把画面描述里第一次出现的角色名标成 `<Subject n>`——与首帧注入 `<Picture n>` 对称。
+
+    AI 照旧写角色名（约定：编号不由 AI 写，见 `ai/prompts.py`），渲染层在这里把名字与它的
+    `<Subject n>` 硬绑。缺了这一步，模型只能拿画面描述里的裸名字去和 `subject_definitions`
+    那行的名字对——名字稍有出入（这里写「阿岚」、定义里是「阿岚（默认形象）」）或两个同名
+    角色，就对不上了：「认不出人物是谁」「把甲的台词安到乙头上」正是那种对错的样子。
+
+    **只标人物主体**（`is_person`）：地点 / 道具的名字（「雨夜巷口」）在描述里多半是环境
+    交代，硬塞一个 `<Subject n>` 反而把它当成一个要逐帧保真的实体。人物主体本就在
+    `subject_definitions` 里各占一个 `<Subject n>`，这里只是把它接回描述文本，不新增编号。
+    每个主体只标**第一次出现**、且它的 tag 还没在文里时才标（别处可能已写过）。
+    """
+    if not visual:
+        return visual
+    for p in book.subjects:
+        if not p.is_person or not p.name or p.subject_tag in visual:
+            continue
+        for cand in _name_variants(p.name):
+            at = visual.find(cand)
+            if at < 0:
+                continue
+            end = at + len(cand)
+            visual = f"{visual[:end]}（{p.subject_tag}）{visual[end:]}"
+            break
+    return visual
+
+
 def _detail(req: VideoRequest, shot: str, book: PictureBook | None = None) -> str:
     """画面那一段：`[Shot n] 视觉描述 Camera Motion: 机位`。"""
     if not req.segments:
@@ -672,6 +722,9 @@ def _detail(req: VideoRequest, shot: str, book: PictureBook | None = None) -> st
                 visual = f"画面从首帧（{first.tag}）建立的构图开始，{visual}"
         if last and last.tag not in visual and "末帧" in visual:
             visual = visual.replace("末帧", f"末帧（{last.tag}）", 1)
+        #: 角色名 → `<Subject n>`。放在首尾帧注入之后：那两处改的是「画面从哪一格开始 /
+        #: 结束」，这一处改的是「谁出场」，互不重叠（首尾帧不是 subject）。
+        visual = _bind_subjects(visual, book)
 
     camera = str((req.segments or {}).get("camera_motion") or "").strip()
     body = f"{shot} {visual}".strip()

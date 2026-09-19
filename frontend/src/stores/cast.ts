@@ -198,6 +198,14 @@ export const useCastStore = defineStore('cast', () => {
     })
   }
 
+  /** 删一版定妆图（默认形象的当前版会被后端拒绝并给出提示）。 */
+  async function removeSheet(pid: string, aid: string, sheetId: string): Promise<void> {
+    await guarded(async () => {
+      await castApi.removeSheet(pid, aid, sheetId)
+      await loadAppearances(pid, selectedId.value)
+    })
+  }
+
   return {
     characters,
     selectedId,
@@ -220,6 +228,7 @@ export const useCastStore = defineStore('cast', () => {
     setDefaultAppearance,
     removeAppearance,
     addSheet,
+    removeSheet,
     clearError,
   }
 })

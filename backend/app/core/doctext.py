@@ -1,7 +1,9 @@
 """附件抽文本：把 .docx / .xlsx / .pptx / .csv 之类变成一段能读的纯文本。
 
-AI 协作栏那条输入框只收文字，可导演手上的东西常常是一份 Word 剧本或一张 Excel 分镜表。
+AI 协作栏收的是文字，可导演手上的东西常常是一份 Word 剧本或一张 Excel 分镜表。
 让他自己复制粘贴一遍不是不行，几十页就不行了——所以这里做「文件 → 文字」这一步。
+抽出来的文字挂成一张附件卡随消息一起发送，正文由 `services/director.py::compose_message`
+拼进给模型的提示词。
 
 **零新依赖**：docx / xlsx / pptx 就是 zip 里一堆 xml，标准库的 `zipfile` + `xml.etree`
 够用了。为了取里面那点文字装 `python-docx` + `openpyxl`，打包那侧还要多担两份
@@ -19,8 +21,8 @@ hiddenimports 的风险（见 docs/06），不值得。理由同 `core/pngdraw.p
   4. **表格保留列的位置**：空单元格补空串再用制表符连起来。少一列就串行，那时候
      「第 3 镜的时长」会被读成别的东西。
 
-抽出来的文字**不落库、不落盘、不出网**：它只是填进输入框的一段草稿，用户看得见、
-改得动，按下发送才跟着那句话一起走（见 `services/director.py::attach`）。
+抽出来的文字**不落库、不落盘、不出网**：它只是随消息发送的一份附件，用户看得见、
+删得掉，按下发送才作为独立字段跟着这条消息走（见 `services/director.py::attach`）。
 """
 
 from __future__ import annotations

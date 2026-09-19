@@ -100,6 +100,11 @@ async def add_variant_reference(pid: str, vid: str, body: ReferenceBody) -> dict
     return await world.add_variant_reference(pid, vid, body.asset_id, body.camera, body.note)
 
 
+@router.delete("/projects/{pid}/variants/{vid}/references/{ref_id}", status_code=204)
+async def delete_variant_reference(pid: str, vid: str, ref_id: str) -> None:
+    await world.delete_variant_reference(pid, ref_id)
+
+
 @router.get("/projects/{pid}/props")
 async def list_props(pid: str) -> list[dict[str, Any]]:
     return await world.list_props(pid)
@@ -128,3 +133,8 @@ async def prop_references(pid: str, prop_id: str) -> list[dict[str, Any]]:
 @router.post("/projects/{pid}/props/{prop_id}/references", status_code=201)
 async def add_prop_reference(pid: str, prop_id: str, body: PropReferenceBody) -> dict[str, Any]:
     return await world.add_prop_reference(pid, prop_id, body.asset_id, body.note)
+
+
+@router.delete("/projects/{pid}/props/{prop_id}/references/{ref_id}", status_code=204)
+async def delete_prop_reference(pid: str, prop_id: str, ref_id: str) -> None:
+    await world.delete_prop_reference(pid, ref_id)

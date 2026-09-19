@@ -12,8 +12,11 @@
 失败的处理刻意不是「一条挂了整批回滚」：每条独立落，失败的连四要素错误一起回给前端。
 一条角色名对不上，不该让另外四条通过审阅的改动也进不去。
 
-**附件（`attach()`）只是输入法**：一份 Word 剧本 / Excel 分镜表在这里被抽成纯文本填进
-输入框，不落库、不落盘、不出网，`chat()` 那侧一个字都不用改——它收到的仍然只是一句话。
+**附件（`attach()`）是随消息发送的结构化数据**：一份 Word 剧本 / Excel 分镜表在 `attach`
+端点被抽成纯文本回给前端，前端把它挂成一张附件卡（不再灌进输入框），发送时作为独立字段
+随消息一起走。抽出来的文字**在这一层由 `compose_message()` 拼进给模型的提示词**——组合口径
+只有那一处。附件本身仍不落库、不落盘、不出网；user turn 里结构化存下来只是为了气泡显示与
+历史重建，`GenerationVersion` 那侧一个字都不用改。
 
 **流式（`chat_stream()`）与不流式（`chat()`）落的是同一份记录。** 两条路都走
 `agent.collaborate()` 那一个循环，落库那几步也只有一份实现（`_persist()`）——
@@ -71,6 +74,31 @@ log = get_logger("director")
 #: 而现状是靠读工具查的，不靠聊天记录记着。
 HISTORY_TURNS = 10
 
+
+def _attachment_block(att: dict[str, Any]) -> str:
+    """一份附件在给模型的消息里长什么样。**界标格式与升级前逐字一致**（原来前端
+    `DirectorPanel.vue::spliceIn` 拼的就是这个），保证老会话与新会话喂给模型的提示词一样。"""
+    filename = str(att.get("filename") or "附件")
+    label = str(att.get("kind_label") or att.get("kind") or "文件")
+    text = str(att.get("text") or "")
+    return f"【附件 {filename} · {label}】\n{text}\n【附件结束】"
+
+
+def compose_message(text: str, attachments: list[dict[str, Any]] | None) -> str:
+    """把用户那句话与随消息发来的附件拼成给模型看的完整消息。**这是唯一的组合口径。**
+
+    附件不再灌进输入框（那是升级前的做法）：用户只打自己的话，附件作为结构化数据随消息走，
+    到这一层才拼进提示词。两者都空时返回空串（调用方在 `stream_precheck` 里已挡过）；
+    只有附件没有话时，只拼附件块——「贴一份剧本、什么都不说」是允许的。
+    """
+    said = str(text or "").strip()
+    blocks = [_attachment_block(a) for a in (attachments or []) if str(a.get("text") or "").strip()]
+    if not blocks:
+        return said
+    body = "\n\n".join(blocks)
+    return f"{said}\n\n{body}" if said else body
+
+
 #: 三种「等这一批新建的素材」的接线各自叫什么。落库结果里的
 #: `<kind>_wired` / `<kind>_skipped` 两个键就是拿它拼的，前端照键显示，不猜。
 _WIRE_WORD = {"cast": "角色", "props": "道具", "location": "地点"}
@@ -86,16 +114,17 @@ AUTO_STAGES: tuple[tuple[str, str], ...] = (
 
 #: 第一步只出文字、不出提案：先把这一章读完并说清主线。它同时是后面三步的上下文
 #: （`_llm_history()` 会把它带过去），所以要它把人名 / 地名 / 道具名按**原文**列出来。
-_AUTO_DIGEST = """现在开始「一键全流程」的第一步：把剧本读完，只说结论，先不要提任何提案。
+_AUTO_DIGEST = """现在开始「一键全流程」的第一步：把剧本读完，攒出一份剧本 MD 存进工程。
 
 这样做：
 1. 用 read_script 从 offset=0 开始分段读，每次 limit 尽量给大（比如 6000），
    一直读到返回里的 done 是 true。原文已经在这个工程里，不用问我要。
-2. 读完写一份中文「核心剧本」：一句话主线、按时间顺序的关键情节（不超过 12 条）、
-   出场人物名单、出现的地点名单、有戏份的关键道具名单。
+2. 读完调 update_screenplay，把**完整的一份**中文剧本 Markdown 回填进去：一句话主线、
+   按时间顺序的关键情节（不超过 12 条）、出场人物名单、地点名单、有戏份的关键道具名单。
+3. 再用一两句话把主线说给我听。
 
 人名、地名、道具名一律用剧本里的原文，不要改写也不要音译，更不要编原文里没有的。
-这一步**只说话**：add_scene / add_shot / add_character 这类写工具一个都不要调。"""
+这一步**只调 update_screenplay 这一个写工具**：add_scene / add_shot / add_character 一个都不要调。"""
 
 #: 第二步：素材。出图那一句按三种情况分岔（`_image_hint`），其余一个字不变。
 _AUTO_MATERIALS = """第二步：把上面那份核心剧本里的人物、地点、道具建成素材。
@@ -124,19 +153,24 @@ time_of_day 填时间、location_name 用剧本里的地点原文（上一步刚
 
 #: 第四步：**按幕各来一轮**。一次把所有幕的镜头都拆完必然超时或被截断，
 #: 所以这一步在 `autopilot()` 里循环，每一幕一句话、一次 `propose()`、一次 `apply()`。
-_AUTO_SHOTS = """第四步（第 {index}/{total} 幕）：给这一幕拆分镜。
+_AUTO_SHOTS = """第四步（第 {index}/{total} 幕）：给这一幕拆分镜。这一步分两小步——**先写连贯的剧情，再照 SKILL 转成 prompt**。
 
-这一幕的 scene_id 是 {scene_id}，标题「{title}」。先用 get_scene 看它现在什么样，
-再用 read_skill 取一份镜头提示词的写法（这一轮的镜头还没有指定首尾帧，取 h3-ref 或 references/ref-en.txt 那一份）。
+这一幕的 scene_id 是 {scene_id}，标题「{title}」。先用 read_screenplay 看这一幕在整部片子里的
+上下文，再用 get_scene 看它现在什么样，再用 read_skill 取一份镜头提示词的写法
+（这一轮的镜头还没有指定首尾帧，取 h3-ref 或 references/ref-en.txt 那一份）。
 
 然后用 add_shot 提 {hint} 个镜头，每一镜：
 
 · scene_id 一律填 {scene_id}
-· title 一句话说清这一镜拍什么，description 写画面内容
+· title 一句话说清这一镜拍什么
+· description 写**剧情详情**：谁在场、站在哪、在做什么、说什么、情绪怎样。
+  **写连贯**——下一镜要出场的人 / 道具，在这一镜的 description 里就交代好它此刻的位置与动作，
+  让下一镜自然接得上（比如下一镜某人推门进来，这一镜就写清门在画面哪一侧、他从哪来）。
 · duration 2~8 秒
 · camera 写景别（近景 / 中景 / 全景…），movement 写运镜（推 / 摇 / 固定…）
 · character_names 用剧本里的人名原文列出这一镜谁出场（刚建好的角色会自动接上）
-· camera_motion / visual_prompt / audio_dialogue 三段照 SKILL 的写法写，skill 填你取的那份
+· 照 SKILL 把上面这段剧情**转成 prompt**：camera_motion / visual_prompt / audio_dialogue
+  三段照你取的那份写法写，skill 填你取的那份。visual_prompt 只写画面里看得见的东西。
 
 镜头按时间顺序提，不用填 position。这一幕有关键道具出场时，最后再提一条
 set_scene_props（道具是挂在幕上的，镜头上没有这一项）。
@@ -352,12 +386,22 @@ class DirectorService:
                 if fresh is not None:
                     await session.delete(fresh)
 
-    async def chat(self, pid: str, message: str, scope: str = "flow") -> dict[str, Any]:
-        """说一句话，拿回一份提案。**不改任何业务数据。**
+    async def chat(
+        self,
+        pid: str,
+        message: str,
+        scope: str = "flow",
+        attachments: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """说一句话（可带附件），拿回一份提案。**不改任何业务数据。**
 
         `scope` 是「用户现在开着哪一页」（`script` 剧本页 / `flow` 幕流程图页）。它**只影响
         这一次请求拼出来的系统提示词**那一句提示，不落库、不加列——两页共用同一个会话，
         换页不该让历史对话变味。
+
+        `attachments` 是随消息发来的附件（每份已经在 `attach` 端点抽成文字）：user turn 里
+        **结构化存下来**（气泡渲染成附件卡，不铺开正文），喂给模型的消息则由 `compose_message`
+        把附件文字拼进提示词——组合口径只有那一处。
 
         这是不流式那条路（兼容 + 不支持 SSE 的调用方）。流式那条见 `chat_stream()`，
         两条共用 `_persist()` 与 `_over_limit()`。
@@ -365,10 +409,10 @@ class DirectorService:
         **免确认模式开着时，产出的提案在这同一个请求里就落库**（`_auto_applied()`，走的还是
         `apply()` 那一份实现）。返回体里因此多 `auto_applied` / `applied` / `failed` / `count`。
         """
-        text = await self.stream_precheck(pid, message)
-        await self._add_turn(pid, "user", {"text": text})
+        text, atts = await self.stream_precheck(pid, message, attachments)
+        await self._add_turn(pid, "user", {"text": text, "attachments": atts})
         history = await self._llm_history(pid)
-        out = await agent.propose(pid, text, history, scope=scope)
+        out = await agent.propose(pid, compose_message(text, atts), history, scope=scope)
         turns = await self._persist(pid, out)
         auto = await self._auto_applied(pid, out["ops"])
         if out["over_limit"]:
@@ -376,27 +420,41 @@ class DirectorService:
             raise self._over_limit(len(out["ops"]), auto["auto_applied"])
         return {"turns": turns, "ops": out["ops"], "degraded": out["degraded"], **auto}
 
-    async def stream_precheck(self, pid: str, message: str) -> str:
-        """能在开流之前报的错，就别等到流里再报。返回收拾干净的那句话。
+    async def stream_precheck(
+        self, pid: str, message: str, attachments: list[dict[str, Any]] | None = None
+    ) -> tuple[str, list[dict[str, Any]]]:
+        """能在开流之前报的错，就别等到流里再报。返回（收拾干净的那句话，那几份附件）。
 
         `api/director.py` 的流式端点先 `await` 这一下，于是「消息是空的」「LLM 没配置」
         「这个工程没打开」拿到的仍是正常的 4xx/503 JSON 四要素错误——不是一个 200
         然后夹在 `text/event-stream` 里的 `error` 事件（那种前端得写两套错误处理）。
+
+        **空判据是「话与附件都空」**：贴一份剧本、什么都不说也算有内容（附件也是输入），
+        和 agent 那侧一致。
         """
         text = str(message or "").strip()
-        if not text:
+        atts = [a for a in (attachments or []) if str(a.get("text") or "").strip()]
+        if not text and not atts:
             raise AppError(
                 ErrorCode.VALIDATION_ERROR,
                 "说点什么",
-                "消息是空的。",
-                ["比如「在第 2 幕后面加一幕雨夜追车」", "或直接在流程图上手动加一幕"],
+                "消息是空的，也没有带上任何附件。",
+                [
+                    "比如「在第 2 幕后面加一幕雨夜追车」",
+                    "或挂一份剧本附件再发",
+                    "或直接在流程图上手动加一幕",
+                ],
             )
         llm.require_configured()
         db_of(pid)  # 工程没打开就在这里 404，别等流开了才发现
-        return text
+        return text, atts
 
     async def chat_stream(
-        self, pid: str, message: str, scope: str = "flow"
+        self,
+        pid: str,
+        message: str,
+        scope: str = "flow",
+        attachments: list[dict[str, Any]] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         """说一句话，把过程当 SSE 事件吐出来。**一行业务数据都不改。**
 
@@ -412,14 +470,16 @@ class DirectorService:
         `done` 与 `error` **互斥且必有其一**；收到任一个前端都该重拉一次历史
         （提案已经落成记录了，刷新也不丢）。
         """
-        text = await self.stream_precheck(pid, message)
-        await self._add_turn(pid, "user", {"text": text})
+        text, atts = await self.stream_precheck(pid, message, attachments)
+        await self._add_turn(pid, "user", {"text": text, "attachments": atts})
         history = await self._llm_history(pid)
         said: list[str] = []
         ops: list[dict[str, Any]] = []
         out: dict[str, Any] = {}
         try:
-            async for event in agent.collaborate(pid, text, history, scope=scope):
+            async for event in agent.collaborate(
+                pid, compose_message(text, atts), history, scope=scope
+            ):
                 kind = event["kind"]
                 if kind == "delta":
                     said.append(event["text"])
@@ -551,7 +611,7 @@ class DirectorService:
         return AppError(
             ErrorCode.LLM_INVALID_OUTPUT,
             "AI 转了太多轮还没收尾",
-            f"已经跑满 {agent.MAX_ROUNDS} 轮工具调用，这一轮就此停下。",
+            f"已经跑满 {agent.max_rounds()} 轮工具调用，这一轮就此停下。",
             [
                 first,
                 "把要求说得更具体一点再试（比如指明是哪一幕）",
@@ -567,7 +627,11 @@ class DirectorService:
         chat = [r for r in rows if r.role in ("user", "assistant")][-HISTORY_TURNS:]
         out = []
         for row in chat[:-1] if chat and chat[-1].role == "user" else chat:
-            text = str(load_json(row.content_json, {}).get("text") or "")
+            content = load_json(row.content_json, {})
+            text = str(content.get("text") or "")
+            # user turn 带附件时，把附件文字也拼回去——否则模型在后续轮次看不到之前那份文档。
+            if row.role == "user":
+                text = compose_message(text, content.get("attachments") or [])
             if text:
                 out.append({"role": row.role, "content": text})
         return out
@@ -582,12 +646,14 @@ class DirectorService:
         replace_script: bool = False,
         auto_image: bool | None = None,
         max_scenes: int | None = None,
+        attachments: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """一趟跑完四步：核心剧本 → 人物 / 地点 / 道具 → 拆幕 → 按幕拆分镜。
 
         `text` 是这一章的原文：非空就先存进 `Story.raw_text`（库里已经有**不同**的一份时
-        绝不覆盖，报错并给出路）；空就用工程里已经有的那一份。`auto_image` / `max_scenes`
-        留空表示跟随设置页那两项。
+        绝不覆盖，报错并给出路）；空就用工程里已经有的那一份。**带了附件的话，附件文字先由
+        `compose_message` 拼进原文**——「贴一份 Word 剧本 → 一键全流程」于是也走得通。
+        `auto_image` / `max_scenes` 留空表示跟随设置页那两项。
 
         **每一步都真落库**（所以要求免确认模式开着，见 `_require_auto_apply()`）：后一步要用
         前一步的 id——拆分镜要 `scene_id`，镜头里那几个人要接到刚建出来的形象上。
@@ -605,7 +671,9 @@ class DirectorService:
         want_image = settings.director_auto_image if auto_image is None else bool(auto_image)
         cap = max(1, int(settings.director_max_scenes if max_scenes is None else max_scenes))
         configured = registry.image_configured()
-        source = await self._autopilot_source(pid, text, replace_script)
+        source = await self._autopilot_source(
+            pid, compose_message(text, attachments), replace_script
+        )
 
         stages: list[dict[str, Any]] = []
         applied: list[dict[str, Any]] = []
@@ -848,7 +916,7 @@ class DirectorService:
         }
         if out["over_limit"]:
             row["warning"] = (
-                f"AI 在这一步转满了 {agent.MAX_ROUNDS} 轮工具调用才停下，"
+                f"AI 在这一步转满了 {agent.max_rounds()} 轮工具调用才停下，"
                 "已经产出的提案照旧落库了，但这一步可能没做完。"
             )
         return row
@@ -997,6 +1065,11 @@ class DirectorService:
         name = str(op["op"])
         after = op.get("after") or {}
         sid = str(op.get("scene_id") or "")
+
+        if name == "update_screenplay":
+            text = str(after.get("screenplay_md") or "")
+            await story.save_story(pid, {"screenplay_md": text})
+            return {"chars": len(text), "saved": True}
 
         if name == "add_scene":
             row = await story.create_scene(

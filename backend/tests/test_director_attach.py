@@ -233,3 +233,126 @@ def test_attach_needs_an_open_project(client: TestClient) -> None:
     resp = attach(client, "prj_notopen", "剧本.txt", b"hi")
     assert resp.status_code == 404
     error_of(resp)
+
+
+# --- 结构化附件：随消息一起发送（不再灌进输入框） ---
+
+
+def test_compose_message_wraps_attachments_in_markers() -> None:
+    """组合口径只有 `compose_message` 一处：界标格式与升级前逐字一致。"""
+    from app.services.director import compose_message
+
+    # 都空 → 空串
+    assert compose_message("", []) == ""
+    # 只有话 → 原样
+    assert compose_message("加一幕", []) == "加一幕"
+    # 有话 + 一份附件 → 话在前，附件块跟后
+    one = compose_message(
+        "照这份剧本拆幕", [{"filename": "剧本.txt", "kind_label": "纯文本", "text": "第一幕 雨夜"}]
+    )
+    assert one.startswith("照这份剧本拆幕")
+    assert "【附件 剧本.txt · 纯文本】" in one
+    assert "第一幕 雨夜" in one
+    assert "【附件结束】" in one
+    # 只有附件、没有话 → 只拼附件块（贴一份剧本、什么都不说是允许的）
+    only = compose_message("", [{"filename": "a.txt", "kind_label": "纯文本", "text": "内容"}])
+    assert only.startswith("【附件 a.txt")
+    # 空正文的附件不占块
+    assert compose_message("说点什么", [{"filename": "空.txt", "text": ""}]) == "说点什么"
+
+
+def _fake_llm(monkeypatch: pytest.MonkeyPatch) -> list[list[dict[str, object]]]:
+    """把 LLM 换成一个只回一句话、不调工具的假端；返回它每一轮收到的 messages。"""
+    from app.ai.llm import client as llm
+
+    monkeypatch.setattr(settings, "llm_provider", "openai_compatible")
+    monkeypatch.setattr(settings, "llm_model", "fake-model")
+    monkeypatch.setattr(settings, "llm_base_url", "http://127.0.0.1:9/v1")
+    seen: list[list[dict[str, object]]] = []
+
+    async def fake(
+        messages: list[dict[str, object]], tools: list[dict[str, object]]
+    ) -> dict[str, object]:
+        seen.append([dict(m) for m in messages])
+        return {"content": "好的，看完了。", "tool_calls": []}
+
+    monkeypatch.setattr(llm, "complete_tools", fake)
+    return seen
+
+
+def test_chat_stores_structured_turn_and_feeds_markers_to_model(
+    client: TestClient, pid: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """带附件的 chat：user turn 结构化存下来（正文不进 text），喂给模型的消息含界标块。"""
+    seen = _fake_llm(monkeypatch)
+    body = {
+        "message": "照这份剧本拆幕",
+        "attachments": [
+            {
+                "filename": "剧本.txt",
+                "kind": "txt",
+                "kind_label": "纯文本",
+                "text": "第一幕 雨夜追车",
+                "chars": 6,
+            }
+        ],
+    }
+    resp = client.post(f"{API}/projects/{pid}/director/chat", json=body)
+    assert resp.status_code == 201, resp.text
+
+    turns = client.get(f"{API}/projects/{pid}/director").json()["turns"]
+    user = next(t for t in turns if t["role"] == "user")
+    # 气泡里 text 只放用户自己的话，附件结构化挂着
+    assert user["content"]["text"] == "照这份剧本拆幕"
+    assert user["content"]["attachments"][0]["filename"] == "剧本.txt"
+    assert "第一幕" not in user["content"]["text"]
+    # 但模型收到的消息里，附件正文被拼进了界标块
+    joined = "\n".join(str(m.get("content") or "") for m in seen[0])
+    assert "【附件 剧本.txt · 纯文本】" in joined
+    assert "第一幕 雨夜追车" in joined
+
+
+def test_chat_with_only_an_attachment_is_allowed(
+    client: TestClient, pid: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """贴一份剧本、什么都不打字也能发——附件也是输入。"""
+    _fake_llm(monkeypatch)
+    body = {
+        "message": "",
+        "attachments": [{"filename": "剧本.txt", "kind_label": "纯文本", "text": "第一幕 雨夜"}],
+    }
+    resp = client.post(f"{API}/projects/{pid}/director/chat", json=body)
+    assert resp.status_code == 201, resp.text
+
+
+def test_chat_with_neither_message_nor_attachment_is_refused(
+    client: TestClient, pid: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """话与附件都空 → 四要素错误（不是静默的无操作）。"""
+    _fake_llm(monkeypatch)
+    resp = client.post(
+        f"{API}/projects/{pid}/director/chat", json={"message": "  ", "attachments": []}
+    )
+    assert resp.status_code == 422
+    error_of(resp)
+
+
+def test_history_rebuild_feeds_prior_attachment_back_to_model(
+    client: TestClient, pid: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """带附件的历史 user turn 在下一轮要被 `compose_message` 拼回去——否则模型看不到那份文档。"""
+    seen = _fake_llm(monkeypatch)
+    first = {
+        "message": "先看这份",
+        "attachments": [
+            {"filename": "剧本.txt", "kind_label": "纯文本", "text": "第一幕 雨夜追车"}
+        ],
+    }
+    assert client.post(f"{API}/projects/{pid}/director/chat", json=first).status_code == 201
+    assert (
+        client.post(f"{API}/projects/{pid}/director/chat", json={"message": "继续拆"}).status_code
+        == 201
+    )
+    # 第二轮的 messages 里，历史那条 user 也带着附件界标块
+    joined = "\n".join(str(m.get("content") or "") for m in seen[-1])
+    assert "第一幕 雨夜追车" in joined

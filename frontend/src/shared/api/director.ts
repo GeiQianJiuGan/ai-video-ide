@@ -72,10 +72,15 @@ export const OP_FIELD_LABEL: Record<string, string> = {
   /** 这一句落在哪一列（形象上是 traits，其余是 description）。 */
   field: '写进哪一列',
   generate_image: '顺带出一张图',
+  // 剧本 MD（工作流第一步）
+  screenplay_md: '剧本正文',
+  chars: '字数',
+  preview: '现有开头',
 }
 
 /** 写工具名 = 提案的 op。用户丢弃一条时，前端把它改成 'reject'。 */
 export const DIRECTOR_OPS = [
+  'update_screenplay',
   'add_scene',
   'update_scene',
   'set_scene_prompt',
@@ -99,6 +104,7 @@ export type DirectorOpName = (typeof DIRECTOR_OPS)[number]
 
 /** 每种提案在界面上叫什么。文案在这里写一遍，别在组件里散着写。 */
 export const OP_LABEL: Record<string, string> = {
+  update_screenplay: '维护剧本',
   add_scene: '加一幕',
   update_scene: '改这一幕',
   set_scene_prompt: '改整幕画面描述',
@@ -122,7 +128,7 @@ export const OP_LABEL: Record<string, string> = {
 export interface DirectorOp {
   /** 写工具名；丢弃时被改成 'reject'。 */
   op: string
-  target: 'scene' | 'link' | 'shot' | 'shot_link' | 'material' | string
+  target: 'scene' | 'link' | 'shot' | 'shot_link' | 'material' | 'story' | string
   temp_id: string
   scene_id?: string
   shot_id?: string
@@ -139,6 +145,7 @@ export interface DirectorTurn {
   id: string
   /** user / assistant / proposal / applied */
   role: string
+  /** user turn 可能带 `attachments`（随消息发送的附件），气泡里渲染成附件卡。 */
   content: Record<string, unknown>
   created_at: string
 }
@@ -165,7 +172,10 @@ export interface DirectorAttachInfo {
   note: string
 }
 
-/** 一份附件抽出来的文字。**它只是输入框里的一段草稿**：没落库、没落盘、没出网。 */
+/**
+ * 一份附件抽出来的文字。**随消息作为独立字段一起发送**（不再灌进输入框）：没落库、
+ * 没落盘、没出网，正文由后端 `compose_message()` 拼进给模型的提示词。
+ */
 export interface DirectorAttachment {
   filename: string
   kind: string
@@ -247,7 +257,7 @@ export interface DirectorDone extends DirectorAutoApplied {
   turns: DirectorTurn[]
   ops: DirectorOp[]
   degraded: boolean
-  /** 这一轮和模型往返了几次。转满 `MAX_ROUNDS` 会走 error 那条。 */
+  /** 这一轮和模型往返了几次。转满上限（设置页「协作栏单轮最多往返几次」）会走 error 那条。 */
   rounds: number
 }
 
@@ -319,8 +329,12 @@ export const directorApi = {
    *
    * 这是不流式那条（兼容路径）。界面走的是下面的 `chatStream()`。
    */
-  chat: (pid: string, message: string, scope: DirectorScope = 'flow') =>
-    api.post<DirectorChat>(`/projects/${pid}/director/chat`, { message, scope }),
+  chat: (
+    pid: string,
+    message: string,
+    scope: DirectorScope = 'flow',
+    attachments: DirectorAttachment[] = [],
+  ) => api.post<DirectorChat>(`/projects/${pid}/director/chat`, { message, scope, attachments }),
   /**
    * 同一件事，但一边说一边给。**照旧一行库都不动**（`done` 里的 `turns` 只是聊天记录）。
    *
@@ -336,7 +350,8 @@ export const directorApi = {
     message: string,
     scope: DirectorScope = 'flow',
     signal?: AbortSignal,
-  ): AsyncGenerator<DirectorStreamEvent> => stream(pid, message, scope, signal),
+    attachments: DirectorAttachment[] = [],
+  ): AsyncGenerator<DirectorStreamEvent> => stream(pid, message, scope, signal, attachments),
   apply: (pid: string, ops: DirectorOp[]) =>
     api.post<DirectorApply>(`/projects/${pid}/director/apply`, { ops }),
   /**
@@ -350,10 +365,12 @@ export const directorApi = {
    *   3. **`auto_image` / `max_scenes` 不传**——跟随设置页那一组，前端不记第二份默认值；
    *   4. **半路断了照样回 201**（`halted: true`），已经落的一条都不回滚。
    */
-  autopilot: (pid: string, body: { text?: string; replace_script?: boolean }) =>
-    api.post<DirectorAutopilot>(`/projects/${pid}/director/autopilot`, body),
+  autopilot: (
+    pid: string,
+    body: { text?: string; replace_script?: boolean; attachments?: DirectorAttachment[] },
+  ) => api.post<DirectorAutopilot>(`/projects/${pid}/director/autopilot`, body),
   /**
-   * 一份 .docx / .xlsx / … → 一段纯文本，**只填进输入框**。
+   * 一份 .docx / .xlsx / … → 一段纯文本，前端挂成一张附件卡，**发送时随消息一起走**。
    *
    * 三条与 `chat()` 不同的规矩：
    *   1. **什么都不落**：没记录、没文件、没资产，所以它回 200 而不是 201；
@@ -371,9 +388,10 @@ async function* stream(
   message: string,
   scope: DirectorScope,
   signal?: AbortSignal,
+  attachments: DirectorAttachment[] = [],
 ): AsyncGenerator<DirectorStreamEvent> {
   const path = `/projects/${pid}/director/chat/stream`
-  for await (const frame of api.stream(path, { message, scope }, signal)) {
+  for await (const frame of api.stream(path, { message, scope, attachments }, signal)) {
     if (frame.event === 'error') {
       // 状态码是 200——错误是在流里来的。但对调用方来说它和开流前失败没有区别。
       throw new ApiError((frame.data as { error: ErrorPayload }).error, 200)

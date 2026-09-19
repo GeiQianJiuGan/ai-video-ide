@@ -16,8 +16,14 @@
  *      让用户自己发现待审的卡都不见了是最糟的一种。
  *   2. **提案产出即可审**。流式那条路把 `op` 夹在过程里给（见 `stores/director.ts`），
  *      所以第一条提案出来时就能看，不用等这一轮说完；一轮拆解常常是 1 幕 + 8 镜，
- *      所以按对象分组，每组能一起采用。
- *   3. **正在写的那段话是一条临时气泡**（`live`）。它还没落库，所以不进 `messages`——
+ *      所以按对象分组，每组能一起采用。**只有正等审的那一条**（`director.livePendingTurnId`）
+ *      走底部这份可操作的分组卡。
+ *   2.5 **每一轮改了什么，跟着那条 AI 消息留一份只读 Diff**。对话按时间顺序摊开时，历史里
+ *      每条 `proposal` 记录都画成一张可折叠的「AI 改动 · N 处」卡（复用 `rowsOf` / `visibleRows`
+ *      那套 before → after），默认折起来。这样免确认模式 / 一键全流程落库、可操作的卡走掉之后，
+ *      「这一轮到底动了哪里、改成什么样」照样翻得到，而不是只剩一句「已落库 N 条」（硬约束 4）。
+ *      正等审的那条在这里跳过（它已经在底部那份可操作的卡里），`applied` 记录顺手画个落库收尾标。
+ *   3. **正在写的那段话是一条临时气泡**（`live`）。它还没落库，所以不进 `turns`——
  *      历史只有一份真源；收尾时被落库的那条 assistant 记录顶掉。
  *   4. **工具足迹要看得见**。「它现在在查什么」是这一栏最容易变成黑盒的地方。失败的那一步
  *      标红**但不代表这一轮废了**：后端把错误回喂给模型，它常常自己换个做法再来。
@@ -29,10 +35,11 @@
  *      编排生成全都不依赖 LLM，这一栏关掉整条链路照旧能走完。
  *   8. **`scope` 只是一句提示**。它透传给后端拼系统提示词（用户现在在哪一页），
  *      不落库、不分会话——换页不该让历史对话变味。
- *   9. **附件是输入法，不是暗地里带上的东西**。一份 Word 剧本 / Excel 分镜表抽成文字后
- *      **原样塞进输入框**（前后各一行界标），用户看得见、删得掉、改得动；「按 gb18030
- *      读的」「太长截断了」这些话贴在输入框上方。绝不做「文件跟着请求偷偷走一遍」——
- *      那样用户永远不知道模型到底读到了什么。
+ *   9. **附件随消息发送，看得见、删得掉**。一份 Word 剧本 / Excel 分镜表抽成文字后挂成
+ *      一张附件卡（不再灌进输入框），用户在输入框上方看得见、能删掉；发送时作为独立字段
+ *      随消息一起走，气泡里也显示成附件卡。「按 gb18030 读的」「太长截断了」这些话贴在卡上。
+ *      正文由后端 `compose_message()` 拼进给模型的提示词——用户始终知道带了哪几份文档，
+ *      不是「文件跟着请求偷偷走一遍」。
  *  10. **落库回执里那几句话必须显示出来**。落成了的那张提案卡会走掉，于是「同一批新建的
  *      角色接上了没有」「参考图排上没排上」「哪个名字对不上」只剩这里能说了。只给一行
  *      「已落库 N 条」等于把降级藏起来（硬约束 4）——少接一个人不该让用户等到成片才发现。
@@ -125,6 +132,7 @@ const filePicker = ref<HTMLInputElement | null>(null)
 
 /** 提案改的是什么对象。分组标题用它。 */
 const TARGET_LABEL: Record<string, string> = {
+  story: '剧本',
   scene: '幕',
   shot: '镜头',
   link: '幕衔接',
@@ -230,17 +238,63 @@ function toggle(key: string): void {
   opened.value = next
 }
 
-/** 提案按对象分组。一轮拆解常常是「1 幕 + 8 镜」，混成一长条谁也审不动。 */
-const groups = computed(() => {
+/** 一批提案按对象分组。一轮拆解常常是「1 幕 + 8 镜」，混成一长条谁也审不动。 */
+function groupOps(ops: DirectorOp[]): { target: string; label: string; ops: DirectorOp[] }[] {
   const out: { target: string; label: string; ops: DirectorOp[] }[] = []
-  for (const op of director.pending) {
+  for (const op of ops) {
     const target = String(op.target || 'scene')
     const hit = out.find((g) => g.target === target)
     if (hit) hit.ops.push(op)
     else out.push({ target, label: TARGET_LABEL[target] ?? target, ops: [op] })
   }
   return out
-})
+}
+
+/** 待审的那几条提案，分组显示（可操作：采用 / 丢弃）。 */
+const groups = computed(() => groupOps(director.pending))
+
+/** 一条 proposal 记录里的提案。坏数据退回空数组，不抛。 */
+function opsOf(turn: DirectorTurn): DirectorOp[] {
+  const raw = (turn.content as { ops?: unknown }).ops
+  return Array.isArray(raw) ? (raw as DirectorOp[]) : []
+}
+
+/**
+ * 一条 proposal 记录 = 这一轮 AI 改了什么。**历史区里它是只读的 Diff**（改动前后照样看得见），
+ * 与右栏那份可操作的分组卡分工：正等审的那条走右栏（`director.livePendingTurnId` 跳过它），
+ * 已经落库 / 免确认自动落 / 一键全流程落的那几条只在这里留个 before → after 的账。
+ */
+function proposalGroupsOf(turn: DirectorTurn): { target: string; label: string; ops: DirectorOp[] }[] {
+  return groupOps(opsOf(turn))
+}
+
+/** 这一轮改了多少处，压成一行摘要（「加一幕 ×1、加镜头 ×8」）。历史 Diff 默认折起来看它。 */
+function proposalSummary(turn: DirectorTurn): string {
+  const counts = new Map<string, number>()
+  for (const op of opsOf(turn)) {
+    const label = OP_LABEL[op.op] ?? op.op
+    counts.set(label, (counts.get(label) ?? 0) + 1)
+  }
+  return [...counts.entries()].map(([label, n]) => `${label} ×${n}`).join('、')
+}
+
+/** 展开了哪几条历史 Diff，键是记录 id。默认折起来——一部长剧本几十轮，全铺开就没法看了。 */
+const openedTurns = ref<Set<string>>(new Set())
+function isTurnOpen(id: string): boolean {
+  return openedTurns.value.has(id)
+}
+function toggleTurn(id: string): void {
+  const next = new Set(openedTurns.value)
+  if (next.has(id)) next.delete(id)
+  else next.add(id)
+  openedTurns.value = next
+}
+
+/** 一条 applied 记录落了几条。历史区里给这一轮画一个「已落库」的收尾标。 */
+function appliedCountOf(turn: DirectorTurn): number {
+  const raw = (turn.content as { count?: unknown }).count
+  return typeof raw === 'number' ? raw : 0
+}
 /** 落库失败按 temp_id 贴回对应那张卡。 */
 const failByTemp = computed(() => {
   const map = new Map<string, DirectorApplyFail>()
@@ -376,10 +430,14 @@ watch(() => director.lastAutopilot, follow)
 
 async function send(): Promise<void> {
   const text = draft.value.trim()
-  if (!text) return
+  // 只挂附件、不打字也能发——附件也是输入（与后端 `stream_precheck` 的空判据一致）。
+  if (!text && !director.attached.length) return
   draft.value = ''
   await director.send(props.pid, text, props.scope)
 }
+
+/** 能不能发：有话说，或者至少挂了一份附件。 */
+const canSend = computed(() => Boolean(draft.value.trim()) || director.attached.length > 0)
 
 /**
  * 一键全流程。**它不产提案，四步都直接落库**，所以入口与「发送」刻意分开。
@@ -405,28 +463,9 @@ function pickFile(): void {
 }
 
 /**
- * 抽出来的文字**塞进输入框**，前后各一行界标。
- *
- * 界标是给两边看的：模型得分清哪一段是文档、哪一句是用户自己说的话；用户得看见这一整段
- * 会跟着发出去（所以它能删、能改、能只留要用的那几段）。
- */
-function spliceIn(att: DirectorAttachment): void {
-  const block = `【附件 ${att.filename} · ${att.kind_label}】\n${att.text}\n【附件结束】`
-  const had = draft.value.replace(/\s+$/, '')
-  draft.value = had ? `${had}\n\n${block}\n` : `${block}\n`
-  // 光标落到最后：接着打字就是「照这份文档做什么」，不用在两万字里找位置。
-  nextTick(() => {
-    const el = composer.value
-    if (!el) return
-    el.focus()
-    el.setSelectionRange(el.value.length, el.value.length)
-    el.scrollTop = el.scrollHeight
-  })
-}
-
-/**
  * 选了几份就一份份抽。**一份抽不了不影响其余几份**——原因（连 suggestions）显示在
- * 输入框上方那块错误里，抽成了的照旧进输入框。
+ * 输入框上方那块错误里，抽成了的挂进待发送列表（`director.attached`），作为一张附件卡随
+ * 下一条消息一起走。文字不再灌进输入框：用户只打自己的话。
  *
  * 收尾把 `value` 清空：不清的话同一个文件第二次选不出 change 事件。
  */
@@ -435,9 +474,14 @@ async function onPicked(ev: Event): Promise<void> {
   const files = [...(input.files ?? [])]
   input.value = ''
   for (const file of files) {
-    const out = await director.attach(props.pid, file)
-    if (out) spliceIn(out)
+    await director.attach(props.pid, file)
   }
+}
+
+/** 一条 user 记录带的附件（气泡里渲染成附件卡）。坏数据退回空数组，不抛。 */
+function attachmentsOf(turn: DirectorTurn): DirectorAttachment[] {
+  const raw = (turn.content as { attachments?: unknown }).attachments
+  return Array.isArray(raw) ? (raw as DirectorAttachment[]) : []
 }
 
 async function accept(op: DirectorOp): Promise<void> {
@@ -544,24 +588,130 @@ function discardGroup(ops: DirectorOp[]): void {
             :body="emptyText"
           />
 
-          <!-- 落了库的对话。提案不在这里，走下面那份可逐条审阅的 Diff -->
-          <div
-            v-for="turn in director.messages"
-            :key="turn.id"
-            class="text-2xs"
-            :class="turn.role === 'user' ? 'pl-6' : ''"
-          >
-            <p class="text-fg-4 mb-0.5 flex items-center gap-1">
-              <Sparkles v-if="turn.role === 'assistant'" :size="10" class="text-accent" />
-              {{ turn.role === 'user' ? '我' : 'AI 导演' }}
-            </p>
-            <p
-              class="border-line-1 border px-2 py-1.5 leading-relaxed whitespace-pre-wrap"
-              :class="turn.role === 'user' ? 'bg-base-2 text-fg-2' : 'bg-base-1 text-fg-1'"
+          <!--
+            对话按时间顺序摊开。人 / AI 说的话是气泡；**每一轮 AI 改了什么就跟在那条 AI 消息
+            后面画成一份只读的 before → after Diff**（`proposal` 记录）——这样免确认模式 /
+            一键全流程落完之后，「这一轮到底动了哪里、改成什么样」照样翻得到，而不是只剩一句
+            「已落库 N 条」。正等审的那条提案不在这里画（它走底下那份可操作的分组卡，
+            `livePendingTurnId` 跳过它），落库的收尾标（`applied`）也顺手画一个。
+          -->
+          <template v-for="turn in director.turns" :key="turn.id">
+            <!-- 人 / AI 说的话 -->
+            <div
+              v-if="turn.role === 'user' || turn.role === 'assistant'"
+              class="text-2xs"
+              :class="turn.role === 'user' ? 'pl-6' : ''"
             >
-              {{ textOf(turn) }}
+              <p class="text-fg-4 mb-0.5 flex items-center gap-1">
+                <Sparkles v-if="turn.role === 'assistant'" :size="10" class="text-accent" />
+                {{ turn.role === 'user' ? '我' : 'AI 导演' }}
+              </p>
+              <p
+                v-if="textOf(turn)"
+                class="border-line-1 border px-2 py-1.5 leading-relaxed whitespace-pre-wrap"
+                :class="turn.role === 'user' ? 'bg-base-2 text-fg-2' : 'bg-base-1 text-fg-1'"
+              >
+                {{ textOf(turn) }}
+              </p>
+              <!--
+                这条消息带的附件：气泡里只显示一张附件卡（文件名 + 类型 + 字数），**不铺开正文**
+                ——正文在后端已经拼进给模型的提示词了，这里再摊开一遍只会把对话淹掉。
+              -->
+              <div
+                v-for="att in attachmentsOf(turn)"
+                :key="att.filename"
+                class="border-line-1 bg-base-2 mt-0.5 flex items-center gap-1 border px-1.5 py-1"
+              >
+                <Paperclip :size="10" class="text-fg-4 shrink-0" />
+                <span class="text-fg-2 min-w-0 flex-1 truncate" :title="att.filename">
+                  {{ att.filename }}
+                </span>
+                <span class="text-fg-4 shrink-0">{{ att.kind_label }} · {{ att.chars }} 字</span>
+                <AppBadge v-if="att.truncated" tone="warn">已截断</AppBadge>
+              </div>
+            </div>
+
+            <!--
+              这一轮 AI 改了什么（只读留存）。正等审的那条跳过——它在底下那份可操作的分组卡里。
+              默认折起来（一部长剧本几十轮），点标题展开看每一处 before → after。
+            -->
+            <div
+              v-else-if="turn.role === 'proposal' && turn.id !== director.livePendingTurnId"
+              class="border-line-1 bg-base-2/50 border"
+            >
+              <button
+                class="hover:bg-base-3/40 flex w-full items-center gap-1 px-2 py-1 text-left"
+                @click="toggleTurn(turn.id)"
+              >
+                <component
+                  :is="isTurnOpen(turn.id) ? ChevronDown : ChevronRight"
+                  :size="10"
+                  class="text-fg-4 shrink-0"
+                />
+                <Wand :size="10" class="text-accent shrink-0" />
+                <span class="text-fg-3 min-w-0 flex-1 truncate text-2xs" :title="proposalSummary(turn)">
+                  AI 改动 · {{ opsOf(turn).length }} 处
+                  <span class="text-fg-4">{{ proposalSummary(turn) }}</span>
+                </span>
+              </button>
+              <!-- 展开：按对象分组，每条画 before → after（只读，没有采用 / 丢弃） -->
+              <div v-if="isTurnOpen(turn.id)" class="space-y-1.5 border-t border-line-1 px-2 py-1.5">
+                <div v-for="g in proposalGroupsOf(turn)" :key="g.target" class="space-y-1">
+                  <AppBadge tone="accent">{{ g.label }} · {{ g.ops.length }} 条</AppBadge>
+                  <div
+                    v-for="op in g.ops"
+                    :key="op.temp_id"
+                    class="border-line-1 bg-base-2 border px-2 py-1.5 space-y-1"
+                  >
+                    <p class="text-fg-3 text-2xs">{{ opLabel(op) }}</p>
+                    <p v-if="op.why" class="text-fg-4 text-2xs leading-relaxed">{{ op.why }}</p>
+                    <div
+                      v-for="row in visibleRows(op)"
+                      :key="row.key"
+                      class="text-2xs flex items-baseline gap-1"
+                    >
+                      <span class="text-fg-4 w-14 shrink-0 truncate" :title="row.label">
+                        {{ row.label }}
+                      </span>
+                      <div class="min-w-0 flex-1">
+                        <p v-if="op.before" class="text-fg-4 break-words">
+                          {{ isLong(row.from) && !isOpen(keyOf(op, row)) ? clip(row.from) : row.from }}
+                        </p>
+                        <p class="break-words" :class="row.changed ? 'text-accent-hi' : 'text-fg-3'">
+                          <span v-if="op.before" class="text-fg-4">→ </span
+                          >{{ isLong(row.to) && !isOpen(keyOf(op, row)) ? clip(row.to) : row.to }}
+                        </p>
+                        <button
+                          v-if="isLong(row.from) || isLong(row.to)"
+                          class="text-fg-4 hover:text-fg-2 mt-px inline-flex items-center gap-0.5"
+                          @click="toggle(keyOf(op, row))"
+                        >
+                          <component
+                            :is="isOpen(keyOf(op, row)) ? ChevronDown : ChevronRight"
+                            :size="10"
+                          />
+                          {{ isOpen(keyOf(op, row)) ? '收起' : '展开全文' }}
+                        </button>
+                      </div>
+                    </div>
+                    <ul v-if="op.warnings.length" class="space-y-px">
+                      <li v-for="w in op.warnings" :key="w" class="text-st-review text-2xs break-words">
+                        · {{ w }}
+                      </li>
+                    </ul>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- 落库的收尾标：这一轮真的写进了库 -->
+            <p
+              v-else-if="turn.role === 'applied' && appliedCountOf(turn)"
+              class="text-st-done flex items-center gap-1 pl-1 text-2xs"
+            >
+              <Check :size="10" class="shrink-0" />已落库 {{ appliedCountOf(turn) }} 条
             </p>
-          </div>
+          </template>
 
           <!--
             正在写的那段：**一条临时气泡，还没落库**，所以不进 `messages`——
@@ -928,8 +1078,8 @@ function discardGroup(ops: DirectorOp[]): void {
             </button>
           </div>
           <!--
-            抽进输入框的附件。**这几条不是「待上传的文件」**——文字已经在输入框里了，
-            这里留着的是「按什么读的 / 有没有截断」这些必须显示出来的话。
+            待随下一条消息发送的附件。**这几份会跟着消息一起走**（不再灌进输入框）：
+            每条还带着「按什么读的 / 有没有截断」这些必须显示出来的话。
           -->
           <div v-if="director.attached.length" class="space-y-1">
             <div
@@ -948,7 +1098,7 @@ function discardGroup(ops: DirectorOp[]): void {
                 <AppBadge v-if="att.truncated" tone="warn">已截断</AppBadge>
                 <button
                   class="text-fg-4 hover:text-fg-2 shrink-0"
-                  title="只把这条提示收起来。文字已经在输入框里，要去掉请在输入框里删那一段"
+                  title="把这份附件从待发送列表里拿掉——它就不会跟着下一条消息走了"
                   @click="director.forgetAttachment(att.filename)"
                 >
                   <X :size="10" />
@@ -997,7 +1147,7 @@ function discardGroup(ops: DirectorOp[]): void {
               "
               :title="
                 director.attachInfo
-                  ? `一份 Word / Excel / PPT / 文本 → 一段文字填进输入框（最大 ${director.attachInfo.max_mb} MB，最多 ${director.attachInfo.max_chars} 字）。${director.attachInfo.note}`
+                  ? `一份 Word / Excel / PPT / 文本 → 一张附件卡，随消息一起发送（最大 ${director.attachInfo.max_mb} MB，最多 ${director.attachInfo.max_chars} 字）。${director.attachInfo.note}`
                   : '还在读这一栏的配置'
               "
               @click="pickFile()"
@@ -1073,7 +1223,7 @@ function discardGroup(ops: DirectorOp[]): void {
                 v-else
                 size="sm"
                 variant="primary"
-                :disabled="!draft.trim() || locked"
+                :disabled="!canSend || locked"
                 @click="send()"
               >
                 <Send :size="10" />发送

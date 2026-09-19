@@ -95,7 +95,14 @@ IMAGE_PROMPT_PARAMS: dict[str, dict[str, Any]] = {
 #: 镜头上那些「不是 prompt」的字段。
 SHOT_PLAIN_PARAMS: dict[str, dict[str, Any]] = {
     "title": {"type": "string", "description": "一句话概括这一镜在讲什么"},
-    "description": {"type": "string", "description": "这一镜的画面描述（人也要看的那份）"},
+    "description": {
+        "type": "string",
+        "description": (
+            "这一镜的**剧情详情**（人也要看的那份，也是第三步转 prompt 的底本）：谁在场、"
+            "站在哪、在做什么、说什么、情绪怎样。**写连贯**——下一镜要出场的人 / 道具，"
+            "在这一镜就交代好它此刻的位置与动作，让下一镜自然衔接得上。"
+        ),
+    },
     "duration": {"type": "number", "description": "秒，2~8：空镜短、情绪戏长"},
     "camera": {"type": "string", "description": "景别：远景 / 全景 / 中景 / 近景 / 特写"},
     "movement": {"type": "string", "description": "运镜：固定 / 推 / 拉 / 摇 / 跟"},
@@ -193,6 +200,15 @@ TOOLS: dict[str, dict[str, Any]] = {
             },
         },
     },
+    "read_screenplay": {
+        "kind": "read",
+        "desc": (
+            "读这个工程里 AI 维护的那份剧本 MD（工作流第一步的产物）。"
+            "拆幕 / 拆镜头之前先读它，以它为底本——它是这部片子「到底在讲什么」的持久真源，"
+            "比翻聊天记录可靠。空的（还没攒过）就照用户这句话先用 update_screenplay 起一份。"
+        ),
+        "params": {},
+    },
     "read_skill": {
         "kind": "read",
         "desc": (
@@ -210,6 +226,24 @@ TOOLS: dict[str, dict[str, Any]] = {
             }
         },
         "required": ["name"],
+    },
+    "update_screenplay": {
+        "kind": "write",
+        "desc": (
+            "维护这个工程的剧本 MD（工作流第一步）。**整份替换**：先 read_screenplay 看现在有什么，"
+            "把用户这一轮的新信息并进去，再把**完整的一份**回填这里（不是只写增量）。"
+            "写成一份结构清楚的 Markdown：一句话主线、按时间顺序的关键情节、出场人物名单、"
+            "地点名单、关键道具名单——人名 / 地名一律用用户原文，同一个人前后一致。"
+            "这是拆幕 / 拆镜头的底本，所以要写全、写准。它照旧是提案，免确认模式下才直接落。"
+        ),
+        "params": {
+            "screenplay_md": {
+                "type": "string",
+                "description": "完整的剧本 Markdown 全文（会整份替换掉现有的那份）",
+            },
+            "why": {"type": "string", "description": "这一轮往剧本里并进了什么 / 改了什么"},
+        },
+        "required": ["screenplay_md"],
     },
     "add_scene": {
         "kind": "write",
@@ -700,6 +734,18 @@ async def run_read(pid: str, name: str, args: dict[str, Any]) -> Any:
         return lane
     if name == "read_script":
         return await _read_script(pid, args)
+    if name == "read_screenplay":
+        text = str((await story.get_story(pid)).get("screenplay_md") or "")
+        return {
+            "screenplay_md": text,
+            "chars": len(text),
+            "has_text": bool(text.strip()),
+            "note": (
+                "这份剧本 MD 是拆幕 / 拆镜头的底本，把它读进去再动手。"
+                if text.strip()
+                else "还没有攒过剧本：照用户这句话先用 update_screenplay 起一份，再往下拆。"
+            ),
+        }
     if name == "read_skill":
         return {"skill": args.get("name"), "text": skills.render(args.get("name", ""))}
     raise AppError(
@@ -1097,6 +1143,7 @@ async def _shot_after(
 
 #: 每个写工具动的是哪一类东西。前端按 target 分组显示提案，所以这张表是它的唯一来源。
 _TARGET = {
+    "update_screenplay": "story",
     "set_link": "link",
     "add_shot": "shot",
     "update_shot": "shot",
@@ -1177,6 +1224,15 @@ async def to_op(
         "why": why,
         "warnings": [],
     }
+
+    if name == "update_screenplay":
+        text = str(args.get("screenplay_md") or "")
+        old = str((await story.get_story(pid)).get("screenplay_md") or "")
+        op["before"] = {"chars": len(old), "preview": old[:200]}
+        op["after"] = {"screenplay_md": text, "chars": len(text)}
+        if not text.strip():
+            op["warnings"].append("剧本正文是空的：采用后会把现有的那份清掉")
+        return op
 
     if name == "add_scene":
         shots: list[dict[str, Any]] = []

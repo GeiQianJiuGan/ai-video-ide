@@ -330,5 +330,49 @@ class CastService:
         )
         return [as_dict(r) for r in rows]
 
+    async def delete_sheet(self, pid: str, sheet_id: str) -> None:
+        """删一版定妆图（历史版本随时删；默认形象的当前定妆图不许删）。
+
+        只解引用（`assets.unlink`），底层素材文件不动——与素材库那侧同一个口径。
+        删的若是当前版本，把兄弟里 `version_no` 最大的一条提升为当前，绝不留下
+        「一版都没当前」的形象。
+        """
+        db = db_of(pid)
+        sheet = await fetch(db, SheetVersion, sheet_id, "定妆图")
+        appearance = await fetch(db, Appearance, sheet.appearance_id, "形象")
+        if appearance.is_default and sheet.is_current:
+            raise AppError(
+                ErrorCode.CONFLICT,
+                "默认定妆图不能删除",
+                "默认形象必须始终保留一张当前定妆图；挂新图即可替换它。",
+                ["先给默认形象挂一张新定妆图", "再删除旧的历史版本"],
+                {"protected_default": True},
+            )
+        siblings = await fetch_all(
+            db, SheetVersion, where=SheetVersion.appearance_id == appearance.id
+        )
+        if sheet.asset_id:
+            await assets.unlink(pid, sheet.asset_id, appearance.id)
+        async with db.write() as session:
+            if sheet.is_current:
+                previous = max(
+                    (item for item in siblings if item.id != sheet.id),
+                    key=lambda item: item.version_no,
+                    default=None,
+                )
+                if previous is not None:
+                    held_previous = await session.get(SheetVersion, previous.id)
+                    if held_previous is not None:
+                        held_previous.is_current = 1
+            fresh = await session.get(SheetVersion, sheet_id)
+            if fresh is not None:
+                await session.delete(fresh)
+        bus.emit(
+            Channel.VERSION,
+            "sheet.deleted",
+            {"appearance_id": appearance.id},
+            project_id=pid,
+        )
+
 
 cast = CastService()

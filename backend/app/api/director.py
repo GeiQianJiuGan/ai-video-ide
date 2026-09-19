@@ -9,8 +9,9 @@
   - `POST /director/apply`       把审阅通过的条目落库，只落 `op != "reject"` 的；
   - `POST /director/autopilot`   一键全流程：核心剧本 → 素材 → 幕 → 分镜，四步都直接落库，
     **要求免确认模式开着**（关着时是四要素错误，不会偷偷写几十行数据）；
-  - `POST /director/attach`      一份 .docx / .xlsx / … → 一段纯文本，**只填输入框**：
-    不落库、不落盘、不出网，也**不要求配好 LLM**（用户得先看见抽出来什么）；
+  - `POST /director/attach`      一份 .docx / .xlsx / … → 一段纯文本回给前端，前端挂成
+    一张附件卡（不再灌进输入框），发送时随消息作为 `attachments` 一起走：**不落库、
+    不落盘、不出网**，也**不要求配好 LLM**（用户得先看见抽出来什么）；
   - `GET  /director`             历史对话与提案（刷新页面不丢）+ LLM 状态
     （未配置时前端据此显示去配置页的引导，而不是一个红叉）+ 附件能收什么
     + **免确认那一组的当前口径**（`auto`：开没开、顺带出图的服务配没配、最多拆几幕）——
@@ -35,11 +36,27 @@ from app.services.director import director
 router = APIRouter(tags=["director"])
 
 
+class Attachment(BaseModel):
+    """随消息发来的一份附件。字段对齐 `core/doctext.py::Extracted.to_dict()`——它已经在
+    `POST /director/attach` 那一下抽成文字了，这里只是把它随消息带回来。正文由后端的
+    `compose_message()` 拼进给模型的提示词，user turn 里也结构化存下来（气泡显示成附件卡）。"""
+
+    filename: str = Field(default="附件")
+    kind: str = Field(default="")
+    kind_label: str = Field(default="")
+    text: str = Field(default="")
+    chars: int = Field(default=0)
+    truncated: bool = Field(default=False)
+    notes: list[str] = Field(default_factory=list)
+
+
 class ChatBody(BaseModel):
     message: str = Field(description="想让 AI 做什么，例如「在第 2 幕后面加一幕雨夜追车」")
     #: 用户现在开着哪一页。**只影响这一次请求拼的系统提示词**那一句提示，不落库——
     #: 剧本页与幕流程图共用同一个会话，换页不该让历史对话变味。
     scope: str = Field(default="flow", description="script（剧本页）/ flow（幕流程图页）")
+    #: 随这句话一起发来的附件（可空）。抽文字在 `attach` 端点做过了，这里只带结果。
+    attachments: list[Attachment] = Field(default_factory=list)
 
 
 class ApplyBody(BaseModel):
@@ -56,7 +73,9 @@ async def history(pid: str) -> dict[str, Any]:
 @router.post("/projects/{pid}/director/chat", status_code=201)
 async def chat(pid: str, body: ChatBody) -> dict[str, Any]:
     """产出提案。落库的是「提案」这条记录，不是提案里的改动。"""
-    return await director.chat(pid, body.message, body.scope)
+    return await director.chat(
+        pid, body.message, body.scope, [a.model_dump() for a in body.attachments]
+    )
 
 
 def _sse(event: str, data: Any) -> bytes:
@@ -75,10 +94,11 @@ async def chat_stream(pid: str, body: ChatBody) -> StreamingResponse:
     两个头是给中间那层代理的：`no-cache` 不许缓存，`X-Accel-Buffering: no` 让 nginx
     别攒着一起发（攒着就等于不流式了）。
     """
-    await director.stream_precheck(pid, body.message)
+    atts = [a.model_dump() for a in body.attachments]
+    await director.stream_precheck(pid, body.message, atts)
 
     async def frames() -> AsyncIterator[bytes]:
-        async for event in director.chat_stream(pid, body.message, body.scope):
+        async for event in director.chat_stream(pid, body.message, body.scope, atts):
             yield _sse(event["event"], event["data"])
 
     return StreamingResponse(
@@ -104,6 +124,8 @@ class AutopilotBody(BaseModel):
     max_scenes: int | None = Field(
         default=None, ge=1, description="这一趟最多拆几幕；留空跟随设置页"
     )
+    #: 随原文一起发来的附件（可空）：附件文字会由 `compose_message` 拼进这一章的原文。
+    attachments: list[Attachment] = Field(default_factory=list)
 
 
 @router.post("/projects/{pid}/director/apply", status_code=201)
@@ -124,6 +146,7 @@ async def autopilot(pid: str, body: AutopilotBody) -> dict[str, Any]:
         replace_script=body.replace_script,
         auto_image=body.auto_image,
         max_scenes=body.max_scenes,
+        attachments=[a.model_dump() for a in body.attachments],
     )
 
 

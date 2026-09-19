@@ -29,6 +29,12 @@ export interface Story {
   id: string
   title: string
   raw_text: string
+  /**
+   * AI 维护的剧本 MD（工作流第一步的产物，「类似一份会随对话更新的记忆」）。
+   * 和 `raw_text` 是两件事：那是用户贴的原文，这是 AI 攒出来、拆幕拆镜头的底本。
+   * 空 = 还没攒过。它由 AI 编剧那一栏的 `update_screenplay` 提案落库，这一页只读不写。
+   */
+  screenplay_md: string
   /** manual / ai_assisted / ai_auto —— 这份结构是怎么来的。 */
   mode: string
   llm: LlmStatus
