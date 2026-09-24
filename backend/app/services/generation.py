@@ -226,6 +226,28 @@ def _provider_of(params: dict[str, Any]) -> str:
     return str(params.get("generation_mode") or "").strip() or str(settings.video_provider or "")
 
 
+def _skill_of(params: dict[str, Any]) -> str:
+    """这个任务当时照哪份 SKILL 渲染 prompt。**只读入队时冻结的那一份，绝不重新解析。**
+
+    与 `_provider_of` 同一个作风、同一个理由——三级回退，各有各的出处：
+
+      1. `params["route"]["skill"]`——`route.require()` 在入队那一刻解析并冻结的那一份
+         （`skill_name_of` 的结果），新任务都走这里。中途在设置页换了 skill，「重试」
+         该照旧用当时那份形状（硬约束 3）。
+      2. `settings.video_skill`——这一轮改造之前入队的老 job（`route` 里没有 `skill` 键）。
+         老任务本来就没有 skill 概念，退回设置页那份是最接近「当时会怎么排」的答案。
+      3. `""`——上面都取不到时交空串给渲染器，`renderers.render_prompt` 会折成
+         `minimax-h3` 并记一条 note（未知 / 缺失 skill 的唯一口径都在那里，硬约束 4），
+         **这里不替它挑默认**，免得两处各有一份「默认 skill 是谁」。
+    """
+    frozen = params.get("route")
+    if isinstance(frozen, dict):
+        chosen = str(frozen.get("skill") or "").strip()
+        if chosen:
+            return chosen
+    return str(settings.video_skill or "").strip()
+
+
 class GenerationService:
     def __init__(self) -> None:
         self._pumps: dict[str, asyncio.Task[None]] = {}
@@ -332,6 +354,11 @@ class GenerationService:
                     #: **冻结的那一份路由**（硬约束 3）：重试只读它，绝不重新解析——否则中途
                     #: 改了设置会让「重试」变成「换个后端跑一遍」，而版本上写的还是旧那条。
                     "route": chosen.frozen(),
+                    #: **模型无关的导演意图**（创作层）。冻在这里，提交时由生成层按
+                    #: `route.skill` 选定的渲染器翻成该模型的正向 prompt（`generation/renderers.py`）
+                    #: ——同一份意图配不同 skill 渲染成不同模型的形状。老工程 / Manual 没有意图，
+                    #: 是 `{}`，渲染器回退到入队时拆好的 `segments` / `prompt`，输出逐字不变。
+                    "director_intent": load_json(shot.intent_json, {}),
                     #: 「这个镜头的画面素材是哪一段」。长视频切段的镜头才有值。
                     "source_version_id": segment_version_id,
                 }
@@ -1045,6 +1072,15 @@ class GenerationService:
             mode=mode,
             prompt=prompt,
             negative=str(params.get("negative_prompt") or ""),
+            #: 照哪份 SKILL 排 prompt（规范层）。**只读入队时冻结的那一份**（`_skill_of`），
+            #: 与 provider 一样不重新解析（硬约束 3）。渲染分岔只有 `renderers.render_prompt`
+            #: 一处，它按这个名字选渲染器；空 / 未知都在那里折成默认并记 note。
+            skill=_skill_of(params),
+            #: **模型无关的导演意图**（创作层）。冻结在入队那一刻，渲染器**优先吃它**：
+            #: 有意图就过 `intent.to_segments` 覆盖到 `segments` 上再按 skill 渲染，
+            #: 没有（老工程 / Manual）才回退到下面拆好的 `segments` / `prompt`——两条路
+            #: 的分岔只在 `renderers.render_prompt` 一处。
+            intent=params.get("director_intent") or {},
             first_frame=first,
             last_frame=last,
             source_video=source_video,

@@ -84,6 +84,10 @@ SHOT_FIELDS = (
     #: 清空 = 传 null，表示这个镜头没有指定首帧。
     "first_frame_asset_id",
     "last_frame_asset_id",
+    #: **模型无关的导演意图**（`app/generation/intent.py` 那份 schema，JSON 落库）。AI 导演写
+    #: 的是这份意图而不是某个模型的 prompt；提交时按 `route.skill` 渲染成该模型的形状。
+    #: Manual 模式不填，直接写 `prompt`（硬约束 2 不变）。见 `get_shot` 展开成 `intent`。
+    "intent_json",
 )
 
 #: 首 / 末帧槽位对应的中文说法，校验错误与账单文案共用一份。
@@ -825,6 +829,9 @@ class StoryService:
             "scene_title": scene.title,
             "scene_index_no": scene.index_no,
             "context_overrides": load_json(row.context_overrides_json, []),
+            #: `intent_json` 展开成干净字段（与 `context_overrides` 同一条口径）：模型无关的
+            #: 导演意图，前端画分镜板 / 编辑镜头时读它，提交时按 `route.skill` 渲染成 prompt。
+            "intent": load_json(row.intent_json, {}),
             "cast": [
                 {
                     **as_dict(c),

@@ -75,6 +75,10 @@ REF_SLOTS_KEY = "reference_image_slots"
 #: 它**：那边要先 `apply()` 把 `_baseline` 装起来，只读路径不该依赖这个时序。
 _DEFAULT_PROVIDER: str = str(Settings.model_fields["video_provider"].default or "")
 
+#: 渲染 SKILL 的代码默认值（`skill_name_of` 继承链最后那一档）。与 `settings.video_skill`
+#: 的默认同源——单独拎出来只为在设置项被人清空时仍有一个兜底，不至于把空串当 skill 名。
+_DEFAULT_SKILL: str = str(Settings.model_fields["video_skill"].default or "")
+
 
 @dataclass(frozen=True)
 class Route:
@@ -100,6 +104,11 @@ class Route:
     workflow_name: str | None = None
     #: 只有 `http_api` 有；**永不带密钥**。
     base_url: str | None = None
+    #: **照哪份 SKILL 把「导演意图」渲染成 prompt**（规范层）：`minimax-h3`（默认）/ `generic`。
+    #: 已经按继承顺序解析到具体那一份（`skill_name_of`）。与 `provider` 是两件正交的事——
+    #: provider 是「提交给谁」，skill 是「按谁的形状排 prompt」，所以 ComfyUI 预设路照样要选它
+    #: （那条路根本不知道你跑的是什么模型，见硬约束 1）。入队时和 provider 一起冻进版本参数。
+    skill: str = ""
     ready: bool = True
     #: 缺什么。四要素形状（`AppError.to_dict()`），前端原样显示 suggestions。
     issues: list[dict[str, Any]] = field(default_factory=list)
@@ -117,6 +126,7 @@ class Route:
             "workflow_id": self.workflow_id,
             "workflow_name": self.workflow_name,
             "base_url": self.base_url,
+            "skill": self.skill,
             "ready": self.ready,
             "issues": self.issues,
         }
@@ -136,6 +146,7 @@ class Route:
             "workflow_name": self.workflow_name,
             "preset": self.preset,
             "base_url": self.base_url,
+            "skill": self.skill,
         }
 
 
@@ -310,6 +321,25 @@ def preset_name_of(project: Project, capability: str, override: str | None = Non
     return None
 
 
+def skill_name_of(project: Project, override: str | None = None) -> str:
+    """这个工程照哪份 SKILL 把「导演意图」渲染成 prompt（规范层）。
+
+    继承顺序：**覆写 → 工程那一列**（`render_skill`）**→ 设置页**（`video.skill`）
+    **→ 代码默认**（`minimax-h3`）。与 `preset_name_of` / `generation_mode` 同一个口径：
+    **工程那一列为空 = 跟随设置页**，显式选了才不跟。
+
+    **与 provider 正交、必须显式选、不能从 provider 推**——ComfyUI 预设路根本不知道跑的是
+    什么模型（硬约束 1）。所以这里既不看 `provider` 也不看 `binds`，只按继承链取一个名字；
+    认不认得它由生成层的 `renderers.render_prompt` 判（未知折默认并记 note，硬约束 4）。
+    与预设那条不同：skill 总能落到一个非空名（最差是代码默认），所以回 `str` 不回 `None`。
+    """
+    for candidate in (override, project.render_skill, settings.video_skill):
+        name = (candidate or "").strip()
+        if name:
+            return name
+    return _DEFAULT_SKILL
+
+
 #: **每条路要绑什么。** 这是本文件里唯一一处按名字分岔的地方：硬约束 1 管的是业务层不许认路，
 #: 而「哪条路要什么」这件事总得有一个人知道。收在这一张表里之后，其它模块只读 `Route` 上那几个
 #: 字段（`binds_workflow` / `preset` / `workflow_id` / `base_url`），一个 `if provider ==` 都不写。
@@ -416,6 +446,7 @@ async def _resolve(
         workflow_id=row.id if row is not None else None,
         workflow_name=row.name if row is not None else None,
         base_url=base_url,
+        skill=skill_name_of(project),
         ready=not issues,
         issues=issues,
     )

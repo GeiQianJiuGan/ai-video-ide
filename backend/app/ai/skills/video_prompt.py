@@ -19,32 +19,40 @@ class Skill:
     title: str
     when: str
     guide_file: str
+    #: **这份写法是给哪个模型的**（与规范层 `renderers.SKILLS` 同一套名字）。以后一台机器上
+    #: 接了第二个模型时，`catalog(model)` 只把当前工程选定那个模型的写法塞进系统提示词——
+    #: 不然两家的结构会一起进去，既让模型犯迷糊又每一轮多烧 token。本轮只发 `minimax-h3`。
+    model: str = "minimax-h3"
 
 
-def _skill_dir() -> Path:
-    """定位官方 H3 Skill 目录。按冻结解包目录 → 仓库根 skill/ → .agents/skills/ 依次查找。"""
+def _skill_dir(dirname: str = "h3-prompt-writing") -> Path:
+    """定位官方 Skill 目录。按冻结解包目录 → 仓库根 skill/ → .agents/skills/ 依次查找。
+
+    `dirname` 默认是 H3 那份（本轮唯一发的一个模型）。留出这个参数是为「结构就绪」：
+    以后加一家模型只多放一个 `skill/<model>/` 目录，查找逻辑一行不用改。
+    """
     candidates: list[Path] = []
     if getattr(sys, "frozen", False):
         bundled = getattr(sys, "_MEIPASS", None)
         if bundled:
-            candidates.append(Path(bundled) / "skill" / "h3-prompt-writing")
-            candidates.append(Path(bundled) / ".agents" / "skills" / "h3-prompt-writing")
+            candidates.append(Path(bundled) / "skill" / dirname)
+            candidates.append(Path(bundled) / ".agents" / "skills" / dirname)
         exe_dir = Path(sys.executable).resolve().parent
-        candidates.append(exe_dir / "skill" / "h3-prompt-writing")
+        candidates.append(exe_dir / "skill" / dirname)
 
     candidates.extend(
         [
-            REPO_ROOT / "skill" / "h3-prompt-writing",
-            REPO_ROOT / ".agents" / "skills" / "h3-prompt-writing",
-            Path("skill") / "h3-prompt-writing",
-            Path(".agents") / "skills" / "h3-prompt-writing",
+            REPO_ROOT / "skill" / dirname,
+            REPO_ROOT / ".agents" / "skills" / dirname,
+            Path("skill") / dirname,
+            Path(".agents") / "skills" / dirname,
         ]
     )
 
     for cand in candidates:
         if cand.exists():
             return cand
-    return REPO_ROOT / "skill" / "h3-prompt-writing"
+    return REPO_ROOT / "skill" / dirname
 
 
 def resolve_skill_file(rel_path: str) -> Path | None:
@@ -77,7 +85,7 @@ def resolve_skill_file(rel_path: str) -> Path | None:
     )
     for prefix in prefixes:
         if clean.lower().startswith(prefix):
-            sub = clean[len(prefix):]
+            sub = clean[len(prefix) :]
             candidates.append(s_dir / sub)
             candidates.append(s_dir / "references" / sub)
             candidates.append(REPO_ROOT / "skill" / "h3-prompt-writing" / sub)
@@ -85,7 +93,7 @@ def resolve_skill_file(rel_path: str) -> Path | None:
 
     # 3. references/ 路径兼容
     if clean.lower().startswith("references/"):
-        sub = clean[len("references/"):]
+        sub = clean[len("references/") :]
         candidates.append(s_dir / "references" / sub)
         candidates.append(s_dir / sub)
 
@@ -184,12 +192,16 @@ ALIASES: dict[str, str] = {
 }
 
 
-def catalog() -> str:
-    """给系统提示词用的清单。**只有这几行进提示词**，全文靠 `read_skill` 按需取。"""
-    return "\n".join(
-        f"- {s.name}（{s.title}，文件引用：{s.guide_file}）：{s.when}"
-        for s in SKILLS.values()
-    )
+def catalog(model: str | None = None) -> str:
+    """给系统提示词用的清单。**只有这几行进提示词**，全文靠 `read_skill` 按需取。
+
+    `model` 非空时只列该模型那几份 SKILL（按 `Skill.model` 过滤）——一台机器上以后接了第二个
+    模型时，别把两家的写法一起塞进系统提示词（既让模型犯迷糊，又每一轮多烧 token）。默认列
+    全部：**本轮只发 minimax-h3**，三份都属于它，所以过不过滤结果一样，结构先就位。
+    """
+    want = str(model or "").strip()
+    rows = [s for s in SKILLS.values() if not want or s.model == want]
+    return "\n".join(f"- {s.name}（{s.title}，文件引用：{s.guide_file}）：{s.when}" for s in rows)
 
 
 def render(name: str) -> str:

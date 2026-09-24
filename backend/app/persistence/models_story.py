@@ -121,6 +121,15 @@ class Shot(Base):
 
     prompt: Mapped[str | None] = mapped_column(Text)
     negative_prompt: Mapped[str | None] = mapped_column(Text)
+    #: **模型无关的「导演意图」**（创作层）。AI 导演写工具产它——一份 dict：
+    #: beat（剧情）/ action（动作）/ shot_size（景别）/ angle（视角机位）/ movement（运镜）/
+    #: first_frame（起始画面）/ last_frame（末帧定格）/ dialogue（对白）/ subjects（出场主体）/
+    #: duration / mood / no_scoring_music（恒 true，无配乐标记）。提交时由生成层按所选 skill
+    #: 的渲染器翻成该模型的 prompt 形状（`app/generation/renderers.py`）——同一份意图 + 不同
+    #: skill = 不同模型的 prompt。**空 = 没有意图**：Manual 模式与老镜头不填它，渲染器回退到
+    #: 下面的 `prompt`（四段格式），输出与升级前逐字相同。它是**权威**，`prompt` 是它渲染出来
+    #: 的派生缓存（供分镜板 / Manual 编辑显示）。走的还是「写工具永不落库，只有 apply 落」那条路。
+    intent_json: Mapped[str | None] = mapped_column(Text)
     #: **这个镜头说的话**（音源那条链要的「说什么」）。
     #:
     #: 为什么不复用 `description` 或 `prompt`：那两个是给**视频模型**看的（画面描述、

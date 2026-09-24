@@ -48,6 +48,12 @@ class Project(Base):
     #: 历史上这一列写死成 `comfy_preset` 且**从来没有被读过**（生成时是硬编码的），
     #: `0022_project_route` 把等于默认值的老行清成空串——那些不是用户的选择。
     generation_mode: Mapped[str | None] = mapped_column(String(20), default="")
+    #: **这个工程照哪份 SKILL 把「导演意图」渲染成提示词**（`minimax-h3` / `generic`）。
+    #: 与 `generation_mode` 同一套语义：**空串 = 跟随设置页**（应用级 `video.skill`），
+    #: 显式选了就不再跟。skill 是规范层（把模型无关的 `shot.intent_json` 翻成该模型的
+    #: prompt 形状），必须显式选、不能从 provider 推——ComfyUI 预设路不知道跑的是什么模型。
+    #: 解析口径只有一份：`services/route.py::skill_name_of()`。
+    render_skill: Mapped[str | None] = mapped_column(String(40), default="")
     #: 项目唯一生成预设；预设由应用级管理，项目只选择其中一份。
     preset_name: Mapped[str | None] = mapped_column(String(100))
     #: 普通 Shot 的 R2V 预设；为空时回退到旧的 preset_name。

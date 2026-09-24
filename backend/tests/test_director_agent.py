@@ -386,7 +386,12 @@ def test_skill_pick_covers_every_frame_combination() -> None:
 def test_shot_tools_are_proposal_only_then_land_with_a_four_part_prompt(
     client: TestClient, pid: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """镜头级工具与幕级同一条边界：chat 之后库里镜头数不变，apply 之后才真落库。"""
+    """镜头级工具与幕级同一条边界：chat 之后库里镜头数不变，apply 之后才真落库。
+
+    导演产的是**模型无关的意图**（`intent`），落库时单独存进 `intent_json`，并从意图派生出
+    一份 4 段预览 prompt（供分镜板 / Manual 编辑显示；真正喂给模型的画面提示词由生成层在
+    提交时按 skill 重新渲染）。
+    """
     sid = scene(client, pid, "第一幕")
     use_fake_llm(
         monkeypatch,
@@ -398,12 +403,16 @@ def test_shot_tools_are_proposal_only_then_land_with_a_four_part_prompt(
                         "add_shot",
                         scene_id=sid,
                         title="雨中疾驰",
-                        duration=5,
-                        camera_motion="中景，缓慢推进",
-                        visual_prompt="轿车在雨幕里疾驰，路灯拉出长长的光带",
-                        audio_dialogue="雨声与轮胎摩擦水面的声音",
-                        negative_prompt="模糊, 变形",
-                        skill="i2v",
+                        intent={
+                            "beat": "轿车在雨幕里疾驰",
+                            "action": "路灯拉出长长的光带",
+                            "shot_size": "中景",
+                            "movement": "缓慢推进",
+                            "dialogue": "雨声与轮胎摩擦水面的声音",
+                            "subjects": ["轿车"],
+                            "duration": 5,
+                        },
+                        skill="h3-base",
                         why="这一幕还没有开场镜头",
                     )
                 ],
@@ -420,11 +429,17 @@ def test_shot_tools_are_proposal_only_then_land_with_a_four_part_prompt(
     )
 
     after = ops[0]["after"]
+    # 意图是权威：原样带在提案里，落库时进 intent_json。
+    assert after["intent"]["beat"] == "轿车在雨幕里疾驰"
+    assert after["intent"]["no_scoring_music"] is True, "无配乐是恒定标记，由代码补"
+    assert after["duration"] == 5, "时长从意图派生"
+    # 派生的 4 段预览：机位 = 景别 + 运镜，画面 = 剧情 + 动作。
     assert after["prompt"].startswith("[SHOT 1]")
     assert "Camera Motion: 中景，缓慢推进" in after["prompt"]
     assert "Visual Prompt: 轿车在雨幕里疾驰" in after["prompt"]
     assert "声音设计：" in after["prompt"], "无配乐硬约束由代码补，不靠模型自觉"
-    assert "background music" in after["negative_prompt"]
+    # 导演不再产负向；这个镜头没有 Manual 负向，所以派生负向为空。
+    assert after["negative_prompt"] == ""
 
     resp = client.post(f"{API}/projects/{pid}/director/apply", json={"ops": ops})
     assert resp.status_code == 201, resp.text
@@ -435,24 +450,48 @@ def test_shot_tools_are_proposal_only_then_land_with_a_four_part_prompt(
     shot = client.get(f"{API}/projects/{pid}/shots/{shots[0]['id']}").json()
     assert shot["title"] == "雨中疾驰" and shot["duration"] == 5
     assert shot["prompt"].startswith("[SHOT 1]")
-    assert "background music" in shot["negative_prompt"]
+    assert shot["intent"]["beat"] == "轿车在雨幕里疾驰", "意图落进 intent_json，get_shot 展开成 intent"
 
 
-def test_update_shot_keeps_the_segments_it_was_not_given(
+def test_update_shot_merges_intent_keeping_fields_it_was_not_given(
     client: TestClient, pid: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """只给 visual_prompt 时，机位与对白不该被抹成默认值。"""
+    """只给意图的一部分（只改剧情 beat）时，原意图里没被覆盖的机位与对白要留着。
+
+    意图是权威，保留靠的是 `intent.merge`（给了才覆盖、没给保留原样），派生的 4 段预览
+    prompt 也就跟着保住原来的机位与对白，而不是被抹成默认值。
+    """
     sid = scene(client, pid, "第一幕")
-    created = client.post(
-        f"{API}/projects/{pid}/scenes/{sid}/shots",
-        json={
-            "title": "旧镜头",
-            "prompt": (
-                "[SHOT 1]\nCamera Motion: 特写，固定\n"
-                "Visual Prompt: 旧的画面\nAudio / Dialogue: 老王：别追了"
-            ),
-        },
-    ).json()
+    # 先由导演建一个带完整意图的镜头并落库，作为后面这次 update 的底。
+    use_fake_llm(
+        monkeypatch,
+        [
+            {
+                "content": "",
+                "tool_calls": [
+                    call(
+                        "add_shot",
+                        scene_id=sid,
+                        title="旧镜头",
+                        intent={
+                            "beat": "旧的画面",
+                            "shot_size": "特写",
+                            "movement": "固定",
+                            "dialogue": "老王：别追了",
+                        },
+                        skill="h3-base",
+                        why="开场镜头",
+                    )
+                ],
+            },
+            {"content": "建好了。", "tool_calls": []},
+        ],
+    )
+    ops = client.post(f"{API}/projects/{pid}/director/chat", json={"message": "建一个镜头"}).json()[
+        "ops"
+    ]
+    client.post(f"{API}/projects/{pid}/director/apply", json={"ops": ops})
+    shot_id = client.get(f"{API}/projects/{pid}/storyboard").json()[0]["shots"][0]["id"]
 
     use_fake_llm(
         monkeypatch,
@@ -462,8 +501,8 @@ def test_update_shot_keeps_the_segments_it_was_not_given(
                 "tool_calls": [
                     call(
                         "update_shot",
-                        shot_id=created["id"],
-                        visual_prompt="新的画面：雨点砸在挡风玻璃上",
+                        shot_id=shot_id,
+                        intent={"beat": "新的画面：雨点砸在挡风玻璃上"},
                         why="原来的画面描述太空",
                     )
                 ],
@@ -474,14 +513,19 @@ def test_update_shot_keeps_the_segments_it_was_not_given(
     ops = client.post(f"{API}/projects/{pid}/director/chat", json={"message": "重写画面"}).json()[
         "ops"
     ]
-    prompt = ops[0]["after"]["prompt"]
-    assert "Camera Motion: 特写，固定" in prompt, "没给的那一段要从原 prompt 里接着用"
+    after = ops[0]["after"]
+    assert after["intent"]["beat"] == "新的画面：雨点砸在挡风玻璃上"
+    assert after["intent"]["shot_size"] == "特写", "没给的意图字段要保留"
+    assert after["intent"]["dialogue"] == "老王：别追了"
+    prompt = after["prompt"]
+    assert "Camera Motion: 特写，固定" in prompt, "没给的那一段要从原意图里接着用"
     assert "Audio / Dialogue: 老王：别追了" in prompt
     assert "新的画面：雨点砸在挡风玻璃上" in prompt
 
     client.post(f"{API}/projects/{pid}/director/apply", json={"ops": ops})
-    shot = client.get(f"{API}/projects/{pid}/shots/{created['id']}").json()
+    shot = client.get(f"{API}/projects/{pid}/shots/{shot_id}").json()
     assert "特写，固定" in shot["prompt"] and "老王：别追了" in shot["prompt"]
+    assert shot["intent"]["shot_size"] == "特写"
 
 
 def test_delete_and_reorder_shots_go_through_the_same_review(

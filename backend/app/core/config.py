@@ -33,7 +33,7 @@ class Settings(BaseSettings):
 
     app_name: str = "AI Video Studio"
     version: str = "0.1.0"
-    schema_version: int = 23
+    schema_version: int = 24
 
     # --- 网络：只监听回环，绝不对外暴露工程数据 ---
     host: str = "127.0.0.1"
@@ -91,6 +91,13 @@ class Settings(BaseSettings):
     # `<Subject 1> is … <Picture 2>: 林小雨（常服）`）。ComfyUI 那类图收不到标签，只能靠
     # 这几句让模型知道哪张是谁；关掉就原样发送用户手写的提示词，图册照旧记进版本参数。
     video_ref_labels: bool = True
+    # **这个工程照哪份 SKILL 把「导演意图」渲染成提示词**（创作层→规范层那一步）。
+    # 意图是模型无关的结构化 dict（`shot.intent_json`）；渲染器按这个名字把它翻成该模型的
+    # prompt 形状：`minimax-h3`（默认，MiniMax H3 六段）/ `generic`（自由散文兜底）。
+    # 它是**跟随设置页**时用的那份：工程可以显式选另一份（`project.render_skill`，
+    # 空 = 跟随这里），解析口径只有 `services/route.py::skill_name_of` 一份。
+    # 为什么不能从 provider 推：ComfyUI 预设路根本不知道用户跑的是什么模型，所以必须显式选。
+    video_skill: str = "minimax-h3"
     # 二次处理（超分 / 插帧 / 重做）用哪一份图：它必须标了 AIVS_SOURCE_VIDEO。
     # 留空时退回**出画面那份默认**（presets.app_default("r2v")：按角色那一格 → 共用那一格）
     # ——很多人就一份图，那份图上标了源视频入口也能处理。

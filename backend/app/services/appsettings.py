@@ -28,6 +28,7 @@ from app.ai.llm import protocols as llm_protocols
 from app.core.config import Settings, settings
 from app.core.errors import AppError, ErrorCode
 from app.core.logging import get_logger
+from app.generation import renderers
 from app.generation.providers import image as image_protocols
 from app.persistence.models import utc_now
 
@@ -70,6 +71,14 @@ GROUPS: tuple[tuple[str, str], ...] = (
     ("scene", "幕（流程图节点）"),
     ("runtime", "运行"),
 )
+
+#: `video.skill` 那个下拉的人话标签。**候选本身来自渲染器注册表**（`renderers.SKILLS`，
+#: 加一家模型只在那里多一个名字），这里只补一句中文；注册表里有、这张表里没有的名字
+#: 直接显示原名（`.get(s, s)`），不至于让新加的 skill 在设置页凭空消失。
+_SKILL_LABELS: dict[str, str] = {
+    "minimax-h3": "MiniMax H3 六段（默认）",
+    "generic": "通用（自由散文兜底）",
+}
 
 FIELDS: tuple[FieldSpec, ...] = (
     FieldSpec(
@@ -263,6 +272,25 @@ FIELDS: tuple[FieldSpec, ...] = (
             "按参考生成格式重排提示词，写明「<Subject 1> 就是 <Picture 2> 里那个人」。"
             "ComfyUI 那类图收不到标签，只能靠这几句让模型分清谁是谁；关掉就原样发送你写的"
             "提示词，图册照旧记进版本参数（界面上仍看得到喂了哪几张、按什么顺序）。"
+        ),
+    ),
+    # **照哪份 SKILL 把「导演意图」渲染成 prompt**（规范层）。候选来自渲染器注册表，
+    # 不在这里第二次写死可选值——加一家模型只改 `renderers.SKILLS` 一处。与「调用方式」正交：
+    # provider 是「提交给谁」，skill 是「按谁的形状排 prompt」，ComfyUI 预设路照样要选它
+    # （那条路不知道你跑的是什么模型，硬约束 1）。工程可以显式选另一份（`project.render_skill`，
+    # 空 = 跟随这里），解析口径只有 `services/route.py::skill_name_of` 一份。
+    FieldSpec(
+        "video.skill",
+        "video_skill",
+        "video",
+        "提示词渲染规范（按模型）",
+        "enum",
+        renderers.SKILLS,
+        tuple(_SKILL_LABELS.get(s, s) for s in renderers.SKILLS),
+        impact=(
+            "把「导演意图」按哪个模型的形状排成正向 prompt。minimax-h3 走 MiniMax H3 官方六段；"
+            "generic 是一线自由文本模型的散文兜底。它与「调用方式」是两件事——ComfyUI 预设路也要"
+            "选它，因为那条路不知道你跑的是什么模型。老镜头没有「导演意图」时按原样发送，不受影响。"
         ),
     ),
     # --- 音源：与视频**完全独立的一套**。声音那条链跑的往往是另一台机器 / 另一个服务
