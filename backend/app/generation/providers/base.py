@@ -181,6 +181,11 @@ class VideoRequest:
     mode: str
     prompt: str = ""
     negative: str = ""
+    #: **照哪份 SKILL 把这次请求渲染成 prompt**（规范层）——`minimax-h3`（默认）/ `generic`。
+    #: 入队时由工程路由解析并冻结（`route.skill`），执行与重试只读冻结值（硬约束 3）。
+    #: 与 `extra["skill"]` 不是一回事：那个是 H3 内部的子模式提示（base / ref），这个是
+    #: 「选哪个渲染器」。渲染分岔只有 `app/generation/renderers.py::render_prompt` 一处。
+    skill: str = ""
     first_frame: Path | None = None
     last_frame: Path | None = None
     #: 首尾帧之外的参考素材（图片 / 视频 / 音频混在一个列表里，按账单顺序、优先级高的在前）。
@@ -217,6 +222,12 @@ class VideoRequest:
     #: 这一次的图册（`<Picture n>` / `<Subject n>` 到底指谁）。适配器填，service 层冻结进
     #: `params.pictures`。`None` = 这条路不编号（通用 REST 那类收得到结构化字段的端）。
     book: PictureBook | None = None
+    #: **模型无关的导演意图**（`app/generation/intent.py` 那份 schema）。入队时由
+    #: `params.director_intent` 冻结、`_run_provider` 传进来。渲染器**优先吃它**
+    #: （`renderers.render_prompt` 把它过 `intent.to_segments` 覆盖到 `segments` 上），
+    #: 空 dict = 老工程 / Manual 镜头没有意图，此时回退到 `segments` / `prompt`，
+    #: 输出与升级前逐字相同。同一份意图配不同 `skill` → 不同模型的 prompt。
+    intent: dict[str, Any] = field(default_factory=dict)
 
 
 def refs_by_media(refs: Sequence[RefAsset]) -> dict[str, list[RefAsset]]:

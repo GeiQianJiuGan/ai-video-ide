@@ -153,10 +153,10 @@ time_of_day 填时间、location_name 用剧本里的地点原文（上一步刚
 
 #: 第四步：**按幕各来一轮**。一次把所有幕的镜头都拆完必然超时或被截断，
 #: 所以这一步在 `autopilot()` 里循环，每一幕一句话、一次 `propose()`、一次 `apply()`。
-_AUTO_SHOTS = """第四步（第 {index}/{total} 幕）：给这一幕拆分镜。这一步分两小步——**先写连贯的剧情，再照 SKILL 转成 prompt**。
+_AUTO_SHOTS = """第四步（第 {index}/{total} 幕）：给这一幕拆分镜。这一步分两小步——**先写连贯的剧情，再照 SKILL 落成导演意图**。
 
 这一幕的 scene_id 是 {scene_id}，标题「{title}」。先用 read_screenplay 看这一幕在整部片子里的
-上下文，再用 get_scene 看它现在什么样，再用 read_skill 取一份镜头提示词的写法
+上下文，再用 get_scene 看它现在什么样，再用 read_skill 取一份镜头写法
 （这一轮的镜头还没有指定首尾帧，取 h3-ref 或 references/ref-en.txt 那一份）。
 
 然后用 add_shot 提 {hint} 个镜头，每一镜：
@@ -166,11 +166,11 @@ _AUTO_SHOTS = """第四步（第 {index}/{total} 幕）：给这一幕拆分镜�
 · description 写**剧情详情**：谁在场、站在哪、在做什么、说什么、情绪怎样。
   **写连贯**——下一镜要出场的人 / 道具，在这一镜的 description 里就交代好它此刻的位置与动作，
   让下一镜自然接得上（比如下一镜某人推门进来，这一镜就写清门在画面哪一侧、他从哪来）。
-· duration 2~8 秒
-· camera 写景别（近景 / 中景 / 全景…），movement 写运镜（推 / 摇 / 固定…）
 · character_names 用剧本里的人名原文列出这一镜谁出场（刚建好的角色会自动接上）
-· 照 SKILL 把上面这段剧情**转成 prompt**：camera_motion / visual_prompt / audio_dialogue
-  三段照你取的那份写法写，skill 填你取的那份。visual_prompt 只写画面里看得见的东西。
+· 照 SKILL 把上面这段剧情落成 **intent**（模型无关的导演意图）：beat 写剧情核心、action 写动作走位、
+  shot_size 写景别、angle 写机位视角、movement 写运镜、first_frame 写起始画面、dialogue 写对白与
+  同期声、subjects 用原文列出场主体、duration 填 4~15 秒；skill 填你取的那份。
+  **你写的是意图，不是某个模型的 prompt**——别写负向、别写背景音乐，那些由系统在提交时统一处理。
 
 镜头按时间顺序提，不用填 position。这一幕有关键道具出场时，最后再提一条
 set_scene_props（道具是挂在幕上的，镜头上没有这一项）。
@@ -1043,9 +1043,11 @@ class DirectorService:
         for shot in wait.targets:
             await story.set_shot_props(pid, shot, items)
 
-    #: 提案的 `after` 里能直接落库的镜头字段。**只有这一张表**——`camera_motion` /
-    #: `visual_prompt` / `audio_dialogue` / `skill` 是给人看的过程量，正向 prompt 已经在
-    #: `ai/director/tools.py::_shot_after` 里拼好写进 `after["prompt"]` 了。
+    #: 提案的 `after` 里能直接落库的镜头字段。**只有这一张表**。
+    #: 权威是 `after["intent"]`（模型无关的导演意图，单独落进 `intent_json`）；
+    #: `prompt` 是从意图派生的一份 4 段预览（`ai/director/tools.py::_shot_after` 拼好写进
+    #: `after["prompt"]`），供分镜板 / Manual 编辑显示——真正喂给模型的画面提示词由生成层在
+    #: 提交时按工程选定的渲染规范从 intent 重新渲染（`generation/renderers.py`）。
     SHOT_PATCH_KEYS = (
         "title",
         "description",
@@ -1081,9 +1083,9 @@ class DirectorService:
             )
             made = 0
             for shot in after.get("shots") or []:
-                created = await story.create_shot(
-                    pid, row["id"], {k: shot.get(k) for k in self.SHOT_PATCH_KEYS}
-                )
+                patch = {k: shot.get(k) for k in self.SHOT_PATCH_KEYS}
+                patch["intent_json"] = dump_json(shot.get("intent") or {})
+                created = await story.create_shot(pid, row["id"], patch)
                 made += 1
                 ids, pending = _split_ids(shot.get("cast"), "appearance_id")
                 if ids:
@@ -1119,10 +1121,12 @@ class DirectorService:
             return {"link_id": row["id"], "mode": row["mode"]}
 
         if name == "add_shot":
+            patch = {k: after.get(k) for k in self.SHOT_PATCH_KEYS}
+            patch["intent_json"] = dump_json(after.get("intent") or {})
             created = await story.create_shot(
                 pid,
                 str(after.get("scene_id") or sid),
-                {k: after.get(k) for k in self.SHOT_PATCH_KEYS},
+                patch,
             )
             ids, pending = _split_ids(after.get("cast"), "appearance_id")
             if ids:
@@ -1142,6 +1146,8 @@ class DirectorService:
         if name == "update_shot":
             shot_id = str(op.get("shot_id") or "")
             patch = {k: after[k] for k in self.SHOT_PATCH_KEYS if k in after}
+            if "intent" in after:
+                patch["intent_json"] = dump_json(after.get("intent") or {})
             if patch:
                 row = await story.update_shot(pid, shot_id, patch)
             else:

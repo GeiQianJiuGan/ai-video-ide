@@ -76,6 +76,30 @@ const reference = computed(
 const referenceAsset = computed(() =>
   reference.value?.asset_id ? (assetById.value.get(reference.value.asset_id) ?? null) : null,
 )
+
+/**
+ * 删一版道具参考图。**先弹确认再动手**；当前版本会被后端拒绝并给出提示，
+ * 前端不做二次判断，只把错误留给 ErrorPanel。
+ */
+type PropReferenceRow = (typeof world.propReferences)[number]
+const refToDelete = ref<PropReferenceRow | null>(null)
+const deleteRefOpen = ref(false)
+
+function promptRemoveReference(r: PropReferenceRow): void {
+  world.clearError()
+  refToDelete.value = r
+  deleteRefOpen.value = true
+}
+
+async function confirmRemoveReference(): Promise<void> {
+  if (!refToDelete.value || !prop.value) return
+  await world.removePropReference(pid.value, prop.value.id, refToDelete.value.id).catch(() => {})
+  if (!world.lastError) {
+    deleteRefOpen.value = false
+    refToDelete.value = null
+    await loadAssets()
+  }
+}
 /**
  * 两个面板都在说同一件事时只留一个。
  *
@@ -288,7 +312,7 @@ async function saveField(key: 'name' | 'description' | 'notes', value: string): 
             <figure
               v-for="r in world.propReferences"
               :key="r.id"
-              class="border bg-base-2 flex cursor-pointer flex-col overflow-hidden"
+              class="group border bg-base-2 relative flex cursor-pointer flex-col overflow-hidden"
               :class="
                 r.id === reference?.id
                   ? 'border-accent'
@@ -308,6 +332,15 @@ async function saveField(key: 'name' | 'description' | 'notes', value: string): 
                 />
                 <span v-else class="text-fg-4 text-2xs">文件不在了</span>
               </span>
+              <!-- 悬停才露出的删除按钮：删这一版参考图（当前版本后端会拦下） -->
+              <button
+                type="button"
+                class="border-line-2 bg-base-1/90 text-fg-3 hover:!bg-st-failed hover:!text-white absolute top-1 right-1 flex size-5 items-center justify-center rounded border opacity-0 transition group-hover:opacity-100"
+                title="删除这一版参考图"
+                @click.stop="promptRemoveReference(r)"
+              >
+                <Trash2 :size="11" />
+              </button>
               <figcaption class="flex items-center gap-1 px-1.5 py-1">
                 <span class="text-fg-2 tnum text-2xs">v{{ r.version_no }}</span>
                 <AppBadge v-if="r.is_current" tone="ok">当前</AppBadge>
@@ -490,6 +523,42 @@ async function saveField(key: 'name' | 'description' | 'notes', value: string): 
         >
           <Plus :size="11" />新建道具
         </AppButton>
+      </template>
+    </AppDialog>
+
+    <!-- 删参考图：先确认再动手（版本只增不改，删掉不可回退） -->
+    <AppDialog
+      v-model:open="deleteRefOpen"
+      title="删除这一版参考图"
+      subtitle="版本只增不改，删掉不可回退"
+      size="sm"
+    >
+      <div v-if="refToDelete" class="space-y-2 p-3 text-xs">
+        <div class="text-fg-2">
+          将删除
+          <strong class="text-fg-1">v{{ refToDelete.version_no }}</strong>
+          <AppBadge v-if="refToDelete.is_current" tone="ok" class="ml-1">当前</AppBadge>
+        </div>
+        <p class="text-fg-3">
+          只解除这一版与道具的关联并从历史里移除。底层素材文件保留在资产库里，不会被删。
+        </p>
+        <p class="text-fg-4 text-2xs">
+          当前版本不能删——后端会拒绝并说明，先上传或换一版当前再删这一版即可。
+        </p>
+      </div>
+      <template #footer>
+        <div class="ml-auto flex items-center gap-2">
+          <AppButton size="sm" variant="ghost" @click="deleteRefOpen = false">取消</AppButton>
+          <AppButton
+            size="sm"
+            variant="primary"
+            class="!bg-st-failed !text-white hover:opacity-90"
+            :disabled="world.busy"
+            @click="confirmRemoveReference"
+          >
+            <Trash2 :size="10" />确认删除
+          </AppButton>
+        </div>
       </template>
     </AppDialog>
   </div>

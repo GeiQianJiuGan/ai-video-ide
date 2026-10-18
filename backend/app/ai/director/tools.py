@@ -37,6 +37,7 @@ from typing import Any
 from app.ai import prompts, skills
 from app.ai.llm import client as llm
 from app.core.errors import AppError, ErrorCode
+from app.generation import intent as gen_intent
 from app.generation.providers import registry
 from app.generation.providers.base import DESC_MAX
 from app.persistence.models_flow import LINK_MODES, SHOT_LINK_MODES
@@ -59,18 +60,24 @@ from app.services.world import world
 SCRIPT_CHUNK = 2000
 SCRIPT_CHUNK_MAX = 6000
 
-#: 镜头 prompt 的三段 + 负向 + 照的哪份 SKILL。**只有这一处口径**：`add_shot` /
-#: `update_shot` / `add_scene` 里的 `shots[]` 收的都是这几个字段，正向那段完整 prompt
-#: 由 `prompts.format_shot_prompt()` 拼、再过 `prompts.with_shot_audio_policy()`。
+#: 镜头的**模型无关导演意图** + 照哪份规范写它。**只有这一处口径**：`add_shot` /
+#: `update_shot` / `add_scene` 里的 `shots[]` 收的都是这两个字段。导演产的是「意图」
+#: （剧情 / 动作 / 景别 / 视角 / 运镜 / 首末帧 / 对白 / 出场主体 / 时长），**不是某个模型
+#: 认得的 prompt**；提交时按 `route.skill` 由规范层（`generation/renderers.py`）渲染成该模型
+#: 的形状。落库时 `_shot_after` 还会顺手用同一份意图拼一段预览 prompt 供分镜板 / Manual 编辑显示。
 SHOT_PROMPT_PARAMS: dict[str, dict[str, Any]] = {
-    "camera_motion": {"type": "string", "description": "机位、景别与运镜，如「中景，缓慢推进」"},
-    "visual_prompt": {"type": "string", "description": "只写画面里看得见的东西 + SKILL 的锚定语"},
-    "audio_dialogue": {"type": "string", "description": "同期环境声、动作音效与对白原文"},
-    "negative_prompt": {"type": "string", "description": "逗号分隔的模型规避项"},
+    "intent": {
+        "type": "object",
+        "description": (
+            "这一镜的**导演意图**（模型无关）：写「画面里发生什么、怎么拍」，"
+            "**别写某个模型的 prompt、别写负向、别写背景音乐**——无配乐是恒定约束，系统会补"
+        ),
+        "properties": gen_intent.properties(),
+    },
     "skill": {
         "type": "string",
         "enum": list(skills.NAMES),
-        "description": "照的是哪一份内置 SKILL（先用 read_skill 取全文）",
+        "description": "照哪一份内置 SKILL 的口径写意图（先用 read_skill 取全文找准字段该怎么填）",
     },
 }
 
@@ -92,20 +99,18 @@ IMAGE_PROMPT_PARAMS: dict[str, dict[str, Any]] = {
     },
 }
 
-#: 镜头上那些「不是 prompt」的字段。
+#: 镜头上那些「不是意图」的字段。景别 / 运镜 / 时长都进 `intent`（模型无关那一份），
+#: 这里只剩人也要读的标题、剧情详情，与出场角色的接线名单。
 SHOT_PLAIN_PARAMS: dict[str, dict[str, Any]] = {
     "title": {"type": "string", "description": "一句话概括这一镜在讲什么"},
     "description": {
         "type": "string",
         "description": (
-            "这一镜的**剧情详情**（人也要看的那份，也是第三步转 prompt 的底本）：谁在场、"
+            "这一镜的**剧情详情**（人也要看的那份，也是攒 intent 的底本）：谁在场、"
             "站在哪、在做什么、说什么、情绪怎样。**写连贯**——下一镜要出场的人 / 道具，"
             "在这一镜就交代好它此刻的位置与动作，让下一镜自然衔接得上。"
         ),
     },
-    "duration": {"type": "number", "description": "秒，2~8：空镜短、情绪戏长"},
-    "camera": {"type": "string", "description": "景别：远景 / 全景 / 中景 / 近景 / 特写"},
-    "movement": {"type": "string", "description": "运镜：固定 / 推 / 拉 / 摇 / 跟"},
     "character_names": {
         "type": "array",
         "items": {"type": "string"},
@@ -1071,10 +1076,9 @@ async def _shot(pid: str, shot_id: str) -> dict[str, Any]:
         ) from exc
 
 
-#: 镜头上「直接落库」的那几个字段（`story.SHOT_FIELDS` 的子集）。
+#: 镜头上「直接落库」的那几个展示标量（`story.SHOT_FIELDS` 的子集）。景别 / 运镜 / 时长现在
+#: 从 `intent` 派生（DB 列还在，分镜板 / ShotView 读它），意图本身另存进 `intent_json`。
 SHOT_PLAIN_KEYS = ("title", "description", "duration", "camera", "movement")
-#: prompt 那三段。顺序即 `format_shot_prompt` 的段落顺序。
-SHOT_SEGMENT_KEYS = ("camera_motion", "visual_prompt", "audio_dialogue")
 
 
 async def _shot_after(
@@ -1083,27 +1087,37 @@ async def _shot_after(
     index: int,
     before: dict[str, Any] | None,
 ) -> tuple[dict[str, Any], list[str]]:
-    """把镜头类写工具的参数拼成提案的 `after`。**正向 prompt 只在这里拼一次。**
+    """把镜头类写工具的参数拼成提案的 `after`。
 
-    三段里没给的那几段从 `before` 的 prompt 里解析出来接着用——改一个镜头时模型往往只给
-    `visual_prompt`，直接重拼会把原来的机位与对白抹成默认值。
+    导演产的是**模型无关的意图**（`app/generation/intent.py`）：这次给的意图叠到原有意图上
+    （给了才覆盖、没给保留原样，走 `gen_intent.merge`），存进 `after["intent"]`。**转成某个
+    模型的 prompt 是提交那一刻的事**（规范层 `generation/renderers.py` 按 `route.skill` 渲染）
+    ——这里只顺手过同一座 `intent.to_segments` 桥拼一段**预览 prompt** 落进 `Shot.prompt`，
+    供分镜板 / Manual 编辑显示，也当无 intent 的老工程 / 老 provider 那条兜底路。
     """
     warnings: list[str] = []
     after: dict[str, Any] = _clean(args, SHOT_PLAIN_KEYS)
-    if "duration" in after:
-        after["duration"] = float(after["duration"])
 
-    segs = dict(prompts.parse_shot_prompt(str((before or {}).get("prompt") or "")))
-    given = {k: str(args[k]).strip() for k in SHOT_SEGMENT_KEYS if args.get(k) is not None}
-    segs.update({k: v for k, v in given.items() if v})
-    if not segs.get("camera_motion"):
-        camera = str(args.get("camera") or (before or {}).get("camera") or "").strip()
-        movement = str(args.get("movement") or (before or {}).get("movement") or "").strip()
-        if camera or movement:
-            segs["camera_motion"] = "，".join(x for x in (camera, movement) if x)
-    fallback = str(
-        after.get("description") or (before or {}).get("description") or after.get("title") or ""
-    )
+    intent, warn = gen_intent.merge((before or {}).get("intent") or {}, args.get("intent"))
+    warnings.extend(warn)
+    #: 模型只给了剧情详情、没在意图里单列剧情核心时，用 description 兜底当 beat——否则预览
+    #: prompt 里就没有「此刻在讲什么」。意图权威，description 只是人看的底本。
+    description = str(after.get("description") or (before or {}).get("description") or "").strip()
+    if description and not intent.get("beat"):
+        intent["beat"] = description
+    after["intent"] = intent
+
+    #: 从意图派生展示标量（DB 列还在，界面读它）：景别→camera、运镜→movement、时长→duration。
+    after["duration"] = float(intent.get("duration") or (before or {}).get("duration") or 4.0)
+    if intent.get("shot_size"):
+        after["camera"] = intent["shot_size"]
+    if intent.get("movement"):
+        after["movement"] = intent["movement"]
+
+    #: 预览 prompt：过唯一那座意图→三段桥再拼四段。**无配乐只留正向侧**（Phase 0）；
+    #: 负向原样透传——导演不产负向，所以这里带上 before 里 Manual 存的那份、不擦也不新增。
+    segs = gen_intent.to_segments(intent)
+    fallback = description or str(after.get("title") or "")
     prompt, negative = prompts.with_shot_audio_policy(
         prompts.format_shot_prompt(
             index,
@@ -1112,9 +1126,8 @@ async def _shot_after(
             segs.get("audio_dialogue", ""),
             fallback,
         ),
-        str(args.get("negative_prompt") or (before or {}).get("negative_prompt") or ""),
+        str((before or {}).get("negative_prompt") or ""),
     )
-    after.update({k: segs[k] for k in SHOT_SEGMENT_KEYS if k in segs})
     after["prompt"] = prompt
     after["negative_prompt"] = negative
 
@@ -1130,7 +1143,7 @@ async def _shot_after(
         )
         if before is not None and canonical in skills.NAMES and canonical != expected:
             warnings.append(
-                f"这个镜头挂的图对应 {expected} 那一份，但 prompt 是照 {declared} 写的——"
+                f"这个镜头挂的图对应 {expected} 那一份，但意图是照 {declared} 写的——"
                 "锚定语可能与实际首 / 末帧不符"
             )
 
@@ -1138,6 +1151,13 @@ async def _shot_after(
         picked, warn = await _resolve_appearances(pid, args)
         after["cast"] = picked
         warnings.extend(warn)
+    elif intent.get("subjects"):
+        # 出场主体里常混着道具，且这是「模型没显式给出场角色、只在意图里点了名」的兜底：
+        # 只接得上真实角色的那几个，接不上的（含道具）默默略过，不刷一堆 pending 警告。
+        picked, _ = await _resolve_appearances(pid, {"character_names": intent["subjects"]})
+        matched = [p for p in picked if p.get("appearance_id")]
+        if matched:
+            after["cast"] = matched
     return after, warnings
 
 
@@ -1241,13 +1261,8 @@ async def to_op(
                 continue
             after, warn = await _shot_after(pid, raw, len(shots) + 1, None)
             op["warnings"].extend(warn)
-            shots.append(
-                {
-                    "title": str(raw.get("title") or f"镜头 {len(shots) + 1}"),
-                    "duration": float(raw.get("duration") or 4.0),
-                    **after,
-                }
-            )
+            # `after` 已带上从 intent 派生的 duration，这里只补一个标题默认值。
+            shots.append({"title": str(raw.get("title") or f"镜头 {len(shots) + 1}"), **after})
         spot, warn = await _resolve_variant(pid, args)
         op["warnings"].extend(warn)
         op["after"] = {
@@ -1349,7 +1364,7 @@ async def to_op(
         op["after"] = {
             "scene_id": row["id"],
             "title": str(args.get("title") or f"镜头 {position or count + 1}"),
-            "duration": float(args.get("duration") or 4.0),
+            # `after` 已带上从 intent 派生的 duration，这里不再另读一个顶层 duration。
             **after,
             **({"position": position} if position else {}),
         }
@@ -1364,6 +1379,7 @@ async def to_op(
             "scene_title": row["scene_title"],
             "index_no": row["index_no"],
             **{k: row.get(k) for k in SHOT_PLAIN_KEYS},
+            "intent": row.get("intent") or {},
             "prompt": row.get("prompt"),
             "negative_prompt": row.get("negative_prompt"),
             "cast": [

@@ -70,11 +70,12 @@ BREAKDOWN_AUDIO_POLICY = """声音处理硬约束：不要生成背景音乐、�
 background music, BGM, soundtrack, musical score。"""
 
 #: 拆解服务会再兜一次底，避免模型或用户自定义 Prompt 漏掉声音边界。
+#: **无配乐现在只有正向这一处口径**：一线模型在抛弃负向，负向侧那份
+#: `background music, BGM, …` 词表已随 `with_shot_audio_policy` 一起去掉。
 SHOT_AUDIO_PROMPT_SUFFIX = (
     "声音设计：仅使用人物对白、同期环境声和必要动作音效；"
     "没有对白时不编造对白；无背景音乐、无配乐、无 BGM。"
 )
-SHOT_AUDIO_NEGATIVE_TERMS = ("background music", "BGM", "soundtrack", "musical score")
 
 #: AI 导演（协作栏）——可改的那一段。
 DIRECTOR_TASK = """你是一部 AI 生成短片的助理导演，同时也是它的分镜师。你面对的是「幕流程图」：
@@ -104,9 +105,11 @@ DIRECTOR_TASK = """你是一部 AI 生成短片的助理导演，同时也是它
 在做什么、说什么；**下一镜要出场的人 / 道具，在上一镜的 `description` 里就交代好它此刻的位置与动作**，
 让两镜自然衔接得上——这是拆剧情时最要紧的一件事。
 
-**第三步——照 SKILL 把剧情转成 prompt。** 写 prompt 之前先 `read_skill` 取一份结构说明
-（挂了首帧的镜头和什么都没挂的镜头写法不一样，照那份范例的段落写；同一轮同一份 SKILL 只读一次），
-再把上面那段剧情转成 `camera_motion` / `visual_prompt` / `audio_dialogue` 三段。
+**第三步——照 SKILL 把剧情落成导演意图。** 动手之前先 `read_skill` 取一份结构说明
+（挂了首帧的镜头和什么都没挂的镜头拍法不一样，照那份范例的镜头语言填；同一轮同一份 SKILL 只读一次），
+再把上面那段剧情填进 add_shot / update_shot 的 `intent`（剧情核心 / 动作 / 景别 / 视角 / 运镜 /
+起始画面 / 末帧 / 对白 / 出场主体 / 时长那几项）。**你写的是模型无关的意图，不是某个模型的 prompt**
+——转成目标模型的提示词由系统在提交时按工程选定的渲染规范完成。
 
 结尾说清这一轮拆到哪儿，然后停下来等用户说「继续」。**不要**在一轮里把整个故事拆完。
 
@@ -127,22 +130,30 @@ DIRECTOR_SCREENPLAY_CONTRACT = """剧本 MD（工作流第一步，read_screenpl
 
 拆镜头时，每一镜的剧情写在 add_shot / update_shot 的 description 里，**必须连贯**：
 下一镜要出场的人 / 道具，在上一镜的 description 里就交代好它此刻的位置与动作，让两镜接得上。
-description 是给人看的剧情详情，也是第三步照 SKILL 转 prompt 的底本；最终喂给模型的画面提示词
-是 camera_motion / visual_prompt / audio_dialogue 那三段拼出来的 prompt，两者不是一回事。"""
+description 是给人看的剧情详情，也是第三步照 SKILL 攒 intent 的底本；最终喂给模型的画面提示词
+由系统在提交时按工程选定的渲染规范从 intent 生成，两者不是一回事。"""
 
-DIRECTOR_SKILL_CONTRACT_HEAD = """镜头 prompt 的写法（内置 MiniMax H3 官方 SKILL，用 read_skill 按名称或文件引用路径取全文）：
+DIRECTOR_SKILL_CONTRACT_HEAD = """镜头意图的拍法（内置 MiniMax H3 官方 SKILL，用 read_skill 按名称或文件引用路径取全文）：
 """
 
 DIRECTOR_SKILL_CONTRACT_TAIL = """
-在 add_shot / update_shot 中，请遵循 MiniMax H3 官方 prompt 结构（T2VA, I2VA, FL2VA, L2VA, Ref2VA）：
+在 add_shot / update_shot 中，你写的是一份**模型无关的导演意图**（intent 对象），
+而不是某个模型认得的 prompt——「意图 → 某个模型的 prompt」由系统在提交时按工程选定的
+渲染规范完成。请照上面 SKILL 里的镜头语言把这一镜的意图填清楚：
 
-- camera_motion: 机位、景别与运镜（运镜方式、幅度、速度）。
-- visual_prompt: 画面描述，包含影像风格、主体外观与动作演进、环境光线，以及根据 MiniMax H3 规范要求的起止锚定语。
-- audio_dialogue: 对白、同期声与动作音效（对白保留说话人姓名与原台词）。
-- negative_prompt: 逗号分隔的模型规避项（必须包含 background music, BGM, soundtrack, musical score）。
-- skill: 填写对应的 MiniMax H3 skill 名称或文件引用（如 h3-prompt-writing, h3-base, h3-ref, references/base-en.txt, references/ref-en.txt）。
+- beat: 这一镜的剧情核心（此刻在讲什么、推进到哪一步）；
+- action: 画面里主体的具体动作与走位（谁在做什么）；
+- shot_size: 景别（远景 / 全景 / 中景 / 近景 / 特写）；angle: 机位视角（平视 / 俯视 / 仰视 / 过肩 等）；
+- movement: 运镜（固定 / 推 / 拉 / 摇 / 移 / 跟）；
+- first_frame: 起始画面（首帧）的构图与内容；last_frame: 末帧定格，可留空；
+- dialogue: 对白原文 + 同期环境声 / 动作音效（没有对白就只写声音设计，别编台词）；
+- subjects: 这一镜出场的主体（人物 / 关键道具），用剧本里的名字原文；
+- duration: 画面时长（秒，约 4~15）；mood: 整体氛围 / 影调，可留空；
+- skill: 照的是上面哪一份 SKILL（如 h3-prompt-writing / h3-base / h3-ref）。
 
-请勿自行生成编号 (<Picture n> / <Subject n>) 或结构性对齐声明，这些由系统处理。系统会自动处理 overall_soundscape 和 non_diegetic_music (固定为 none)。"""
+**别写负向提示词、别写背景音乐**：一线模型在抛弃负向，无配乐是恒定约束、由系统在正向侧统一表达。
+也不要自行生成编号 (<Picture n> / <Subject n>) 或结构性对齐声明——这些由系统在把意图渲染成
+目标模型 prompt 时处理。"""
 
 #: 素材图那条链的契约（角色 / 地点 / 道具 / 镜头首尾帧候选）。**同样由代码始终追加**：
 #: 这几句写反了用户看不出来——图照样出得来，只是它当参考素材时会把环境、光影、
@@ -274,7 +285,14 @@ def describe() -> str:
 
 
 def with_shot_audio_policy(prompt: str, negative_prompt: str) -> tuple[str, str]:
-    """给 AI 拆解产出的 Shot Prompt 加上可执行且幂等的无配乐约束。"""
+    """给 Shot Prompt 补上可执行且幂等的无配乐约束——**只在正向侧**。
+
+    一线模型（含 MiniMax H3）在抛弃负向，所以「无配乐」不再正 / 负双写：正向的
+    `SHOT_AUDIO_PROMPT_SUFFIX` 说清声音边界（渲染成六段时由 `non_diegetic_music: none`
+    承接，见生成层的渲染器），**负向原样透传**、不再自动注入
+    `background music, BGM, …`。负向那一列仍保留（Manual 用户与 ComfyUI 图里的
+    `AIVS_NEGATIVE` 标量默认要它），改的只是「系统不再往里塞配乐词」这一件事。
+    """
     raw_prompt = str(prompt or "").strip()
     if SHOT_AUDIO_PROMPT_SUFFIX in raw_prompt:
         positive = raw_prompt
@@ -285,10 +303,6 @@ def with_shot_audio_policy(prompt: str, negative_prompt: str) -> tuple[str, str]
         )
 
     negative = str(negative_prompt or "").strip().rstrip(",， ")
-    existing = negative.lower()
-    missing = [term for term in SHOT_AUDIO_NEGATIVE_TERMS if term.lower() not in existing]
-    if missing:
-        negative = f"{negative}，{', '.join(missing)}" if negative else ", ".join(missing)
     return positive, negative
 
 

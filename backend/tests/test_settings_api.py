@@ -177,8 +177,9 @@ def test_system_prompt_is_configurable_but_the_shape_is_not(client: TestClient) 
         "low quality",
     )
     assert "林昭说：“有人吗？”" in positive, "对白原文应保留在 Shot Prompt 中"
-    assert "无背景音乐" in positive
-    assert all(term in negative for term in prompts.SHOT_AUDIO_NEGATIVE_TERMS)
+    assert "无背景音乐" in positive, "无配乐只留正向这一处口径"
+    # 负向原样透传：一线模型在抛弃负向，系统不再自动注入 background music 等配乐词
+    assert negative == "low quality"
     assert prompts.with_shot_audio_policy(positive, negative) == (positive, negative), "兜底应幂等"
 
 
@@ -191,8 +192,10 @@ def test_director_prompt_reaches_both_paths(client: TestClient) -> None:
     assert resp.status_code == 200, resp.text
     system = prompts.director()
     assert system.startswith("你是一位克制的导演。")
-    # SKILL 清单与镜头字段契约由代码始终追加，用户在设置页改不到
-    assert "read_skill" in system and "camera_motion" in system
+    # SKILL 清单与镜头**意图**契约由代码始终追加，用户在设置页改不到。导演产的是模型无关的
+    # 意图（intent 对象里的 beat / shot_size …），不再是某个模型的 camera_motion 散文。
+    assert "read_skill" in system and "导演意图" in system and "shot_size" in system
+    assert "camera_motion" not in system, "镜头字段契约已从 H3 三段散文改成模型无关的意图"
     assert "剧本页" not in system, "默认 scope 是流程图页"
     assert "剧本页" in prompts.director("script")
 

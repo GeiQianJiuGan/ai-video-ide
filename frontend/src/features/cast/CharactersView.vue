@@ -141,6 +141,30 @@ const sheetAsset = computed(() =>
   sheet.value?.asset_id ? (assetById.value.get(sheet.value.asset_id) ?? null) : null,
 )
 
+/**
+ * 删一版角色表。**先弹确认再动手**（版本只增不改，删掉就没了）；默认形象的当前版会被
+ * 后端拒绝并给出提示，前端不做二次判断，只把错误留给 ErrorPanel。
+ */
+type SheetRow = (typeof cast.sheets)[number]
+const sheetToDelete = ref<SheetRow | null>(null)
+const deleteSheetOpen = ref(false)
+
+function promptRemoveSheet(s: SheetRow): void {
+  cast.clearError()
+  sheetToDelete.value = s
+  deleteSheetOpen.value = true
+}
+
+async function confirmRemoveSheet(): Promise<void> {
+  if (!sheetToDelete.value || !current.value) return
+  await cast.removeSheet(pid.value, current.value.id, sheetToDelete.value.id).catch(() => {})
+  if (!cast.lastError) {
+    deleteSheetOpen.value = false
+    sheetToDelete.value = null
+    await loadAssets()
+  }
+}
+
 function thumb(assetId: string | null | undefined): string {
   if (!assetId) return ''
   const asset = assetById.value.get(assetId)
@@ -437,7 +461,7 @@ async function saveCharacterField(key: string, value: string): Promise<void> {
               <figure
                 v-for="s in cast.sheets"
                 :key="s.id"
-                class="border bg-base-2 flex cursor-pointer flex-col overflow-hidden"
+                class="group border bg-base-2 relative flex cursor-pointer flex-col overflow-hidden"
                 :class="
                   s.id === sheet?.id
                     ? 'border-accent'
@@ -457,6 +481,15 @@ async function saveCharacterField(key: string, value: string): Promise<void> {
                   />
                   <span v-else class="text-fg-4 text-2xs">占位版本（还没有图）</span>
                 </span>
+                <!-- 悬停才露出的删除按钮：删这一版角色表（默认形象的当前版后端会拦下） -->
+                <button
+                  type="button"
+                  class="border-line-2 bg-base-1/90 text-fg-3 hover:!bg-st-failed hover:!text-white absolute top-1 right-1 flex size-5 items-center justify-center rounded border opacity-0 transition group-hover:opacity-100"
+                  title="删除这一版角色表"
+                  @click.stop="promptRemoveSheet(s)"
+                >
+                  <Trash2 :size="11" />
+                </button>
                 <figcaption class="flex items-center gap-1 px-1.5 py-1">
                   <span class="text-fg-2 tnum text-2xs">v{{ s.version_no }}</span>
                   <AppBadge v-if="s.is_current" tone="ok">当前</AppBadge>
@@ -659,6 +692,43 @@ async function saveCharacterField(key: string, value: string): Promise<void> {
         >
           <Plus :size="11" />新建角色
         </AppButton>
+      </template>
+    </AppDialog>
+
+    <!-- 删角色表：先确认再动手（版本只增不改，删掉不可回退） -->
+    <AppDialog
+      v-model:open="deleteSheetOpen"
+      title="删除这一版角色表"
+      subtitle="版本只增不改，删掉不可回退"
+      size="sm"
+    >
+      <div v-if="sheetToDelete" class="space-y-2 p-3 text-xs">
+        <div class="text-fg-2">
+          将删除
+          <strong class="text-fg-1">v{{ sheetToDelete.version_no }}</strong>
+          <AppBadge v-if="sheetToDelete.is_current" tone="ok" class="ml-1">当前</AppBadge>
+        </div>
+        <p class="text-fg-3">
+          只解除这一版与形象的关联并从历史里移除；如果删的是当前版本，后端会把最近的一版顶上来。
+          底层素材文件保留在资产库里，不会被删。
+        </p>
+        <p class="text-fg-4 text-2xs">
+          默认形象的当前版本不能删——后端会拒绝并说明，先换一版当前再删这一版即可。
+        </p>
+      </div>
+      <template #footer>
+        <div class="ml-auto flex items-center gap-2">
+          <AppButton size="sm" variant="ghost" @click="deleteSheetOpen = false">取消</AppButton>
+          <AppButton
+            size="sm"
+            variant="primary"
+            class="!bg-st-failed !text-white hover:opacity-90"
+            :disabled="cast.busy"
+            @click="confirmRemoveSheet"
+          >
+            <Trash2 :size="10" />确认删除
+          </AppButton>
+        </div>
       </template>
     </AppDialog>
   </div>

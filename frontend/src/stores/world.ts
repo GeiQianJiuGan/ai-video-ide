@@ -194,6 +194,16 @@ export const useWorldStore = defineStore('world', () => {
     })
   }
 
+  /** 删一张变体参考图（默认场景的当前那张会被后端拒绝并给出提示）。 */
+  async function removeVariantReference(pid: string, vid: string, refId: string): Promise<void> {
+    await guarded(async () => {
+      await worldApi.removeVariantReference(pid, vid, refId)
+      await loadVariantDetail(pid)
+      // 变体列表里带着 reference_count，删完要一起刷新才对得上
+      await loadLocations(pid)
+    })
+  }
+
   // --- 道具 ---
 
   async function loadPropsAll(pid: string): Promise<void> {
@@ -236,6 +246,14 @@ export const useWorldStore = defineStore('world', () => {
     })
   }
 
+  /** 删一版道具参考图（当前版本会被后端拒绝并给出提示）。 */
+  async function removePropReference(pid: string, propId: string, refId: string): Promise<void> {
+    await guarded(async () => {
+      await worldApi.removePropReference(pid, propId, refId)
+      await loadProps(pid)
+    })
+  }
+
   return {
     locations,
     selectedLocationId,
@@ -261,12 +279,14 @@ export const useWorldStore = defineStore('world', () => {
     updateVariant,
     removeVariant,
     addVariantReference,
+    removeVariantReference,
     loadProps: loadPropsAll,
     selectProp,
     createProp,
     updateProp,
     removeProp,
     addPropReference,
+    removePropReference,
     clearError,
   }
 })

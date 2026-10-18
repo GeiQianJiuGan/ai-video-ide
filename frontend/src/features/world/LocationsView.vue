@@ -78,6 +78,32 @@ const reference = computed(
 const referenceAsset = computed(() =>
   reference.value?.asset_id ? (assetById.value.get(reference.value.asset_id) ?? null) : null,
 )
+
+/**
+ * 删一张变体参考图。**先弹确认再动手**；默认场景的当前那张会被后端拒绝并给出提示，
+ * 前端不做二次判断，只把错误留给 ErrorPanel。
+ */
+type ReferenceRow = (typeof world.references)[number]
+const refToDelete = ref<ReferenceRow | null>(null)
+const deleteRefOpen = ref(false)
+
+function promptRemoveReference(r: ReferenceRow): void {
+  world.clearError()
+  refToDelete.value = r
+  deleteRefOpen.value = true
+}
+
+async function confirmRemoveReference(): Promise<void> {
+  if (!refToDelete.value || !variant.value) return
+  await world
+    .removeVariantReference(pid.value, variant.value.id, refToDelete.value.id)
+    .catch(() => {})
+  if (!world.lastError) {
+    deleteRefOpen.value = false
+    refToDelete.value = null
+    await loadAssets()
+  }
+}
 /**
  * 两个面板都在说同一件事时只留一个。
  *
@@ -371,7 +397,7 @@ async function saveVariantField(key: keyof VariantPatch, value: string): Promise
               <figure
                 v-for="r in world.references"
                 :key="r.id"
-                class="border bg-base-2 flex cursor-pointer flex-col overflow-hidden"
+                class="group border bg-base-2 relative flex cursor-pointer flex-col overflow-hidden"
                 :class="
                   r.id === reference?.id
                     ? 'border-accent'
@@ -391,6 +417,15 @@ async function saveVariantField(key: keyof VariantPatch, value: string): Promise
                   />
                   <span v-else class="text-fg-4 text-2xs">文件不在了</span>
                 </span>
+                <!-- 悬停才露出的删除按钮：删这一张参考图（默认场景的当前那张后端会拦下） -->
+                <button
+                  type="button"
+                  class="border-line-2 bg-base-1/90 text-fg-3 hover:!bg-st-failed hover:!text-white absolute top-1 right-1 flex size-5 items-center justify-center rounded border opacity-0 transition group-hover:opacity-100"
+                  title="删除这一张参考图"
+                  @click.stop="promptRemoveReference(r)"
+                >
+                  <Trash2 :size="11" />
+                </button>
                 <figcaption class="flex items-center gap-1 px-1.5 py-1">
                   <span class="text-fg-2 truncate text-2xs">{{ r.camera || '未标机位' }}</span>
                   <!-- 描述空着 = 模型引用这张图时只看到一个文件名 -->
@@ -590,6 +625,43 @@ async function saveVariantField(key: keyof VariantPatch, value: string): Promise
         >
           <Plus :size="11" />新建地点
         </AppButton>
+      </template>
+    </AppDialog>
+
+    <!-- 删参考图：先确认再动手 -->
+    <AppDialog
+      v-model:open="deleteRefOpen"
+      title="删除这一张参考图"
+      subtitle="删掉不可回退"
+      size="sm"
+    >
+      <div v-if="refToDelete" class="space-y-2 p-3 text-xs">
+        <div class="text-fg-2">
+          将删除机位
+          <strong class="text-fg-1">{{ refToDelete.camera || '未标机位' }}</strong>
+          <AppBadge v-if="refToDelete.is_current" tone="ok" class="ml-1">当前</AppBadge>
+        </div>
+        <p class="text-fg-3">
+          只解除这一张与变体的关联；如果删的是当前那张，后端会把最近的一张顶上来。
+          底层素材文件保留在资产库里，不会被删。
+        </p>
+        <p class="text-fg-4 text-2xs">
+          默认场景的当前那张不能删——后端会拒绝并说明。
+        </p>
+      </div>
+      <template #footer>
+        <div class="ml-auto flex items-center gap-2">
+          <AppButton size="sm" variant="ghost" @click="deleteRefOpen = false">取消</AppButton>
+          <AppButton
+            size="sm"
+            variant="primary"
+            class="!bg-st-failed !text-white hover:opacity-90"
+            :disabled="world.busy"
+            @click="confirmRemoveReference"
+          >
+            <Trash2 :size="10" />确认删除
+          </AppButton>
+        </div>
       </template>
     </AppDialog>
   </div>

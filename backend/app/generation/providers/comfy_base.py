@@ -28,6 +28,7 @@ from typing import Any
 from app.core.config import settings
 from app.core.errors import AppError, ErrorCode
 from app.core.logging import get_logger
+from app.generation import renderers
 from app.generation.comfy import rejection
 from app.generation.comfy.client import ComfyClient, comfy, outputs_of
 from app.generation.comfy.graph import Detached, reconnect
@@ -70,8 +71,9 @@ class ComfyTasks:
         """把正向 prompt 换成六段图册格式，并记下这一次到底喂了哪段话、哪几张图。
 
         ComfyUI 那类图收不到结构化字段，只收得到一串图片加一段文字，所以「第 3 张是张秀才」
-        这件事只能写进 prompt（拼装只有 `base.render_video_prompt` 一处）。老路是在四段格式
-        末尾附一句「参考图1=宋焘」，模型读到的仍是一段散文，`<Picture n>` 与画面里的人没有
+        这件事只能写进 prompt（渲染分岔只有 `renderers.render_prompt` 一处，它按 `req.skill`
+        选渲染器——默认那份 `minimax-h3` 主体仍在 `base.render_video_prompt`）。老路是在四段
+        格式末尾附一句「参考图1=宋焘」，模型读到的仍是一段散文，`<Picture n>` 与画面里的人没有
         任何显式绑定——「张秀才长成了宋焘」就是那个形状。
 
         **两条 ComfyUI 路共用这一份**（预设按标题填、绑定按绑定表填，但收到提示词的都只是
@@ -102,7 +104,7 @@ class ComfyTasks:
                 f"模型收不到「第几张图是谁」（这一次的图册：{book.listing}）。"
             )
             return
-        sent = base.render_video_prompt(req, book)
+        sent = renderers.render_prompt(req.skill, req, book)
         if not write(sent):
             log.info("provider.prompt_entry_missing", source=source)
             return

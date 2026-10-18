@@ -540,10 +540,12 @@ def test_the_resolved_route_is_frozen_into_the_job(client: TestClient, pid: str)
         "workflow_name",
         "preset",
         "base_url",
+        "skill",
     }, "`ready` / `issues` 说的是解析那一刻缺什么，冻进去会被当成这次任务的失败原因"
     assert (frozen["provider"], frozen["source"]) == ("http_api", "settings")
     assert frozen["capability"] == "image2video"
     assert frozen["base_url"] == BASE, "地址进档：排查时第一个要看的东西"
+    assert frozen["skill"] == "minimax-h3", "照哪份 SKILL 渲染也进档：重试不该换一份渲染器（硬约束 3）"
     assert SECRET not in json.dumps(job["params"], ensure_ascii=False), "密钥永不进档"
     assert job["params"]["generation_mode"] == "http_api", "兼容旧读法的那个键这次是真的"
     assert job["workflow_id"] is None, "绑定那条路才有值：装配条件是「这个任务有绑定的图」"
