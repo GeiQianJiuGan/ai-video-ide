@@ -137,9 +137,7 @@ def vision_config() -> protocols.LlmConfig:
     return protocols.config(model=settings.llm_vision_model or None)
 
 
-async def describe_image(
-    system: str, user: str, images: list[protocols.ImagePart]
-) -> str:
+async def describe_image(system: str, user: str, images: list[protocols.ImagePart]) -> str:
     """看着这几张图写一段文字（纯文本）。
 
     端不认图时由 `protocols` 那边的默认实现报四要素错误，建议里带手动路径——

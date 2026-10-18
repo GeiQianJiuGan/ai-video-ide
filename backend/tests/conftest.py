@@ -33,10 +33,13 @@ def client() -> Iterator[TestClient]:
 
 
 @pytest.fixture
-async def db(tmp_path: Path) -> Database:
+async def db(tmp_path: Path) -> AsyncIterator[Database]:
     database = Database(tmp_path / "project.db")
     await database.create_all()
-    return database
+    try:
+        yield database
+    finally:
+        await database.close()
 
 
 @pytest.fixture(autouse=True)

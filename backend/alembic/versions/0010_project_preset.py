@@ -1,7 +1,8 @@
 """add project preset selection"""
 
-from alembic import op
 import sqlalchemy as sa
+
+from alembic import op
 
 revision = "0010_project_preset"
 down_revision = "0009_project_generation_mode"

@@ -42,9 +42,7 @@ def upgrade() -> None:
             sa.Column("kind", sa.String(length=20), nullable=False, server_default="storyboard")
         )
         batch_op.add_column(
-            sa.Column(
-                "param_mode", sa.String(length=20), nullable=False, server_default="per_shot"
-            )
+            sa.Column("param_mode", sa.String(length=20), nullable=False, server_default="per_shot")
         )
         batch_op.add_column(sa.Column("params_json", sa.Text(), nullable=True))
         # 导入幕的镜头区间都指向同一个源文件，这一列记的就是那个文件（可空、不加外键：

@@ -604,9 +604,7 @@ def test_audio_cannot_overlap_on_one_track_but_can_move_to_a_new_track(
     assert overlap.status_code == 409, overlap.text
     assert "同一条音频轨不能重叠" in error_of(overlap)["title"]
 
-    moved = client.post(
-        f"/api/v1/projects/{pid}/clips/{first.json()['clip_id']}/new-audio-track"
-    )
+    moved = client.post(f"/api/v1/projects/{pid}/clips/{first.json()['clip_id']}/new-audio-track")
     assert moved.status_code == 201, moved.text
     tracks = [t for t in moved.json()["timeline"]["tracks"] if t["kind"] == "audio"]
     assert len(tracks) == 2

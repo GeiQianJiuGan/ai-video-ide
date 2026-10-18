@@ -38,8 +38,9 @@ AI Video Studio（`aivs`）：桌面端优先的 AI 原生长视频制作工作�
   26 个 service（cast / world / assets / workflows / story / context / generation / timeline /
   overview / projects / library / adopt / fsbrowse / appsettings / frames / sequence / director /
   packages / ingest / dub / refine / audio / images / describe / onboarding / **route**；`base` /
-  `params` / `global_registry` 是公共件不算）+ 25 个 router（含 `/ws`），552 passed（没跑过
-  `fetch_ffmpeg.py` 的机器上会多 1 skipped：「用的是内置那份」那条正向断言）。
+  `params` / `global_registry` 是公共件不算）+ 25 个 router（含 `/ws`）。完整测试以
+  `cd backend && python -m pytest -q` 的当次结果为准；没跑过 `fetch_ffmpeg.py` 的机器上
+  会多 1 skipped：「用的是内置那份」那条正向断言。
 - **前端也全部接上了后端**：`app/features.ts` 里 15 个功能都是 `ready: true`，
   `/p/:pid` 下不再有外壳页。`shared/ui/FeatureView.vue`（按注册表画工作区骨架与能力锁）
   暂时没人用，留给下一个「登记了但还没接后端」的功能——那种情况先挂它，绝不给假界面。
@@ -106,7 +107,7 @@ cd frontend && npm run dev
 ```
 
 ```bash
-cd frontend && npm run typecheck && npm run lint && npm run build
+cd frontend && npm run typecheck && npm run lint && npm run test && npm run build
 ```
 
 内置 FFmpeg（首次克隆仓库后跑一次；二进制约 150 MB，不进 git，`.gitignore` 忽略 `bin/ffmpeg*`）：

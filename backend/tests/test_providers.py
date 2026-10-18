@@ -316,8 +316,12 @@ async def test_preset_feeds_reference_images_into_the_ref_slots(tmp_path: Path) 
     # 顺序即语义：ComfyUI 那类图收不到标签，所以提交出去的那段 prompt 本身就是六段格式，
     # 每张图一个 `<Picture n>`、每个出场的人一个 `<Subject n>`
     text = graph["3"]["inputs"]["text"]
-    assert text.startswith("For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1]) is fully referenced.")
-    assert "<Picture 1> ([Shot 1] first frame):" not in text, "首帧时间锚点不进入 retention_analysis 避免姿态构图被死锁至片尾"
+    assert text.startswith(
+        "For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1]) is fully referenced."
+    )
+    assert "<Picture 1> ([Shot 1] first frame):" not in text, (
+        "首帧时间锚点不进入 retention_analysis 避免姿态构图被死锁至片尾"
+    )
     assert "subject_definitions:" in text and "retention_analysis:" in text
     assert "<Subject 1> is the visible subject shown in <Picture 2>: 林小雨（常服）" in text
     assert "<Subject 2> is the visible subject shown in <Picture 3>: 雨夜巷口" in text
@@ -1842,12 +1846,32 @@ def test_location_reference_retention_adapts_to_first_frame() -> None:
     """当存在首帧时，场景原图不得要求保持 exact layout，避免与首帧构图冲突。"""
     from app.generation.providers import base
 
-    ff = base.Picture(role="first_frame", kind="first_frame", media="image", name="首帧", desc="", file="ff.png", index=1)
-    loc = base.Picture(role="reference", kind="location_reference", media="image", name="正屋", desc="民居正屋", file="loc.png", index=2, subject=1)
+    ff = base.Picture(
+        role="first_frame",
+        kind="first_frame",
+        media="image",
+        name="首帧",
+        desc="",
+        file="ff.png",
+        index=1,
+    )
+    loc = base.Picture(
+        role="reference",
+        kind="location_reference",
+        media="image",
+        name="正屋",
+        desc="民居正屋",
+        file="loc.png",
+        index=2,
+        subject=1,
+    )
 
     book_with_ff = base.PictureBook(items=[ff, loc])
     retention_ff = base._retention(book_with_ff, "[Shot 2]")
-    assert "keep the architectural elements, materials, lighting and environment consistent across different camera angles" in retention_ff
+    assert (
+        "keep the architectural elements, materials, lighting and environment consistent across different camera angles"
+        in retention_ff
+    )
     assert "exact layout" not in retention_ff
 
     book_without_ff = base.PictureBook(items=[loc])
@@ -1859,7 +1883,15 @@ def test_detail_anchors_first_frame_when_not_in_prompt() -> None:
     """当镜头挂了首帧但提示词没写「首帧」时，系统自动在 detailed_description 开头锚定首帧 tag。"""
     from app.generation.providers import base
 
-    ff = base.Picture(role="first_frame", kind="first_frame", media="image", name="首帧", desc="", file="ff.png", index=1)
+    ff = base.Picture(
+        role="first_frame",
+        kind="first_frame",
+        media="image",
+        name="首帧",
+        desc="",
+        file="ff.png",
+        index=1,
+    )
     book = base.PictureBook(items=[ff])
 
     req = base.VideoRequest(
@@ -1883,8 +1915,13 @@ def test_detail_binds_character_name_to_subject() -> None:
         role="first_frame", kind="first_frame", media="image", name="首帧", file="ff.png", index=1
     )
     alan = base.Picture(
-        role="reference", kind="character_sheet", media="image",
-        name="阿岚（默认形象）", file="alan.png", index=2, subject=1,
+        role="reference",
+        kind="character_sheet",
+        media="image",
+        name="阿岚（默认形象）",
+        file="alan.png",
+        index=2,
+        subject=1,
     )
     book = base.PictureBook(items=[ff, alan])
 
@@ -1903,16 +1940,25 @@ def test_detail_does_not_bind_location_or_missing_names() -> None:
     from app.generation.providers import base
 
     spot = base.Picture(
-        role="reference", kind="location_reference", media="image",
-        name="雨夜巷口", file="alley.png", index=1, subject=1,
+        role="reference",
+        kind="location_reference",
+        media="image",
+        name="雨夜巷口",
+        file="alley.png",
+        index=1,
+        subject=1,
     )
     person = base.Picture(
-        role="reference", kind="character_sheet", media="image",
-        name="林小雨（常服）", file="lin.png", index=2, subject=2,
+        role="reference",
+        kind="character_sheet",
+        media="image",
+        name="林小雨（常服）",
+        file="lin.png",
+        index=2,
+        subject=2,
     )
     book = base.PictureBook(items=[spot, person])
 
     req = base.VideoRequest(mode="i2v", segments={"visual_prompt": "雨夜巷口空无一人"})
     detail = base._detail(req, "[Shot 3]", book)
     assert "<Subject" not in detail, "地点名不标 subject，未出场的人物也不硬塞"
-

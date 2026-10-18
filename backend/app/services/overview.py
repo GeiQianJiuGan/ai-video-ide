@@ -56,7 +56,6 @@ def _route_detail(label: str, r2v: dict[str, Any], flf: dict[str, Any]) -> str:
     return f"{label} · " + "；".join(parts)
 
 
-
 class OverviewService:
     async def summary(self, pid: str) -> dict[str, Any]:
         db = db_of(pid)

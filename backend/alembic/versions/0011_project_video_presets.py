@@ -1,7 +1,8 @@
 """add separate R2V and FL2VA project presets"""
 
-from alembic import op
 import sqlalchemy as sa
+
+from alembic import op
 
 revision = "0011_project_video_presets"
 down_revision = "0010_project_preset"

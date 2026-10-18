@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import sqlite3
 import sys
+from contextlib import closing
+from datetime import UTC, datetime
 from pathlib import Path
 
 from alembic.config import Config
@@ -18,6 +20,7 @@ from alembic.script import ScriptDirectory
 from sqlalchemy import create_engine
 
 from alembic import command
+from app.core.errors import AppError, ErrorCode
 from app.core.logging import get_logger
 
 log = get_logger("migrate")
@@ -102,7 +105,45 @@ def upgrade_to_head(db_path: Path) -> tuple[str | None, str]:
     before = current_revision(db_path)
     head = head_revision()
     if before != head:
-        command.upgrade(_config(db_path), "head")
+        backup: Path | None = None
+        if before is not None:
+            # SQLite backup API 会把尚在 WAL 中的已提交数据一并复制进快照。
+            backup_dir = db_path.parent / "backups" / "schema"
+            stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+            backup = backup_dir / f"project-{before}-{stamp}.db"
+            pending = backup.with_suffix(".db.tmp")
+            try:
+                backup_dir.mkdir(parents=True, exist_ok=True)
+                with (
+                    closing(sqlite3.connect(db_path)) as source,
+                    closing(sqlite3.connect(pending)) as target,
+                ):
+                    source.backup(target)
+                pending.replace(backup)
+            except (OSError, sqlite3.Error) as exc:
+                raise AppError(
+                    ErrorCode.DISK_FULL
+                    if getattr(exc, "errno", None) == 28
+                    else ErrorCode.SCHEMA_MISMATCH,
+                    "无法备份工程数据库",
+                    f"升级前快照写入失败：{type(exc).__name__}: {exc}",
+                    ["检查工程目录的写入权限与剩余空间", "备份成功前不会升级数据库"],
+                ) from exc
+            finally:
+                pending.unlink(missing_ok=True)
+            log.info("db.pre_migration_backup", path=str(backup), from_rev=before)
+        try:
+            command.upgrade(_config(db_path), "head")
+        except Exception as exc:
+            raise AppError(
+                ErrorCode.SCHEMA_MISMATCH,
+                "工程数据库升级失败",
+                f"从 {before or '空库'} 升到 {head} 时失败：{type(exc).__name__}: {exc}",
+                [
+                    f"升级前快照保存在 {backup}" if backup else "检查数据库文件是否可写",
+                    "查看后端日志中的迁移错误，再从快照恢复或升级应用",
+                ],
+            ) from exc
         log.info("db.migrated", path=str(db_path), from_rev=before, to_rev=head)
     return before, head
 

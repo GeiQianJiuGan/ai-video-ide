@@ -361,12 +361,20 @@ def test_read_skill_gives_the_full_text_and_rejects_unknown_names(
         [
             {
                 "content": "",
-                "tool_calls": [{"id": "c1", "name": "read_skill", "arguments": {"name": "references/base-en.txt"}}],
+                "tool_calls": [
+                    {
+                        "id": "c1",
+                        "name": "read_skill",
+                        "arguments": {"name": "references/base-en.txt"},
+                    }
+                ],
             },
             {"content": "照 references/base-en.txt 写。", "tool_calls": []},
         ],
     )
-    resp = client.post(f"{API}/projects/{pid}/director/chat", json={"message": "怎么写 base prompt"})
+    resp = client.post(
+        f"{API}/projects/{pid}/director/chat", json={"message": "怎么写 base prompt"}
+    )
     assert resp.status_code == 201, resp.text
 
 

@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import shutil
 from pathlib import Path
@@ -210,14 +211,14 @@ class AssetService:
     ) -> dict[str, Any]:
         """登记磁盘上已有的文件（桌面端选文件、从素材库采用都走这条）。"""
         proj = project_of(pid)
-        raw_path = Path(src.strip().strip('"')).expanduser()
-        if raw_path.is_file():
+        raw_path = await asyncio.to_thread(Path(src.strip().strip('"')).expanduser)
+        if await asyncio.to_thread(raw_path.is_file):
             path = raw_path
-        elif (proj.dir / src).is_file():
+        elif await asyncio.to_thread((proj.dir / src).is_file):
             path = proj.dir / src
-        elif (proj.dir / "assets" / src).is_file():
+        elif await asyncio.to_thread((proj.dir / "assets" / src).is_file):
             path = proj.dir / "assets" / src
-        elif (proj.dir / "assets/uploads" / src).is_file():
+        elif await asyncio.to_thread((proj.dir / "assets/uploads" / src).is_file):
             path = proj.dir / "assets/uploads" / src
         else:
             raise AppError(

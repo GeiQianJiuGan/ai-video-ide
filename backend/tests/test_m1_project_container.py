@@ -17,6 +17,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.core.config import settings
+from app.core.errors import AppError
 from app.events.bus import Channel, bus
 from app.persistence import migrate
 from app.services.projects import DB_NAME, MANIFEST_NAME, SUBDIRS, projects
@@ -233,6 +234,26 @@ def test_open_rejects_manifest_from_newer_app(client: TestClient, tmp_path: Path
 
 
 # --- schema 升级 ---
+
+
+def test_failed_migration_preserves_pre_upgrade_snapshot(
+    client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    created = make_project(client, tmp_path / "film")
+    client.post(f"/api/v1/projects/{created['id']}/close")
+    db_path = tmp_path / "film" / "project.db"
+    monkeypatch.setattr(migrate, "current_revision", lambda _path: "0022_project_route")
+
+    def fail_upgrade(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("模拟迁移中断")
+
+    monkeypatch.setattr(migrate.command, "upgrade", fail_upgrade)
+    with pytest.raises(AppError, match="工程数据库升级失败"):
+        migrate.upgrade_to_head(db_path)
+    backups = list((db_path.parent / "backups" / "schema").glob("project-0022_project_route-*.db"))
+    assert len(backups) == 1
+    with sqlite3.connect(backups[0]) as conn:
+        assert conn.execute("SELECT id FROM project").fetchone()[0] == created["id"]
 
 
 def test_open_old_project_upgrades_and_reports(

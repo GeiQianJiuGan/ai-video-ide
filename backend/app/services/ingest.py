@@ -77,6 +77,7 @@ class IngestService:
             db = db_of(pid)
             asset_row = await fetch(db, Asset, src, "资产")
             from app.services.base import as_dict
+
             asset = as_dict(asset_row)
         else:
             asset = await assets.register_path(pid, "upload", src, source="ingest", copy=copy)
@@ -205,9 +206,7 @@ class IngestService:
         low = max(0.0, float(range_in or 0.0))
         high = float(range_out) if range_out is not None and range_out > 0 else (total or 0.0)
         if total and high > total + 0.05:
-            notes.append(
-                f"片尾位置标到 {high:.2f}s，但这段视频只有 {total:.2f}s，按文件末尾处理。"
-            )
+            notes.append(f"片尾位置标到 {high:.2f}s，但这段视频只有 {total:.2f}s，按文件末尾处理。")
             high = total
         #: 这一条先判：片头本身就超出了文件，说「什么都不剩」不算错但没指出真正的毛病。
         if total and low > total:

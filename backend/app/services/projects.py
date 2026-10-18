@@ -416,6 +416,15 @@ class ProjectService:
                 _write_manifest(target, self._manifest_of(proj))
 
             self._open[proj.id] = proj
+            # 调度器只活在进程里；工程库重新打开后要处理上次中断的任务。
+            from app.services.generation import generation
+
+            try:
+                await generation.recover_on_open(proj.id)
+            except BaseException:
+                self._open.pop(proj.id, None)
+                await db.close()
+                raise
             self._remember(proj)
             log.info(
                 "project.opened",
@@ -442,9 +451,13 @@ class ProjectService:
     # --- 关闭 ---
 
     async def close(self, pid: str) -> None:
-        proj = self._open.pop(pid, None)
+        proj = self._open.get(pid)
         if proj is None:
             return
+        from app.services.generation import generation
+
+        await generation.stop_pump(pid)
+        self._open.pop(pid, None)
         await proj.db.close()
         log.info("project.closed", id=pid)
         bus.emit(Channel.SYSTEM, "project.closed", {"project_id": pid}, project_id=pid)

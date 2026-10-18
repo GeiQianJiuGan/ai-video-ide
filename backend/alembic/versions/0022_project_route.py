@@ -50,10 +50,10 @@ depends_on: str | Sequence[str] | None = None
 def upgrade() -> None:
     #: SQLite 改列必须走 batch 模式（它没有 ALTER COLUMN，alembic 靠重建表实现）。
     with op.batch_alter_table("project", schema=None) as batch_op:
-        batch_op.alter_column(
-            "generation_mode", existing_type=sa.String(length=20), nullable=True
-        )
-    op.execute("UPDATE project SET generation_mode='comfy_workflow' WHERE generation_mode='workflow_api'")
+        batch_op.alter_column("generation_mode", existing_type=sa.String(length=20), nullable=True)
+    op.execute(
+        "UPDATE project SET generation_mode='comfy_workflow' WHERE generation_mode='workflow_api'"
+    )
     op.execute(
         "UPDATE project SET generation_mode='' "
         "WHERE generation_mode IS NULL OR generation_mode='comfy_preset'"
@@ -63,8 +63,12 @@ def upgrade() -> None:
 def downgrade() -> None:
     #: 回滚时先把「继承」填回旧的默认值，否则列改回 NOT NULL 会失败。
     #: `comfy_workflow` 换回老名字，旧代码只认那个。
-    op.execute("UPDATE project SET generation_mode='comfy_preset' WHERE generation_mode IS NULL OR generation_mode=''")
-    op.execute("UPDATE project SET generation_mode='workflow_api' WHERE generation_mode='comfy_workflow'")
+    op.execute(
+        "UPDATE project SET generation_mode='comfy_preset' WHERE generation_mode IS NULL OR generation_mode=''"
+    )
+    op.execute(
+        "UPDATE project SET generation_mode='workflow_api' WHERE generation_mode='comfy_workflow'"
+    )
     with op.batch_alter_table("project", schema=None) as batch_op:
         batch_op.alter_column(
             "generation_mode",

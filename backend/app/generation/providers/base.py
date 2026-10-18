@@ -600,7 +600,9 @@ def _summary(book: PictureBook, shot: str, seconds: str) -> str:
     first = book.of_role("first_frame")
     last = book.of_role("last_frame")
     if first is not None and last is not None:
-        task_type = "[keyframe completion + reference generation]" if subjects else "[keyframe completion]"
+        task_type = (
+            "[keyframe completion + reference generation]" if subjects else "[keyframe completion]"
+        )
     else:
         task_type = "[reference generation]"
 

@@ -77,7 +77,7 @@ def resolve_skill_file(rel_path: str) -> Path | None:
     )
     for prefix in prefixes:
         if clean.lower().startswith(prefix):
-            sub = clean[len(prefix):]
+            sub = clean[len(prefix) :]
             candidates.append(s_dir / sub)
             candidates.append(s_dir / "references" / sub)
             candidates.append(REPO_ROOT / "skill" / "h3-prompt-writing" / sub)
@@ -85,7 +85,7 @@ def resolve_skill_file(rel_path: str) -> Path | None:
 
     # 3. references/ 路径兼容
     if clean.lower().startswith("references/"):
-        sub = clean[len("references/"):]
+        sub = clean[len("references/") :]
         candidates.append(s_dir / "references" / sub)
         candidates.append(s_dir / sub)
 
@@ -187,8 +187,7 @@ ALIASES: dict[str, str] = {
 def catalog() -> str:
     """给系统提示词用的清单。**只有这几行进提示词**，全文靠 `read_skill` 按需取。"""
     return "\n".join(
-        f"- {s.name}（{s.title}，文件引用：{s.guide_file}）：{s.when}"
-        for s in SKILLS.values()
+        f"- {s.name}（{s.title}，文件引用：{s.guide_file}）：{s.when}" for s in SKILLS.values()
     )
 
 

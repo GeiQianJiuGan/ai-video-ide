@@ -64,9 +64,7 @@ def test_new_character_gets_a_usable_default_appearance(client: TestClient, pid:
     assert apps[0]["parent_id"] is None
 
 
-def test_create_with_default_images_binds_them_immediately(
-    client: TestClient, pid: str
-) -> None:
+def test_create_with_default_images_binds_them_immediately(client: TestClient, pid: str) -> None:
     character_asset = upload_png(client, pid, "character_sheet", "character-default.png")
     character = client.post(
         f"/api/v1/projects/{pid}/characters",

@@ -72,7 +72,7 @@ function tip(f: Feature): string {
 
 /**
  * 退出工程。清掉前端持有的「当前工程」，但**不调后端的 close**——
- * 那会关掉 SQLite 连接却不停 pump，正在跑的生成会断在半路。
+ * 后端 close 会停止 pump 并中断正在跑的生成；这里只改变浏览位置。
  */
 function leaveProject(): void {
   proj.leave()

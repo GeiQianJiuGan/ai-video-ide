@@ -229,8 +229,35 @@ def _provider_of(params: dict[str, Any]) -> str:
 class GenerationService:
     def __init__(self) -> None:
         self._pumps: dict[str, asyncio.Task[None]] = {}
+        self._active_jobs: dict[tuple[str, str], asyncio.Task[None]] = {}
         self._paused: set[str] = set()
         self._cancelled: set[str] = set()
+
+    async def recover_on_open(self, pid: str) -> None:
+        """进程重启后把失去执行协程的任务标成可重试，再接着跑排队任务。"""
+        db = db_of(pid)
+        rows = await fetch_all(db, Job)
+        interrupted = [row for row in rows if row.status == "running"]
+        for row in interrupted:
+            err = AppError(
+                ErrorCode.WORKFLOW_ERROR,
+                "任务因应用退出而中断",
+                "上次运行的进程已经结束，无法确认外部服务是否完成了这次生成。",
+                ["检查模型服务中的任务结果", "需要重新生成时点击重试"],
+                {"job_id": row.id},
+            )
+            await self._set(
+                pid,
+                row.id,
+                expected_status="running",
+                status="failed",
+                error_json=dump_json(err.to_dict()),
+                finished_at=utc_now(),
+            )
+        if interrupted:
+            log.warning("queue.interrupted_recovered", project_id=pid, count=len(interrupted))
+        if any(row.status in ("queued", "waiting") for row in rows):
+            self.ensure_pump(pid)
 
     # --- 入队 ---
 
@@ -689,8 +716,11 @@ class GenerationService:
         cancelled: list[str] = []
         for row in [r for r in rows if r.status in ACTIVE]:
             self._cancelled.add(row.id)
-            await self._set(pid, row.id, status="canceled", finished_at=utc_now())
-            cancelled.append(row.id)
+            if await self._set(
+                pid, row.id, expected_status=row.status, status="canceled", finished_at=utc_now()
+            ):
+                cancelled.append(row.id)
+        await self._stop_active(pid, cancelled)
         bus.emit(
             Channel.QUEUE,
             "queue.batch_cancelled",
@@ -722,7 +752,11 @@ class GenerationService:
                 {"job_id": job_id},
             )
         self._cancelled.add(job_id)
-        await self._set(pid, job_id, status="canceled", finished_at=utc_now())
+        changed = await self._set(
+            pid, job_id, expected_status=row.status, status="canceled", finished_at=utc_now()
+        )
+        if changed:
+            await self._stop_active(pid, [job_id])
         return await self._one(pid, job_id)
 
     async def set_priority(self, pid: str, job_id: str, priority: int) -> dict[str, Any]:
@@ -761,8 +795,11 @@ class GenerationService:
         for j in jobs:
             job_id = str(j["id"])
             self._cancelled.add(job_id)
-            await self._set(pid, job_id, status="canceled", finished_at=utc_now())
-            cancelled_ids.append(job_id)
+            if await self._set(
+                pid, job_id, expected_status=j["status"], status="canceled", finished_at=utc_now()
+            ):
+                cancelled_ids.append(job_id)
+        await self._stop_active(pid, cancelled_ids)
         bus.emit(
             Channel.QUEUE, "queue.cancelled_all", {"count": len(cancelled_ids)}, project_id=pid
         )
@@ -807,15 +844,28 @@ class GenerationService:
             raise AppError(ErrorCode.NOT_FOUND, "任务不存在", job_id, ["刷新队列后重试"])
         return found
 
-    async def _set(self, pid: str, job_id: str, **fields: Any) -> None:
+    async def _set(
+        self,
+        pid: str,
+        job_id: str,
+        *,
+        expected_status: str | None = None,
+        expected_attempt: int | None = None,
+        **fields: Any,
+    ) -> bool:
         db = db_of(pid)
         async with db.write() as session:
             row = await session.get(Job, job_id)
-            if row is None:
-                return
+            if (
+                row is None
+                or (expected_status is not None and row.status != expected_status)
+                or (expected_attempt is not None and row.attempt != expected_attempt)
+            ):
+                return False
             for key, value in fields.items():
                 setattr(row, key, value)
         bus.emit(Channel.JOB, "job.updated", {"id": job_id, **fields}, project_id=pid)
+        return True
 
     # --- 调度 ---
 
@@ -833,6 +883,15 @@ class GenerationService:
             except (asyncio.CancelledError, Exception):  # noqa: BLE001 - 关停不该再抛
                 pass
 
+    async def _stop_active(self, pid: str, job_ids: list[str]) -> None:
+        tasks = [
+            self._active_jobs[(pid, jid)] for jid in job_ids if (pid, jid) in self._active_jobs
+        ]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
     async def _pump(self, pid: str) -> None:
         """取一批可跑的任务并发执行，直到队列里没有可跑的东西。"""
         try:
@@ -842,7 +901,18 @@ class GenerationService:
                 ready = await self._claim(pid)
                 if not ready:
                     return
-                await asyncio.gather(*(self._run(pid, job_id) for job_id in ready))
+                tasks = [asyncio.create_task(self._run(pid, job_id)) for job_id in ready]
+                for job_id, task in zip(ready, tasks, strict=True):
+                    self._active_jobs[(pid, job_id)] = task
+                try:
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
+                    for result in results:
+                        if isinstance(result, Exception):
+                            raise result
+                finally:
+                    for job_id, task in zip(ready, tasks, strict=True):
+                        if self._active_jobs.get((pid, job_id)) is task:
+                            self._active_jobs.pop((pid, job_id), None)
         except asyncio.CancelledError:  # pragma: no cover
             raise
         except Exception as exc:  # noqa: BLE001 - pump 崩了必须说出来
@@ -904,15 +974,24 @@ class GenerationService:
         job = await fetch(db, Job, job_id, "任务")
         if job_id in self._cancelled:
             return
-        await self._set(
-            pid, job_id, status="running", started_at=utc_now(), attempt=job.attempt + 1
+        attempt = job.attempt + 1
+        started = await self._set(
+            pid,
+            job_id,
+            expected_status="queued",
+            expected_attempt=job.attempt,
+            status="running",
+            started_at=utc_now(),
+            attempt=attempt,
         )
+        if not started:
+            return
         bus.emit(Channel.JOB, "job.started", {"id": job_id, "shot_id": job.shot_id}, project_id=pid)
         params = load_json(job.params_json, {})
         try:
             version = await self._execute(pid, job, params)
         except AppError as err:
-            await self._fail(pid, job_id, err, params)
+            await self._fail(pid, job_id, err, params, attempt)
             return
         except Exception as exc:  # noqa: BLE001 - 未预期异常同样要变成结构化失败
             await self._fail(
@@ -925,16 +1004,21 @@ class GenerationService:
                     ["查看后端日志 .runtime/logs", "重试该任务"],
                 ),
                 params,
+                attempt,
             )
             return
-        await self._set(
+        completed = await self._set(
             pid,
             job_id,
+            expected_status="running",
+            expected_attempt=attempt,
             status="done",
             progress=1.0,
             version_id=version["id"],
             finished_at=utc_now(),
         )
+        if not completed:
+            return
         bus.emit(
             Channel.QUEUE,
             "job.done",
@@ -942,16 +1026,25 @@ class GenerationService:
             project_id=pid,
         )
 
-    async def _fail(self, pid: str, job_id: str, err: AppError, params: dict[str, Any]) -> None:
+    async def _fail(
+        self, pid: str, job_id: str, err: AppError, params: dict[str, Any], attempt: int
+    ) -> None:
         payload = {
             **err.to_dict(),
             "raw": err.related_ids.get("raw"),
             "graph_snapshot": params.get("graph_snapshot"),
         }
-        await self._set(
-            pid, job_id, status="failed", error_json=dump_json(payload), finished_at=utc_now()
+        failed = await self._set(
+            pid,
+            job_id,
+            expected_status="running",
+            expected_attempt=attempt,
+            status="failed",
+            error_json=dump_json(payload),
+            finished_at=utc_now(),
         )
-        bus.emit(Channel.ERROR, "job.failed", {"id": job_id, **err.to_dict()}, project_id=pid)
+        if failed:
+            bus.emit(Channel.ERROR, "job.failed", {"id": job_id, **err.to_dict()}, project_id=pid)
 
     async def _execute(self, pid: str, job: Job, params: dict[str, Any]) -> dict[str, Any]:
         """跑一次生成。
@@ -988,7 +1081,9 @@ class GenerationService:
             if filename.lower().endswith((".mp4", ".webm", ".mov", ".gif"))
             else "generated_image"
         )
+        self._require_not_cancelled(job.id)
         asset = await assets.register_bytes(pid, kind, filename, data, source="generated")
+        self._require_not_cancelled(job.id)
         return await self.add_version(
             pid,
             job.shot_id,
@@ -1338,9 +1433,11 @@ class GenerationService:
         )
         if req.notes:
             params["ref_notes"] = list(req.notes)
+        self._require_not_cancelled(job.id)
         asset = await assets.register_bytes(
             pid, "generated_audio", filename, data, source="generated"
         )
+        self._require_not_cancelled(job.id)
         return await self.add_version(
             pid,
             job.shot_id,
@@ -1384,6 +1481,7 @@ class GenerationService:
         if req.notes:
             params["ref_notes"] = list(req.notes)
             await self._set(pid, job.id, params_json=dump_json(params))
+        self._require_not_cancelled(job.id)
         return await images.land(pid, job, filename, data)
 
     async def _asset_path(self, pid: str, asset_id: Any) -> Path | None:
