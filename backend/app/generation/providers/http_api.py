@@ -49,7 +49,7 @@ from __future__ import annotations
 import base64
 from pathlib import Path
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import httpx
 
@@ -335,7 +335,12 @@ class HttpApiProvider:
                     if url.startswith(("http://", "https://"))
                     else urljoin(base + "/", url.lstrip("/"))
                 )
-                resp = await http.get(target, headers=self._headers(), timeout=self._timeout())
+                headers = (
+                    self._headers()
+                    if urlparse(target).netloc == urlparse(base).netloc
+                    else {}
+                )
+                resp = await http.get(target, headers=headers, timeout=self._timeout())
                 resp.raise_for_status()
         except httpx.HTTPError as exc:
             raise self._offline(exc) from exc

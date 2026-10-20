@@ -35,6 +35,8 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
+from urllib.parse import urlparse
+
 import httpx
 
 from app.core.config import settings
@@ -485,15 +487,25 @@ class ImageProtocol:
     async def _download(self, cfg: ImageConfig, url: str) -> bytes:
         """有些端只回一个图片地址。**必须自己下回来**：素材要落进工程，不能只存在服务端
         （那个地址往往几小时后就失效）。"""
+        headers: dict[str, str] = {}
+        # 绝不带 Content-Type（GET 请求无 body，且在阿里云 OSS/AWS S3 等预签名 URL 校验中会破坏 HMAC 签名导致 403）；
+        # 且仅当下载目标与 API 基地址同源时才转发 Authorization，绝不向第三方 CDN / 对象存储泄漏 API Key。
+        target_netloc = urlparse(url).netloc
+        base_netloc = urlparse(self.base(cfg)).netloc
+        if target_netloc and target_netloc == base_netloc and cfg.api_key:
+            auth = self.headers(cfg).get("Authorization")
+            if auth:
+                headers["Authorization"] = auth
+
         try:
             async with _client(TIMEOUT) as http:
-                resp = await http.get(url, headers=self.headers(cfg))
+                resp = await http.get(url, headers=headers)
                 resp.raise_for_status()
         except httpx.HTTPError as exc:
             raise AppError(
                 ErrorCode.WORKFLOW_ERROR,
                 "图片下载失败",
-                f"{url}：{type(exc).__name__}: {exc}",
+                f"下载 {url} 失败：{type(exc).__name__}: {exc}",
                 ["重新生成一次（很多端的图片地址有有效期）", MANUAL_WAY_OUT],
                 {"url": url, "protocol": self.name},
             ) from exc

@@ -67,6 +67,7 @@ hiddenimports += [
     "sqlalchemy.dialects.sqlite",
     "sqlalchemy.dialects.sqlite.aiosqlite",
     "sqlalchemy.ext.asyncio",
+    "greenlet",
     # pydantic-settings 读 .env
     "dotenv",
     # FastAPI 的表单解析（上传素材那条路）在第一次用到时才 import
