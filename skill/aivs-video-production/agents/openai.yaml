@@ -1,0 +1,4 @@
+interface:
+  display_name: "AI Video Studio 视频制作"
+  short_description: "通过开放 API 管理视频工程、素材、镜头与生成任务"
+  default_prompt: "使用 $aivs-video-production 查看我的视频工程，并按我的要求编辑镜头或提交生成。"
