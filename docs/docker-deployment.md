@@ -41,11 +41,9 @@ cp .env.docker.example .env
 
 编辑 `.env` 文件，重点配置你的 **ComfyUI 算力服务器 IP 和端口**：
 ```ini
-# 前端 Web 访问端口
-AIVS_WEB_PORT=80
-
-# 后端 API 端口
-AIVS_BACKEND_PORT=8765
+# 前端只绑定宿主机回环地址；后端 API 只在 Compose 网络内可见
+AIVS_BIND_ADDR=127.0.0.1
+AIVS_WEB_PORT=8080
 
 # 外部 ComfyUI 算力机地址（局域网 IP 或公网 IP）
 AIVS_COMFY_BASE_URL=http://192.168.1.100:8188
@@ -69,6 +67,21 @@ chmod +x docker-start.sh docker-stop.sh
 ```bash
 docker compose up -d --build
 ```
+
+默认在服务器本机访问 `http://127.0.0.1:8080`。从自己的电脑访问远程服务器时建立隧道：
+
+```bash
+ssh -L 8080:127.0.0.1:8080 <服务器>
+```
+
+隧道建立后在本机打开 `http://127.0.0.1:8080`。不要将 `AIVS_BIND_ADDR` 改成
+`0.0.0.0` 后直接开放端口：工程 API 可读写项目文件，而且容器模式没有桌面握手。
+如需给多人从公网访问，在前面配置 HTTPS 反向代理并保护**所有路径**（包括 `/api/` 与
+`/api/v1/ws`）；后端端口继续只留在 Compose 网络内。
+仓库提供 [Nginx 示例](../docker/nginx-auth.example.conf)：先把域名和证书路径改成实际值，
+再在宿主机创建认证文件（例如 `htpasswd -cB /etc/nginx/aivs.htpasswd <用户名>`），
+启用配置并执行 `nginx -t`。认证放在 `server` 级别，页面、API 和 WebSocket 都会受保护；
+Compose 的 `AIVS_BIND_ADDR` 仍保持 `127.0.0.1`。
 
 ### 3. 服务运维与停止
 
@@ -114,7 +127,7 @@ python scripts/package-docker.py --check
 ```bash
 docker run -d \
   --name aivs-app \
-  -p 80:80 \
+  -p 127.0.0.1:8080:80 \
   -e AIVS_COMFY_BASE_URL="http://192.168.1.100:8188" \
   -v $(pwd)/data/runtime:/app/.runtime \
   -v $(pwd)/data/projects:/app/data \
@@ -170,7 +183,7 @@ AIVS_VERSION=0.1.0 docker compose up -d
 ## 跨服务器通信与防火墙排查
 
 1. **算力机 ComfyUI 防火墙**：确保 ComfyUI 所在机器开放了相应端口（如 `8188`），且 ComfyUI 启动时带有 `--listen 0.0.0.0` 参数以允许外部访问。
-2. **云服务器安全组**：确保 Linux 服务器开放了前端端口（如 `80` 或自定义端口）。
+2. **远程访问**：默认只需开放 SSH；通过上面的隧道访问。只有配置了 HTTPS 与认证反向代理时才开放 Web 端口。
 
 ---
 

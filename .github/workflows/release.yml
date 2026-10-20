@@ -66,9 +66,22 @@ jobs:
         working-directory: frontend
         run: npm ci
 
-      - name: 装后端依赖（含 PyInstaller）
+      - name: 装后端依赖（含测试工具与 PyInstaller）
         # sidecar 要在这套依赖里冻结，所以 package 这个 extra 必须装上。
-        run: python -m pip install -e "./backend[package]"
+        run: python -m pip install -e "./backend[dev,package]"
+
+      - name: 后端质量检查
+        working-directory: backend
+        run: |
+          python -m ruff check .
+          python -m ruff format --check .
+          python -m pytest -q
+
+      - name: 前端静态检查
+        working-directory: frontend
+        run: |
+          npm run lint
+          npm run test
 
       - name: 出包
         # 图标 → FFmpeg → sidecar（含启动自检）→ cargo tauri build，顺序在脚本里。

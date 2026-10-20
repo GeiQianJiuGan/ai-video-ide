@@ -10,13 +10,14 @@ services:
         AIVS_VERSION: ${AIVS_VERSION:-0.0.0-dev}
     container_name: aivs-backend
     restart: unless-stopped
-    ports:
-      - "${AIVS_BACKEND_PORT:-8765}:8765"
+    # API 只在 Compose 内网供前端反代，不发布宿主机端口。
+    expose:
+      - "8765"
     environment:
       - AIVS_HOST=0.0.0.0
       - AIVS_PORT=8765
       - AIVS_REQUIRE_HANDSHAKE=false
-      - AIVS_DEV_CORS=true
+      - AIVS_DEV_CORS=false
       # 外部 ComfyUI 算力机地址（局域网 IP 或公网 IP）
       - AIVS_COMFY_BASE_URL=${AIVS_COMFY_BASE_URL:-http://127.0.0.1:8188}
       # LLM 与其它 API 配置（可选）
@@ -42,7 +43,8 @@ services:
     container_name: aivs-frontend
     restart: unless-stopped
     ports:
-      - "${AIVS_WEB_PORT:-80}:80"
+      # 默认仅本机可访问；远程使用 SSH 隧道或带认证的 HTTPS 反向代理。
+      - "${AIVS_BIND_ADDR:-127.0.0.1}:${AIVS_WEB_PORT:-8080}:80"
     depends_on:
       - backend
     networks:

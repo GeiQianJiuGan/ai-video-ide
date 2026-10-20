@@ -228,6 +228,7 @@ def _shot_media(
     versions: dict[str, GenerationVersion],
     assets: dict[str, Asset],
     posters: dict[str, Asset],
+    shot_versions: list[GenerationVersion],
 ) -> dict[str, Any]:
     """一张卡片上「能播的那一段」与「能当图显示的那一张」。
 
@@ -239,11 +240,7 @@ def _shot_media(
     确实有视频时回 `poster_pending=true`，前端据它去调
     `POST /storyboard/posters` 补抽——读路径自己绝不起 FFmpeg。
     """
-    mine = [
-        v
-        for v in versions.values()
-        if v.shot_id == shot.id and v.status == "done" and v.asset_id and v.asset_id in assets
-    ]
+    mine = [v for v in shot_versions if v.status == "done" and v.asset_id and v.asset_id in assets]
     mine.sort(key=lambda v: v.version_no)
 
     def bucket(version: GenerationVersion) -> str:
@@ -1220,6 +1217,32 @@ class StoryService:
         scene_links = await fetch_all(db, SceneLink)
         by_id = {s.id: s for s in shots}
 
+        # 一次建索引，避免每画一张卡片又扫描全片的镜头、角色与版本。
+        shots_by_scene: dict[str, list[Shot]] = {}
+        real_by_scene: dict[str, list[Shot]] = {}
+        cast_by_shot: dict[str, list[ShotCast]] = {}
+        cast_by_scene: dict[str, list[SceneCast]] = {}
+        locations_by_scene: dict[str, list[SceneLocation]] = {}
+        versions_by_shot: dict[str, list[GenerationVersion]] = {}
+        shot_link_by_pair: dict[tuple[str, str], ShotLink] = {}
+        scene_link_by_pair: dict[tuple[str, str], SceneLink] = {}
+        for shot in shots:
+            shots_by_scene.setdefault(shot.scene_id, []).append(shot)
+            if shot.kind != "transition":
+                real_by_scene.setdefault(shot.scene_id, []).append(shot)
+        for row in cast_rows:
+            cast_by_shot.setdefault(row.shot_id, []).append(row)
+        for row in scene_cast_rows:
+            cast_by_scene.setdefault(row.scene_id, []).append(row)
+        for row in scene_location_rows:
+            locations_by_scene.setdefault(row.scene_id, []).append(row)
+        for version in versions.values():
+            versions_by_shot.setdefault(version.shot_id, []).append(version)
+        for row in shot_links:
+            shot_link_by_pair.setdefault((row.from_shot_id, row.to_shot_id), row)
+        for row in scene_links:
+            scene_link_by_pair.setdefault((row.from_scene_id, row.to_scene_id), row)
+
         lanes = []
         for scene in scenes:
             cards = []
@@ -1228,19 +1251,15 @@ class StoryService:
             scene_names = _unique(
                 [
                     chars[apps[c.appearance_id].character_id].name
-                    for c in scene_cast_rows
-                    if c.scene_id == scene.id
-                    and c.appearance_id in apps
-                    and apps[c.appearance_id].character_id in chars
+                    for c in cast_by_scene.get(scene.id, [])
+                    if c.appearance_id in apps and apps[c.appearance_id].character_id in chars
                 ]
             )
-            for shot in [s for s in shots if s.scene_id == scene.id]:
+            for shot in shots_by_scene.get(scene.id, []):
                 own = [
                     chars[apps[c.appearance_id].character_id].name
-                    for c in cast_rows
-                    if c.shot_id == shot.id
-                    and c.appearance_id in apps
-                    and apps[c.appearance_id].character_id in chars
+                    for c in cast_by_shot.get(shot.id, [])
+                    if c.appearance_id in apps and apps[c.appearance_id].character_id in chars
                 ]
                 names = own or scene_names
                 issues = []
@@ -1255,7 +1274,8 @@ class StoryService:
                         issues.append("没有出场角色")
                     if params.prompt_missing(shot, scene):
                         issues.append("没有 prompt 也没有画面描述")
-                media = _shot_media(shot, versions, assets, posters)
+                shot_versions = versions_by_shot.get(shot.id, [])
+                media = _shot_media(shot, versions, assets, posters, shot_versions)
                 cards.append(
                     {
                         "id": shot.id,
@@ -1272,24 +1292,15 @@ class StoryService:
                         "has_audio_version": bool(shot.current_audio_version_id),
                         "cast_names": names,
                         **media,
-                        "version_count": len(
-                            [v for v in versions.values() if v.shot_id == shot.id]
-                        ),
+                        "version_count": len(shot_versions),
                         "context_ok": not issues,
                         "context_issues": issues,
                     }
                 )
-            real = [s for s in shots if s.scene_id == scene.id and s.kind != "transition"]
+            real = real_by_scene.get(scene.id, [])
             links = []
             for head, tail in zip(real, real[1:], strict=False):
-                row = next(
-                    (
-                        r
-                        for r in shot_links
-                        if r.from_shot_id == head.id and r.to_shot_id == tail.id
-                    ),
-                    None,
-                )
+                row = shot_link_by_pair.get((head.id, tail.id))
                 links.append(
                     _connector(
                         row,
@@ -1307,18 +1318,11 @@ class StoryService:
             nxt = next((s for s in scenes if s.index_no > scene.index_no), None)
             next_link = None
             if nxt is not None:
-                row = next(
-                    (
-                        r
-                        for r in scene_links
-                        if r.from_scene_id == scene.id and r.to_scene_id == nxt.id
-                    ),
-                    None,
-                )
+                row = scene_link_by_pair.get((scene.id, nxt.id))
                 # 幕之间那条线接的是「上一幕末镜头 → 下一幕首镜头」，门槛也就落在这两个镜头上
                 # （和 `sequence.transition_plan` 认的是同一对，两处不会各说一套）。
                 head_shot = real[-1] if real else None
-                nxt_real = [s for s in shots if s.scene_id == nxt.id and s.kind != "transition"]
+                nxt_real = real_by_scene.get(nxt.id, [])
                 tail_shot = nxt_real[0] if nxt_real else None
                 if head_shot is None or tail_shot is None:
                     which = scene if head_shot is None else nxt
@@ -1353,11 +1357,11 @@ class StoryService:
                     "param_mode": scene.param_mode,
                     "location_variant_id": scene.location_variant_id,
                     "cast_appearance_ids": [
-                        c.appearance_id for c in scene_cast_rows if c.scene_id == scene.id
+                        c.appearance_id for c in cast_by_scene.get(scene.id, [])
                     ],
                     "cast_names": scene_names,
                     "location_variant_ids": [
-                        l.location_variant_id for l in scene_location_rows if l.scene_id == scene.id
+                        loc.location_variant_id for loc in locations_by_scene.get(scene.id, [])
                     ],
                     "shots": cards,
                     "links": links,

@@ -858,7 +858,6 @@ class TimelineService:
     async def split_clip(self, pid: str, clip_id: str, at: float) -> dict[str, Any]:
         db = db_of(pid)
         clip = await fetch(db, TimelineClip, clip_id, "片段")
-        track = await fetch(db, Track, clip.track_id, "轨道")
         offset = float(at) - clip.start
         if not 0 < offset < clip.duration:
             raise AppError(

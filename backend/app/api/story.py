@@ -245,7 +245,7 @@ async def update_shot(pid: str, shot_id: str, body: ShotBody) -> dict[str, Any]:
             raise AppError(
                 ErrorCode.VALIDATION_ERROR,
                 "有上游镜头时不能指定首帧",
-                f"这个镜头的首帧来自上游镜头（tail_frame 衔接）。"
+                "这个镜头的首帧来自上游镜头（tail_frame 衔接）。"
                 "要用自己的首帧就先断开上游：清空「上游镜头」那一栏。",
                 ["在镜头编辑器里清空「上游镜头」", "保持当前的上游衔接，不指定首帧"],
             )

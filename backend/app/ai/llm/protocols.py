@@ -131,9 +131,7 @@ def config(
 ) -> LlmConfig:
     """当前设置 + 可选覆盖。覆盖只为「保存之前先试一下」，不会被写回任何地方。"""
     token_limit = (
-        max_tokens
-        if max_tokens is not None
-        else getattr(settings, "llm_max_tokens", 8192)
+        max_tokens if max_tokens is not None else getattr(settings, "llm_max_tokens", 8192)
     )
     return LlmConfig(
         provider=str(provider if provider is not None else settings.llm_provider).strip(),
@@ -667,9 +665,7 @@ class OpenAiCompatible(LlmProtocol):
         # 图走 `image_url` 块里的 data URL：这一族没有「上传文件再引用」的必要，
         # 一张素材图几百 KB，内联最省事也最不容易在别处留一份副本。
         content: list[dict[str, Any]] = [{"type": "text", "text": user}]
-        content += [
-            {"type": "image_url", "image_url": {"url": img.data_url}} for img in images
-        ]
+        content += [{"type": "image_url", "image_url": {"url": img.data_url}} for img in images]
         data = await self.request(
             "POST",
             f"{self.base(cfg)}/chat/completions",
@@ -1013,9 +1009,7 @@ def _gemini_body(messages: list[dict[str, Any]]) -> dict[str, Any]:
                     if isinstance(parsed_args, dict)
                     else {}
                 )
-                parts.append(
-                    {"functionCall": {"name": name, "args": clean_args}}
-                )
+                parts.append({"functionCall": {"name": name, "args": clean_args}})
             push("model", parts)
         elif role == "tool":
             cid = str(msg.get("tool_call_id") or "")

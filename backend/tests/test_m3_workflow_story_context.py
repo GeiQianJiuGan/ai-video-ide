@@ -203,7 +203,9 @@ def test_deleted_preset_does_not_break_project_preset_change(client: TestClient,
     presets.save("预设B", graph_b)
 
     # 项目绑定预设A
-    resp = client.put(f"/api/v1/projects/{pid}/preset", json={"r2v_name": "预设A", "flf_name": "预设A"})
+    resp = client.put(
+        f"/api/v1/projects/{pid}/preset", json={"r2v_name": "预设A", "flf_name": "预设A"}
+    )
     assert resp.status_code == 200, resp.text
 
     # 删除预设A
@@ -255,9 +257,7 @@ def test_generation_mode_alias_is_normalized_on_both_sides(client: TestClient, p
     )
     assert route["binds"] == "workflow", "这条路绑的是工作流，界面照 binds 画控件"
 
-    bad = client.put(
-        f"/api/v1/projects/{pid}/workflow-bindings", json={"generation_mode": "wan"}
-    )
+    bad = client.put(f"/api/v1/projects/{pid}/workflow-bindings", json={"generation_mode": "wan"})
     assert bad.status_code == 422
     err = error_of(bad)
     assert err["code"] == "VALIDATION_ERROR"

@@ -184,7 +184,13 @@ cd backend && python -m ruff check . && python -m ruff format .
 ```
 
 ```bash
-cd frontend && npm run typecheck && npm run lint && npm run build
+cd frontend && npm run typecheck && npm run lint && npm run test && npm run build
+```
+
+分镜板规模基准（自动创建并清理临时工程，不访问模型服务）：
+
+```bash
+python scripts/benchmark_storyboard.py --scenes 30 --shots-per-scene 10 --versions-per-shot 3
 ```
 
 迁移是**按工程库**跑的，没有全局数据库：
@@ -198,12 +204,12 @@ cd backend && python -m alembic -x db=<工程目录>/project.db upgrade head
 
 ## 现状
 
-- **后端与前端已全量接通**：23 个 service + 21 个 router（含 `/ws`），后端测试 352 passed。
+- **后端与前端已全量接通**：关键功能已有后端测试与前端构建检查覆盖。
   界面上登记的功能都真的连着后端，单个能力缺失（ComfyUI 离线、没配 LLM）时按钮保持禁用并说明原因，
   绝不画假界面、不造假数据。
-- **桌面安装包还没打出来**：`tauri.conf.json` 已经把 Windows / macOS / Linux 三个目标写好了，
-  但 Python sidecar 的构建脚本尚未落地，所以目前只有开发期跑法。
-- **Linux**：后端与 Docker 路径已在用；桌面壳的 AppImage 目标尚未验证。
+- **桌面打包流水线已接入**：`scripts/build_desktop.py` 会构建 Python sidecar 与 Tauri 安装包；
+  Windows / Linux 的实际安装体验仍需在目标系统验收，macOS 尚无发布作业。
+- **Docker 默认仅本机可访问**：远程访问用 SSH 隧道，公网部署需带认证的 HTTPS 反向代理。
 
 ## 许可
 

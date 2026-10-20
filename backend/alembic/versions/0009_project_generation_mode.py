@@ -1,7 +1,8 @@
 """add project-level generation mode"""
 
-from alembic import op
 import sqlalchemy as sa
+
+from alembic import op
 
 revision = "0009_project_generation_mode"
 down_revision = "0008_global_workflow_bindings"

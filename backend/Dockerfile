@@ -9,7 +9,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     AIVS_HOST=0.0.0.0 \
     AIVS_PORT=8765 \
     AIVS_REQUIRE_HANDSHAKE=false \
-    AIVS_DEV_CORS=true
+    AIVS_DEV_CORS=false
 
 # 镜像自报版本号：由 scripts/package-docker.py 用 --build-arg 传进来。AIVS_ 前缀的环境变量
 # 会盖掉 Settings 里的默认值，所以后端 /health 报的版本号与镜像 tag 永远是同一个数。

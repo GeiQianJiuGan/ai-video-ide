@@ -26,7 +26,7 @@ API = "/api/v1"
 def test_json_repair_syntax_and_markdown() -> None:
     """测试常规 Markdown 剥离、未转义换行、悬挂逗号修复。"""
     # 1. 带 Markdown 代码块
-    raw_md = "```json\n{\"title\": \"雨夜追车\", \"duration\": 5}\n```"
+    raw_md = '```json\n{"title": "雨夜追车", "duration": 5}\n```'
     parsed, err = json_repair.parse_lenient_json(raw_md)
     assert err is None
     assert parsed == {"title": "雨夜追车", "duration": 5}

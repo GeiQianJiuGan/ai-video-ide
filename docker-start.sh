@@ -42,8 +42,9 @@ echo "✅ AI Video Studio 服务已在后台成功启动！"
 echo "--------------------------------------------------"
 # 读取当前配置的端口
 WEB_PORT=$(grep '^AIVS_WEB_PORT=' .env | cut -d '=' -f2)
-WEB_PORT=${WEB_PORT:-80}
-echo "🌐 前端访问地址: http://<你的服务器IP>:${WEB_PORT}"
+WEB_PORT=${WEB_PORT:-8080}
+echo "🌐 本机访问地址: http://127.0.0.1:${WEB_PORT}"
+echo "🔐 远程访问：ssh -L ${WEB_PORT}:127.0.0.1:${WEB_PORT} <服务器>"
 echo "📊 查看运行日志: $DOCKER_COMPOSE_CMD logs -f"
 echo "🛑 停止服务请运行: ./docker-stop.sh"
 echo "--------------------------------------------------"

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
 from fastapi.testclient import TestClient
 
 API = "/api/v1"
@@ -25,8 +24,9 @@ def test_refine_lineage_tracing(client: TestClient, pid: str) -> None:
     ).json()
 
     # 1. 创建祖先版本 v1
-    from app.services.generation import generation
     import asyncio
+
+    from app.services.generation import generation
 
     loop = asyncio.get_event_loop()
     v1 = loop.run_until_complete(

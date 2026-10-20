@@ -7,6 +7,10 @@ venv/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+# 测试运行时的临时目录（pytest --basetemp 和本地验证脚本）
+.pytest_tmp/
+.tmp-*/
+.codex-test-tmp*/
 
 # ---- Node ----
 node_modules/
@@ -46,4 +50,3 @@ backend/build/
 !.vscode/settings.json
 .DS_Store
 Thumbs.db
-backend/.pytest_tmp

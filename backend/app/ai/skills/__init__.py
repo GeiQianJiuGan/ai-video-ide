@@ -28,6 +28,7 @@ ALL_NAMES = (*NAMES, *FILE_REFERENCES, *IMAGE_NAMES)
 
 __all__ = [
     "ALL_NAMES",
+    "ALIASES",
     "FILE_REFERENCES",
     "IMAGE_NAMES",
     "IMAGE_NEGATIVE",
@@ -54,7 +55,7 @@ def render(name: str) -> str:
         return _image_render(key)
     try:
         return _video_render(name)
-    except AppError:
+    except AppError as exc:
         raise AppError(
             ErrorCode.VALIDATION_ERROR,
             "没有这份 SKILL",
@@ -65,4 +66,4 @@ def render(name: str) -> str:
                 f"出参考图的是：{'、'.join(IMAGE_NAMES)}",
             ],
             {"name": name, "available": list(ALL_NAMES)},
-        )
+        ) from exc

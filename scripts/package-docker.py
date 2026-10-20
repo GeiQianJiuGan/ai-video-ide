@@ -588,7 +588,7 @@ def how_to(group: str, version: str, tar: Path) -> list[str]:
     if group == "allinone":
         return [
             load,
-            "docker run -d --name aivs-app -p 80:80 \\",
+            "docker run -d --name aivs-app -p 127.0.0.1:8080:80 \\",
             "  -e AIVS_COMFY_BASE_URL=http://<算力机IP>:8188 \\",
             "  -v $(pwd)/data/runtime:/app/.runtime \\",
             "  -v $(pwd)/data/projects:/app/data \\",
