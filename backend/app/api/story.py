@@ -50,6 +50,7 @@ class SceneBody(BaseModel):
 
 
 class ShotBody(BaseModel):
+    manual_prompt: bool = Field(default=False, description="手动编辑提示词时清除旧导演意图")
     title: str | None = None
     description: str | None = None
     duration: float | None = None

@@ -23,6 +23,8 @@
 
 from __future__ import annotations
 
+import re
+
 from app.generation import intent as gen_intent
 from app.generation.providers import base
 from app.generation.providers.base import PictureBook, VideoRequest, clip_desc
@@ -110,6 +112,15 @@ def render_prompt(skill: str, req: VideoRequest, book: PictureBook) -> str:
         if any(segs.values()):
             req.segments = segs
     name = normalize(skill)
+    # 手动填写的完整结构不再包进 detailed_description，避免产生两套嵌套字段。
+    if (
+        not req.intent
+        and name == "minimax-h3"
+        and re.search(
+            r"(?m)^\s*(integrated_multimodal_description|subject_definitions):", req.prompt
+        )
+    ):
+        return req.prompt
     renderer = _RENDERERS.get(name)
     if renderer is None:
         req.notes.append(

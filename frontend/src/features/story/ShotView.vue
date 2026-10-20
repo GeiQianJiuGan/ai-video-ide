@@ -13,8 +13,8 @@
  *      同时留一颗「跳过检查强行入队」——它是显式选择，不是默认值。
  *   3. **手动导入的成片也走版本系统**。不接 AI 也能把工程做完（硬约束 2）。
  */
-import { computed, onMounted, ref, watch } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { onBeforeRouteLeave, onBeforeRouteUpdate, useRoute, useRouter } from 'vue-router'
 import {
   GitBranch,
   ListVideo,
@@ -41,6 +41,9 @@ import FeatureHeader from '@/shared/ui/FeatureHeader.vue'
 import SegmentPlayer from '@/shared/ui/SegmentPlayer.vue'
 import DubModal from './components/DubModal.vue'
 import RefineModal from './components/RefineModal.vue'
+import ShotGraph, { type GraphFrame } from './components/ShotGraph.vue'
+import ShotPromptComposer from './components/ShotPromptComposer.vue'
+import { inputMode, referencesOf, unresolvedMentions, type PromptReference } from './shotPrompt'
 import GenerateImageDialog from '@/features/images/GenerateImageDialog.vue'
 import { fileUrl } from '@/shared/api/files'
 import { ApiError, confirmFlagOf } from '@/shared/api/client'
@@ -52,6 +55,7 @@ import { refineApi, type VersionLineageResult } from '@/shared/api/refine'
 import {
   CONTEXT_KIND_LABEL,
   CONTEXT_MEDIA_LABEL,
+  JOB_STATUS_LABEL,
   type ContextCapacityMedia,
   type ContextItem,
   type GenerationVersion,
@@ -60,12 +64,14 @@ import { SHOT_STATUS, SHOT_STATUS_LABEL } from '@/shared/api/story'
 import { useConsoleStore } from '@/stores/console'
 import { useShotStore } from '@/stores/shot'
 import { useStoryStore } from '@/stores/story'
+import { useQueueStore } from '@/stores/queue'
 
 const route = useRoute()
 const router = useRouter()
 const editor = useShotStore()
 const story = useStoryStore()
 const consolePanel = useConsoleStore()
+const queue = useQueueStore()
 
 const pid = computed(() => String(route.params.pid ?? ''))
 const sid = computed(() => String(route.params.sid ?? ''))
@@ -344,7 +350,136 @@ const currentLane = computed(() => {
   return story.lanes.find((l) => l.id === editor.shot?.scene_id) ?? null
 })
 
+const editorMode = ref<'graph' | 'details'>('graph')
+const graph = ref<InstanceType<typeof ShotGraph> | null>(null)
+const composer = ref<InstanceType<typeof ShotPromptComposer> | null>(null)
+const promptDraft = ref('')
+const promptDirty = ref(false)
+const promptSaving = ref(false)
+const previewVersion = ref<GenerationVersion | null>(null)
+const inheritedPrompt = computed(
+  () => shot.value?.inherited_prompt ?? currentLane.value?.prompt ?? '',
+)
+const promptReferences = computed(() =>
+  referencesOf(bill.value?.items ?? [], promptDraft.value || inheritedPrompt.value),
+)
+const graphFrames = computed<GraphFrame[]>(() => {
+  const first = firstFrameSources.value[0]
+  const last = lastFrameSlot.value
+  const lastItem = bill.value?.items.find((i) => i.included && i.role === 'last_frame')
+  return [
+    {
+      role: 'first_frame',
+      path: first?.path ?? null,
+      assetId: first?.assetId ?? null,
+      locked: !!first?.disabled,
+      hint: first?.hint ?? '',
+    },
+    {
+      role: 'last_frame',
+      path: lastItem?.asset_path ?? last?.path ?? null,
+      assetId: lastItem?.asset_id ?? last?.assetId ?? null,
+      locked: !!last?.disabled,
+      hint: last?.hint ?? '',
+    },
+  ]
+})
+const promptMode = computed(() =>
+  inputMode(
+    Boolean(graphFrames.value[0]?.assetId),
+    Boolean(graphFrames.value[1]?.assetId),
+    referenceMaterials.value.filter(
+      (item) => !graphFrames.value.some((frame) => frame.assetId === item.asset_id),
+    ).length,
+  ),
+)
+const graphJob = computed(() => {
+  const jobs = queue.jobs.filter((job) => job.shot_id === sid.value)
+  return (
+    jobs.find((job) => ['queued', 'running', 'waiting'].includes(job.status)) ??
+    jobs[0] ??
+    (editor.lastJob?.shot_id === sid.value ? editor.lastJob : null)
+  )
+})
+watch(
+  () => (graphJob.value ? `${graphJob.value.id}:${graphJob.value.status}` : ''),
+  async (next, previous) => {
+    if (next !== previous && graphJob.value?.status === 'done' && previous) {
+      if (await flushPrompt()) await reload()
+    }
+  },
+)
+let promptTimer: ReturnType<typeof setTimeout> | undefined
+let savingPrompt: Promise<boolean> | null = null
+watch(
+  () => [shot.value?.id, shot.value?.prompt] as const,
+  ([id, value], previous) => {
+    if (id !== previous?.[0] || !promptDirty.value) {
+      promptDraft.value = value ?? ''
+      promptDirty.value = false
+    }
+  },
+  { immediate: true },
+)
+
+function editPrompt(value: string): void {
+  promptDraft.value = value
+  promptDirty.value = true
+  clearTimeout(promptTimer)
+  promptTimer = setTimeout(() => void flushPrompt(), 800)
+}
+
+async function flushPrompt(): Promise<boolean> {
+  clearTimeout(promptTimer)
+  if (savingPrompt) {
+    if (!(await savingPrompt)) return false
+    return flushPrompt()
+  }
+  if (!promptDirty.value || !shot.value) return true
+  const text = promptDraft.value
+  const id = shot.value.id
+  promptSaving.value = true
+  savingPrompt = (async () => {
+    try {
+      await editor.save(pid.value, { prompt: text, manual_prompt: true })
+      if (editor.shot?.id === id && promptDraft.value === text) promptDirty.value = false
+      return true
+    } catch {
+      return false
+    } finally {
+      promptSaving.value = false
+    }
+  })()
+  const ok = await savingPrompt
+  savingPrompt = null
+  return ok && (promptDirty.value ? flushPrompt() : true)
+}
+
+async function insertReference(reference: PromptReference): Promise<void> {
+  editorMode.value = 'graph'
+  await nextTick()
+  await composer.value?.insertReference(reference)
+}
+
+async function locateReference(key: string): Promise<void> {
+  editorMode.value = 'graph'
+  await nextTick()
+  graph.value?.focusReference(key)
+}
+
+async function addGraphAsset(assetId: string): Promise<void> {
+  const asset = assets.value.find((a) => a.id === assetId)
+  await editor
+    .override(pid.value, { action: 'add', asset_id: assetId, label: asset?.path.split('/').pop() })
+    .catch(() => {})
+}
+
+onBeforeRouteLeave(async () => await flushPrompt())
+onBeforeRouteUpdate(async () => await flushPrompt())
+onBeforeUnmount(() => clearTimeout(promptTimer))
+
 async function promoteShotPromptToScene(): Promise<void> {
+  if (!(await flushPrompt())) return
   const promptVal = editor.shot?.prompt
   const lane = currentLane.value
   if (!promptVal || !lane || !pid.value) return
@@ -354,7 +489,8 @@ async function promoteShotPromptToScene(): Promise<void> {
 
 async function clearShotPromptToInherit(): Promise<void> {
   if (!pid.value) return
-  await editor.save(pid.value, { prompt: '' }).catch(() => {})
+  editPrompt('')
+  if (!(await flushPrompt())) return
   await reload()
 }
 
@@ -380,6 +516,7 @@ async function loadSide(): Promise<void> {
 
 async function reload(): Promise<void> {
   if (!pid.value) return
+  if (!(await flushPrompt())) return
   await Promise.all([
     editor.load(pid.value, sid.value).catch(() => {}),
     story.loadBoard(pid.value).catch(() => {}),
@@ -411,6 +548,11 @@ async function saveText(
   key: 'prompt' | 'negative_prompt' | 'description' | 'dialogue',
   value: string,
 ) {
+  if (key === 'prompt') {
+    editPrompt(value)
+    await flushPrompt()
+    return
+  }
   await editor.save(pid.value, { [key]: value || null }).catch(() => {})
 }
 
@@ -586,6 +728,24 @@ async function onPickVersionFile(event: Event): Promise<void> {
 }
 
 async function generate(skipContext: boolean, allowRefDrop = false): Promise<void> {
+  if (!(await flushPrompt())) return
+  const invalid = unresolvedMentions(
+    promptDraft.value || inheritedPrompt.value,
+    promptReferences.value,
+  )
+  if (invalid.length) {
+    sideError.value = new ApiError(
+      {
+        code: 'MISSING_INPUT',
+        title: '提示词存在失效引用',
+        detail: invalid.join('、'),
+        suggestions: ['在画布重新连接素材，或删除 / 替换失效引用标签'],
+        related_ids: {},
+      },
+      422,
+    )
+    return
+  }
   const job = await editor.enqueue(pid.value, {
     workflowId: shot.value?.workflow_id ?? null,
     checkContext: !skipContext,
@@ -611,7 +771,9 @@ function cancelDrop(): void {
 <template>
   <div class="flex min-h-0 flex-1 flex-col">
     <FeatureHeader />
-    <div class="border-line-1 bg-base-1 flex h-row shrink-0 items-center gap-1.5 border-b px-2">
+    <div
+      class="border-line-1 bg-base-1 flex min-h-row shrink-0 flex-wrap items-center gap-1.5 border-b px-2 py-1"
+    >
       <span class="text-fg-4 text-2xs">镜头</span>
       <select
         :value="sid"
@@ -658,6 +820,18 @@ function cancelDrop(): void {
       >
         <RefreshCw :size="10" />刷新
       </AppButton>
+      <AppButton
+        size="sm"
+        :variant="editorMode === 'graph' ? 'primary' : 'ghost'"
+        @click="editorMode = 'graph'"
+        >镜头画布</AppButton
+      >
+      <AppButton
+        size="sm"
+        :variant="editorMode === 'details' ? 'primary' : 'ghost'"
+        @click="editorMode = 'details'"
+        >详细检查 / 参数</AppButton
+      >
     </div>
 
     <ErrorPanel
@@ -687,7 +861,34 @@ function cancelDrop(): void {
       body="上面的下拉里选一个镜头，或先去剧本 / 分镜页建几个。这一页回答的是「这条片段是怎么来的」。"
     />
     <template v-else>
-      <div class="flex min-h-0 flex-1 gap-2 p-2">
+      <div v-show="editorMode === 'graph'" class="flex min-h-0 flex-1 p-2">
+        <ShotGraph
+          ref="graph"
+          :pid="pid"
+          :shot="shot"
+          :bill="bill"
+          :assets="assets"
+          :versions="editor.versions"
+          :frames="graphFrames"
+          :busy="editor.busy || uploading"
+          :prompt="promptDraft || inheritedPrompt"
+          :job-status="
+            graphJob ? (JOB_STATUS_LABEL[graphJob.status] ?? graphJob.status) : undefined
+          "
+          @add="addGraphAsset"
+          @remove="editor.override(pid, { action: 'remove', key: $event }).catch(() => {})"
+          @frame="
+            (role, id) =>
+              setSlot(role === 'first_frame' ? 'first_frame_asset_id' : 'last_frame_asset_id', id)
+          "
+          @upload="contextInput?.click()"
+          @generate="generate(false)"
+          @adopt="editor.setCurrent(pid, $event).catch(() => {})"
+          @reference="insertReference"
+          @preview="previewVersion = $event"
+        />
+      </div>
+      <div v-show="editorMode === 'details'" class="flex min-h-0 flex-1 gap-2 p-2">
         <!-- 左：镜头信息 + 出场 -->
         <AppPanel title="镜头信息" class="w-64 shrink-0">
           <div class="space-y-3 p-2">
@@ -1468,15 +1669,32 @@ function cancelDrop(): void {
           </div>
         </AppPanel>
       </div>
+      <ShotPromptComposer
+        :key="shot.id"
+        ref="composer"
+        :model-value="promptDraft"
+        :inherited="inheritedPrompt"
+        :references="promptReferences"
+        :pid="pid"
+        :duration="shot.duration"
+        :mode="promptMode"
+        :saved="!promptDirty"
+        :saving="promptSaving"
+        :version="previewVersion"
+        @update:model-value="editPrompt"
+        @save="flushPrompt"
+        @locate="locateReference"
+        @hover="graph?.highlightReference($event)"
+      />
       <!-- 底：prompt 与参数。这些值会在入队那一刻被冻结进版本里 -->
-      <div class="border-line-1 bg-base-1 shrink-0 border-t p-2">
+      <div v-if="editorMode === 'details'" class="border-line-1 bg-base-1 shrink-0 border-t p-2">
         <div class="flex gap-2">
-          <label class="min-w-0 flex-1 block space-y-0.5">
+          <div class="min-w-0 flex-1 space-y-0.5">
             <div class="flex items-center justify-between">
               <span class="text-fg-4 text-2xs font-medium">Prompt</span>
               <div class="flex items-center gap-2">
                 <AppBadge v-if="shot.prompt" tone="warn">当前 Shot 专属覆盖</AppBadge>
-                <AppBadge v-else-if="currentLane?.prompt" tone="accent">继承本幕共用</AppBadge>
+                <AppBadge v-else-if="inheritedPrompt" tone="accent">继承本幕共用</AppBadge>
                 <button
                   v-if="shot.prompt && currentLane"
                   type="button"
@@ -1487,7 +1705,7 @@ function cancelDrop(): void {
                   <Sparkles :size="9" />设为本幕共用
                 </button>
                 <button
-                  v-if="shot.prompt && currentLane?.prompt"
+                  v-if="shot.prompt && inheritedPrompt"
                   type="button"
                   class="text-fg-4 text-3xs hover:text-fg-2 cursor-pointer"
                   title="清空此 Shot 的独立 Prompt，恢复为继承本幕共用 Prompt"
@@ -1497,18 +1715,10 @@ function cancelDrop(): void {
                 </button>
               </div>
             </div>
-            <textarea
-              :value="shot.prompt ?? ''"
-              rows="3"
-              :placeholder="
-                currentLane?.prompt
-                  ? `（留空继承本幕共用 Prompt: ${currentLane.prompt}）`
-                  : '这条镜头要画什么。上下文里的参考素材（图 / 视频 / 音频）会和它一起喂给模型。'
-              "
-              class="border-line-1 bg-base-2 text-fg-1 placeholder:text-fg-4 focus:border-accent/60 mt-px w-full resize-none border px-1.5 py-1 text-2xs outline-none font-mono"
-              @change="saveText('prompt', ($event.target as HTMLTextAreaElement).value)"
-            />
-          </label>
+            <p class="text-fg-3 pt-1 text-2xs">
+              在上方提示词构筑器中编写和引用素材；这里管理幕级共用与继承。
+            </p>
+          </div>
           <label class="min-w-0 flex-1">
             <span class="text-fg-4 text-2xs">Negative Prompt</span>
             <textarea
@@ -1548,7 +1758,7 @@ function cancelDrop(): void {
             </p>
           </div>
           <label class="w-56 shrink-0">
-            <span class="text-fg-4 text-2xs">镜头描述（给人看的，不进 prompt）</span>
+            <span class="text-fg-4 text-2xs">镜头描述（未填写提示词时作为兜底）</span>
             <textarea
               :value="shot.description ?? ''"
               rows="3"

@@ -487,6 +487,7 @@ class ComfyPresetProvider(ComfyTasks):
                         media=ref.media,
                         name=ref.who,
                         desc=ref.desc,
+                        asset_id=ref.asset_id,
                         file=str(file),
                     )
                 else:

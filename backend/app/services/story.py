@@ -720,6 +720,8 @@ class StoryService:
     async def update_shot(self, pid: str, shot_id: str, patch: dict[str, Any]) -> dict[str, Any]:
         db = db_of(pid)
         row = await fetch(db, Shot, shot_id, "镜头")
+        if patch.pop("manual_prompt", False) and "prompt" in patch:
+            patch["intent_json"] = "{}"
         if row.kind == "transition" and "prev_shot_id" in patch:
             raise AppError(
                 ErrorCode.VALIDATION_ERROR,
@@ -825,6 +827,8 @@ class StoryService:
             **slots,
             "scene_title": scene.title,
             "scene_index_no": scene.index_no,
+            "inherited_prompt": str(params.scene_params(scene).get("prompt") or scene.prompt or ""),
+            "effective_prompt": params.prompt_of(row, scene),
             "context_overrides": load_json(row.context_overrides_json, []),
             #: `intent_json` 展开成干净字段（与 `context_overrides` 同一条口径）：模型无关的
             #: 导演意图，前端画分镜板 / 编辑镜头时读它，提交时按 `route.skill` 渲染成 prompt。

@@ -163,6 +163,9 @@ export interface ShotVersionRow {
 }
 
 export interface Shot {
+  /** 由后端按统一取值规则提供的幕级提示词。 */
+  inherited_prompt?: string
+  effective_prompt?: string
   id: string
   scene_id: string
   index_no: number
@@ -435,7 +438,7 @@ export type ShotPatch = Partial<
     | 'first_frame_asset_id'
     | 'last_frame_asset_id'
   >
->
+> & { manual_prompt?: boolean }
 
 export const storyApi = {
   story: (pid: string) => api.get<Story>(`/projects/${pid}/story`),

@@ -95,7 +95,18 @@ class ComfyTasks:
         写进去了回 True。这一层不认识任何入口约定。
         """
         req.book = book
+        from app.generation.mentions import resolve_request
+
+        linked = resolve_request(req, book)
         req.sent_prompt = req.prompt
+        if linked:
+            if not write(req.prompt):
+                raise AppError(
+                    ErrorCode.INVALID_WORKFLOW,
+                    "无法提交素材引用提示词",
+                    "当前工作流没有可写的正向提示词入口。",
+                    ["为工作流绑定正向提示词入口", "更换支持提示词输入的工作流"],
+                )
         if not book or not book.subjects:
             return
         if not settings.video_ref_labels:

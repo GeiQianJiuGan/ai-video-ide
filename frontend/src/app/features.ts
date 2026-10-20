@@ -309,12 +309,12 @@ const PROJECT_DEFS: FeatureDef[] = [
     id: 'shot',
     route: 'shot',
     title: '镜头编辑器',
-    purpose: '单个镜头的全部真相：上下文喂了什么、用哪套 Workflow、生成了几个版本',
+    purpose: '围绕镜头连接素材、指定首尾帧，逐步构筑提示词并预览视频版本',
     group: 'generate',
     icon: Clapperboard,
     milestone: 'M4',
     ready: true,
-    requires: ['backend', 'comfyui'],
+    requires: ['backend'],
     panels: {
       left: {
         title: '镜头信息',

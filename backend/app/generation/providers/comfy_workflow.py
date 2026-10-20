@@ -175,6 +175,7 @@ def _pics_of(
             media=ref.media,
             name=ref.who,
             desc=ref.desc,
+            asset_id=ref.asset_id,
             file=str(file),
         )
     return pics
@@ -298,6 +299,8 @@ class ComfyWorkflowProvider(ComfyTasks):
         #: 仍然要在 summary 里点一句名——「送没送出去」和「模型知不知道它是谁」是两件事。
         others = [r for r in req.refs if r.media != "image"]
         for ref in others:
+            if ref.asset_id:
+                req.unavailable_assets.add(ref.asset_id)
             req.notes.append(
                 f"工作流绑定这条路只能喂图片，{ref.media_label}"
                 f"「{ref.label or ref.path.name}」没有送出去"

@@ -24,6 +24,7 @@ from app.core.errors import AppError, ErrorCode
 from app.core.ids import new_id
 from app.core.logging import get_logger
 from app.events.bus import Channel, bus
+from app.generation.mentions import validate_mentions
 from app.generation.providers import registry
 from app.generation.providers.base import (
     AudioRequest,
@@ -325,6 +326,11 @@ class GenerationService:
             await context.require_complete(pid, shot_id, include_prev=use_prev_frame)
         snapshot = await context.snapshot(
             pid, shot_id, include_prev=use_prev_frame, capability=capability
+        )
+        validate_mentions(
+            prompt,
+            snapshot.get("included") or [],
+            pending_first=bool(shot.prev_shot_id and use_prev_frame),
         )
         # 参考图比模型端那份图能收的多时先问一句。**不是失败**：确认（allow_ref_drop）后
         # 照旧生成，只是按槽位顺序喂前几张。悄悄少喂两张图，事后没人查得出形象为什么跑偏。
@@ -1176,6 +1182,7 @@ class GenerationService:
             #: 没有（老工程 / Manual）才回退到下面拆好的 `segments` / `prompt`——两条路
             #: 的分岔只在 `renderers.render_prompt` 一处。
             intent=params.get("director_intent") or {},
+            frame_assets=params.get("frame_assets") or {},
             first_frame=first,
             last_frame=last,
             source_video=source_video,
@@ -1576,6 +1583,11 @@ class GenerationService:
         explicit_last = explicit_last or by_role("last_frame", ("last_frame",))
         explicit_last = explicit_last or shot.last_frame_asset_id
         spent = {explicit_first, explicit_last} - {None, ""}
+        params["frame_assets"] = {
+            str(asset_id): role
+            for role, asset_id in (("first_frame", explicit_first), ("last_frame", explicit_last))
+            if asset_id
+        }
 
         async def resolve(asset_id: str | None) -> Path | None:
             if not asset_id:
@@ -1610,6 +1622,7 @@ class GenerationService:
                     #: 而模型要靠这个名字把台词对上 `<Subject n>`。老账单里没有这一项，
                     #: 此时 `RefAsset.who` 自然退回 `label`。
                     name=str(item.get("name") or ""),
+                    asset_id=asset_id,
                 )
             )
         return await resolve(explicit_first), await resolve(explicit_last), refs

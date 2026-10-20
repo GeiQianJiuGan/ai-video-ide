@@ -39,7 +39,8 @@
       —— role ∈ first_frame | last_frame | reference；name / desc 就是「他是谁 / 长什么样」
       —— 顺序与 refs 无关：refs 说的是「送了哪几个文件」，pictures 说的是「模型该按第几张认谁」
 
-**prompt 一个字节都不重排**：`req.prompt` 原样送出去，`sent_prompt` 也保持原样。
+**普通文本 prompt 不重排**：`req.prompt` 原样送出去。镜头编辑器的稳定素材链接
+会在合同图册形成后解析为实际编号，`sent_prompt` 记录解析后的正文。
 服务端收到的是结构化的那一份，在提示词里再拼一遍只会让它解析两遍、两处措辞还必然分叉
 （描述属于素材本身，不属于提示词——同一条规矩 `refs[].desc` 已经走了一遍）。
 """
@@ -115,6 +116,7 @@ def _book_of(req: VideoRequest) -> base.PictureBook:
             media=ref.media,
             name=ref.who,
             desc=ref.desc,
+            asset_id=ref.asset_id,
             #: **这条路刻意不填 `file`**：图册按 `file or 入口名` 去重（`base.picture_book`），
             #: 而那条去重规则是为 ComfyUI 那两条路写的——那边同一个上传文件名就是模型端磁盘上
             #: 同一个文件，一份素材占两个入口是常态。这条路上每一项都自带一份 `data`，
@@ -235,10 +237,14 @@ class HttpApiProvider:
             body[f"{key}_name"] = path.name
         # **图册走结构化字段，不进 prompt**（理由整段写在模块开头）：这一族收得到字段，所以
         # 「第几张图是谁」用 `pictures[]` 说；两条 ComfyUI 路只能把同一件事写进正向提示词
-        # （`comfy_base.ComfyTasks._retold`）。`sent_prompt` 保持原样——我们一个字节都没重排，
-        # 冻结参数里说成重排过就是谎报（硬约束 4）。
+        # （`comfy_base.ComfyTasks._retold`）。普通文本保持原样；下方仅解析用户明确插入的
+        # 稳定素材链接，不替用户改写创作内容。
         book = _book_of(req)
         req.book = book
+        from app.generation.mentions import resolve_request
+
+        resolve_request(req, book)
+        body["prompt"] = req.prompt
         req.sent_prompt = req.prompt
         if book:
             body["pictures"] = [p.to_dict() for p in book.items]

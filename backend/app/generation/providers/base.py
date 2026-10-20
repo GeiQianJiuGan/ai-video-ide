@@ -92,6 +92,9 @@ class RefAsset:
     desc: str = ""
     name: str = ""
 
+    #: 工程内稳定素材标识，编辑器引用不依赖显示序号。
+    asset_id: str = ""
+
     @property
     def media_label(self) -> str:
         return MEDIA_LABEL.get(self.media, "参考素材")
@@ -229,6 +232,10 @@ class VideoRequest:
     #: 输出与升级前逐字相同。同一份意图配不同 `skill` → 不同模型的 prompt。
     intent: dict[str, Any] = field(default_factory=dict)
 
+    #: 已解析的首尾帧资产标识 → 角色，用于素材从参考区移到帧槽位后的链接解析。
+    frame_assets: dict[str, str] = field(default_factory=dict)
+    unavailable_assets: set[str] = field(default_factory=set)
+
 
 def refs_by_media(refs: Sequence[RefAsset]) -> dict[str, list[RefAsset]]:
     """把参考素材按媒体分组，组内保持账单顺序。三个键一定齐全（空组给空列表）。
@@ -324,6 +331,10 @@ class Picture:
     #: 上传到模型端之后的文件名。**去重按它**（见 `picture_book`）。
     file: str = ""
     subject: int = 0
+    asset_id: str = ""
+
+    #: 同一文件可同时承担首尾帧，去重后仍保留所有帧角色。
+    roles: tuple[str, ...] = ()
 
     @property
     def tag(self) -> str:
@@ -353,6 +364,7 @@ class Picture:
             "desc": self.desc,
             "entry": self.entry,
             "file": self.file,
+            "asset_id": self.asset_id,
         }
 
 
@@ -395,7 +407,7 @@ class PictureBook:
         return _listing(self.items)
 
     def of_role(self, role: str) -> Picture | None:
-        return next((p for p in self.items if p.role == role), None)
+        return next((p for p in self.items if p.role == role or role in p.roles), None)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -452,6 +464,13 @@ def picture_book(
             continue
         mark = seed.file or key
         if mark in seen:
+            for at, existing in enumerate(items):
+                if (existing.file or existing.entry) == mark:
+                    items[at] = replace(
+                        existing,
+                        asset_id=existing.asset_id or seed.asset_id,
+                        roles=tuple(dict.fromkeys((*existing.roles, existing.role, seed.role))),
+                    )
             continue
         seen.add(mark)
         kept.append(key)
