@@ -8,13 +8,14 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 
 from app.core.logging import get_logger
 from app.generation.providers import presets
 from app.persistence.models import Project, utc_now
+from app.services.access import access
 from app.services.base import db_of, fetch_all
 from app.services.projects import projects
 
@@ -23,7 +24,9 @@ log = get_logger("api.projects")
 
 
 class ProjectCreate(BaseModel):
-    dir: str = Field(description="工程目录绝对路径；不存在会被创建")
+    dir: str | None = Field(
+        default=None, description="管理员可指定工程目录；省略时在受控项目目录创建"
+    )
     name: str = Field(min_length=1, max_length=200)
     width: int = Field(default=1920, ge=64, le=8192)
     height: int = Field(default=1080, ge=64, le=8192)
@@ -63,16 +66,121 @@ class RecentOut(BaseModel):
 
 
 @router.post("/projects", response_model=ProjectOut, status_code=201)
-async def create_project(body: ProjectCreate) -> ProjectOut:
+async def create_project(body: ProjectCreate, request: Request) -> ProjectOut:
+    from app.core.config import settings
+    from app.core.ids import new_id
+    from app.services.access import denied
+
+    principal = request.state.principal
+    if principal.project_ids is not None:
+        raise denied("受限项目 Key 不能创建其他项目。")
+    if body.dir:
+        principal.require("admin")
+    directory = body.dir or str(settings.projects_root / new_id("project"))
     proj = await projects.create(
-        directory=body.dir,
+        directory=directory,
         name=body.name,
         width=body.width,
         height=body.height,
         fps=body.fps,
         duration_unit=body.duration_unit,
     )
-    return ProjectOut(**proj.to_dict())
+    data = proj.to_dict()
+    if not principal.allows("admin"):
+        data["dir"] = ""
+    return ProjectOut(**data)
+
+
+@router.get("/projects")
+async def list_projects(
+    request: Request,
+    q: str = "",
+    archived: bool = False,
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+) -> dict:
+    """持久登记的项目，不受最近列表条数与本次进程已打开状态限制。"""
+    from pathlib import Path
+
+    principal = request.state.principal
+    rows = [
+        r
+        for r in access.registered()
+        if principal.project(r["id"])
+        and bool(r["archived"]) == archived
+        and q.casefold() in r["name"].casefold()
+    ]
+    opened = {p.id for p in projects.opened}
+    items = []
+    for row in rows[offset : offset + limit]:
+        item = {
+            "id": row["id"],
+            "name": row["name"],
+            "archived": bool(row["archived"]),
+            "exists": (Path(row["dir"]) / "project.aivs.json").is_file(),
+            "is_open": row["id"] in opened,
+        }
+        if principal.allows("admin"):
+            item["dir"] = row["dir"]
+        items.append(item)
+    return {"items": items, "total": len(rows), "limit": limit, "offset": offset}
+
+
+class ProjectPatch(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    archived: bool | None = Field(
+        default=None, description="true 归档（还需 delete 权限）；false 恢复归档"
+    )
+
+
+@router.patch("/projects/{pid}")
+async def patch_project(pid: str, body: ProjectPatch, request: Request) -> dict:
+    """修改名称或恢复归档；不移动、递归清除项目目录。"""
+    from app.core.errors import not_found
+    from app.events.bus import Channel, bus
+    from app.services.base import fetch
+
+    if body.archived is True:
+        request.state.principal.require("delete", pid)
+
+    rows = access.registered(pid)
+    if not rows:
+        raise not_found("项目", pid)
+    entry = rows[0]
+    proj = await projects.open(entry["dir"])
+    if body.name is not None:
+        await fetch(proj.db, Project, pid, "项目")
+        async with proj.db.write() as session:
+            row = await session.get(Project, pid)
+            row.name = body.name
+            row.updated_at = utc_now()
+            proj.name = row.name
+            proj.updated_at = row.updated_at
+        from app.services.projects import _write_manifest
+
+        _write_manifest(proj.dir, projects._manifest_of(proj))
+        projects._remember(proj)
+    archived = body.archived if body.archived is not None else bool(entry["archived"])
+    with access.connect() as db:
+        db.execute(
+            "UPDATE project_registry SET archived=?,revision=revision+1 WHERE id=?",
+            (int(archived), pid),
+        )
+    if archived:
+        await projects.close(pid)
+    bus.emit(
+        Channel.SYSTEM,
+        "project.updated",
+        {"id": pid, "name": proj.name, "archived": archived},
+        project_id=pid,
+    )
+    return {"id": pid, "name": proj.name, "archived": archived}
+
+
+@router.delete("/projects/{pid}", status_code=204)
+async def archive_project(pid: str, request: Request) -> None:
+    """删除项目入口采用可恢复归档，不删除数据库和素材文件。"""
+    await patch_project(pid, ProjectPatch(archived=True), request)
 
 
 @router.post("/projects/open", response_model=ProjectOut)
@@ -93,8 +201,11 @@ async def forget_recent(body: ProjectOpen) -> None:
 
 
 @router.get("/projects/{pid}", response_model=ProjectOut)
-async def get_project(pid: str) -> ProjectOut:
-    return ProjectOut(**projects.get(pid).to_dict())
+async def get_project(pid: str, request: Request) -> ProjectOut:
+    data = projects.get(pid).to_dict()
+    if not request.state.principal.allows("admin"):
+        data["dir"] = ""
+    return ProjectOut(**data)
 
 
 @router.get("/projects/{pid}/preset")

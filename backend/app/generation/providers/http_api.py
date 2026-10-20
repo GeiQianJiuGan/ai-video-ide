@@ -342,9 +342,7 @@ class HttpApiProvider:
                     else urljoin(base + "/", url.lstrip("/"))
                 )
                 headers = (
-                    self._headers()
-                    if urlparse(target).netloc == urlparse(base).netloc
-                    else {}
+                    self._headers() if urlparse(target).netloc == urlparse(base).netloc else {}
                 )
                 resp = await http.get(target, headers=headers, timeout=self._timeout())
                 resp.raise_for_status()

@@ -61,8 +61,28 @@ class Database:
         """写事务：串行化 + 自动提交/回滚。"""
         async with self._write_lock, self._sessionmaker() as session:
             try:
+                from app.services.access import access, expected_revision
+
+                condition = expected_revision.get()
+                tracked = self.path.name == "project.db"
+                if condition and tracked:
+                    from app.core.errors import AppError, ErrorCode
+
+                    if access.revision(condition[0]) != condition[1]:
+                        raise AppError(
+                            ErrorCode.PRECONDITION_FAILED,
+                            "项目已发生变化",
+                            "写入前项目版本已经改变。",
+                            ["重新读取 ETag 并合并修改"],
+                        )
+                    expected_revision.set(None)
                 yield session
                 await session.commit()
+                if tracked:
+                    from app.core.config import settings
+
+                    if (settings.runtime_dir / "access.db").exists():
+                        access.bump(self.path.parent)
             except Exception:
                 await session.rollback()
                 raise

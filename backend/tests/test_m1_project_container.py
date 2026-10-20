@@ -147,7 +147,8 @@ def test_open_roundtrip_after_close(client: TestClient, tmp_path: Path) -> None:
     target = tmp_path / "my_film"
     created = make_project(client, target)
     assert client.post(f"/api/v1/projects/{created['id']}/close").status_code == 204
-    assert client.get(f"/api/v1/projects/{created['id']}").status_code == 404
+    # 已登记工程按 ID 自动重新打开，外部 AI 无需知道磁盘路径。
+    assert client.get(f"/api/v1/projects/{created['id']}").status_code == 200
 
     resp = client.post("/api/v1/projects/open", json={"dir": str(target)})
     assert resp.status_code == 200, resp.text

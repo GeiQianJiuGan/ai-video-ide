@@ -34,6 +34,8 @@ AIVS 不做模型，只做那个把「几秒钟」组织成「一部片子」的
 
 ## 核心链路
 
+外部 AI 可通过 [开放 API](docs/open-api/README.md) 查询项目、增删改查素材与幕、编辑 Shot 和提交生成。回环直连可免 Key，服务部署使用 Key 和项目范围授权；提供 OpenAPI 与可运行示例，供后续编写 Skill。
+
 ```text
 Character → Appearance → Scene → Shot → Context → Generation
          → GenerationVersion → Clip → Timeline → Final Video

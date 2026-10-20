@@ -458,7 +458,9 @@ def test_shot_tools_are_proposal_only_then_land_with_a_four_part_prompt(
     shot = client.get(f"{API}/projects/{pid}/shots/{shots[0]['id']}").json()
     assert shot["title"] == "雨中疾驰" and shot["duration"] == 5
     assert shot["prompt"].startswith("[SHOT 1]")
-    assert shot["intent"]["beat"] == "轿车在雨幕里疾驰", "意图落进 intent_json，get_shot 展开成 intent"
+    assert shot["intent"]["beat"] == "轿车在雨幕里疾驰", (
+        "意图落进 intent_json，get_shot 展开成 intent"
+    )
 
 
 def test_update_shot_merges_intent_keeping_fields_it_was_not_given(

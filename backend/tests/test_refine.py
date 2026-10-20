@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from functools import partial
+
 from fastapi.testclient import TestClient
 
 API = "/api/v1"
@@ -24,13 +26,14 @@ def test_refine_lineage_tracing(client: TestClient, pid: str) -> None:
     ).json()
 
     # 1. 创建祖先版本 v1
-    import asyncio
-
     from app.services.generation import generation
 
-    loop = asyncio.get_event_loop()
-    v1 = loop.run_until_complete(
-        generation.add_version(
+    # 服务与 TestClient 的项目库使用同一个事件循环，避免把调度任务留在
+    # pytest 的另一条循环里，关停时跨线程取消会造成悬挂。
+    assert client.portal is not None
+    v1 = client.portal.call(
+        partial(
+            generation.add_version,
             pid,
             shot["id"],
             asset_id=None,
@@ -39,8 +42,9 @@ def test_refine_lineage_tracing(client: TestClient, pid: str) -> None:
             duration=4.0,
         )
     )
-    v2 = loop.run_until_complete(
-        generation.add_version(
+    v2 = client.portal.call(
+        partial(
+            generation.add_version,
             pid,
             shot["id"],
             asset_id=None,
@@ -52,8 +56,9 @@ def test_refine_lineage_tracing(client: TestClient, pid: str) -> None:
     )
 
     # 3. 从 v2 派生出版本 v3
-    v3 = loop.run_until_complete(
-        generation.add_version(
+    v3 = client.portal.call(
+        partial(
+            generation.add_version,
             pid,
             shot["id"],
             asset_id=None,

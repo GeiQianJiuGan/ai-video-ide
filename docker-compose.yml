@@ -17,6 +17,10 @@ services:
       - AIVS_HOST=0.0.0.0
       - AIVS_PORT=8765
       - AIVS_REQUIRE_HANDSHAKE=false
+      - AIVS_ACCESS_MODE=server
+      - AIVS_PROJECTS_ROOT=/app/data
+      - AIVS_SESSION_SECURE_COOKIE=${AIVS_SESSION_SECURE_COOKIE:-true}
+      - AIVS_ALLOWED_ORIGINS=${AIVS_ALLOWED_ORIGINS:-[]}
       - AIVS_DEV_CORS=false
       # 外部 ComfyUI 算力机地址（局域网 IP 或公网 IP）
       - AIVS_COMFY_BASE_URL=${AIVS_COMFY_BASE_URL:-http://127.0.0.1:8188}

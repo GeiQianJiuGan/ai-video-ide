@@ -488,6 +488,9 @@ class ProjectService:
         return [e for e in data if isinstance(e, dict) and e.get("dir")]
 
     def _remember(self, proj: OpenProject) -> None:
+        from app.services.access import access
+
+        access.remember(proj.id, proj.name, proj.dir.resolve().as_posix())
         entries = [e for e in self._load_recent() if e.get("dir") != proj.dir.as_posix()]
         entries.insert(
             0,

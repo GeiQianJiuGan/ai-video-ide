@@ -41,6 +41,14 @@ class Settings(BaseSettings):
     # 与前端握手的一次性 token；Tauri 启动 sidecar 时注入
     handshake_token: str = ""
     require_handshake: bool = False
+    # auto 仅在回环监听时允许本机免 Key；代理 / 容器必须使用 server。
+    access_mode: str = "auto"
+    projects_root: Path = Field(default=REPO_ROOT / "data" / "projects")
+    session_seconds: int = 28800
+    session_secure_cookie: bool = True
+    # 外层 HTTPS 域名的完整 Origin；只有管理员环境配置可写，绝不自动信任转发头。
+    allowed_origins: list[str] = Field(default_factory=list)
+    upload_limit_mb: int = 500
 
     # --- 路径 ---
     runtime_dir: Path = Field(default=REPO_ROOT / ".runtime")

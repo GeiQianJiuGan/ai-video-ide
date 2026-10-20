@@ -30,6 +30,8 @@ jobs:
       - name: 后端测试
         working-directory: backend
         run: python -m pytest -q
+      - name: 开放接口文档一致性
+        run: python scripts/export_open_api.py --check
       - name: 安装前端依赖
         working-directory: frontend
         run: npm ci

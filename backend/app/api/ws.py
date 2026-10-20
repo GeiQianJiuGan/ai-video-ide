@@ -10,6 +10,7 @@ from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 from app.core.config import settings
 from app.core.logging import get_logger
 from app.events.bus import Channel, Event, bus
+from app.services.access import COOKIE, access
 
 router = APIRouter()
 log = get_logger("api.ws")
@@ -39,10 +40,6 @@ async def ws_endpoint(
     channels: str | None = Query(default=None),
     token: str | None = Query(default=None),
 ) -> None:
-    if settings.require_handshake and token != settings.handshake_token:
-        await websocket.close(code=4401, reason="invalid handshake token")
-        return
-
     await websocket.accept()
     selected = _parse_channels(channels)
     # 握手与心跳也走 Event.to_dict()：连线上只有**一种**事件信封（channel / event /
@@ -63,11 +60,23 @@ async def ws_endpoint(
 
     async def pump() -> None:
         async for ev in bus.subscribe(project_id=project_id, channels=selected):
+            principal = websocket.state.principal
+            if principal.project_ids is not None and (
+                ev.project_id is None or not principal.project(ev.project_id)
+            ):
+                continue
             await websocket.send_json(ev.to_dict())
 
     async def heartbeat() -> None:
         while True:
             await asyncio.sleep(HEARTBEAT_SECONDS)
+            principal = websocket.state.principal
+            if principal.id != "local":
+                auth_header = websocket.headers.get("authorization", "")
+                raw = auth_header.partition(" ")[2] if auth_header else ""
+                if access.authenticate(raw, websocket.cookies.get(COOKIE, "")) is None:
+                    await websocket.close(code=4401, reason="credential expired or revoked")
+                    return
             await websocket.send_json(
                 Event(
                     channel=Channel.SYSTEM,

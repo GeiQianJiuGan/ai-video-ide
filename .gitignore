@@ -27,6 +27,9 @@ tauri/gen/
 *.log
 logs/
 .runtime/
+/data/
+bootstrap-api-key.txt
+.env
 *.db
 *.db-shm
 *.db-wal

@@ -74,9 +74,14 @@ export class EventClient {
       if (ev.event === 'system.ping') return
       this.handlers.forEach((h) => h(ev))
     }
-    socket.onclose = () => {
+    socket.onclose = (ev) => {
       this.socket = null
       this.emitState('closed')
+      if (ev.code === 4401) {
+        window.dispatchEvent(new Event('aivs:unauthorized'))
+        return
+      }
+      if (ev.code === 4403) return
       if (!this.closedByUser) this.scheduleReconnect()
     }
     socket.onerror = () => socket.close()

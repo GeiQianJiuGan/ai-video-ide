@@ -9,6 +9,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     AIVS_HOST=0.0.0.0 \
     AIVS_PORT=8765 \
     AIVS_REQUIRE_HANDSHAKE=false \
+    AIVS_ACCESS_MODE=server \
+    AIVS_PROJECTS_ROOT=/app/data \
     AIVS_DEV_CORS=false
 
 # 镜像自报版本号：由 scripts/package-docker.py 用 --build-arg 传进来。AIVS_ 前缀的环境变量
@@ -42,4 +44,4 @@ RUN mkdir -p /app/.runtime /app/data
 EXPOSE 8765
 
 # 启动 Uvicorn 服务
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8765"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8765", "--no-proxy-headers"]

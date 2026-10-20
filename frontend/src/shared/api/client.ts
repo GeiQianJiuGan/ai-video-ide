@@ -32,6 +32,8 @@ export type ErrorCode =
   | 'CONFLICT'
   | 'VALIDATION_ERROR'
   | 'UNAUTHORIZED'
+  | 'FORBIDDEN'
+  | 'PRECONDITION_FAILED'
   | 'INTERNAL'
   | 'NETWORK_ERROR'
 
@@ -157,6 +159,7 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
   }
 
   if (!resp.ok) {
+    if (resp.status === 401 && !path.startsWith('/auth/')) window.dispatchEvent(new Event('aivs:unauthorized'))
     const wrapped = jsonOk ? (parsed as { error?: ErrorPayload } | null) : null
     if (!wrapped?.error) throw offContractError(resp.status, text)
     throw new ApiError(wrapped.error, resp.status)

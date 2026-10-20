@@ -1,7 +1,7 @@
 """FastAPI 装配与生命周期。
 
-安全约束：只监听 127.0.0.1；开启 require_handshake 后，所有 /api 请求必须携带
-X-AIVS-Token（WebSocket 用 ?token=）。Tauri 启动 sidecar 时注入该 token。
+访问规则由统一中间件执行：回环直连免开放 Key，服务部署必须鉴权。
+桌面壳的 X-AIVS-Token 握手独立保留。
 """
 
 from __future__ import annotations
@@ -10,10 +10,10 @@ import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException
 
 from app.api import assets as assets_api
 from app.api import cast as cast_api
@@ -26,6 +26,7 @@ from app.api import fs as fs_api
 from app.api import generation as generation_api
 from app.api import images as images_api
 from app.api import ingest as ingest_api
+from app.api import integration as integration_api
 from app.api import library as library_api
 from app.api import onboarding as onboarding_api
 from app.api import overview as overview_api
@@ -39,15 +40,18 @@ from app.api import system, ws
 from app.api import timeline as timeline_api
 from app.api import workflows as workflows_api
 from app.api import world as world_api
+from app.core.access_middleware import AccessMiddleware
 from app.core.config import settings
 from app.core.errors import (
     AppError,
-    ErrorCode,
     app_error_handler,
+    http_error_handler,
     unhandled_error_handler,
     validation_error_handler,
 )
 from app.core.logging import get_logger, setup_logging
+from app.core.openapi import install_openapi
+from app.services.access import access, server_mode
 from app.services.appsettings import app_settings
 from app.services.global_registry import global_registry
 from app.services.library import library
@@ -56,20 +60,6 @@ from app.services.projects import projects
 log = get_logger("main")
 
 API_PREFIX = "/api/v1"
-PUBLIC_PATHS = {"/api/v1/health", "/docs", "/openapi.json", "/redoc"}
-
-
-def _authorized(request: Request) -> bool:
-    """握手校验。
-
-    正常情况只认 X-AIVS-Token 头。但 <img src> / <video src> 没法带自定义头，
-    所以文件读取端点额外接受 ?token=——和 /ws 的做法一致，且仅限只读的 GET。
-    """
-    if request.headers.get("X-AIVS-Token") == settings.handshake_token:
-        return True
-    if request.method == "GET" and "/files/" in request.url.path:
-        return request.query_params.get("token") == settings.handshake_token
-    return False
 
 
 @asynccontextmanager
@@ -77,6 +67,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     setup_logging()
     # 设置文件里的覆盖要在任何 service 读 settings 之前生效（顺序：文件 → 环境变量 → 默认）
     app_settings.apply()
+    server_mode()  # 启动即校验部署模式，避免拼写错误导致降级。
+    access.initialize()
+    for entry in projects.recent():
+        if entry.get("id") and not access.registered(entry["id"]):
+            access.remember(entry["id"], entry["name"], entry["dir"])
     await global_registry.start()
     log.info(
         "backend.starting",
@@ -111,24 +106,8 @@ def create_app() -> FastAPI:
             allow_headers=["*"],
         )
 
-    @app.middleware("http")
-    async def handshake_guard(request: Request, call_next):  # noqa: ANN001, ANN202
-        if (
-            settings.require_handshake
-            and request.url.path.startswith("/api")
-            and request.url.path not in PUBLIC_PATHS
-            and not _authorized(request)
-        ):
-            err = AppError(
-                ErrorCode.UNAUTHORIZED,
-                "握手校验失败",
-                "缺少或错误的 X-AIVS-Token。",
-                ["由 Tauri 壳启动应用，而不要直接访问后端端口"],
-            )
-            return JSONResponse(status_code=401, content={"error": err.to_dict()})
-        return await call_next(request)
-
     app.add_exception_handler(AppError, app_error_handler)
+    app.add_exception_handler(HTTPException, http_error_handler)
     app.add_exception_handler(RequestValidationError, validation_error_handler)
     app.add_exception_handler(Exception, unhandled_error_handler)
 
@@ -157,6 +136,10 @@ def create_app() -> FastAPI:
     app.include_router(overview_api.router, prefix=API_PREFIX)
     app.include_router(packages_api.router, prefix=API_PREFIX)
     app.include_router(ws.router, prefix=API_PREFIX)
+    # 原有静态子路径（如 assets/undescribed）优先于补齐的单资源 GET。
+    app.include_router(integration_api.router, prefix=API_PREFIX)
+    app.add_middleware(AccessMiddleware, router=app.router)
+    install_openapi(app)
     return app
 
 
@@ -165,14 +148,16 @@ app = create_app()
 
 def _write_endpoint(port: int) -> None:
     """把实际端口与 token 写给 Tauri / 前端读取。"""
+    settings.runtime_dir.mkdir(parents=True, exist_ok=True)
     target = settings.runtime_dir / "endpoint.json"
+    url_host = f"[{settings.host}]" if ":" in settings.host else settings.host
     target.write_text(
         json.dumps(
             {
                 "host": settings.host,
                 "port": port,
-                "base_url": f"http://{settings.host}:{port}{API_PREFIX}",
-                "ws_url": f"ws://{settings.host}:{port}{API_PREFIX}/ws",
+                "base_url": f"http://{url_host}:{port}{API_PREFIX}",
+                "ws_url": f"ws://{url_host}:{port}{API_PREFIX}/ws",
                 "token": settings.handshake_token,
                 "version": settings.version,
             },
@@ -190,11 +175,19 @@ def main() -> None:
 
     port = settings.port
     if port == 0:
-        with socket.socket() as sock:
+        family = socket.AF_INET6 if ":" in settings.host else socket.AF_INET
+        with socket.socket(family) as sock:
             sock.bind((settings.host, 0))
             port = sock.getsockname()[1]
     _write_endpoint(port)
-    uvicorn.run(app, host=settings.host, port=port, log_level=settings.log_level.lower())
+    # 不让任意转发头把外部来源改写成本机；服务模式不使用来源 IP 免鉴权。
+    uvicorn.run(
+        app,
+        host=settings.host,
+        port=port,
+        log_level=settings.log_level.lower(),
+        proxy_headers=False,
+    )
 
 
 if __name__ == "__main__":

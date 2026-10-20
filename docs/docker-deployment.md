@@ -1,5 +1,7 @@
 # AI Video Studio · Docker 容器化部署指南
 
+开放 API 已内置统一鉴权，详见 [接口与权限文档](open-api/README.md)。容器强制使用 server 模式；首次 Key 从持久运行目录 `bootstrap-api-key.txt` 领取。Compose 对应 `data/runtime/bootstrap-api-key.txt`，all-in-one 应将 `/app/.runtime` 持久挂载。外网网页使用 HTTPS，并配置 `AIVS_ALLOWED_ORIGINS` 为外部页面的完整 Origin。仅本机 HTTP 容器调试可设置 `AIVS_SESSION_SECURE_COOKIE=false`；这不会关闭 API Key 校验。外部 AI 使用 `Authorization: Bearer ...`。
+
 本项目已全面支持容器化部署到 Linux 服务器。由于生图、生视频的 **ComfyUI 位于外部算力服务器**，本容器仅负责：
 - Web 前端界面服务（Vue 3 + Vite）
 - FastAPI 后端工程编排与数据库（SQLite WAL）
@@ -74,14 +76,16 @@ docker compose up -d --build
 ssh -L 8080:127.0.0.1:8080 <服务器>
 ```
 
-隧道建立后在本机打开 `http://127.0.0.1:8080`。不要将 `AIVS_BIND_ADDR` 改成
-`0.0.0.0` 后直接开放端口：工程 API 可读写项目文件，而且容器模式没有桌面握手。
-如需给多人从公网访问，在前面配置 HTTPS 反向代理并保护**所有路径**（包括 `/api/` 与
-`/api/v1/ws`）；后端端口继续只留在 Compose 网络内。
-仓库提供 [Nginx 示例](../docker/nginx-auth.example.conf)：先把域名和证书路径改成实际值，
-再在宿主机创建认证文件（例如 `htpasswd -cB /etc/nginx/aivs.htpasswd <用户名>`），
-启用配置并执行 `nginx -t`。认证放在 `server` 级别，页面、API 和 WebSocket 都会受保护；
-Compose 的 `AIVS_BIND_ADDR` 仍保持 `127.0.0.1`。
+隧道建立后在本机打开 `http://127.0.0.1:8080`，本机 HTTP 调试在 `.env` 设置
+`AIVS_SESSION_SECURE_COOKIE=false`；API 仍要求 Key。部署公网时恢复 true，并使用 HTTPS。
+容器内置 Key 认证同时覆盖业务 API、媒体和 WebSocket；首次 Key 从
+`data/runtime/bootstrap-api-key.txt` 领取。网页输入 Key 登录，外部 AI 使用 Bearer 请求头。
+后端端口继续只留在 Compose 网络内。
+仓库提供 [Nginx 示例](../docker/nginx-auth.example.conf)：修改域名和证书路径，
+配置 `AIVS_ALLOWED_ORIGINS=["https://实际域名"]`，启用配置并执行 `nginx -t`。
+Compose 的 `AIVS_BIND_ADDR` 保持 `127.0.0.1`，由外层代理提供 HTTPS。
+旧示例的 Basic Auth 已由内置 Key 认证替代；不要同时占用同一个 Authorization 头，
+否则外部 AI 无法正常使用 Bearer。普通自定义代理部署也必须设置 `AIVS_ACCESS_MODE=server`。
 
 ### 3. 服务运维与停止
 

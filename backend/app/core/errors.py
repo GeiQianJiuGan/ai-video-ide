@@ -11,6 +11,7 @@ from typing import Any
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException
 
 
 class ErrorCode(StrEnum):
@@ -42,6 +43,8 @@ class ErrorCode(StrEnum):
     CONFLICT = "CONFLICT"
     VALIDATION_ERROR = "VALIDATION_ERROR"
     UNAUTHORIZED = "UNAUTHORIZED"
+    FORBIDDEN = "FORBIDDEN"
+    PRECONDITION_FAILED = "PRECONDITION_FAILED"
     INTERNAL = "INTERNAL"
 
 
@@ -55,6 +58,8 @@ _STATUS = {
     #: 现在这个状态下不能直接做，换个参数（allow_ref_drop）就能做。
     ErrorCode.REF_OVER_CAPACITY: 409,
     ErrorCode.UNAUTHORIZED: 401,
+    ErrorCode.FORBIDDEN: 403,
+    ErrorCode.PRECONDITION_FAILED: 412,
     ErrorCode.COMFY_OFFLINE: 503,
     ErrorCode.LLM_UNAVAILABLE: 503,
     ErrorCode.INTERNAL: 500,
@@ -104,6 +109,21 @@ def not_found(what: str, ident: str) -> AppError:
 async def app_error_handler(_: Request, exc: Exception) -> JSONResponse:
     assert isinstance(exc, AppError)
     return JSONResponse(status_code=exc.status_code, content={"error": exc.to_dict()})
+
+
+async def http_error_handler(_: Request, exc: Exception) -> JSONResponse:
+    """未知接口与方法不支持也沿用四要素，不向 AI 返回另一套错误格式。"""
+    assert isinstance(exc, HTTPException)
+    err = AppError(
+        ErrorCode.NOT_FOUND if exc.status_code == 404 else ErrorCode.VALIDATION_ERROR,
+        "接口或资源不存在" if exc.status_code == 404 else "请求无法处理",
+        str(exc.detail),
+        ["检查接口路径、HTTP 方法及开放 API 文档"],
+        status_code=exc.status_code,
+    )
+    return JSONResponse(
+        status_code=exc.status_code, content={"error": err.to_dict()}, headers=exc.headers
+    )
 
 
 async def validation_error_handler(_: Request, exc: Exception) -> JSONResponse:

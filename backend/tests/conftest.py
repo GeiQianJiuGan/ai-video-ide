@@ -26,9 +26,19 @@ from app.services.library import library as library_service
 from app.services.projects import projects
 
 
+class LoopbackClient(TestClient):
+    def websocket_connect(self, url: str, *args, **kwargs):  # noqa: ANN002, ANN003, ANN201
+        # Starlette 的相对 WS URL 固定拼 testserver，不跟随 base_url。
+        if url.startswith("/"):
+            url = "ws://127.0.0.1" + url
+        return super().websocket_connect(url, *args, **kwargs)
+
+
 @pytest.fixture
 def client() -> Iterator[TestClient]:
-    with TestClient(create_app()) as c:
+    with LoopbackClient(
+        create_app(), base_url="http://127.0.0.1", client=("127.0.0.1", 50000)
+    ) as c:
         yield c
 
 

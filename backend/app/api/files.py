@@ -83,7 +83,12 @@ def serve(root: Path, rel: str, what: str) -> FileResponse:
     return FileResponse(
         target,
         media_type=mime or "application/octet-stream",
-        headers={"Cache-Control": CACHE_CONTROL},
+        headers={
+            "Cache-Control": CACHE_CONTROL,
+            "X-Content-Type-Options": "nosniff",
+            # 上传文件即使作为独立文档打开，也不能执行同源脚本或借用管理会话。
+            "Content-Security-Policy": "sandbox; default-src 'none'",
+        },
     )
 
 

@@ -21,6 +21,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     AIVS_HOST=127.0.0.1 \
     AIVS_PORT=8765 \
     AIVS_REQUIRE_HANDSHAKE=false \
+    AIVS_ACCESS_MODE=server \
+    AIVS_PROJECTS_ROOT=/app/data \
     AIVS_DEV_CORS=false
 
 # 镜像自报版本号：由 scripts/package-docker.py 用 --build-arg 传进来。AIVS_ 前缀的环境变量

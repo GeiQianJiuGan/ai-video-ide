@@ -10,4 +10,4 @@ nginx
 
 # 切换到后端目录启动 FastAPI
 cd /app/backend
-exec uvicorn app.main:app --host 127.0.0.1 --port 8765
+exec uvicorn app.main:app --host 127.0.0.1 --port 8765 --no-proxy-headers

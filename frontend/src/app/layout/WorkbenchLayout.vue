@@ -17,7 +17,7 @@
  * 标题栏、命令面板、项目概览页三个入口指的都是这一个弹窗。
  */
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
-import { RouterView, useRoute } from 'vue-router'
+import { RouterView, useRoute, useRouter } from 'vue-router'
 import ActivityBar from './ActivityBar.vue'
 import ConsolePanel from './ConsolePanel.vue'
 import DirectorDock from './DirectorDock.vue'
@@ -38,9 +38,27 @@ const consolePanel = useConsoleStore()
 const shell = useShellStore()
 const wiz = useOnboardingStore()
 const route = useRoute()
+const router = useRouter()
 const paletteOpen = ref(false)
+const externalChange = ref(false)
+const viewRevision = ref(0)
 
 const pid = computed(() => (route.params.pid as string | undefined) ?? null)
+
+watch(() => sys.events.at(-1), (event) => {
+  if (event?.event === 'project.external_changed' && event.project_id === pid.value) externalChange.value = true
+})
+watch(() => route.fullPath, () => { externalChange.value = false })
+
+async function refreshExternalChanges() {
+  // 通过路由的离开守卫先保存当前草稿，再重新进入页面读取外部修改。
+  const target = route.fullPath
+  const moved = await router.push({ name: 'projects' })
+  if (moved) return
+  await router.push(target)
+  viewRevision.value += 1
+  externalChange.value = false
+}
 
 // 刷新页面或直接深链接进来时，路由只带着 pid，工程信息要自己补齐
 watch(pid, (id) => void (id ? proj.ensure(id) : null), { immediate: true })
@@ -90,7 +108,12 @@ onUnmounted(() => {
     <div class="flex min-h-0 flex-1">
       <ActivityBar />
       <main class="bg-base-0 flex min-h-0 min-w-0 flex-1 flex-col">
-        <RouterView />
+        <div v-if="externalChange" class="border-b border-indigo-400/30 bg-indigo-500/10 px-4 py-2 text-xs">
+          外部 AI 更新了当前项目。
+          <button class="ml-3 text-indigo-300 underline" @click="refreshExternalChanges">保存当前草稿并刷新</button>
+          <button class="ml-3 text-slate-400" @click="externalChange = false">稍后查看</button>
+        </div>
+        <RouterView :key="viewRevision" />
       </main>
       <DirectorDock :project-id="pid" />
     </div>
