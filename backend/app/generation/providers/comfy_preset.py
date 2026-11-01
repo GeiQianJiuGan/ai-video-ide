@@ -12,8 +12,8 @@
      参考图」变成一个 400）；
   5. 轮询 history，取最后一个产物。
 
-图里的 lora、加速节点、采样器我们不看也不校验——那是模型端的事。摘节点也只跟着连线走，
-不认识任何 class_type（`app/generation/comfy/graph.py::detach`）。
+图里的 lora、加速节点、采样器我们不看也不校验——那是模型端的事。摘节点只跟着连线走；
+清理结束后，对已知的图片数组节点压紧输入编号（`app/generation/comfy/graph.py::detach`）。
 
 参考素材（`AIVS_REF_*` / `AIVS_REF_VIDEO_*` / `AIVS_REF_AUDIO_*`）与首尾帧分开处理，
 **按媒体各填各的槽位**（图片、视频、音频接的节点根本不是一类），且**槽位不够不是失败**：
@@ -77,6 +77,83 @@ def _book_of(
     entries = {marker: points[marker]["node_id"] for marker in fed.pics if marker in points}
     order = feed_order(graph, entries)
     return base.picture_book(fed.pics, order.order, order_source=order.source, others=fed.others)
+
+
+def _numbered_sources(node: dict[str, Any], prefix: str) -> list[str]:
+    inputs = node.get("inputs")
+    if not isinstance(inputs, dict):
+        return []
+    numbered = sorted(
+        (int(key[len(prefix) :]), value)
+        for key, value in inputs.items()
+        if key.startswith(prefix) and key[len(prefix) :].isdigit()
+    )
+    return [str(value[0]) for _, value in numbered if isinstance(value, list) and len(value) == 2]
+
+
+def _align_llm_pictures(
+    graph: dict[str, Any],
+    points: dict[str, dict[str, str]],
+    fed: _Fed,
+    book: base.PictureBook,
+    name: str,
+) -> None:
+    """让接图片批次的 LLM 系统提示词使用本次视频节点的实际 Picture 编号。"""
+    video_nodes = [
+        node for node in graph.values() if node.get("class_type") == "MiniMaxH3ReferenceToVideo"
+    ]
+    if not video_nodes:
+        return
+    video_sources = _numbered_sources(video_nodes[0], "ref_images.ref_image_")
+    by_node = {
+        points[marker]["node_id"]: pic for marker, pic in fed.pics.items() if marker in points
+    }
+    for llm_id, llm in graph.items():
+        if llm.get("class_type") != "llama_cpp_instruct_adv":
+            continue
+        inputs = llm.get("inputs")
+        if not isinstance(inputs, dict) or inputs.get("inference_mode") != "images":
+            continue
+        link = inputs.get("images")
+        if not isinstance(link, list) or len(link) != 2:
+            continue
+        source = graph.get(str(link[0]), {})
+        if source.get("class_type") == "PreviewImage":
+            preview_link = source.get("inputs", {}).get("images")
+            source = graph.get(str(preview_link[0]), {}) if isinstance(preview_link, list) else {}
+        if source.get("class_type") != "BatchImagesNode":
+            continue
+        llm_sources = _numbered_sources(source, "images.image")
+        ordered_files = [by_node[node_id].file for node_id in video_sources if node_id in by_node]
+        if (
+            llm_sources != video_sources
+            or len(ordered_files) != len(video_sources)
+            or ordered_files != [pic.file for pic in book.items]
+        ):
+            raise AppError(
+                ErrorCode.INVALID_WORKFLOW,
+                "LLM 与视频的图片编号不一致",
+                f"预设 {name} 中 LLM 节点 {llm_id} 收到的图片顺序，与视频节点的"
+                "参考图顺序或本次 <Picture N> 图册不一致。",
+                [
+                    "在 ComfyUI 中让图片合批节点与视频参考图节点按同一顺序连接相同图片",
+                    "同一张图不要占两个编号；修改后重新导出并导入预设",
+                ],
+                {"llm_sources": llm_sources, "video_sources": video_sources},
+            )
+        mapping = "\n".join(
+            f"<Picture {pic.index}> = image {pic.index} in the input batch = {pic.name or pic.entry}"
+            for pic in book.items
+        )
+        inputs["system_prompt"] = (
+            str(inputs.get("system_prompt") or "")
+            + "\n\n[Actual image mapping for this request]\n"
+            + "The input is an ordered batch of separate images, not a labeled contact sheet. "
+            + "The image positions below are authoritative for both this LLM and the video generator. "
+            + "Ignore earlier instructions about contact-sheet panels or visible labels. "
+            + "Use only these <Picture N> numbers; do not infer numbers from image content.\n"
+            + mapping
+        )
 
 
 def _idle_summary(idle: list[str]) -> str:
@@ -361,7 +438,9 @@ class ComfyPresetProvider(ComfyTasks):
                 continue
             graph[spot["node_id"]]["inputs"][spot["field"]] = value
         removed = _detach_idle(graph, name, points, idle, req)
-        self._retell(req, graph, points, _book_of(graph, points, fed), name)
+        book = _book_of(graph, points, fed)
+        _align_llm_pictures(graph, points, fed, book, name)
+        self._retell(req, graph, points, book, name)
         prompt_id = await self._submit_graph(
             graph,
             client_id=client_id,

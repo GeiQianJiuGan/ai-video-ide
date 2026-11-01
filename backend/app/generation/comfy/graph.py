@@ -7,8 +7,9 @@
 再给预设那条路（`providers/comfy_preset.py`）用一份，所以它们不能留在 `services/workflows.py`
 里——那边只是重新导出前三个名字，老调用点一行不用改。
 
-这里**只做形状、写值与摘节点**，不认识任何具体模型：绑定表长什么样、哪些槽位是必需的，
-仍然是 `services/workflows.py` 与 `persistence/models_gen.py` 的事。
+这里**只做形状、写值与摘节点**：摘完后会压紧两种已知图片数组节点的输入编号。
+绑定表长什么样、哪些槽位是必需的，仍然是 `services/workflows.py` 与
+`persistence/models_gen.py` 的事。
 """
 
 from __future__ import annotations
@@ -146,6 +147,48 @@ def _linked(value: Any) -> str | None:
     return None
 
 
+_AUTOGROW_IMAGE_PREFIXES = {
+    "BatchImagesNode": "images.image",
+    "MiniMaxH3ReferenceToVideo": "ref_images.ref_image_",
+}
+
+
+def _compact_image_inputs(graph: dict[str, Any]) -> None:
+    """摘掉空图片入口后，压紧已知图片数组节点的编号，保持原来的接线顺序。"""
+    for node in graph.values():
+        if not isinstance(node, dict):
+            continue
+        prefix = _AUTOGROW_IMAGE_PREFIXES.get(str(node.get("class_type") or ""))
+        inputs = node.get("inputs")
+        if prefix is None or not isinstance(inputs, dict):
+            continue
+        numbered = sorted(
+            (int(key[len(prefix) :]), key)
+            for key in inputs
+            if key.startswith(prefix) and key[len(prefix) :].isdigit()
+        )
+        if not numbered:
+            continue
+        in_graph_order = [
+            key for key in inputs if key.startswith(prefix) and key[len(prefix) :].isdigit()
+        ]
+        if all(
+            index == position for position, (index, _) in enumerate(numbered)
+        ) and in_graph_order == [key for _, key in numbered]:
+            continue
+        names = {key for _, key in numbered}
+        values = [inputs[key] for _, key in numbered]
+        first_key = next(key for key in inputs if key in names)
+        packed: dict[str, Any] = {}
+        for key, value in inputs.items():
+            if key in names:
+                if key == first_key:
+                    packed.update({f"{prefix}{index}": item for index, item in enumerate(values)})
+                continue
+            packed[key] = value
+        node["inputs"] = packed
+
+
 def detach(
     graph: dict[str, Any],
     node_ids: Iterable[str],
@@ -164,7 +207,7 @@ def detach(
     是用户有意存进去的默认值，保持原值正是想要的行为。两类的分界表是 `MEDIA_SLOTS`
     与 `providers/presets.py::MEDIA_MARKERS`。
 
-    摘的办法只用局部信息，不问 ComfyUI 的 `/object_info`，也不认识任何 class_type：
+    摘的办法只用局部信息，不问 ComfyUI 的 `/object_info`，摘节点时也不认识 class_type：
 
       1. 把图里所有指向它的连线（`inputs` 里那个 `[node_id, k]`）连键一起删掉；
       2. 删掉这个节点本身——ComfyUI 是从输出节点往回走的，剩下的孤立节点既不会被校验
@@ -176,6 +219,9 @@ def detach(
 
     `keep` 是这一次真填了值的那些入口节点：它们永远不会被连带摘掉（第 3 步在它们那儿停），
     最坏情况下也只是少一个输入键，而不是把这次真正要跑的那条链摘断。
+
+    摘完后仅对已知的 Autogrow 图片数组输入压紧编号，避免留下 image0、image1、image7
+    这样的空号；这一步不增删图片，也不改变它们的次序。
 
     回的 `Detached.nodes` 每一项是 `{node_id, class_type, title}`——调用方把它写进 `req.notes`，
     一路冻进版本参数 `ref_notes` 并显示在界面上：**摘掉一个节点是降级，绝不静默**（硬约束 4）。
@@ -223,6 +269,10 @@ def detach(
                 continue
             if not any(_linked(value) is not None for value in inputs.values()):
                 pending.append(other_id)
+    #: Autogrow 图片数组不能留空号：例如末帧原来在 image7，前面的参考图摘掉后
+    #: 必须顺次挪到下一个编号。只改已知图片数组的键，原来的素材和顺序不变。
+    if removed:
+        _compact_image_inputs(graph)
     #: 下游自己也被摘掉了的那些切口留着没用（那个节点已经不在图里）。
     return Detached(removed, [cut for cut in cuts if cut["node_id"] in graph])
 

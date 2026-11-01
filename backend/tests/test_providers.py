@@ -24,7 +24,7 @@ import pytest
 from app.core.config import settings
 from app.core.errors import AppError, ErrorCode
 from app.generation.comfy import rejection
-from app.generation.comfy.graph import feed_order
+from app.generation.comfy.graph import detach, feed_order
 from app.generation.providers import presets, registry
 from app.generation.providers.base import RefAsset, VideoRequest, WorkflowSpec
 from app.generation.providers.comfy_preset import ComfyPresetProvider
@@ -1703,6 +1703,127 @@ BATCH_GRAPH: dict[str, Any] = {
     **with_ref_slots(2),
     "13": {"class_type": "ImageBatch", "inputs": {"image1": ["12", 0], "image2": ["11", 0]}},
 }
+
+
+def llm_image_batch_graph() -> dict[str, Any]:
+    """用户的 MiniMax 图中，首帧、参考图和末帧同时接入视频节点及 LLM 图片合批节点。"""
+    graph = {
+        str(100 + i): {
+            "class_type": "LoadImage",
+            "inputs": {"image": f"示例{i}.png"},
+            "_meta": {"title": title},
+        }
+        for i, title in enumerate(
+            ["AIVS_FIRST_FRAME", *(f"AIVS_REF_{n}" for n in range(1, 7)), "AIVS_LAST_FRAME"]
+        )
+    }
+    graph["200"] = {
+        "class_type": "MiniMaxH3ReferenceToVideo",
+        "inputs": {
+            "prompt": ["204", 0],
+            **{f"ref_images.ref_image_{i}": [str(100 + i), 0] for i in range(8)},
+        },
+    }
+    graph["201"] = {
+        "class_type": "BatchImagesNode",
+        "inputs": {f"images.image{i}": [str(100 + i), 0] for i in range(8)},
+    }
+    graph["202"] = {"class_type": "PreviewImage", "inputs": {"images": ["201", 0]}}
+    graph["203"] = {
+        "class_type": "llama_cpp_instruct_adv",
+        "inputs": {
+            "custom_prompt": ["204", 0],
+            "images": ["202", 0],
+            "inference_mode": "images",
+            "system_prompt": "Read the labeled contact sheet.",
+        },
+    }
+    graph["204"] = {
+        "class_type": "PrimitiveStringMultiline",
+        "inputs": {"value": "原提示词"},
+        "_meta": {"title": "AIVS_PROMPT"},
+    }
+    return graph
+
+
+@pytest.mark.parametrize("keep", [("100", "101"), ("100", "101", "107"), ("107",)])
+def test_detach_compacts_llm_and_video_image_arrays(keep: tuple[str, ...]) -> None:
+    graph = llm_image_batch_graph()
+    idle = [str(100 + i) for i in range(8) if str(100 + i) not in keep]
+
+    detach(graph, idle, keep=keep)
+
+    expected = [[node_id, 0] for node_id in keep]
+    assert graph["201"]["inputs"] == {f"images.image{i}": link for i, link in enumerate(expected)}
+    assert [
+        value for key, value in graph["200"]["inputs"].items() if key.startswith("ref_images.")
+    ] == expected
+    assert [key for key in graph["200"]["inputs"] if key.startswith("ref_images.")] == [
+        f"ref_images.ref_image_{i}" for i in range(len(keep))
+    ]
+    assert graph["203"]["inputs"]["images"] == ["202", 0], "LLM 图片链仍可用"
+    assert graph["200"]["inputs"]["prompt"] == ["204", 0]
+    assert all(node_id not in graph for node_id in idle), "示例图节点不能留在提交图里"
+
+
+async def test_preset_compacts_image_batch_before_llm_submit(tmp_path: Path) -> None:
+    write_preset("LLM 图片合批", llm_image_batch_graph())
+    first = tmp_path / "first.png"
+    last = tmp_path / "last.png"
+    first.write_bytes(b"A")
+    last.write_bytes(b"B")
+    fake = FakeComfy()
+    req = VideoRequest(
+        mode="flf",
+        prompt="雨夜推门",
+        first_frame=first,
+        last_frame=last,
+        refs=make_refs(tmp_path, "林小雨"),
+        extra={"preset": "LLM 图片合批"},
+    )
+
+    await ComfyPresetProvider(client=fake).submit(req, client_id="aivs-test")  # type: ignore[arg-type]
+
+    submitted = fake.submitted or {}
+    expected = [["100", 0], ["101", 0], ["107", 0]]
+    assert list(submitted["201"]["inputs"].values()) == expected
+    assert list(submitted["200"]["inputs"].values())[1:] == expected
+    assert "102" not in submitted and "106" not in submitted
+    assert submitted["203"]["inputs"]["images"] == ["202", 0]
+    system_prompt = submitted["203"]["inputs"]["system_prompt"]
+    assert "<Picture 1> = image 1 in the input batch = 首帧" in system_prompt
+    assert "<Picture 2> = image 2 in the input batch = 林小雨" in system_prompt
+    assert "<Picture 3> = image 3 in the input batch = 末帧" in system_prompt
+    assert req.book is not None and [pic.file for pic in req.book.items] == [
+        "aivs/first.png",
+        "aivs/ref1.png",
+        "aivs/last.png",
+    ]
+
+
+async def test_preset_rejects_llm_picture_order_different_from_video(tmp_path: Path) -> None:
+    graph = llm_image_batch_graph()
+    graph["201"]["inputs"]["images.image0"] = ["101", 0]
+    graph["201"]["inputs"]["images.image1"] = ["100", 0]
+    write_preset("LLM 图片顺序错位", graph)
+    first = tmp_path / "first.png"
+    first.write_bytes(b"A")
+    fake = FakeComfy()
+    req = VideoRequest(
+        mode="i2v",
+        prompt="雨夜推门",
+        first_frame=first,
+        refs=make_refs(tmp_path, "林小雨"),
+        extra={"preset": "LLM 图片顺序错位"},
+    )
+
+    with pytest.raises(AppError) as caught:
+        await ComfyPresetProvider(client=fake).submit(req, client_id="aivs-test")  # type: ignore[arg-type]
+
+    assert caught.value.code == ErrorCode.INVALID_WORKFLOW
+    assert "图片编号不一致" in caught.value.title
+    assert fake.submitted is None, "编号不一致时不能提交可能张冠李戴的图"
+
 
 #: 与上面只差一处：第二个槽位先过一个缩放节点再汇进合批节点。于是被切掉的那一根原来接的是
 #: `ImageScale`，而这一版真在喂的入口是 `LoadImage`——接过去只会换来一条更难懂的错误。
