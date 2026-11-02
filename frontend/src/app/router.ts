@@ -13,6 +13,12 @@ import { createRouter, createWebHistory, type RouteRecordRaw } from 'vue-router'
  */
 
 const projectRoutes: RouteRecordRaw[] = [
+  { path: 'frames', name: 'frames', component: () => import('@/features/frames/FramesView.vue') },
+  {
+    path: 'frame-video',
+    name: 'frame-video',
+    component: () => import('@/features/frames/FramesView.vue'),
+  },
   {
     path: '',
     name: 'dashboard',

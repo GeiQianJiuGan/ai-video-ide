@@ -78,7 +78,7 @@ def test_skills_listing(client: TestClient, pid: str) -> None:
     assert resp.status_code == 200, resp.text
     body = resp.json()
 
-    assert [row["name"] for row in body["items"]] == ["char_sheet", "scene_simple", "prop_ref"]
+    assert [row["name"] for row in body["items"]] == ["char_sheet", "scene_simple", "prop_ref", "shot_frame"]
     for row in body["items"]:
         # 前端只渲染，不在组件里抄第二份文案
         assert row["title"] and row["when"] and row["fixed"] and row["lead"]

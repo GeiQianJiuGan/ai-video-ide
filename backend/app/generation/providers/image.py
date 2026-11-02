@@ -341,7 +341,7 @@ class ImageProtocol:
         `client_id` 用不上（同步端没有 WS 频道这回事），但签名必须与 `VideoProvider`
         一致——那是 `generation._await_task()` 能复用的前提。
         """
-        cfg = config()
+        cfg = config(**(req.extra.get("image_config") or {}))
         if req.refs and not self.supports_refs:
             names = "、".join(r.label or r.path.name for r in req.refs)
             req.notes.append(

@@ -23,6 +23,7 @@ from app.persistence.models_flow import (
     SceneLink,
     ShotLink,
 )
+from app.persistence.models_frames import FrameCandidate, FrameCard, FrameWorkspace
 from app.persistence.models_gen import (
     CAPABILITIES,
     JOB_STATUS,
@@ -52,6 +53,9 @@ from app.persistence.models_world import (
 )
 
 __all__ = [
+    "FrameWorkspace",
+    "FrameCard",
+    "FrameCandidate",
     "CAPABILITIES",
     "INHERITABLE",
     "JOB_STATUS",

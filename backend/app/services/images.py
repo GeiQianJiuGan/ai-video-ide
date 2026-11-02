@@ -37,6 +37,7 @@ from app.generation.providers import presets, registry
 from app.generation.providers.base import RefAsset
 from app.persistence.models import utc_now
 from app.persistence.models_cast import Appearance, Character
+from app.persistence.models_frames import FrameCard
 from app.persistence.models_gen import IMAGE_TARGETS, Job
 from app.persistence.models_story import Shot
 from app.persistence.models_world import Asset, Location, LocationVariant, Prop
@@ -62,6 +63,13 @@ class TargetSpec:
 
 
 TARGETS: dict[str, TargetSpec] = {
+    "frame_card": TargetSpec(
+        "frame_card",
+        "镜头画面",
+        FrameCard,
+        "upload",
+        "追加到制帧空间的候选版本，不改动原镜头首尾帧。",
+    ),
     "appearance": TargetSpec(
         "appearance",
         "形象",
@@ -204,6 +212,15 @@ class ImageService:
                     "prompt": bill["prompt"],
                     "negative_prompt": bill["negative_prompt"],
                     "image_prompt": bill["user_text"],
+                    "image_config": {
+                        "protocol": bill["provider"]["name"],
+                        "model": bill["provider"]["model"],
+                        "base_url": settings.image_base_url,
+                        "size": bill["provider"]["size"],
+                        "preset": bill["provider"]["preset"],
+                    }
+                    if bill["target_kind"] == "frame_card"
+                    else None,
                     "size": bill["provider"]["size"],
                     "preset": bill["provider"]["preset"],
                     "provider": bill["provider"]["name"],
@@ -252,7 +269,13 @@ class ImageService:
         asset_id = str(asset["id"])
         described = await self._describe(pid, job, asset)
         hint = ""
-        if spec.kind == "appearance":
+        if spec.kind == "frame_card":
+            from app.services.frame_authoring import frames
+
+            landed = await frames.add_candidate(
+                pid, target_id, asset_id, job.id, load_json(job.params_json, {})
+            )
+        elif spec.kind == "appearance":
             landed = await cast.add_sheet(pid, target_id, asset_id, source="generated")
         elif spec.kind == "location_variant":
             landed = await world.add_variant_reference(pid, target_id, asset_id, None, "AI 生成")
@@ -374,6 +397,30 @@ class ImageService:
                     f"{proto.label} 收不了参考图：这 {len(refs)} 张只会被跳过，"
                     "出来的图完全按提示词来（适配层会把这件事写进版本参数，不会静默丢掉）。"
                 )
+        if spec.kind == "frame_card" and refs and not cap["supports_refs"]:
+            err = AppError(
+                ErrorCode.MISSING_CAPABILITY,
+                "图片服务不支持设定图",
+                "本次制帧依赖参考图片，不能跳过这些输入。",
+                ["更换支持参考图的图片服务，或上传已经制作好的画面"],
+            )
+        if (
+            spec.kind == "frame_card"
+            and refs
+            and err is None
+            and proto is not None
+            and proto.wants_preset
+        ):
+            slots = presets.ref_slots(
+                presets.entry_points(presets.load(str(settings.image_preset)))
+            )
+            if len(refs) > len(slots):
+                err = AppError(
+                    ErrorCode.MISSING_CAPABILITY,
+                    "制帧预设容纳不了所选设定图",
+                    f"选了 {len(refs)} 张参考图，但预设只有 {len(slots)} 个图片参考入口。",
+                    ["更换出图预设或减少参考图"],
+                )
         return {
             "target_kind": spec.kind,
             "target_id": target_id,
@@ -446,6 +493,8 @@ class ImageService:
         """一句人话，队列面板与账单共用（前端不拼第二遍）。"""
         db = db_of(pid)
         row = await fetch(db, spec.model, target_id, spec.what)
+        if spec.kind == "frame_card":
+            return f"镜头画面 · {row.title}"
         if spec.kind == "appearance":
             char = await fetch(db, Character, row.character_id, "角色")
             return f"角色 · {char.name} · {row.name} 四视图"

@@ -23,6 +23,7 @@ from app.api import director as director_api
 from app.api import dub as dub_api
 from app.api import files as files_api
 from app.api import fs as fs_api
+from app.api import frames as frames_api
 from app.api import generation as generation_api
 from app.api import images as images_api
 from app.api import ingest as ingest_api
@@ -127,6 +128,7 @@ def create_app() -> FastAPI:
     app.include_router(generation_api.router, prefix=API_PREFIX)
     app.include_router(sequence_api.router, prefix=API_PREFIX)
     app.include_router(images_api.router, prefix=API_PREFIX)
+    app.include_router(frames_api.router, prefix=API_PREFIX)
     app.include_router(describe_api.router, prefix=API_PREFIX)
     app.include_router(refine_api.router, prefix=API_PREFIX)
     app.include_router(dub_api.router, prefix=API_PREFIX)

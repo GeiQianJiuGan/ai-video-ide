@@ -24,7 +24,7 @@
  * 没打开工程时不画一排灰锁：那些功能此刻根本没有对象可操作，画出来只是噪音。
  * 每项 hover 出现全名与作用，未启用的功能带锁标记。
  */
-import { computed } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { RouterLink, useRoute, useRouter } from 'vue-router'
 import { ArrowLeft, Lock, Settings } from '@lucide/vue'
 import {
@@ -35,6 +35,14 @@ import {
   type Feature,
 } from '@/app/features'
 import { useProjectStore } from '@/stores/project'
+import {
+  PRODUCTION_MODES,
+  loadProductionMode,
+  productionModeForRoute,
+  saveProductionMode,
+  showProductionFeature,
+  type ProductionMode,
+} from '@/app/productionNavigation'
 
 const route = useRoute()
 const router = useRouter()
@@ -47,6 +55,51 @@ const routePid = computed(() => (route.params.pid as string | undefined) ?? null
  * 没有时退到 store——设置页这类应用级路由上没有 pid，但工程还开着。
  */
 const openPid = computed(() => routePid.value ?? proj.current?.id ?? null)
+const productionMode = ref<ProductionMode>('direct')
+const switching = ref(false)
+const switchError = ref('')
+
+// A deep link or command-palette jump reveals the menu that owns that page.
+// Shared pages preserve the project's last selected menu.
+watch(
+  [openPid, () => route.name],
+  ([pid, name], [previousPid]) => {
+    if (!pid) return
+    const owner = productionModeForRoute(String(name || ''))
+    if (pid !== previousPid) productionMode.value = loadProductionMode(pid)
+    if (owner) productionMode.value = owner
+    saveProductionMode(pid, productionMode.value)
+  },
+  { immediate: true },
+)
+
+async function switchProductionMode(mode: ProductionMode): Promise<void> {
+  const pid = openPid.value
+  if (!pid || switching.value || mode === productionMode.value) return
+  switching.value = true
+  switchError.value = ''
+  try {
+    const owner = productionModeForRoute(String(route.name || ''))
+    if (owner && owner !== mode) {
+      // Await the current editor's save/leave guard before changing the menu.
+      const sid = String(route.name === 'shot' ? route.params.sid || '' : route.query.shot || '')
+      const failed = await router.push(
+        mode === 'frames'
+          ? { name: 'frames', params: { pid }, query: sid ? { shot: sid } : {} }
+          : sid
+            ? { name: 'shot', params: { pid, sid } }
+            : { name: 'flow', params: { pid } },
+      )
+      if (failed) return
+    }
+    productionMode.value = mode
+    saveProductionMode(pid, mode)
+  } catch (err) {
+    switchError.value = err instanceof Error ? err.message : '切换失败，请先保存当前草稿'
+  } finally {
+    switching.value = false
+  }
+}
 
 /** 应用级功能只在没打开工程时出现——这就是「两级」的那道界。 */
 const appItems = computed<Feature[]>(() => (openPid.value ? [] : APP_NAV_FEATURES))
@@ -62,7 +115,12 @@ const grouped = computed<{ title: string; items: Feature[] }[]>(() => {
   if (!openPid.value) return []
   return GROUPS.map((g) => ({
     title: g.title,
-    items: PROJECT_NAV_FEATURES.filter((f) => f.id !== 'dashboard' && f.group === g.id),
+    items: PROJECT_NAV_FEATURES.filter(
+      (f) =>
+        f.id !== 'dashboard' &&
+        f.group === g.id &&
+        showProductionFeature(f.id, productionMode.value),
+    ),
   })).filter((g) => g.items.length > 0)
 })
 
@@ -109,6 +167,40 @@ function leaveProject(): void {
         {{ NAV_LABEL[overviewItem.id] ?? overviewItem.title }}
       </span>
     </RouterLink>
+
+    <div
+      v-if="openPid"
+      class="border-line-1 my-1 flex w-10 shrink-0 flex-col gap-0.5 rounded-sm border p-0.5"
+      role="group"
+      aria-label="制作方式"
+    >
+      <span class="text-fg-4 text-center text-[8px]">制作方式</span>
+      <button
+        v-for="mode in PRODUCTION_MODES"
+        :key="mode.id"
+        type="button"
+        class="rounded-sm px-0.5 py-1 text-[10px] transition-colors"
+        :class="
+          productionMode === mode.id
+            ? 'bg-accent-dim text-accent'
+            : 'text-fg-3 hover:bg-base-2 hover:text-fg-1'
+        "
+        :aria-label="mode.label"
+        :aria-pressed="productionMode === mode.id"
+        :disabled="switching"
+        :title="`${mode.label} · ${mode.description}`"
+        @click="switchProductionMode(mode.id)"
+      >
+        {{ mode.short }}
+      </button>
+      <span
+        v-if="switchError"
+        role="alert"
+        class="text-st-failed text-center text-[8px]"
+        :title="switchError"
+        >切换失败</span
+      >
+    </div>
 
     <!-- 没打开工程时才有应用级功能：项目管理 / 素材库 -->
     <RouterLink

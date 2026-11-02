@@ -293,6 +293,7 @@ class GenerationService:
         priority: int = 100,
         workflow_id: str | None = None,
         check_context: bool = True,
+        frame_inputs: dict[str, Any] | None = None,
         allow_ref_drop: bool = False,
         first_frame_asset_id: str | None = None,
         last_frame_asset_id: str | None = None,
@@ -319,28 +320,39 @@ class GenerationService:
         # 而不是排进队列再由 pump 一条条失败（那时用户看到的只剩「ComfyUI 未连接」这种
         # 与真正原因差一层的话）。解析出来的这一份下面会整个冻结进 `params["route"]`。
         chosen = await route.require(
-            pid, capability, project=project, workflow_id=workflow_id or shot.workflow_id
+            pid,
+            capability,
+            project=project,
+            workflow_id=workflow_id or shot.workflow_id,
+            preset=(frame_inputs or {}).get("preset") or None,
         )
-        use_prev_frame = capability in route.FLF_CAPABILITIES
-        if check_context:
-            await context.require_complete(pid, shot_id, include_prev=use_prev_frame)
-        snapshot = await context.snapshot(
-            pid, shot_id, include_prev=use_prev_frame, capability=capability
-        )
-        validate_mentions(
-            prompt,
-            snapshot.get("included") or [],
-            pending_first=bool(shot.prev_shot_id and use_prev_frame),
-        )
-        # 参考图比模型端那份图能收的多时先问一句。**不是失败**：确认（allow_ref_drop）后
-        # 照旧生成，只是按槽位顺序喂前几张。悄悄少喂两张图，事后没人查得出形象为什么跑偏。
-        if not allow_ref_drop:
-            over = drop_entry(shot, snapshot.get("capacity") or {})
-            if over:
-                raise over_capacity_error([over])
+        if frame_inputs is not None:
+            prompt = frame_inputs["prompt"]
+            snapshot = {"included": [], "pipeline": "frames", "frame_inputs": frame_inputs}
+            first_frame_asset_id = frame_inputs["first_frame_asset_id"]
+            last_frame_asset_id = frame_inputs.get("last_frame_asset_id")
+            validate_mentions(prompt, [])
+        else:
+            use_prev_frame = capability in route.FLF_CAPABILITIES
+            if check_context:
+                await context.require_complete(pid, shot_id, include_prev=use_prev_frame)
+            snapshot = await context.snapshot(
+                pid, shot_id, include_prev=use_prev_frame, capability=capability
+            )
+            validate_mentions(
+                prompt,
+                snapshot.get("included") or [],
+                pending_first=bool(shot.prev_shot_id and use_prev_frame),
+            )
+            # 参考图比模型端那份图能收的多时先问一句。**不是失败**：确认（allow_ref_drop）后
+            # 照旧生成，只是按槽位顺序喂前几张。悄悄少喂两张图，事后没人查得出形象为什么跑偏。
+            if not allow_ref_drop:
+                over = drop_entry(shot, snapshot.get("capacity") or {})
+                if over:
+                    raise over_capacity_error([over])
 
         depends_on, wait_reason = None, None
-        if shot.prev_shot_id and capability in route.FLF_CAPABILITIES:
+        if frame_inputs is None and shot.prev_shot_id and capability in route.FLF_CAPABILITIES:
             prev = await fetch(db, Shot, shot.prev_shot_id, "上游镜头")
             if wait_for_job_id:
                 # 单线程续接等待的是本次编排中的上一条任务，而不是旧的当前版本。
@@ -355,7 +367,9 @@ class GenerationService:
         # 不能等到执行时再去问 `shot.current_version_id`：新版本入库即成为当前版本，
         # 第二次生成就会拿上一次的产物（整段、没有区间）当输入——那正是「传进去的片段
         # 明显不对」的由来。
-        segment_version_id = await self._segment_version_id(pid, shot_id)
+        segment_version_id = (
+            None if frame_inputs is not None else await self._segment_version_id(pid, shot_id)
+        )
 
         row = Job(
             id=new_id("job"),
@@ -371,10 +385,14 @@ class GenerationService:
             params_json=dump_json(
                 {
                     "prompt": prompt,
-                    "negative_prompt": shot.negative_prompt,
-                    "seed": shot.seed,
+                    "creation_pipeline": "frames" if frame_inputs is not None else "direct",
+                    "frame_inputs": frame_inputs,
+                    "negative_prompt": "" if frame_inputs is not None else shot.negative_prompt,
+                    "seed": None if frame_inputs is not None else shot.seed,
                     "steps": shot.steps,
-                    "duration": shot.duration,
+                    "duration": frame_inputs["duration"]
+                    if frame_inputs is not None
+                    else shot.duration,
                     "context": snapshot,
                     "first_frame_asset_id": first_frame_asset_id,
                     "last_frame_asset_id": last_frame_asset_id,
@@ -391,7 +409,9 @@ class GenerationService:
                     #: `route.skill` 选定的渲染器翻成该模型的正向 prompt（`generation/renderers.py`）
                     #: ——同一份意图配不同 skill 渲染成不同模型的形状。老工程 / Manual 没有意图，
                     #: 是 `{}`，渲染器回退到入队时拆好的 `segments` / `prompt`，输出逐字不变。
-                    "director_intent": load_json(shot.intent_json, {}),
+                    "director_intent": {}
+                    if frame_inputs is not None
+                    else load_json(shot.intent_json, {}),
                     #: 「这个镜头的画面素材是哪一段」。长视频切段的镜头才有值。
                     "source_version_id": segment_version_id,
                 }
@@ -1469,7 +1489,10 @@ class GenerationService:
             source_video=source_video,
             duration=float(params.get("duration") or shot.duration or 4.0),
             seed=params.get("seed"),
-            extra={**(params.get("extra") or {}), "preset": params.get("preset")},
+            extra={
+                **(params.get("extra") or {}),
+                "preset": params.get("preset"),
+            },
         )
         filename, data = await self._await_task(
             pid, job, provider, await provider.submit(req, client_id=f"aivs-{pid}")
@@ -1506,7 +1529,9 @@ class GenerationService:
         prompt 与负向 prompt 是**入队那一刻就拼好冻结**的（`services/images.py`），
         这里一个字都不再拼：SKILL 之后改了，已经排在队列里的这一张也不该变样。
         """
-        provider = registry.image_provider()
+        provider = registry.image_provider(
+            params.get("provider") if job.target_kind == "frame_card" else None
+        )
         refs = await images.refs_of(pid, params)
         req = ImageRequest(
             prompt=str(params.get("prompt") or ""),
@@ -1514,7 +1539,11 @@ class GenerationService:
             size=str(params.get("size") or settings.image_size),
             refs=refs,
             seed=params.get("seed"),
-            extra={**(params.get("extra") or {}), "preset": params.get("preset")},
+            extra={
+                **(params.get("extra") or {}),
+                "preset": params.get("preset"),
+                **({"image_config": params["image_config"]} if params.get("image_config") else {}),
+            },
         )
         filename, data = await self._await_task(
             pid, job, provider, await provider.submit(req, client_id=f"aivs-{pid}")
@@ -1557,6 +1586,37 @@ class GenerationService:
         还不存在（上游还没出片），所以对这种镜头在真正要跑的时候重新结一次账并按需抽帧
         ——否则会拿一段视频、或者随便一张角色表去当首帧。
         """
+        if params.get("creation_pipeline") == "frames":
+            proj = project_of(pid)
+
+            async def frame_path(key: str) -> Path | None:
+                aid = params.get(key)
+                if not aid:
+                    return None
+                asset = await fetch(db_of(pid), Asset, aid, "画面资产")
+                path = proj.dir / asset.path
+                if not path.is_file():
+                    raise AppError(
+                        ErrorCode.MISSING_ASSET,
+                        "画面文件已丢失",
+                        asset.path,
+                        ["重新选择画面后生成"],
+                    )
+                return path
+
+            params["frame_assets"] = {
+                str(params[k]): role
+                for k, role in (
+                    ("first_frame_asset_id", "first_frame"),
+                    ("last_frame_asset_id", "last_frame"),
+                )
+                if params.get(k)
+            }
+            return (
+                await frame_path("first_frame_asset_id"),
+                await frame_path("last_frame_asset_id"),
+                [],
+            )
         db = db_of(pid)
         proj = project_of(pid)
         shot = await fetch(db, Shot, job.shot_id, "镜头")
@@ -1689,7 +1749,7 @@ class GenerationService:
         async with db.write() as session:
             session.add(row)
             shot = await session.get(Shot, shot_id)
-            if shot is not None:
+            if shot is not None and (params or {}).get("creation_pipeline") != "frames":
                 # 新版本自动成为当前版本；旧版本一条都不删
                 if kind == "audio":
                     shot.current_audio_version_id = row.id

@@ -45,10 +45,10 @@ export interface FeatureGroup {
 
 export const GROUPS: FeatureGroup[] = [
   { id: 'app', title: '工作台', question: '做哪一部片子、从哪里取素材' },
-  { id: 'asset', title: '素材层', question: '谁出场、在哪里、用什么道具' },
-  { id: 'story', title: '叙事层', question: '讲什么故事、怎么切成镜头' },
-  { id: 'generate', title: '生成层', question: '怎么一幕一幕把片子做出来' },
-  { id: 'assemble', title: '成片层', question: '怎么拼成一条完整的片子' },
+  { id: 'asset', title: '创作准备', question: '谁出场、在哪里、用什么道具' },
+  { id: 'story', title: '叙事规划', question: '讲什么故事、怎么切成镜头' },
+  { id: 'generate', title: '镜头制作', question: '怎么一幕一幕把片子做出来' },
+  { id: 'assemble', title: '成片', question: '怎么拼成一条完整的片子' },
 ]
 
 export interface PanelSpec {
@@ -156,6 +156,34 @@ const APP_DEFS: FeatureDef[] = [
 
 /** 必须先打开一个工程才有意义的功能。 */
 const PROJECT_DEFS: FeatureDef[] = [
+  {
+    id: 'frames',
+    route: 'frames',
+    title: '镜头制帧',
+    purpose: '制作镜头画面，比较与采用候选，再用于生成视频',
+    group: 'generate',
+    icon: Images,
+    milestone: 'M4',
+    ready: true,
+    requires: ['backend'],
+    panels: { main: { title: '镜头画面', body: '多画面、设定图与候选版本' } },
+    actions: [],
+    outcome: ['选定镜头画面'],
+  },
+  {
+    id: 'frame-video',
+    route: 'frame-video',
+    title: '视频生成',
+    purpose: '从选定画面生成视频，或进入原镜头制作',
+    group: 'generate',
+    icon: Video,
+    milestone: 'M4',
+    ready: true,
+    requires: ['backend'],
+    panels: { main: { title: '视频生成', body: '首帧或首尾帧驱动，独立输入与版本' } },
+    actions: [],
+    outcome: ['新的视频候选'],
+  },
   {
     id: 'dashboard',
     route: 'dashboard',
@@ -583,6 +611,11 @@ export const PROJECT_NAV = [
   'props',
   'story',
   'storyboard',
+  'frames',
+  'frame-video',
+  'flow',
+  'shot',
+  'queue',
   'timeline',
   'assets',
 ] as const
@@ -614,7 +647,10 @@ export const NAV_LABEL: Record<string, string> = {
   props: '道具',
   story: '剧本',
   storyboard: '分镜',
-  flow: '幕',
+  frames: '镜头制帧',
+  'frame-video': '视频生成',
+  shot: '镜头',
+  flow: '幕流程',
   scene: '幕内',
   workflows: '流程',
   queue: '队列细看',

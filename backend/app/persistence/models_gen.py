@@ -45,6 +45,7 @@ JOB_KINDS = (*VIDEO_KINDS, *REFINE_KINDS, *AUDIO_KINDS, *IMAGE_KINDS)
 #: 镜头那两项刻意只表示「这张图是给这个镜头出的候选」——**落地时绝不动首尾帧槽位**，
 #: 哪一张是首帧只认用户按下去的那一下。
 IMAGE_TARGETS = (
+    "frame_card",
     "appearance",
     "location_variant",
     "prop",

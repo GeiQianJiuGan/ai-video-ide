@@ -109,13 +109,24 @@ _PROP_REF = ImageSkill(
 )
 
 #: 三份内置出图 SKILL。名字就是 `read_skill` 的参数，也是提案里 `skill` 字段的值。
-IMAGE_SKILLS: dict[str, ImageSkill] = {s.name: s for s in (_CHAR_SHEET, _SCENE_SIMPLE, _PROP_REF)}
+_SHOT_FRAME = ImageSkill(
+    name="shot_frame",
+    title="镜头画面",
+    when="制作有完整人物、环境和构图的视频画面。",
+    fixed="一张完整的单镜头画面。遵循所述景别、机位、人物姿态、场景、道具和光线；参考设定图保持身份与服装一致。只呈现一个时刻，不画四视图、设定板、拼图或分格，无文字与水印。",
+    lead="这一时刻的画面",
+    note="人物可以出场；描述静态画面，动作发展另写在视频描述中。",
+)
+IMAGE_SKILLS: dict[str, ImageSkill] = {
+    s.name: s for s in (_CHAR_SHEET, _SCENE_SIMPLE, _PROP_REF, _SHOT_FRAME)
+}
 
 IMAGE_NAMES = tuple(IMAGE_SKILLS)
 
 #: 素材类型 → 默认用哪一份。**只有这一张表**：AI 提案、界面按钮、服务层兜底共用它。
 #: 镜头首 / 末帧走场景那一份——它要的正是「一张干净的画面」，而不是四视图。
 BY_TARGET: dict[str, str] = {
+    "frame_card": "shot_frame",
     "appearance": "char_sheet",
     "location_variant": "scene_simple",
     "prop": "prop_ref",
