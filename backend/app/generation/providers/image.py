@@ -44,7 +44,7 @@ from app.core.logging import get_logger
 from app.generation.comfy.client import ComfyClient
 from app.generation.providers import presets
 from app.generation.providers.base import ImageRequest, TaskState
-from app.generation.providers.comfy_preset import ComfyPresetProvider
+from app.generation.providers.comfy_preset import ComfyPresetProvider, _detach_idle, _filled_media
 
 log = get_logger("provider.image")
 
@@ -226,6 +226,14 @@ class ImageProtocol:
     supports_refs = True
     #: 要不要在设置页里指一份本机预设（只有 ComfyUI 那一支要）。
     wants_preset = False
+
+    def reference_limit(self, cfg: ImageConfig) -> int | None:
+        """参考图容量；None 表示协议没有声明数量上限，不猜测第三方端的限制。"""
+        if not self.supports_refs:
+            return 0
+        if self.wants_preset and cfg.preset:
+            return len(presets.ref_slots(presets.entry_points(presets.load(cfg.preset))))
+        return None
 
     def __init__(self) -> None:
         #: task_id → (文件名, 字节)。同步端那层壳的全部状态，`fetch()` 弹出即清。
@@ -564,6 +572,17 @@ class OpenAiImages(ImageProtocol):
     needs_key = True
     supports_refs = True
 
+    def reference_limit(self, cfg: ImageConfig) -> int | None:
+        # 官方 Images edit 合同：https://developers.openai.com/api/reference/resources/images/methods/edit
+        if not self.supports_refs:
+            return 0
+        model = self.model(cfg).split("/")[-1]
+        if model.startswith("gpt-image-") or model == "chatgpt-image-latest":
+            return 16
+        if model == "dall-e-2":
+            return 1
+        return None
+
     def headers(self, cfg: ImageConfig) -> dict[str, str]:
         head = {"Content-Type": "application/json"}
         if cfg.api_key:
@@ -622,6 +641,14 @@ class GeminiImages(ImageProtocol):
     models_path = "/v1beta/models"
     needs_key = True
     supports_refs = True
+
+    def reference_limit(self, cfg: ImageConfig) -> int | None:
+        # 官方明确的上限；2.5 Flash 的三图是质量建议，不当作接口硬上限。
+        # https://ai.google.dev/gemini-api/docs/image-generation
+        if not self.supports_refs:
+            return 0
+        model = self.model(cfg).split("/")[-1]
+        return 14 if model.startswith(("gemini-3-pro-image", "gemini-3.1-flash-image")) else None
 
     def headers(self, cfg: ImageConfig) -> dict[str, str]:
         head = {"Content-Type": "application/json"}
@@ -881,12 +908,24 @@ class ComfyImageProvider(ComfyPresetProvider):
                 "——出来的是图里原本的画幅。"
             )
         values.update(await self._image_refs(name, points, req))
+        idle: list[str] = []
         for marker, spot in points.items():
             value = values.get(marker)
             if value is None or value == "":
-                continue  # 没给的项保持图里原来的值，不要用空串把它冲掉
+                # 媒体槽位不能保留存图时的示例文件；标量仍使用工作流原来的默认参数。
+                if marker in presets.MEDIA_MARKERS:
+                    idle.append(marker)
+                continue
             graph[spot["node_id"]]["inputs"][spot["field"]] = value
-        prompt_id = await self._client.submit(graph, client_id=client_id)
+        removed = _detach_idle(graph, name, points, idle, req)
+        prompt_id = await self._submit_graph(
+            graph,
+            client_id=client_id,
+            source=f"图片预设 {name}",
+            detached=removed,
+            refill=_filled_media(points, values, idle),
+            notes=req.notes,
+        )
         self._used[prompt_id] = name
         log.info(
             "provider.image_submitted",

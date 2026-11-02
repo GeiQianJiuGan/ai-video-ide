@@ -141,11 +141,18 @@ class ImageService:
         """
         configured = registry.image_configured()
         proto = image_protocols.get(settings.image_provider) if configured else None
+        limit = None
+        if proto:
+            try:
+                limit = proto.reference_limit(image_protocols.config())
+            except AppError:
+                pass  # 无效预设由生成预检给出具体错误，素材选择页仍可使用。
         return {
             "configured": configured,
             "provider": settings.image_provider,
             "label": proto.label if proto else image_protocols.NONE_LABEL,
             "supports_refs": bool(proto.supports_refs) if proto else False,
+            "max_refs": limit,
         }
 
     # --- 账单（只读） ---
@@ -225,6 +232,9 @@ class ImageService:
                     "preset": bill["provider"]["preset"],
                     "provider": bill["provider"]["name"],
                     "ref_asset_ids": [r["asset_id"] for r in bill["refs"]],
+                    "requested_ref_asset_ids": bill["requested_ref_asset_ids"],
+                    "dropped_ref_asset_ids": [r["asset_id"] for r in bill["dropped_refs"]],
+                    "reference_limit": bill["provider"]["max_refs"],
                 }
             ),
             created_at=utc_now(),
@@ -359,7 +369,8 @@ class ImageService:
         name = str(skill or "").strip() or skills.image_pick(spec.kind)
         positive, negative = skills.render_image_prompt(name, prompt)
         detail = skills.image_get(name)
-        refs = await self._refs(pid, ref_asset_ids or [])
+        requested_ids = list(dict.fromkeys(ref_asset_ids or []))
+        refs = await self._refs(pid, requested_ids)
         cap = self.capability()
         configured = bool(cap["configured"])
         proto = image_protocols.get(settings.image_provider) if configured else None
@@ -397,29 +408,13 @@ class ImageService:
                     f"{proto.label} 收不了参考图：这 {len(refs)} 张只会被跳过，"
                     "出来的图完全按提示词来（适配层会把这件事写进版本参数，不会静默丢掉）。"
                 )
-        if spec.kind == "frame_card" and refs and not cap["supports_refs"]:
-            err = AppError(
-                ErrorCode.MISSING_CAPABILITY,
-                "图片服务不支持设定图",
-                "本次制帧依赖参考图片，不能跳过这些输入。",
-                ["更换支持参考图的图片服务，或上传已经制作好的画面"],
-            )
-        if (
-            spec.kind == "frame_card"
-            and refs
-            and err is None
-            and proto is not None
-            and proto.wants_preset
-        ):
-            slots = presets.ref_slots(
-                presets.entry_points(presets.load(str(settings.image_preset)))
-            )
-            if len(refs) > len(slots):
-                err = AppError(
-                    ErrorCode.MISSING_CAPABILITY,
-                    "制帧预设容纳不了所选设定图",
-                    f"选了 {len(refs)} 张参考图，但预设只有 {len(slots)} 个图片参考入口。",
-                    ["更换出图预设或减少参考图"],
+        dropped = []
+        if spec.kind == "frame_card" and configured and cap["max_refs"] is not None:
+            limit = cap["max_refs"]
+            dropped, refs = refs[limit:], refs[:limit]
+            if dropped:
+                warnings.append(
+                    f"参考图容量为 {limit} 张：按添加顺序采用前 {len(refs)} 张，舍弃后 {len(dropped)} 张。"
                 )
         return {
             "target_kind": spec.kind,
@@ -430,6 +425,10 @@ class ImageService:
             "prompt": positive,
             "negative_prompt": negative,
             "refs": [{"asset_id": a, "file": r.path.name, "media": r.media} for a, r in refs],
+            "requested_ref_asset_ids": requested_ids,
+            "dropped_refs": [
+                {"asset_id": a, "file": r.path.name, "media": r.media} for a, r in dropped
+            ],
             "lands": spec.lands,
             "asset_kind": spec.asset_kind,
             "provider": {
@@ -437,6 +436,7 @@ class ImageService:
                 "label": cap["label"],
                 "configured": configured,
                 "supports_refs": cap["supports_refs"],
+                "max_refs": cap["max_refs"],
                 "preset": settings.image_preset,
                 "model": settings.image_model,
                 "size": settings.image_size,

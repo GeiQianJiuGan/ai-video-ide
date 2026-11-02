@@ -1,4 +1,6 @@
-/** Menu preference only: switching never modifies a project's generation settings. */
+import { reactive } from 'vue'
+
+/** 制作方式同时驱动导航与分镜内容，不修改工程的生成配置。 */
 export type ProductionMode = 'direct' | 'frames'
 
 export const PRODUCTION_MODES = [
@@ -23,8 +25,10 @@ export function showProductionFeature(id: string, mode: ProductionMode): boolean
 }
 
 const key = (pid: string) => `aivs-production-menu:${pid}`
+const preferences = reactive<Record<string, ProductionMode>>({})
 
 export function loadProductionMode(pid: string): ProductionMode {
+  if (preferences[pid]) return preferences[pid]
   try {
     return window.localStorage.getItem(key(pid)) === 'frames' ? 'frames' : 'direct'
   } catch {
@@ -33,6 +37,7 @@ export function loadProductionMode(pid: string): ProductionMode {
 }
 
 export function saveProductionMode(pid: string, mode: ProductionMode): void {
+  preferences[pid] = mode
   try {
     window.localStorage.setItem(key(pid), mode)
   } catch {

@@ -328,6 +328,13 @@ def test_read_skill_gives_the_full_text_and_rejects_unknown_names(
         text = skills.render(name)
         assert "non_diegetic_music" in text, "MiniMax H3 规范必须包含 non_diegetic_music 结构"
 
+    assert "frame-video-planning" in skills.ALL_NAMES
+    assert "frame-video-planning" not in skills.NAMES  # 规划方法不能误当视频渲染规范。
+    from app.ai.director.tools import TOOLS
+
+    assert "frame-video-planning" in TOOLS["read_skill"]["params"]["name"]["enum"]
+    assert skills.render("frame-video-planning").startswith("---\nname: frame-video-planning")
+
     # 测试官方文件引用路径及别名直接读取
     for ref_path in (
         "references/base-en.txt",

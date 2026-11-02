@@ -51,9 +51,15 @@ import { SHOT_STATUS, SHOT_STATUS_LABEL, storyApi, type PosterResult, type ShotS
 import { useConsoleStore } from '@/stores/console'
 import { useStoryStore } from '@/stores/story'
 import { generationApi } from '@/shared/api/generation'
+import { enqueueStoryboardVideo } from './storyboardGeneration'
+import type { ProductionMode } from '@/app/productionNavigation'
+import FrameVideoInputs from './components/FrameVideoInputs.vue'
 import { LINK_MODES, LINK_MODE_LABEL, SHOT_LINK_MODES, SHOT_LINK_MODE_LABEL, sequenceApi, type TransitionRun } from '@/shared/api/sequence'
 
 const route = useRoute()
+const props = withDefaults(defineProps<{ mode?: ProductionMode }>(), { mode: 'direct' })
+const isFrames = computed(() => props.mode === 'frames')
+const frameInputs = ref<InstanceType<typeof FrameVideoInputs> | null>(null)
 const router = useRouter()
 const story = useStoryStore()
 const consolePanel = useConsoleStore()
@@ -174,11 +180,15 @@ function previewVersion(card: StoryboardCard, versionId: string): void {
     }
   }
 }
-function openShot(shotId: string): void { void router.push({ name: 'shot', params: { pid: pid.value, sid: shotId } }) }
+function openShot(shotId: string): void {
+  void router.push(isFrames.value ? { name: 'frame-video', params: { pid: pid.value }, query: { shot: shotId } } : { name: 'shot', params: { pid: pid.value, sid: shotId } })
+}
 async function adoptVersion(versionId: string): Promise<void> { await generationApi.setCurrent(pid.value, versionId).catch(() => {}); await reload() }
 async function reload(): Promise<void> {
   if (!pid.value) return
   await story.loadBoard(pid.value).catch(() => {})
+  const requested = String(route.query.shot || '')
+  if (requested && requested !== story.selectedShotId && allCards.value.some(c => c.id === requested)) await story.selectShot(pid.value, requested)
   // 幕列表换了以后旧的锚点可能已经不在了，回落到第一幕，别让锚点条整条不高亮
   if (!story.lanes.some((l) => l.id === activeLaneId.value)) activeLaneId.value = story.lanes[0]?.id ?? ''
 }
@@ -218,21 +228,44 @@ const pendingDrop = ref<'shot' | 'scene' | 'transition' | null>(null)
 const transitionRun = ref<TransitionRun | null>(null)
 const transitionOnly = ref<string[] | undefined>(undefined)
 function resetEnqueue(): void { enqueueError.value = null; enqueueNote.value = ''; skipped.value = []; pendingDrop.value = null; transitionRun.value = null }
+watch(() => props.mode, resetEnqueue)
+async function generateFrameCards(cards: StoryboardCard[]): Promise<void> {
+  resetEnqueue(); enqueuing.value = true
+  const targetPid = pid.value
+  let queued = 0
+  try {
+    await frameInputs.value?.save()
+    for (const card of cards) {
+      try {
+        await enqueueStoryboardVideo(targetPid, card, 'frames')
+        queued++
+      } catch (err) {
+        const error = err instanceof ApiError ? err : null
+        skipped.value.push({ shot_id: card.id, index_no: card.index_no, error: { title: error?.title || '制帧输入未就绪', detail: error?.detail || String(err) } })
+      }
+    }
+    enqueueNote.value = `制帧视频已入队：${queued} / ${cards.length} 个 Shot；按各镜头已保存的帧图与视频描述提交。`
+  } catch (err) { enqueueError.value = err instanceof ApiError ? err : null }
+  finally { enqueuing.value = false }
+}
 async function generateShot(allowRefDrop = false): Promise<void> {
   const shot = story.shot; if (!shot) return
+  const targetPid = pid.value, mode = props.mode
   resetEnqueue(); enqueuing.value = true
-  try { const job = await generationApi.enqueueShot(pid.value, shot.id, { allow_ref_drop: allowRefDrop }); enqueueNote.value = `已入队：${shot.index_no}. ${shot.title}（${job.kind}）`; await reload() }
+  try { if (mode === 'frames') await frameInputs.value?.save(); const job = await enqueueStoryboardVideo(targetPid, shot, mode, allowRefDrop); enqueueNote.value = `已入队：${shot.index_no}. ${shot.title}（${mode === 'frames' ? '帧图驱动' : job.kind}）`; await reload() }
   catch (err) { enqueueError.value = err instanceof ApiError ? err : null; pendingDrop.value = confirmFlagOf(err) ? 'shot' : null }
   finally { enqueuing.value = false }
 }
 async function generateScene(allowRefDrop = false): Promise<void> {
   const sceneId = story.shot?.scene_id; if (!sceneId) return
+  if (isFrames.value) { await generateFrameCards(realShots(story.lanes.find(l => l.id === sceneId)!)); return }
   resetEnqueue(); enqueuing.value = true
   try { const out = await generationApi.enqueueScene(pid.value, sceneId, 100, allowRefDrop); enqueueNote.value = `这一场入队：${out.queued.length} / ${out.total} 个 Shot`; skipped.value = out.skipped; await reload() }
   catch (err) { enqueueError.value = err instanceof ApiError ? err : null; pendingDrop.value = confirmFlagOf(err) ? 'scene' : null }
   finally { enqueuing.value = false }
 }
 async function runSequential(): Promise<void> {
+  if (isFrames.value) { await generateFrameCards(realCards.value); return }
   resetEnqueue(); enqueuing.value = true
   try {
     const plan = await sequenceApi.plan(pid.value, 'sequential')
@@ -411,14 +444,20 @@ async function confirmDeleteScene(): Promise<void> {
 
 <template>
   <div class="flex min-h-0 flex-1 flex-col">
-    <FeatureHeader />
+    <FeatureHeader :title="isFrames ? '制帧分镜' : '直出分镜'" :purpose="isFrames ? '按镜头规划视频、比较与采用版本；视频输入取自制作图片中已采用的帧图。' : '按镜头规划剧情与视频提示词，直接生成视频并比较版本。'">
+      <template #actions>
+        <AppButton size="sm" variant="ghost" @click="isFrames ? runSequential() : router.push({ name: 'flow', params: { pid } })"
+          >批量编排</AppButton
+        >
+      </template>
+    </FeatureHeader>
     <div class="border-line-1 bg-base-1 flex h-row shrink-0 items-center gap-1.5 border-b px-2">
       <span class="text-fg-4 text-2xs">筛选</span>
       <select v-model="filter" class="border-line-1 bg-base-2 text-fg-1 h-5 border px-1 text-2xs outline-none"><option value="all">全部 Shot</option><option value="issues">只看上下文不完整</option><option v-for="s in SHOT_STATUS" :key="s" :value="s">{{ SHOT_STATUS_LABEL[s] }}</option></select>
       <span class="text-fg-3 text-2xs">{{ total.shots }} Shot<span v-if="total.transitions"> · {{ total.transitions }} 段转场</span> · {{ fmtDuration(total.duration) }}<span v-if="total.issues" class="text-st-review"> · {{ total.issues }} 个缺上下文</span></span>
       <AppButton size="sm" variant="ghost" title="导入本地长视频并自动切分为镜头分镜（零复制）" @click="ingestModalOpen = true"><Scissors :size="10" />导入长视频加工</AppButton>
       <AppButton size="sm" :disabled="!story.shot || enqueuing || story.busy" title="生成当前 Shot 所在场景的全部镜头" @click="generateScene()"><Sparkles :size="10" />生成本场 Shot</AppButton>
-      <AppButton size="sm" variant="primary" :disabled="enqueuing || story.busy || !realCards.length" title="按 Shot 顺序串行生成；上一条完成并产出末帧后才执行下一条" @click="runSequential()"><Sparkles :size="10" />单线程续接</AppButton>
+      <AppButton size="sm" variant="primary" :disabled="enqueuing || story.busy || !realCards.length" :title="isFrames ? '按各镜头保存的帧图与视频描述批量入队' : '按 Shot 顺序串行生成；上一条完成并产出末帧后才执行下一条'" @click="runSequential()"><Sparkles :size="10" />{{ isFrames ? '批量生成' : '单线程续接' }}</AppButton>
       <AppButton size="sm" :disabled="enqueuing || story.busy || !readyLinks.length" :title="transitionTitle" @click="runTransitions()"><Sparkles :size="10" />一键生成转场<span v-if="readyLinks.length" class="tnum"> {{ readyLinks.length }}</span><span v-else-if="blockedLinks.length" class="text-st-review tnum"> 等 {{ blockedLinks.length }}</span></AppButton>
       <AppButton v-if="pendingPosters.length" size="sm" variant="ghost" :disabled="posterBusy" @click="extractPosters()"><Image :size="10" />补首帧 {{ pendingPosters.length }}</AppButton>
       <AppButton size="sm" variant="ghost" @click="consolePanel.openWith('jobs')"><ListVideo :size="10" />任务</AppButton>
@@ -583,7 +622,8 @@ async function confirmDeleteScene(): Promise<void> {
           </section>
 
           <!-- Prompt 编辑与共用继承关系 -->
-          <section class="border-line-1 border-t pt-2 space-y-1">
+          <FrameVideoInputs v-if="isFrames" ref="frameInputs" :pid="pid" :shot-id="story.shot.id" :duration="story.shot.duration" />
+          <section v-else class="border-line-1 border-t pt-2 space-y-1">
             <div class="flex items-center justify-between">
               <span class="text-fg-3 text-2xs font-medium">Prompt 指令</span>
               <AppBadge v-if="story.shot.prompt" tone="warn">当前 Shot 专属覆盖</AppBadge>
@@ -634,7 +674,7 @@ async function confirmDeleteScene(): Promise<void> {
           </section>
 
           <!-- 角色与场景 -->
-          <section class="border-line-1 border-t pt-2 space-y-1">
+          <section v-if="!isFrames" class="border-line-1 border-t pt-2 space-y-1">
             <div class="flex items-center justify-between">
               <p class="text-fg-3 text-2xs font-medium">角色与场景</p>
               <button
@@ -661,7 +701,7 @@ async function confirmDeleteScene(): Promise<void> {
             <p class="text-fg-4 text-3xs">道具与深度上下文账单可双击进入单 Shot 工作台配置。</p>
           </section>
 
-          <section class="border-line-1 border-t pt-2"><div class="flex items-center gap-1"><p class="text-fg-3 flex-1 text-2xs">已生成版本</p><AppBadge>{{ story.shot.versions.length }} 个</AppBadge></div><div v-if="story.shot.versions.length" class="mt-1 space-y-1"><div v-for="version in story.shot.versions" :key="version.id" class="border-line-1 bg-base-2 border p-1"><div class="flex items-center gap-1"><span class="text-fg-2 tnum text-2xs">v{{ version.version_no }}</span><AppBadge v-if="version.id === story.shot.current_version_id" tone="ok">已采纳</AppBadge><span class="text-fg-4 flex-1 text-right text-2xs">{{ fmtDuration(version.duration) }}</span></div><div class="mt-1 flex gap-1"><AppButton v-if="allCards.some((card) => card.id === story.shot?.id)" size="sm" variant="ghost" @click="previewVersion(allCards.find((card) => card.id === story.shot?.id)!, version.id)">预览</AppButton><AppButton v-if="version.id !== story.shot.current_version_id" size="sm" variant="primary" @click="adoptVersion(version.id)">采纳</AppButton></div></div></div><p v-else class="text-fg-4 mt-1 text-2xs">尚无版本。</p><div class="mt-1 flex gap-1"><AppButton size="sm" variant="primary" :disabled="enqueuing || story.busy" @click="generateShot()"><Sparkles :size="10" />生成 Shot</AppButton><AppButton size="sm" variant="ghost" @click="openShot(story.shot.id)">打开工作台</AppButton></div></section>
+          <section class="border-line-1 border-t pt-2"><div class="flex items-center gap-1"><p class="text-fg-3 flex-1 text-2xs">已生成版本</p><AppBadge>{{ story.shot.versions.length }} 个</AppBadge></div><div v-if="story.shot.versions.length" class="mt-1 space-y-1"><div v-for="version in story.shot.versions" :key="version.id" class="border-line-1 bg-base-2 border p-1"><div class="flex items-center gap-1"><span class="text-fg-2 tnum text-2xs">v{{ version.version_no }}</span><AppBadge v-if="version.id === story.shot.current_version_id" tone="ok">已采纳</AppBadge><span class="text-fg-4 flex-1 text-right text-2xs">{{ fmtDuration(version.duration) }}</span></div><div class="mt-1 flex gap-1"><AppButton v-if="allCards.some((card) => card.id === story.shot?.id)" size="sm" variant="ghost" @click="previewVersion(allCards.find((card) => card.id === story.shot?.id)!, version.id)">预览</AppButton><AppButton v-if="version.id !== story.shot.current_version_id" size="sm" variant="primary" @click="adoptVersion(version.id)">采纳</AppButton></div></div></div><p v-else class="text-fg-4 mt-1 text-2xs">尚无版本。</p><div class="mt-1 flex gap-1"><AppButton size="sm" variant="primary" :disabled="enqueuing || story.busy || (isFrames && !frameInputs?.ready)" @click="generateShot()"><Sparkles :size="10" />生成 Shot</AppButton><AppButton size="sm" variant="ghost" @click="openShot(story.shot.id)">打开工作台</AppButton></div></section>
         </div>
       </aside>
     </div>

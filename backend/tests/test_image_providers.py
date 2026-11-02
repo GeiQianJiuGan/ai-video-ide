@@ -342,6 +342,38 @@ def comfy_provider() -> tuple[image_protocols.ComfyImageProvider, FakeImageComfy
     return provider, fake
 
 
+@pytest.mark.parametrize("count", [0, 2, 5])
+async def test_image_workflow_removes_unfilled_media_entries(tmp_path: Path, count: int) -> None:
+    """五个参考槽位只传两张时，其余节点与连线均摘掉，不使用示例图片。"""
+    graph = with_declaration(with_ref_slots(5))
+    graph["90"] = {
+        "class_type": "MergeReferences",
+        "inputs": {"positive": ["3", 0], **{f"image{i}": [f"1{i}", 0] for i in range(1, 6)}},
+    }
+    write_preset("五槽图片预设", graph)
+    use_settings("comfy_preset", preset="五槽图片预设")
+    provider, fake = comfy_provider()
+    request = ImageRequest(
+        prompt="一位少女站在门边",
+        refs=[ref_file(tmp_path, f"ref{i}.png") for i in range(1, count + 1)],
+    )
+    await provider.submit(request, client_id="test")
+    sent = fake.submitted
+    assert sent is not None
+    for i in range(1, 6):
+        if i <= count:
+            assert sent[f"1{i}"]["inputs"]["image"] == f"aivs/ref{i}.png"
+            assert sent["90"]["inputs"][f"image{i}"] == [f"1{i}", 0]
+        else:
+            assert f"1{i}" not in sent
+            assert f"image{i}" not in sent["90"]["inputs"]
+    # 未填写的首尾帧也不会携带示例图片；默认 seed 等标量照旧保留。
+    assert "1" not in sent and "2" not in sent
+    assert sent["5"]["inputs"]["seed"] == graph["5"]["inputs"]["seed"]
+    assert presets.load("五槽图片预设")["15"]["inputs"]["image"] == "占位5.png"
+    assert any("示例文件一个都没有送进" in note for note in request.notes)
+
+
 async def test_comfy_probe_accepts_an_undeclared_preset_but_says_so() -> None:
     """**没标 AIVS_IMAGE 照旧能用**——否则每一台已经配好出图预设的机器升级后当场坏掉。
 

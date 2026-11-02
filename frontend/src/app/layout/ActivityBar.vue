@@ -35,6 +35,7 @@ import {
   type Feature,
 } from '@/app/features'
 import { useProjectStore } from '@/stores/project'
+import { useStoryStore } from '@/stores/story'
 import {
   PRODUCTION_MODES,
   loadProductionMode,
@@ -47,6 +48,7 @@ import {
 const route = useRoute()
 const router = useRouter()
 const proj = useProjectStore()
+const storyState = useStoryStore()
 
 const routePid = computed(() => (route.params.pid as string | undefined) ?? null)
 
@@ -62,12 +64,13 @@ const switchError = ref('')
 // A deep link or command-palette jump reveals the menu that owns that page.
 // Shared pages preserve the project's last selected menu.
 watch(
-  [openPid, () => route.name],
-  ([pid, name], [previousPid]) => {
+  [openPid, () => route.name, () => route.query.production],
+  ([pid, name, explicit], [previousPid]) => {
     if (!pid) return
     const owner = productionModeForRoute(String(name || ''))
     if (pid !== previousPid) productionMode.value = loadProductionMode(pid)
     if (owner) productionMode.value = owner
+    if (!owner && (explicit === 'frames' || explicit === 'direct')) productionMode.value = explicit
     saveProductionMode(pid, productionMode.value)
   },
   { immediate: true },
@@ -80,16 +83,18 @@ async function switchProductionMode(mode: ProductionMode): Promise<void> {
   switchError.value = ''
   try {
     const owner = productionModeForRoute(String(route.name || ''))
-    if (owner && owner !== mode) {
+    if (route.name === 'storyboard' || (owner && owner !== mode)) {
       // Await the current editor's save/leave guard before changing the menu.
-      const sid = String(route.name === 'shot' ? route.params.sid || '' : route.query.shot || '')
-      const failed = await router.push(
-        mode === 'frames'
-          ? { name: 'frames', params: { pid }, query: sid ? { shot: sid } : {} }
-          : sid
-            ? { name: 'shot', params: { pid, sid } }
-            : { name: 'flow', params: { pid } },
+      const sid = String(
+        route.name === 'shot'
+          ? route.params.sid || ''
+          : storyState.selectedShotId || route.query.shot || '',
       )
+      const failed = await router.push({
+        name: 'storyboard',
+        params: { pid },
+        query: { production: mode, ...(sid ? { shot: sid } : {}) },
+      })
       if (failed) return
     }
     productionMode.value = mode
@@ -125,6 +130,10 @@ const grouped = computed<{ title: string; items: Feature[] }[]>(() => {
 })
 
 function tip(f: Feature): string {
+  if (f.id === 'storyboard')
+    return productionMode.value === 'frames'
+      ? '制帧分镜 · 共用分镜板，引用制作图片中已采用的帧图生成视频'
+      : '直出分镜 · 镜头剧情、视频提示词、生成与版本'
   return `${f.title} · ${f.purpose}${f.ready ? '' : `（${f.milestone} 启用）`}`
 }
 
@@ -234,7 +243,13 @@ function leaveProject(): void {
       >
         <component :is="f.icon" :size="16" :stroke-width="1.6" />
         <span class="w-full truncate text-center text-[9px] leading-none">
-          {{ NAV_LABEL[f.id] ?? f.title }}
+          {{
+            f.id === 'storyboard'
+              ? productionMode === 'frames'
+                ? '制帧分镜'
+                : '直出分镜'
+              : (NAV_LABEL[f.id] ?? f.title)
+          }}
         </span>
         <Lock v-if="!f.ready" :size="8" class="text-fg-4 absolute top-0.5 right-1" />
       </RouterLink>

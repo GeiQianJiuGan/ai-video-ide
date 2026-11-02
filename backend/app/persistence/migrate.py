@@ -73,6 +73,7 @@ REVISION_SCHEMA: dict[str, int] = {
     "0024_director_intent": 24,
     "0025_frame_workspace": 25,
     "0026_creation_run": 26,
+    "0027_frame_story": 27,
 }
 
 

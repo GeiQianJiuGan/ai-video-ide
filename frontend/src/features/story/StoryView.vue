@@ -42,6 +42,7 @@ import ErrorPanel from '@/shared/ui/ErrorPanel.vue'
 import FeatureHeader from '@/shared/ui/FeatureHeader.vue'
 import { castApi, type AppearanceRow, type Character } from '@/shared/api/cast'
 import { useShellStore } from '@/stores/shell'
+import { loadProductionMode } from '@/app/productionNavigation'
 import { useStoryStore } from '@/stores/story'
 import { useWorldStore } from '@/stores/world'
 
@@ -52,6 +53,12 @@ const world = useWorldStore()
 const shell = useShellStore()
 
 const pid = computed(() => String(route.params.pid ?? ''))
+const frameMode = computed(() => loadProductionMode(pid.value) === 'frames')
+function shotDestination(sid: string) {
+  return frameMode.value
+    ? { name: 'storyboard', params: { pid: pid.value }, query: { production: 'frames', shot: sid } }
+    : { name: 'shot', params: { pid: pid.value, sid } }
+}
 
 const newSceneTitle = ref('')
 const newShotTitle = ref('')
@@ -172,6 +179,10 @@ async function loadAppearances(): Promise<void> {
 }
 
 async function openShotEditor(shotId: string): Promise<void> {
+  if (frameMode.value) {
+    await router.push(shotDestination(shotId))
+    return
+  }
   if (shotDirty.value) {
     await saveShotEditor()
     if (shotDirty.value) return
@@ -336,8 +347,7 @@ function fmtDuration(n: number): string {
       <pre
         v-if="screenplayOpen"
         class="border-line-1 text-fg-2 max-h-64 overflow-auto border-t px-3 py-2 text-2xs leading-relaxed whitespace-pre-wrap"
-        >{{ screenplay }}</pre
-      >
+        >{{ screenplay }}</pre>
     </div>
 
     <ErrorPanel
@@ -548,7 +558,7 @@ function fmtDuration(n: number): string {
               class="mt-1.5"
               :disabled="!story.shot"
               title="去镜头工作台查看上下文账单、版本和生成参数"
-              @click="router.push({ name: 'shot', params: { pid, sid: story.shot?.id ?? '' } })"
+              @click="router.push(shotDestination(story.shot?.id ?? ''))"
             >
               <Sparkles :size="10" />打开完整 Shot 工作台
             </AppButton>
@@ -658,7 +668,7 @@ function fmtDuration(n: number): string {
             size="sm"
             variant="ghost"
             title="打开单 Shot 工作台查看上下文账单、版本和生成参数"
-            @click="router.push({ name: 'shot', params: { pid, sid: story.shot.id } })"
+            @click="router.push(shotDestination(story.shot.id))"
           >
             <Sparkles :size="10" />打开完整工作台
           </AppButton>

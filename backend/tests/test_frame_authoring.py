@@ -1,6 +1,7 @@
 """Frame authoring must not alter legacy shot inputs or adopted video."""
 
 import json
+import sqlite3
 
 import pytest
 
@@ -52,7 +53,13 @@ def test_drafts_candidates_and_legacy_inputs_are_independent(client, pid):
     assert (
         client.patch(
             f"{root}/frame-cards/{cid}",
-            json={"title": "门口", "prompt": "少女站在门口", "refs": [aid]},
+            json={
+                "title": "门口",
+                "prompt": "少女站在门口",
+                "refs": [aid],
+                "story": "少女在门边发现桌上的信封，尚未走近桌边。",
+                "role": "first",
+            },
         ).status_code
         == 200
     )
@@ -67,6 +74,8 @@ def test_drafts_candidates_and_legacy_inputs_are_independent(client, pid):
     assert ws["video"] == {**draft, "preset": ""}
     assert ws["cards"][0]["adopted_asset_id"] == aid
     assert ws["cards"][0]["refs"] == [aid]
+    assert ws["cards"][0]["story"] == "少女在门边发现桌上的信封，尚未走近桌边。"
+    assert ws["cards"][0]["role"] == "first"
     after = client.get(f"{root}/shots/{sid}").json()
     for key in (
         "prompt",
@@ -79,6 +88,34 @@ def test_drafts_candidates_and_legacy_inputs_are_independent(client, pid):
         assert before.get(key) == after.get(key)
     other = a_shot(client, pid)
     assert client.get(f"{root}/shots/{other}/frames").json() == {"cards": [], "video": {}}
+
+
+def test_schema_26_frame_cards_upgrade_with_candidates_and_video_preserved(
+    client, pid, project_dir
+):
+    from app.persistence import migrate
+
+    root, sid, cid, aid = setup(client, pid)
+    draft = {"prompt": "The girl turns around.", "first_card_id": cid, "duration": 5}
+    expected_video = client.put(f"{root}/shots/{sid}/frame-video", json=draft).json()
+    assert client.post(f"{root}/close").status_code == 204
+    db_path = project_dir / "project.db"
+    # 在隔离测试工程中还原旧版结构，验证有实际帧图数据的升级与升级前备份。
+    migrate.command.downgrade(migrate._config(db_path), "0026_creation_run")
+    migrate.upgrade_to_head(db_path)
+    backups = list((project_dir / "backups" / "schema").glob("project-0026_creation_run-*.db"))
+    assert len(backups) == 1
+    with sqlite3.connect(backups[0]) as connection:
+        assert "story" not in {c[1] for c in connection.execute("PRAGMA table_info(frame_card)")}
+        assert connection.execute("SELECT adopted_asset_id FROM frame_card").fetchone()[0] == aid
+    response = client.post("/api/v1/projects/open", json={"dir": str(project_dir)})
+    assert response.status_code == 200, response.text
+    workspace = client.get(f"{root}/shots/{sid}/frames").json()
+    assert workspace["video"] == expected_video
+    card = workspace["cards"][0]
+    assert card["id"] == cid and card["adopted_asset_id"] == aid
+    assert card["candidates"][0]["asset_id"] == aid
+    assert card["story"] == "" and card["role"] == "key"
 
 
 @pytest.mark.asyncio
@@ -190,9 +227,12 @@ def test_frame_skill_and_unsupported_reference_service(client, pid, monkeypatch)
     from app.generation.providers import image
 
     monkeypatch.setattr(image.get("http_api"), "supports_refs", False)
-    blocked = client.post(f"{root}/images/generate", json={**body, "ref_asset_ids": [aid]})
-    assert blocked.status_code == 400
-    assert blocked.json()["error"]["code"] == "MISSING_CAPABILITY"
+    queued = client.post(f"{root}/images/generate", json={**body, "ref_asset_ids": [aid]})
+    assert queued.status_code == 201, queued.text
+    params = load_json(queued.json()["params_json"], {})
+    assert params["ref_asset_ids"] == []
+    assert params["dropped_ref_asset_ids"] == [aid]
+    assert queued.json()["plan"]["warnings"]
 
 
 def test_frame_preset_override_and_strict_frame_inputs(client, pid):

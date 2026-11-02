@@ -1,6 +1,7 @@
 import { api } from './client'
 import type { DirectorAttachment } from './director'
 import type { ProductionMode } from '@/app/productionNavigation'
+import type { FrameRole } from './frames'
 
 export type CreationGoal = 'screenplay' | 'storyboard'
 
@@ -16,7 +17,12 @@ export interface CreationTask {
     outlines: { title: string }[] | null
     scenes: {
       title: string
-      shots: { title: string; description: string; frames: { title: string; prompt: string }[] }[]
+      shots: {
+        title: string
+        description: string
+        video_prompt?: string
+        frames: { title: string; prompt: string; story?: string; role?: FrameRole }[]
+      }[]
     }[]
     applied: unknown[]
   }

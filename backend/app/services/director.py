@@ -49,6 +49,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
 
+from app.ai import prompts
 from app.ai.director import agent
 from app.ai.llm import client as llm
 from app.core import doctext
@@ -1099,8 +1100,26 @@ class DirectorService:
                 if shot.get("frame_plan"):
                     from app.services.frame_authoring import frames
 
+                    planned = []
                     for frame in shot["frame_plan"]:
-                        await frames.create(pid, created["id"], frame)
+                        planned.append(await frames.create(pid, created["id"], frame))
+                    if shot.get("frame_video_prompt"):
+                        prompt, _ = prompts.with_shot_audio_policy(shot["frame_video_prompt"], "")
+                        await frames.save_video(
+                            pid,
+                            created["id"],
+                            {
+                                "prompt": prompt,
+                                "duration": created["duration"],
+                                "preset": "",
+                                "first_card_id": next(
+                                    (f["id"] for f in planned if f["role"] == "first"), ""
+                                ),
+                                "last_card_id": next(
+                                    (f["id"] for f in planned if f["role"] == "last"), ""
+                                ),
+                            },
+                        )
                 made += 1
                 ids, pending = _split_ids(shot.get("cast"), "appearance_id")
                 if ids:

@@ -9,7 +9,9 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.ai.director.tools import to_op
+from app.ai.frame_plan import FrameDraft, FramePlanDraft
 from app.ai.llm import client as llm
+from app.ai.skills.frame_video import frame_video_render
 from app.core.config import settings
 from app.core.errors import AppError, ErrorCode
 from app.core.ids import new_id
@@ -47,11 +49,6 @@ class OutlineDraft(DraftModel):
     scenes: list[SceneOutline] = Field(min_length=1, max_length=120)
 
 
-class FrameDraft(DraftModel):
-    title: str = Field(min_length=1)
-    prompt: str = Field(min_length=10)
-
-
 class ShotDraft(DraftModel):
     title: str = Field(min_length=1)
     description: str = Field(min_length=10)
@@ -59,6 +56,7 @@ class ShotDraft(DraftModel):
     prop_names: list[str] = Field(default_factory=list)
     intent: dict[str, Any]
     frames: list[FrameDraft] = Field(default_factory=list, max_length=8)
+    video_prompt: str = ""
 
 
 class SceneDraft(DraftModel):
@@ -243,6 +241,12 @@ class CreationService:
                         {"context": context, "schema": schema.model_json_schema(), "repair": error}
                     ),
                 )
+                if schema is SceneDraft and state["mode"] == "direct":
+                    # 直出不使用制帧字段，也不因模型多给的帧图计划触发制帧校验。
+                    for shot in data.get("shots", []) if isinstance(data, dict) else []:
+                        if isinstance(shot, dict):
+                            shot["frames"] = []
+                            shot["video_prompt"] = ""
                 parsed = schema.model_validate(data).model_dump()
                 if schema is SceneDraft:
                     for shot in parsed["shots"]:
@@ -258,10 +262,8 @@ class CreationService:
                         duration = float(intent.get("duration") or 0)
                         if not 1 <= duration <= 15:
                             raise NeedsRepair("镜头 duration 必须为 1~15 秒")
-                        if state["mode"] == "direct":
-                            shot["frames"] = []
-                        if state["mode"] == "frames" and not shot["frames"]:
-                            raise NeedsRepair("制帧模式每个镜头至少需要一张完整画面的 frames 计划")
+                        if state["mode"] == "frames":
+                            FramePlanDraft.model_validate(shot)
                     from app.services.cast import cast
 
                     known = {c["name"] for c in state["draft"]["characters"]} | {
@@ -346,7 +348,13 @@ class CreationService:
                         state,
                         f"制作第 {i + 1}/{len(state['outlines'])} 幕镜头",
                         SceneDraft,
-                        "只完成当前幕，通常3~8镜，完整覆盖本幕概要。每镜含中文剧情description；intent含beat/action/first_frame/shot_size/angle/movement/subjects/duration/dialogue，画面与制作描述用英文，对白保留中文。character_names 与 prop_names 按原名列出本镜人物和道具。不要填写数据库ID。制帧模式还要为每镜提供frames画面计划（开场、关键动作或收尾），每个prompt描述一个完整静态画面，允许人物，禁止四视图、拼图。直出模式frames留空。",
+                        "只完成当前幕，通常3~8镜，完整覆盖本幕概要。每镜含中文剧情description；intent含beat/action/first_frame/shot_size/angle/movement/subjects/duration/dialogue，画面与制作描述用英文，对白保留中文。character_names 与 prop_names 按原名列出本镜人物和道具。不要填写数据库ID。"
+                        + (
+                            "制帧模式遵循以下技能，为每镜提供 frames 与 video_prompt：\n"
+                            + frame_video_render()
+                            if state["mode"] == "frames"
+                            else "直出模式只需完整视频导演意图，frames 留空，video_prompt 留空。"
+                        ),
                         {
                             "script": state["draft"],
                             "outline": outline,
@@ -424,6 +432,7 @@ class CreationService:
             if tool == "add_scene":
                 for target, source in zip(op["after"]["shots"], args["shots"], strict=True):
                     target["frame_plan"] = source.get("frames", [])
+                    target["frame_video_prompt"] = source.get("video_prompt", "")
                     target["creation_props"] = source.get("prop_names", [])
             # The bundle and its checkpoint commit together: no empty scenes or duplicates after a restart.
             async with db_of(pid).atomic():

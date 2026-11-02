@@ -222,6 +222,8 @@ TOOLS: dict[str, dict[str, Any]] = {
             + skills.catalog()
             + "\n"
             + skills.image_catalog()
+            + "\n"
+            + skills.frame_video_catalog()
         ),
         "params": {
             "name": {

@@ -1,0 +1,4 @@
+interface:
+  display_name: "制帧视频叙事规划"
+  short_description: "规划镜头的逐帧故事、静态图片提示词，以及首尾帧之间的视频动作与声音"
+  default_prompt: "使用 $frame-video-planning 将这个镜头规划为有序画面、每张图对应的剧情、图片提示词及独立视频提示词。"

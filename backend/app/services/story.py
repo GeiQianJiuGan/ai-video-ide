@@ -1285,6 +1285,7 @@ class StoryService:
                         "id": shot.id,
                         "index_no": shot.index_no,
                         "title": shot.title,
+                        "description": shot.description,
                         # 转场是系统按衔接补出来的，界面上要能和导演排的戏区分开
                         "kind": shot.kind,
                         "prev_shot_id": shot.prev_shot_id,

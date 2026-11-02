@@ -1,15 +1,27 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
-import { onBeforeRouteLeave, useRoute } from 'vue-router'
-import { framesApi, type FrameCard, type FramePlan, type FrameVideo } from '@/shared/api/frames'
+import { onBeforeRouteLeave, onBeforeRouteUpdate, useRoute } from 'vue-router'
+import {
+  framesApi,
+  FRAME_ROLE_LABEL,
+  type FrameCard,
+  type FramePlan,
+  type FrameRole,
+  type FrameNarrativePlan,
+  type FrameVideo,
+} from '@/shared/api/frames'
 import { assetsApi, type Asset } from '@/shared/api/assets'
 import { storyApi, type StoryboardLane } from '@/shared/api/story'
 import { generationApi, JOB_STATUS_LABEL, type GenerationVersion } from '@/shared/api/generation'
 import { fileUrl } from '@/shared/api/files'
 import { useShellStore } from '@/stores/shell'
+import { useStoryStore } from '@/stores/story'
+import FrameReferencePicker from './FrameReferencePicker.vue'
 
+const props = defineProps<{ planning?: boolean }>()
 const route = useRoute()
 const shell = useShellStore()
+const storyState = useStoryStore()
 const pid = computed(() => String(route.params.pid || ''))
 const lanes = ref<StoryboardLane[]>([])
 const sid = ref('')
@@ -20,6 +32,8 @@ const versions = ref<GenerationVersion[]>([])
 const video = ref<FrameVideo>({ prompt: '', duration: 4, first_card_id: '', last_card_id: '' })
 const title = ref('')
 const prompt = ref('')
+const frameStory = ref('')
+const frameRole = ref<FrameRole>('key')
 const refs = ref<string[]>([])
 const imported = ref('')
 const preview = ref('')
@@ -29,11 +43,14 @@ const notice = ref('')
 const busy = ref(false)
 const dirty = ref(false)
 const plan = ref<FramePlan | null>(null)
+const narrativePlan = ref<FrameNarrativePlan | null>(null)
 const config = ref<{
   provider: string
   presets: { name: string; first_frame_ok: boolean; flf_ready: boolean }[]
 }>({ provider: '', presets: [] })
-const mode = computed(() => (route.name === 'frame-video' ? 'video' : 'frames'))
+const mode = computed(() =>
+  props.planning ? 'planning' : route.name === 'frame-video' ? 'video' : 'frames',
+)
 const selected = computed(() => cards.value.find((c) => c.id === cid.value))
 const shots = computed(() => lanes.value.flatMap((l) => l.shots))
 const shot = computed(() => shots.value.find((s) => s.id === sid.value))
@@ -41,6 +58,28 @@ const images = computed(() =>
   assets.value.filter((a) => !a.missing && /\.(png|jpe?g|webp|bmp)$/i.test(a.path)),
 )
 const prepared = computed(() => cards.value.filter((c) => c.adopted_asset_id))
+const canPlan = computed(
+  () =>
+    cards.value.length <= 8 &&
+    !video.value.prompt.trim() &&
+    !video.value.first_card_id &&
+    !video.value.last_card_id &&
+    cards.value.every(
+      (c) =>
+        !c.prompt.trim() &&
+        !c.story.trim() &&
+        !c.refs.length &&
+        !c.candidates.length &&
+        !c.jobs.length &&
+        !c.adopted_asset_id,
+    ),
+)
+const canGenerateVideo = computed(
+  () =>
+    !!video.value.prompt.trim() &&
+    prepared.value.some((c) => c.id === video.value.first_card_id) &&
+    (!video.value.last_card_id || prepared.value.some((c) => c.id === video.value.last_card_id)),
+)
 const frameVersions = computed(() =>
   versions.value.filter((v) => v.params.creation_pipeline === 'frames'),
 )
@@ -86,6 +125,8 @@ function loadCard() {
   const c = selected.value
   title.value = c?.title || ''
   prompt.value = c?.prompt || ''
+  frameStory.value = c?.story || ''
+  frameRole.value = c?.role || 'key'
   refs.value = [...(c?.refs || [])]
   preview.value = c?.adopted_asset_id || c?.candidates.at(-1)?.asset_id || ''
 }
@@ -95,6 +136,8 @@ async function save() {
     await framesApi.update(pid.value, cid.value, {
       title: title.value,
       prompt: prompt.value,
+      story: frameStory.value,
+      role: frameRole.value,
       refs: refs.value,
     })
   await framesApi.saveVideo(pid.value, sid.value, video.value)
@@ -109,10 +152,18 @@ async function selectCard(id: string) {
 async function selectShot(id: string) {
   await save()
   sid.value = id
+  await storyState.selectShot(pid.value, id)
   plan.value = null
+  narrativePlan.value = null
   imported.value = ''
   const ws = await framesApi.get(pid.value, id)
-  video.value = { prompt: '', duration: 4, first_card_id: '', last_card_id: '', ...ws.video }
+  video.value = {
+    prompt: '',
+    duration: shot.value?.duration || 4,
+    first_card_id: '',
+    last_card_id: '',
+    ...ws.video,
+  }
   await refresh()
   cid.value = cards.value[0]?.id || ''
   loadCard()
@@ -124,6 +175,25 @@ async function add() {
   cid.value = cards.value.at(-1)?.id || ''
   loadCard()
 }
+async function proposeNarrative() {
+  await save()
+  notice.value = '正在按镜头剧情规划画面；完成后请审阅采用。'
+  narrativePlan.value = await framesApi.proposePlan(pid.value, sid.value)
+  notice.value = '制帧草稿已就绪，尚未写入镜头，也未生成图片。'
+}
+async function applyNarrative() {
+  if (!narrativePlan.value) return
+  await framesApi.applyPlan(pid.value, sid.value, narrativePlan.value)
+  await selectShot(sid.value)
+  notice.value = '已采用逐帧计划，可以制作图片并生成视频。'
+}
+async function adoptVideo(versionId: string) {
+  await save()
+  await generationApi.setCurrent(pid.value, versionId)
+  await storyState.selectShot(pid.value, sid.value)
+  await refresh()
+  notice.value = '已采用此视频版本。'
+}
 function derive() {
   refs.value.push(preview.value)
   edit()
@@ -132,6 +202,7 @@ async function generateMissing() {
   await save()
   let queued = 0
   const failures: string[] = []
+  const warnings: string[] = []
   for (const c of cards.value.filter(
     (c) =>
       !c.adopted_asset_id &&
@@ -139,20 +210,21 @@ async function generateMissing() {
       !c.jobs.some((j) => ['queued', 'waiting', 'running'].includes(j.status)),
   )) {
     try {
-      await framesApi.generate(pid.value, c.id)
+      const job = await framesApi.generate(pid.value, c.id)
+      warnings.push(...job.plan.warnings.map((warning) => `${c.title}：${warning}`))
       queued++
     } catch (e) {
       failures.push(`${c.title}: ${e instanceof Error ? e.message : String(e)}`)
     }
   }
   await refresh()
-  notice.value = `已入队 ${queued} 个画面。${failures.join('；')}`
+  notice.value = `已入队 ${queued} 个画面。${[...warnings, ...failures].join('；')}`
 }
 async function generate() {
   await save()
-  await framesApi.generate(pid.value, cid.value)
+  const job = await framesApi.generate(pid.value, cid.value)
   await refresh()
-  notice.value = '图片任务已入队，完成后会出现在候选中。'
+  notice.value = '图片任务已入队，完成后会出现在候选中。' + job.plan.warnings.join('；')
 }
 async function adopt(candidateId: string) {
   await save()
@@ -209,24 +281,27 @@ async function videoPlan() {
 async function generateVideo() {
   await videoPlan()
   await framesApi.video(pid.value, sid.value, video.value)
-  notice.value = '视频已入队。完成后可到原镜头编辑器预览并明确采用。'
+  notice.value = '视频已入队，完成后可在本页预览并采用。'
   await refresh()
 }
-onBeforeRouteLeave(async () => {
+async function beforeLeaving() {
+  if (busy.value) return false
   try {
     await save()
   } catch (e) {
     showError(e)
     return false
   }
-})
+}
+onBeforeRouteLeave(beforeLeaving)
+onBeforeRouteUpdate(beforeLeaving)
 watch(
   pid,
   () =>
     act(async () => {
       lanes.value = await storyApi.storyboard(pid.value)
       config.value = await framesApi.capabilities(pid.value)
-      const requested = String(route.query.shot || '')
+      const requested = String(route.query.shot || storyState.selectedShotId || '')
       const first =
         shots.value.find((s) => s.id === requested) ||
         shots.value.find((s) => s.kind !== 'transition')
@@ -257,18 +332,20 @@ onBeforeUnmount(() => window.clearInterval(timer))
   <div class="frame-workspace">
     <header>
       <div>
-        <strong>{{ mode === 'frames' ? '镜头制帧' : '视频生成' }}</strong
-        ><small>画面设计 → 选定画面 → 生成视频</small>
+        <h1>
+          {{ mode === 'planning' ? '制帧分镜' : mode === 'frames' ? '制作图片' : '视频生成' }}
+        </h1>
+        <small>{{
+          mode === 'planning'
+            ? '镜头剧情 → 逐帧故事与图片提示词 → 视频动作与声音'
+            : '按分镜计划制作画面、比较与采用候选'
+        }}</small>
       </div>
       <nav>
-        <RouterLink :to="{ name: 'frames', params: { pid }, query: { shot: sid } }"
-          >镜头制帧</RouterLink
-        >
-        <RouterLink :to="{ name: 'frame-video', params: { pid }, query: { shot: sid } }"
-          >视频生成</RouterLink
-        >
-        <RouterLink v-if="sid" :to="{ name: 'shot', params: { pid, sid } }"
-          >原镜头制作 / 采用视频</RouterLink
+        <RouterLink
+          v-if="mode !== 'planning'"
+          :to="{ name: 'storyboard', params: { pid }, query: { production: 'frames', shot: sid } }"
+          >制帧分镜 / 视频</RouterLink
         >
         <button :disabled="busy || !dirty" @click="act(save)">
           {{ dirty ? '保存草稿' : '已保存' }}
@@ -292,18 +369,62 @@ onBeforeUnmount(() => window.clearInterval(timer))
             {{ s.index_no }} · {{ s.title || '未命名镜头' }}
           </button>
         </section>
-        <RouterLink :to="{ name: 'storyboard', params: { pid } }">打开分镜规划</RouterLink>
+        <RouterLink :to="{ name: 'story', params: { pid } }">查看剧本</RouterLink>
       </aside>
       <main v-if="sid">
         <div class="shot-heading">
           <strong>{{ shot?.title }}</strong
           ><span>{{ cards.length }} 个画面 · {{ prepared.length }} 个已选图</span>
         </div>
-        <template v-if="mode === 'frames'">
+        <p v-if="shot?.description" class="shot-story">镜头剧情：{{ shot.description }}</p>
+        <template v-if="mode !== 'video'">
+          <section class="narrative-section">
+            <h2>逐帧故事与图片提示词</h2>
+            <p v-if="!cards.length">
+              本镜头尚无制帧计划。可按现有剧情规划画面，或手动添加每张图片。
+            </p>
+            <button
+              :disabled="busy || !canPlan"
+              :title="
+                canPlan
+                  ? '按当前镜头与空白画面位置生成待审阅的计划'
+                  : '已有制作内容，请直接编辑对应剧情与提示词'
+              "
+              @click="act(proposeNarrative)"
+            >
+              AI 规划本镜画面
+            </button>
+            <section v-if="narrativePlan" class="plan-review">
+              <h3>待采用的制帧计划</h3>
+              <article v-for="(frame, index) in narrativePlan.frames" :key="index">
+                <strong
+                  >{{ index + 1 }} · {{ frame.title }} · {{ FRAME_ROLE_LABEL[frame.role] }}</strong
+                >
+                <p>对应剧情：{{ frame.story }}</p>
+                <p>图片提示词：{{ frame.prompt }}</p>
+              </article>
+              <p>视频动作与声音：{{ narrativePlan.video_prompt }}</p>
+              <div class="row">
+                <button :disabled="busy" @click="act(applyNarrative)">采用制帧计划</button>
+                <button :disabled="busy" @click="narrativePlan = null">丢弃草稿</button>
+              </div>
+            </section>
+          </section>
           <div class="row">
-            <button :disabled="busy || !cards.length" @click="act(generateMissing)">
+            <RouterLink
+              v-if="mode === 'planning'"
+              :to="{ name: 'frames', params: { pid }, query: { shot: sid } }"
+              >制作本镜图片</RouterLink
+            >
+            <button
+              v-if="mode === 'frames'"
+              :disabled="busy || !cards.length"
+              @click="act(generateMissing)"
+            >
               批量生成缺失画面</button
-            ><label><input v-model="compare" type="checkbox" /> 对比采用图与候选</label>
+            ><label v-if="mode === 'frames'"
+              ><input v-model="compare" type="checkbox" /> 对比采用图与候选</label
+            >
           </div>
           <div class="filmstrip">
             <button
@@ -314,7 +435,12 @@ onBeforeUnmount(() => window.clearInterval(timer))
               @click="act(() => selectCard(c.id))"
             >
               <img v-if="url(c.adopted_asset_id)" :src="url(c.adopted_asset_id)" alt="采用的画面" />
-              <span>{{ c.title }}</span
+              <span>{{ c.title }} · {{ FRAME_ROLE_LABEL[c.role] }}</span>
+              <span v-if="mode === 'planning'" class="frame-story">
+                {{ c.story || '待填写对应剧情' }}
+              </span>
+              <small v-if="mode === 'planning'" class="frame-prompt"
+                >图片提示词：{{ c.prompt || '待填写' }}</small
               ><small
                 >{{ c.adopted_asset_id ? '已选图' : '待选图' }} ·
                 {{ c.candidates.length }} 个候选</small
@@ -322,8 +448,12 @@ onBeforeUnmount(() => window.clearInterval(timer))
             </button>
             <button :disabled="busy" @click="act(add)">＋ 添加画面</button>
           </div>
-          <div v-if="selected" class="frame-editor">
-            <div class="picture-area">
+          <div
+            v-if="selected"
+            class="frame-editor"
+            :class="{ 'planning-editor': mode === 'planning' }"
+          >
+            <div v-if="mode === 'frames'" class="picture-area">
               <div class="large-preview" :class="{ comparing: compare }">
                 <figure v-if="compare && selected.adopted_asset_id">
                   <img :src="url(selected.adopted_asset_id)" alt="已采用画面" />
@@ -353,60 +483,83 @@ onBeforeUnmount(() => window.clearInterval(timer))
             <aside class="inspector">
               <label>画面名称<input v-model="title" maxlength="200" @input="edit" /></label>
               <label
-                >画面描述<textarea
+                >叙事位置<select v-model="frameRole" @change="edit">
+                  <option v-for="(label, role) in FRAME_ROLE_LABEL" :key="role" :value="role">
+                    {{ label }}
+                  </option>
+                </select></label
+              >
+              <label
+                >对应剧情<textarea
+                  v-model="frameStory"
+                  rows="3"
+                  placeholder="这张图讲到哪一步？谁处于什么状态，如何承接前后画面？"
+                  @input="edit"
+                />
+              </label>
+              <label
+                >图片提示词<textarea
                   v-model="prompt"
                   rows="7"
                   placeholder="描述这一时刻的人物、姿态、景别、机位、场景、道具与光线。"
                   @input="edit"
                 />
               </label>
-              <label
-                >用于制帧的设定图<select v-model="refs" multiple size="6" @change="edit">
-                  <option v-for="a in images" :key="a.id" :value="a.id">
-                    {{ a.description || a.path }}
-                  </option>
-                </select></label
-              >
-              <div class="ref-thumbs">
-                <img v-for="aid in refs" :key="aid" :src="url(aid)" alt="制帧参考" />
-              </div>
-              <button :disabled="busy || !prompt.trim()" @click="act(generate)">生成新候选</button>
-              <button v-if="preview && !refs.includes(preview)" :disabled="busy" @click="derive">
-                以预览图为参考继续修改
-              </button>
-              <div class="row">
-                <button :disabled="busy" @click="act(() => move(-1))">前移</button
-                ><button :disabled="busy" @click="act(() => move(1))">后移</button
-                ><button :disabled="busy" @click="act(removeCard)">移除画面（保留素材）</button>
-              </div>
-              <label
-                >从项目素材添加<select v-model="imported">
-                  <option value="">选择图片</option>
-                  <option v-for="a in images" :key="a.id" :value="a.id">
-                    {{ a.description || a.path }}
-                  </option>
-                </select></label
-              >
-              <button :disabled="busy || !imported" @click="act(attach)">添加为候选</button>
-              <label
-                >上传画面<input
-                  type="file"
-                  accept="image/png,image/jpeg,image/webp,image/bmp"
+              <template v-if="mode === 'frames'">
+                <FrameReferencePicker
+                  v-model="refs"
+                  :pid="pid"
+                  :assets="assets"
                   :disabled="busy"
-                  @change="upload"
-              /></label>
-              <p v-for="j in selected.jobs" :key="j.id">
-                {{ JOB_STATUS_LABEL[j.status] || j.status }}
-                <small v-if="j.error_json">{{ j.error_json }}</small>
-              </p>
+                  @change="edit"
+                />
+                <button :disabled="busy || !prompt.trim()" @click="act(generate)">
+                  生成新候选
+                </button>
+                <button v-if="preview && !refs.includes(preview)" :disabled="busy" @click="derive">
+                  以预览图为参考继续修改
+                </button>
+                <div class="row">
+                  <button :disabled="busy" @click="act(() => move(-1))">前移</button
+                  ><button :disabled="busy" @click="act(() => move(1))">后移</button
+                  ><button :disabled="busy" @click="act(removeCard)">移除画面（保留素材）</button>
+                </div>
+                <label
+                  >从项目素材添加<select v-model="imported">
+                    <option value="">选择图片</option>
+                    <option v-for="a in images" :key="a.id" :value="a.id">
+                      {{ a.description || a.path }}
+                    </option>
+                  </select></label
+                >
+                <button :disabled="busy || !imported" @click="act(attach)">添加为候选</button>
+                <label
+                  >上传画面<input
+                    type="file"
+                    accept="image/png,image/jpeg,image/webp,image/bmp"
+                    :disabled="busy"
+                    @change="upload"
+                /></label>
+                <p v-for="j in selected.jobs" :key="j.id">
+                  {{ JOB_STATUS_LABEL[j.status] || j.status }}
+                  <small v-if="j.error_json">{{ j.error_json }}</small>
+                </p>
+              </template>
+              <div v-else class="row">
+                <button :disabled="busy" @click="act(() => move(-1))">前移</button>
+                <button :disabled="busy" @click="act(() => move(1))">后移</button>
+                <button :disabled="busy" @click="act(removeCard)">移除画面（保留素材）</button>
+              </div>
             </aside>
           </div>
           <p v-else class="empty">
             为当前镜头添加开场、关键动作或收尾画面。每个画面可保存多个候选版本。
           </p>
+          <p>画面按故事顺序排列。视频使用选定首帧及可选尾帧，关键状态仅作叙事参考。</p>
         </template>
-        <div v-else class="video-editor">
-          <p>使用选定画面生成新的视频候选。直接制作入口在上方，两个流程各自保存输入。</p>
+        <div v-if="mode !== 'frames'" class="video-editor">
+          <h2>视频动作与声音</h2>
+          <p>为本镜头单独描述动作推进、运镜与声音，采用图片后即可生成视频。</p>
           <label v-if="config.provider === 'comfy_preset'"
             >本镜头制帧流程的视频预设<select v-model="video.preset" @change="edit">
               <option value="">跟随项目默认</option>
@@ -423,14 +576,18 @@ onBeforeUnmount(() => window.clearInterval(timer))
           >
           <label
             >首帧<select v-model="video.first_card_id" @change="edit">
-              <option value="">选择已选图的画面</option>
-              <option v-for="c in prepared" :key="c.id" :value="c.id">{{ c.title }}</option>
+              <option value="">选择开场画面</option>
+              <option v-for="c in cards" :key="c.id" :value="c.id">
+                {{ c.title }}{{ c.adopted_asset_id ? '' : '（待选图）' }}
+              </option>
             </select></label
           >
           <label
             >尾帧（可选）<select v-model="video.last_card_id" @change="edit">
               <option value="">仅使用首帧</option>
-              <option v-for="c in prepared" :key="c.id" :value="c.id">{{ c.title }}</option>
+              <option v-for="c in cards" :key="c.id" :value="c.id">
+                {{ c.title }}{{ c.adopted_asset_id ? '' : '（待选图）' }}
+              </option>
             </select></label
           >
           <label
@@ -452,10 +609,7 @@ onBeforeUnmount(() => window.clearInterval(timer))
           /></label>
           <div class="row">
             <button :disabled="busy" @click="act(videoPlan)">检查实际输入</button
-            ><button
-              :disabled="busy || !video.first_card_id || !video.prompt.trim()"
-              @click="act(generateVideo)"
-            >
+            ><button :disabled="busy || !canGenerateVideo" @click="act(generateVideo)">
               生成视频候选
             </button>
           </div>
@@ -480,9 +634,12 @@ onBeforeUnmount(() => window.clearInterval(timer))
                 :src="url(v.asset_id)"
                 controls
                 preload="metadata"
-              /><RouterLink :to="{ name: 'shot', params: { pid, sid } }"
-                >到镜头编辑器采用此版本</RouterLink
+              /><button
+                :disabled="busy || !v.asset_id || storyState.shot?.current_version_id === v.id"
+                @click="act(() => adoptVideo(v.id))"
               >
+                {{ storyState.shot?.current_version_id === v.id ? '已采用' : '采用此视频版本' }}
+              </button>
             </article>
           </section>
         </div>
@@ -508,7 +665,7 @@ header {
   gap: 16px;
   flex-wrap: wrap;
 }
-header strong {
+header h1 {
   font-size: 18px;
 }
 small {
@@ -599,11 +756,51 @@ main {
 .filmstrip span {
   display: block;
 }
+.frame-story,
+.frame-prompt {
+  text-align: left;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.frame-prompt {
+  max-height: 100px;
+  overflow: auto;
+}
+.narrative-section,
+.video-editor {
+  margin: 18px 0;
+}
+.narrative-section h2,
+.video-editor h2 {
+  font-size: 15px;
+  font-weight: 600;
+  margin-bottom: 10px;
+}
+.plan-review {
+  border: 1px solid var(--color-accent);
+  padding: 14px;
+  margin-top: 12px;
+}
+.plan-review article {
+  margin: 12px 0;
+  white-space: pre-wrap;
+}
 .frame-editor {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 300px;
   gap: 20px;
   margin-top: 15px;
+}
+.planning-editor {
+  display: block;
+  max-width: 1100px;
+}
+.planning-editor .inspector {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+.planning-editor .inspector > .row {
+  grid-column: 1 / -1;
 }
 .large-preview {
   min-height: 300px;

@@ -179,7 +179,7 @@ def _detach_idle(
     name: str,
     points: dict[str, dict[str, str]],
     idle: list[str],
-    req: VideoRequest,
+    req: VideoRequest | base.ImageRequest,
 ) -> Detached:
     """把这一次没有值的**媒体**入口从提交的那份图里摘掉，并把摘了什么写进 `req.notes`。
 

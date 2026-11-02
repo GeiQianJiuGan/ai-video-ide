@@ -24,6 +24,8 @@ class FrameCard(Base):
     position: Mapped[int] = mapped_column(Integer, default=0)
     title: Mapped[str] = mapped_column(String(200))
     prompt: Mapped[str] = mapped_column(Text, default="")
+    story: Mapped[str] = mapped_column(Text, default="")
+    role: Mapped[str] = mapped_column(String(20), default="key")
     refs_json: Mapped[str] = mapped_column(Text, default="[]")
     adopted_asset_id: Mapped[str | None] = mapped_column(String(40))
 

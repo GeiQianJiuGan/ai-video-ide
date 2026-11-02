@@ -64,6 +64,7 @@ export interface ImageProviderInfo {
   label: string
   configured: boolean
   supports_refs: boolean
+  max_refs?: number | null
   preset: string
   model: string
   size: string
@@ -87,6 +88,7 @@ export interface ImagePlan {
   prompt: string
   negative_prompt: string
   refs: ImagePlanRef[]
+  dropped_refs?: ImagePlanRef[]
   /** 「图会落到哪里」那句话。前端原样显示。 */
   lands: string
   asset_kind: string

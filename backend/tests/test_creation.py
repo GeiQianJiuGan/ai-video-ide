@@ -37,8 +37,26 @@ def scene():
                     "duration": 5,
                 },
                 "frames": [
-                    {"title": "开场", "prompt": "A girl stands at the doorway in a rainy evening."}
+                    {
+                        "title": "开场",
+                        "role": "first",
+                        "story": "阿岚站在门口，手握门把，桌上的信封尚未被触碰。",
+                        "prompt": "A girl stands at the doorway in a rainy evening.",
+                    },
+                    {
+                        "title": "看见来信",
+                        "role": "key",
+                        "story": "阿岚的视线落在桌上的信封，身体仍停在门边。",
+                        "prompt": "A girl at the door looks at an envelope on a wooden table.",
+                    },
+                    {
+                        "title": "走近桌边",
+                        "role": "last",
+                        "story": "阿岚已走到桌边，凝视尚未拿起的信封，准备拆信。",
+                        "prompt": "A girl stands beside a wooden table, looking at an untouched envelope.",
+                    },
                 ],
+                "video_prompt": "The girl releases the door handle, looks at the envelope and walks to the table. Slow push-in. Sound: rain and footsteps; no dialogue or music.",
             }
         ]
     }
@@ -113,6 +131,16 @@ def test_complete_draft_has_all_scenes_and_no_empty_production_rows(client, pid,
     assert client.get(f"{root}/scenes").json()[0]["location_variant_id"]
     frames = client.get(f"{root}/shots/{sid}/frames").json()
     assert frames["cards"][0]["prompt"] == scene()["shots"][0]["frames"][0]["prompt"]
+    assert len(frames["cards"]) == 3
+    for card, expected in zip(frames["cards"], scene()["shots"][0]["frames"], strict=True):
+        assert card["story"] == expected["story"]
+        assert card["role"] == expected["role"]
+        assert card["adopted_asset_id"] is None and card["candidates"] == []
+    assert frames["video"]["prompt"].startswith(scene()["shots"][0]["video_prompt"])
+    assert frames["video"]["duration"] == 5
+    assert frames["video"]["first_card_id"] == frames["cards"][0]["id"]
+    assert frames["video"]["last_card_id"] == frames["cards"][-1]["id"]
+    assert client.get(f"{root}/jobs").json() == []
     client.post(f"{root}/director/tasks/{rid}/apply")
     assert len(client.get(f"{root}/storyboard").json()) == 3
 
@@ -245,13 +273,104 @@ def test_duplicate_submission_reuses_completed_task_and_direct_mode_has_no_frame
     assert len(lanes) == 3
     for lane in lanes:
         for shot in lane["shots"]:
-            assert client.get(f"{root}/shots/{shot['id']}/frames").json()["cards"] == []
+            assert client.get(f"{root}/shots/{shot['id']}/frames").json() == {
+                "cards": [],
+                "video": {},
+            }
+
+
+@pytest.mark.parametrize("broken", ["story", "video_prompt", "first", "last"])
+def test_frame_narrative_errors_are_repaired_before_review(client, pid, ai, monkeypatch, broken):
+    original = llm.complete_json
+    repairs = []
+
+    async def repairing(system, user):
+        data = json.loads(user)
+        if data["schema"]["title"] != "SceneDraft":
+            return await original(system, user)
+        repairs.append(data["repair"])
+        result = scene()
+        if len(repairs) == 1:
+            shot = result["shots"][0]
+            if broken == "story":
+                shot["frames"][1].pop("story")
+            elif broken == "video_prompt":
+                shot.pop("video_prompt")
+            elif broken == "first":
+                shot["frames"][1]["role"] = "first"
+            else:
+                shot["frames"][1]["role"] = "last"
+        return result
+
+    monkeypatch.setattr(llm, "complete_json", repairing)
+    root, _ = start(client, pid)
+    row = wait(client, root)
+    assert row["status"] == "review", row["state"]
+    assert len(row["state"]["attempts"]) == 1
+    assert repairs[1]  # 把具体失败反馈给模型，而不是默默填充剧情。
+    assert client.get(f"{root}/storyboard").json() == []
+
+
+def test_single_opening_frame_is_valid_and_skill_is_loaded_for_frame_mode(
+    client, pid, ai, monkeypatch
+):
+    from app.ai import skills
+
+    original = llm.complete_json
+    instructions = []
+
+    async def single_frame(system, user):
+        if json.loads(user)["schema"]["title"] == "SceneDraft":
+            instructions.append(system)
+            result = scene()
+            result["shots"][0]["frames"] = result["shots"][0]["frames"][:1]
+            return result
+        return await original(system, user)
+
+    monkeypatch.setattr(llm, "complete_json", single_frame)
+    monkeypatch.setattr(settings, "director_auto_apply", True)
+    root, _ = start(client, pid)
+    row = wait(client, root)
+    assert row["status"] == "completed", row["state"]
+    assert all(skills.render("frame-video-planning") in system for system in instructions)
+    for lane in client.get(f"{root}/storyboard").json():
+        ws = client.get(f"{root}/shots/{lane['shots'][0]['id']}/frames").json()
+        assert len(ws["cards"]) == 1
+        assert ws["video"]["first_card_id"] == ws["cards"][0]["id"]
+        assert ws["video"]["last_card_id"] == ""
+
+
+def test_frame_workspace_failure_rolls_back_whole_scene_and_resumes(client, pid, ai, monkeypatch):
+    from app.services.frame_authoring import frames
+
+    original = frames.save_video
+
+    async def broken(*args, **kwargs):
+        await original(*args, **kwargs)
+        raise RuntimeError("模拟视频草稿写入后中断")
+
+    monkeypatch.setattr(settings, "director_auto_apply", True)
+    monkeypatch.setattr(frames, "save_video", broken)
+    root, rid = start(client, pid)
+    row = wait(client, root)
+    assert row["status"] == "failed"
+    assert client.get(f"{root}/storyboard").json() == []
+    generated = list(ai)
+    monkeypatch.setattr(frames, "save_video", original)
+    client.post(f"{root}/director/tasks/{rid}/resume")
+    row = wait(client, root, ("completed", "failed"))
+    assert row["status"] == "completed", row["state"]
+    assert generated == ai
+    lanes = client.get(f"{root}/storyboard").json()
+    assert len(lanes) == 3
+    for lane in lanes:
+        ws = client.get(f"{root}/shots/{lane['shots'][0]['id']}/frames").json()
+        assert len(ws["cards"]) == 3
 
 
 @pytest.mark.asyncio
 async def test_atomic_bundle_rolls_back_and_does_not_share_session_with_child_task(db):
     import asyncio
-
 
     with pytest.raises(RuntimeError):
         async with db.atomic() as parent:

@@ -433,10 +433,17 @@ def director(scope: str = "flow") -> str:
     image_contract = (
         f"{DIRECTOR_IMAGE_CONTRACT_HEAD}{skills.image_catalog()}\n{DIRECTOR_IMAGE_CONTRACT_TAIL}"
     )
+    frame_contract = (
+        "制帧叙事技能（read_skill 按需读取）：\n"
+        + skills.frame_video_catalog()
+        + "\n用户讨论制帧方案时先读取此技能，规划每张图对应的剧情、静态画面及视频动作。"
+        "完整分镜任务会保存逐帧计划；普通聊天工具只提交其明确支持的字段，"
+        "不能声称已保存帧卡或生成图片。规划技能不能用作 intent.skill 或视频渲染规范。"
+    )
     hint = SCOPE_HINT.get(str(scope or "").strip(), SCOPE_HINT["flow"])
     return (
         f"{_custom(settings.prompt_director) or DIRECTOR_TASK}\n\n"
         f"{DIRECTOR_SCREENPLAY_CONTRACT}\n\n"
-        f"{contract}\n\n{image_contract}\n\n{DIRECTOR_MATERIAL_SWEEP}\n\n"
+        f"{contract}\n\n{image_contract}\n\n{frame_contract}\n\n{DIRECTOR_MATERIAL_SWEEP}\n\n"
         f"{describe_contract(llm.supports_vision())}\n\n{hint}"
     )

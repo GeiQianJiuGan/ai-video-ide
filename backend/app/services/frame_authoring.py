@@ -2,6 +2,10 @@
 
 from typing import Any
 
+from app.ai import prompts
+from app.ai.frame_plan import FramePlanDraft
+from app.ai.llm import client as llm
+from app.ai.skills.frame_video import frame_video_render
 from app.core.errors import AppError, ErrorCode
 from app.core.ids import new_id
 from app.generation.providers import presets
@@ -23,6 +27,161 @@ def invalid(detail: str) -> AppError:
 
 
 class FrameService:
+    async def reference_materials(self, pid: str) -> dict[str, Any]:
+        from app.persistence.models_cast import Appearance, Character, SheetVersion
+        from app.persistence.models_world import (
+            Location,
+            LocationReference,
+            LocationVariant,
+            Prop,
+            PropReference,
+        )
+        from app.services.images import images
+
+        db = db_of(pid)
+        asset_rows = {a.id: a for a in await fetch_all(db, Asset)}
+
+        def entry(kind: str, entity_id: str, label: str, aid: str | None) -> dict:
+            asset = asset_rows.get(aid)
+            available = bool(
+                asset
+                and asset.path.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp"))
+                and (project_of(pid).dir / asset.path).is_file()
+            )
+            return {
+                "kind": kind,
+                "id": entity_id,
+                "label": label,
+                "asset_id": aid,
+                "available": available,
+            }
+
+        characters = {c.id: c for c in await fetch_all(db, Character)}
+        sheets = {
+            s.appearance_id: s.asset_id for s in await fetch_all(db, SheetVersion) if s.is_current
+        }
+        character_refs = [
+            entry(
+                "character", a.id, f"{characters[a.character_id].name} · {a.name}", sheets.get(a.id)
+            )
+            for a in await fetch_all(db, Appearance, order_by=Appearance.created_at)
+            if a.character_id in characters
+        ]
+        locations = {loc.id: loc for loc in await fetch_all(db, Location)}
+        location_images = {
+            r.variant_id: r.asset_id
+            for r in await fetch_all(db, LocationReference, order_by=LocationReference.created_at)
+            if r.is_current
+        }
+        location_refs = [
+            entry(
+                "location",
+                v.id,
+                f"{locations[v.location_id].name} · {v.name}",
+                location_images.get(v.id),
+            )
+            for v in await fetch_all(db, LocationVariant, order_by=LocationVariant.created_at)
+            if v.location_id in locations
+        ]
+        prop_images = {
+            r.prop_id: r.asset_id for r in await fetch_all(db, PropReference) if r.is_current
+        }
+        prop_refs = [
+            entry("prop", p.id, p.name, prop_images.get(p.id))
+            for p in await fetch_all(db, Prop, order_by=Prop.created_at)
+        ]
+        return {
+            "groups": {"character": character_refs, "location": location_refs, "prop": prop_refs},
+            "provider": images.capability(),
+        }
+
+    @staticmethod
+    def empty_plan(workspace: dict[str, Any]) -> bool:
+        return not any(
+            workspace["video"].get(k) for k in ("prompt", "first_card_id", "last_card_id")
+        ) and all(
+            not any(
+                card.get(k)
+                for k in ("prompt", "story", "refs", "candidates", "jobs", "adopted_asset_id")
+            )
+            for card in workspace["cards"]
+        )
+
+    async def propose_plan(self, pid: str, sid: str) -> dict[str, Any]:
+        from app.services.story import story
+
+        llm.require_configured()
+        shot = await story.get_shot(pid, sid)
+        workspace = await self.get(pid, sid)
+        if not self.empty_plan(workspace):
+            raise invalid("本镜头已有制作内容，请直接编辑，不能用新计划覆盖。")
+        slots = workspace["cards"]
+        if len(slots) > 8:
+            raise invalid("AI 单镜规划最多八个画面；更多画面可手动填写或拆成多个镜头。")
+        repair = ""
+        for _ in range(3):
+            data = await llm.complete_json(
+                "只规划当前已有镜头的制帧方案，忠实保留剧情、人物与台词，不新增镜头。"
+                "已有空白画面位置时，保持其数量、顺序与名称，为每个位置规划剧情与图片提示词。"
+                "仅返回符合 schema 的 JSON。\n" + frame_video_render(),
+                dump_json(
+                    {
+                        "shot": shot,
+                        "frame_slots": [{"title": c["title"]} for c in slots],
+                        "schema": FramePlanDraft.model_json_schema(),
+                        "repair": repair,
+                    }
+                ),
+            )
+            try:
+                plan = FramePlanDraft.model_validate(data)
+                if slots and [f.title for f in plan.frames] != [c["title"] for c in slots]:
+                    raise ValueError("保持已有空白画面的数量、顺序和名称，不要增删画面位置")
+                return {
+                    **plan.model_dump(),
+                    "duration": shot["duration"],
+                    "shot_updated_at": shot["updated_at"],
+                    "frame_card_ids": [card["id"] for card in slots],
+                }
+            except ValueError as exc:
+                repair = str(exc)[:1800]
+        raise invalid(f"制帧计划三次未通过检查：{repair}")
+
+    async def apply_plan(self, pid: str, sid: str, data: dict[str, Any]) -> dict[str, Any]:
+        plan = FramePlanDraft.model_validate(data)
+        async with db_of(pid).atomic():
+            shot = await fetch(db_of(pid), Shot, sid, "镜头")
+            workspace = await self.get(pid, sid)
+            if shot.updated_at != data["shot_updated_at"]:
+                raise invalid("镜头剧情已被修改，请重新规划后采用。")
+            if not self.empty_plan(workspace):
+                raise invalid("本镜头已有制帧草稿，请直接编辑，不能用新计划覆盖。")
+            slots = workspace["cards"]
+            if [c["id"] for c in slots] != data.get("frame_card_ids", []):
+                raise invalid("画面位置已变化，请重新规划后采用。")
+            if slots:
+                if len(slots) != len(plan.frames):
+                    raise invalid("计划必须完整覆盖现有空白画面位置。")
+                cards = [
+                    await self.update(pid, card["id"], frame.model_dump(exclude={"title"}))
+                    for card, frame in zip(slots, plan.frames, strict=True)
+                ]
+            else:
+                cards = [await self.create(pid, sid, frame.model_dump()) for frame in plan.frames]
+            prompt, _ = prompts.with_shot_audio_policy(plan.video_prompt, "")
+            await self.save_video(
+                pid,
+                sid,
+                {
+                    "prompt": prompt,
+                    "duration": shot.duration,
+                    "preset": workspace["video"].get("preset", ""),
+                    "first_card_id": cards[0]["id"],
+                    "last_card_id": cards[-1]["id"] if cards[-1]["role"] == "last" else "",
+                },
+            )
+        return await self.get(pid, sid)
+
     async def image(self, pid: str, aid: str) -> Asset:
         asset = await fetch(db_of(pid), Asset, aid, "图片")
         if not asset.path.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp")):
@@ -70,6 +229,8 @@ class FrameService:
             position=max((c.position for c in cards), default=-1) + 1,
             title=data["title"],
             prompt=data.get("prompt", ""),
+            story=data.get("story", ""),
+            role=data.get("role", "key"),
             refs_json="[]",
         )
         async with db_of(pid).write() as session:
@@ -83,12 +244,22 @@ class FrameService:
             row = await session.get(FrameCard, cid)
             if row is None:
                 raise invalid("画面不存在。")
-            for key in ("title", "prompt", "position"):
+            for key in ("title", "prompt", "story", "role", "position"):
                 if key in data:
                     setattr(row, key, data[key])
             if "refs" in data:
                 row.refs_json = dump_json(list(dict.fromkeys(data["refs"])))
             return as_dict(row)
+
+    async def save_video(self, pid: str, sid: str, data: dict[str, Any]) -> dict[str, Any]:
+        await fetch(db_of(pid), Shot, sid, "镜头")
+        async with db_of(pid).write() as session:
+            row = await session.get(FrameWorkspace, sid)
+            if row is None:
+                row = FrameWorkspace(shot_id=sid)
+                session.add(row)
+            row.video_json = dump_json(data)
+        return data
 
     async def add_candidate(
         self, pid: str, cid: str, aid: str, job_id: str | None = None, snapshot: dict | None = None

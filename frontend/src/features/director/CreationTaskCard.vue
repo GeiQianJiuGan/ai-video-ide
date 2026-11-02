@@ -4,6 +4,7 @@ import { useRoute } from 'vue-router'
 import { creationApi, type CreationGoal, type CreationTask } from '@/shared/api/creation'
 import type { DirectorAttachment } from '@/shared/api/director'
 import { loadProductionMode, productionModeForRoute } from '@/app/productionNavigation'
+import { FRAME_ROLE_LABEL } from '@/shared/api/frames'
 
 const props = defineProps<{ pid: string }>()
 const emit = defineEmits<{ applied: []; settled: [] }>()
@@ -72,7 +73,10 @@ async function start(
   error.value = ''
   const pid = props.pid
   try {
-    const mode = productionModeForRoute(String(route.name || '')) || loadProductionMode(pid)
+    const explicit = route.query.production
+    const mode =
+      productionModeForRoute(String(route.name || '')) ||
+      (explicit === 'frames' || explicit === 'direct' ? explicit : loadProductionMode(pid))
     const out = await creationApi.start(pid, message, goal, mode, attachments)
     if (pid === props.pid) accept(out)
     return true
@@ -147,9 +151,20 @@ defineExpose({ start, working })
           {{ task.state.draft.screenplay_md }}
           <div v-for="(scene, i) in task.state.scenes" :key="i" class="mt-3">
             <strong>{{ scene.title }}</strong>
-            <p v-for="(shot, j) in scene.shots" :key="j">
-              {{ j + 1 }}. {{ shot.title }} — {{ shot.description }}
-            </p>
+            <div v-for="(shot, j) in scene.shots" :key="j" class="mt-2">
+              <p>{{ j + 1 }}. {{ shot.title }} — {{ shot.description }}</p>
+              <template v-if="task.state.mode === 'frames'">
+                <p v-if="shot.video_prompt" class="mt-1">视频提示词：{{ shot.video_prompt }}</p>
+                <div v-for="(frame, k) in shot.frames" :key="k" class="ml-2 mt-1">
+                  <strong>
+                    画面 {{ k + 1 }} · {{ frame.title }}
+                    {{ frame.role ? `（${FRAME_ROLE_LABEL[frame.role]}）` : '' }}
+                  </strong>
+                  <p v-if="frame.story">对应剧情：{{ frame.story }}</p>
+                  <p>图片提示词：{{ frame.prompt }}</p>
+                </div>
+              </template>
+            </div>
           </div>
         </div>
       </details>

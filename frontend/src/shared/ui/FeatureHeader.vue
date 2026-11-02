@@ -14,6 +14,8 @@ import { useSystemStore } from '@/stores/system'
 const props = defineProps<{
   /** 留空时取当前路由名。 */
   route?: string
+  title?: string
+  purpose?: string
 }>()
 
 const currentRoute = useRoute()
@@ -33,13 +35,13 @@ function satisfied(req: Requirement): boolean {
   <header v-if="feature" class="border-line-1 bg-base-1 shrink-0 border-b px-3 py-2">
     <div class="flex items-center gap-2">
       <component :is="feature.icon" :size="14" :stroke-width="1.6" class="text-accent" />
-      <h1 class="text-fg-1 text-sm font-medium">{{ feature.title }}</h1>
+      <h1 class="text-fg-1 text-sm font-medium">{{ props.title ?? feature.title }}</h1>
       <AppBadge tone="accent">{{ feature.milestone }}</AppBadge>
       <AppBadge v-for="r in feature.requires" :key="r" :tone="satisfied(r) ? 'ok' : 'warn'">
         {{ REQUIREMENT_LABEL[r] }}
       </AppBadge>
       <div class="ml-auto flex items-center gap-1"><slot name="actions" /></div>
     </div>
-    <p class="text-fg-3 mt-1 text-xs">{{ feature.purpose }}</p>
+    <p class="text-fg-3 mt-1 text-xs">{{ props.purpose ?? feature.purpose }}</p>
   </header>
 </template>

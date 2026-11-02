@@ -39,7 +39,7 @@ const projectRoutes: RouteRecordRaw[] = [
   {
     path: 'storyboard',
     name: 'storyboard',
-    component: () => import('@/features/story/StoryboardView.vue'),
+    component: () => import('@/features/story/StoryboardWorkspace.vue'),
   },
   {
     path: 'shot/:sid?',

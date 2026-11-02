@@ -224,6 +224,7 @@ export interface StoryboardCard {
   id: string
   index_no: number
   title: string
+  description?: string | null
   /** shot / transition —— 转场是系统按衔接补出来的，卡片上要标出来。 */
   kind: string
   prev_shot_id: string | null

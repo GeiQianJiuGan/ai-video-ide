@@ -1,13 +1,13 @@
 """Frame authoring endpoints, independent of legacy shot editing."""
 
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter
 from pydantic import BaseModel, Field
 
+from app.ai.frame_plan import FramePlanDraft
 from app.persistence.models_frames import FrameCard, FrameWorkspace
 from app.persistence.models_gen import Job
-from app.persistence.models_story import Shot
 from app.services.base import db_of, dump_json, fetch, fetch_all, load_json
 from app.services.frame_authoring import frames, invalid
 from app.services.images import images
@@ -15,14 +15,23 @@ from app.services.images import images
 router = APIRouter(tags=["frames"])
 
 
+@router.get("/projects/{pid}/frame-reference-materials")
+async def reference_materials(pid: str) -> dict[str, Any]:
+    return await frames.reference_materials(pid)
+
+
 class CardCreate(BaseModel):
     title: str = Field(min_length=1, max_length=200)
     prompt: str = ""
+    story: str = ""
+    role: Literal["first", "key", "last"] = "key"
 
 
 class CardPatch(BaseModel):
     title: str | None = Field(default=None, min_length=1, max_length=200)
     prompt: str | None = None
+    story: str | None = None
+    role: Literal["first", "key", "last"] | None = None
     position: int | None = Field(default=None, ge=0)
     refs: list[str] | None = None
 
@@ -41,6 +50,21 @@ class VideoBody(BaseModel):
     preset: str = ""
     first_card_id: str = ""
     last_card_id: str = ""
+
+
+class PlanApply(FramePlanDraft):
+    shot_updated_at: str
+    frame_card_ids: list[str] = Field(default_factory=list)
+
+
+@router.post("/projects/{pid}/shots/{sid}/frame-plan/propose")
+async def propose_frame_plan(pid: str, sid: str) -> dict[str, Any]:
+    return await frames.propose_plan(pid, sid)
+
+
+@router.post("/projects/{pid}/shots/{sid}/frame-plan/apply")
+async def apply_frame_plan(pid: str, sid: str, body: PlanApply) -> dict[str, Any]:
+    return await frames.apply_plan(pid, sid, body.model_dump())
 
 
 @router.get("/projects/{pid}/shots/{sid}/frames")
@@ -102,14 +126,7 @@ async def generate(pid: str, cid: str) -> dict[str, Any]:
 
 @router.put("/projects/{pid}/shots/{sid}/frame-video")
 async def save_video(pid: str, sid: str, body: VideoBody) -> dict[str, Any]:
-    await fetch(db_of(pid), Shot, sid, "镜头")
-    async with db_of(pid).write() as session:
-        row = await session.get(FrameWorkspace, sid)
-        if row is None:
-            row = FrameWorkspace(shot_id=sid)
-            session.add(row)
-        row.video_json = dump_json(body.model_dump())
-    return body.model_dump()
+    return await frames.save_video(pid, sid, body.model_dump())
 
 
 @router.post("/projects/{pid}/shots/{sid}/frame-video/plan")
