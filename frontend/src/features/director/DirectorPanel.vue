@@ -85,6 +85,10 @@ import {
   type DirectorTurn,
 } from '@/shared/api/director'
 import { useDirectorStore } from '@/stores/director'
+import CreationTaskCard from './CreationTaskCard.vue'
+import { inferCreationGoal } from '@/app/creationGoal'
+const creationCard = ref<InstanceType<typeof CreationTaskCard> | null>(null)
+const creationGoal = ref('auto')
 const props = withDefaults(
   defineProps<{
     pid: string
@@ -114,11 +118,6 @@ const emit = defineEmits<{ applied: []; close: [] }>()
 const router = useRouter()
 const director = useDirectorStore()
 const draft = ref('')
-/**
- * 一键全流程要不要用输入框里这段话**替换掉**工程里已经存着的剧本原文。**默认不换**：
- * 剧本原文是这个工程的源头，不该被一次「一键全流程」悄悄换掉（后端也会先拦一次）。
- */
-const replaceScript = ref(false)
 /** 只看变化的字段。整幕覆盖那种提案 before/after 大半是同值，全列出来反而看不清。 */
 const onlyChanged = ref(true)
 /** 展开了哪几处长文本，键是 `${temp_id}:${字段}`。 */
@@ -264,7 +263,9 @@ function opsOf(turn: DirectorTurn): DirectorOp[] {
  * 与右栏那份可操作的分组卡分工：正等审的那条走右栏（`director.livePendingTurnId` 跳过它），
  * 已经落库 / 免确认自动落 / 一键全流程落的那几条只在这里留个 before → after 的账。
  */
-function proposalGroupsOf(turn: DirectorTurn): { target: string; label: string; ops: DirectorOp[] }[] {
+function proposalGroupsOf(
+  turn: DirectorTurn,
+): { target: string; label: string; ops: DirectorOp[] }[] {
   return groupOps(opsOf(turn))
 }
 
@@ -317,23 +318,16 @@ const stageLine = computed(() => (director.auto?.stages ?? []).map((s) => s.labe
  * 「一键全流程」那颗按钮上的整句话。**禁用的原因必须写在上面**，不能只灰掉一颗按钮
  * ——那句话来自后端的 `auto.hint`（免确认关着时它说的就是「去设置页打开」）。
  */
-const autopilotHint = computed(() => {
-  if (!director.auto) return '还在读这一栏的配置'
-  const source = draft.value.trim()
-    ? '这一次用输入框里那段原文（会一并存进这个工程）。'
-    : '这一次用工程里已经存着的剧本原文。'
-  return director.autoApply ? `${director.auto.hint}${source}` : director.auto.hint
-})
-/** 一键全流程跑着时别让人同时按「采用」：那一趟正在一批批落库。 */
-const locked = computed(() => director.busy || director.autopiloting)
+
+const locked = computed(() => director.busy || director.autopiloting || creationCard.value?.working)
 /**
  * 空态那段话。**免确认模式开着时默认那句是假话**（「按下采用之前，库里什么都不会变」），
  * 所以那时换成这个模式下真正会发生的事——空态往往是新用户唯一会读完的一段字。
  */
 const emptyText = computed(() =>
   director.autoApply
-    ? '免确认模式开着：它想好之后会直接落库，右栏不会有待审的卡，落了什么在这里逐条说明。要逐条审就去设置页的「AI 导演」里关掉它。整章剧本可以直接按底下那颗「一键全流程」：核心剧本 → 人物 / 地点 / 道具 → 拆幕 → 拆分镜一趟走完。'
-    : props.emptyBody,
+    ? '免确认模式开着：它想好之后会直接落库，右栏不会有待审的卡，落了什么在这里逐条说明。要逐条审就去设置页的「AI 导演」里关掉它。完整创作会自动分批完成并检查后保存；下方可以选择仅写剧本或制作完整分镜。'
+    : '描述创作目标，系统会持续完成完整剧本或分镜，并交付草稿审阅。讨论和局部修改仍可逐条采用。',
 )
 
 /**
@@ -370,10 +364,7 @@ interface AppliedRow {
  */
 const appliedRows = computed<AppliedRow[]>(() => {
   const out: AppliedRow[] = []
-  const rows = [
-    ...(director.lastApply?.applied ?? []),
-    ...(director.lastAutopilot?.applied ?? []),
-  ]
+  const rows = [...(director.lastApply?.applied ?? []), ...(director.lastAutopilot?.applied ?? [])]
   rows.forEach((row, i) => {
     const label = String(row.target_label ?? '')
     const headline = String(row.title ?? row.name ?? '') || label
@@ -428,10 +419,28 @@ watch(() => director.messages.length, follow)
 watch(() => director.autopiloting, follow)
 watch(() => director.lastAutopilot, follow)
 
+async function refreshCreationHistory() {
+  await director.load(props.pid).catch(() => {})
+}
+
 async function send(): Promise<void> {
   const text = draft.value.trim()
   // 只挂附件、不打字也能发——附件也是输入（与后端 `stream_precheck` 的空判据一致）。
   if (!text && !director.attached.length) return
+  const goal = creationGoal.value === 'auto' ? inferCreationGoal(text) : creationGoal.value
+  if (goal !== 'chat') {
+    const ok = await creationCard.value?.start(
+      text,
+      goal === 'storyboard' ? 'storyboard' : 'screenplay',
+      [...director.attached],
+    )
+    if (ok) {
+      draft.value = ''
+      director.attached = []
+      await refreshCreationHistory()
+    }
+    return
+  }
   draft.value = ''
   await director.send(props.pid, text, props.scope)
 }
@@ -447,15 +456,14 @@ const canSend = computed(() => Boolean(draft.value.trim()) || director.attached.
  * 被拦下来时（与库里那份不一样、免确认没开）**一个字都不动**，用户接着勾那颗替换再来一次。
  */
 async function autopilot(): Promise<void> {
-  const text = draft.value.trim()
-  const out = await director.autopilot(props.pid, {
-    text,
-    replace_script: replaceScript.value,
-  })
-  if (!out) return
-  if (text) draft.value = ''
-  replaceScript.value = false
-  if (out.count) emit('applied')
+  const ok = await creationCard.value?.start(draft.value.trim(), 'storyboard', [
+    ...director.attached,
+  ])
+  if (ok) {
+    draft.value = ''
+    director.attached = []
+    await refreshCreationHistory()
+  }
 }
 
 function pickFile(): void {
@@ -556,8 +564,27 @@ function discardGroup(ops: DirectorOp[]): void {
         <PanelRightClose :size="10" />
       </AppButton>
     </template>
-
     <div class="flex h-full min-h-0 flex-col">
+      <CreationTaskCard
+        ref="creationCard"
+        :pid="pid"
+        @applied="emit('applied')"
+        @settled="refreshCreationHistory"
+      />
+      <label class="text-fg-3 mx-2 my-1 flex shrink-0 items-center gap-2 text-xs"
+        >本次目标
+        <select
+          v-model="creationGoal"
+          :disabled="locked"
+          class="bg-base-2 border-line-1 text-fg-1 min-w-0 flex-1 rounded border px-2 py-1"
+        >
+          <option value="auto">自动识别</option>
+          <option value="screenplay">编写完整剧本</option>
+          <option value="storyboard">制作完整分镜</option>
+          <option value="chat">讨论与局部修改</option>
+        </select>
+      </label>
+
       <!-- 没配 LLM：一条引导，不是红叉。手动编排本来就能走完全程 -->
       <div v-if="director.history && !director.configured" class="min-h-0 flex-1 overflow-auto p-2">
         <EmptyState
@@ -649,13 +676,19 @@ function discardGroup(ops: DirectorOp[]): void {
                   class="text-fg-4 shrink-0"
                 />
                 <Wand :size="10" class="text-accent shrink-0" />
-                <span class="text-fg-3 min-w-0 flex-1 truncate text-2xs" :title="proposalSummary(turn)">
+                <span
+                  class="text-fg-3 min-w-0 flex-1 truncate text-2xs"
+                  :title="proposalSummary(turn)"
+                >
                   AI 改动 · {{ opsOf(turn).length }} 处
                   <span class="text-fg-4">{{ proposalSummary(turn) }}</span>
                 </span>
               </button>
               <!-- 展开：按对象分组，每条画 before → after（只读，没有采用 / 丢弃） -->
-              <div v-if="isTurnOpen(turn.id)" class="space-y-1.5 border-t border-line-1 px-2 py-1.5">
+              <div
+                v-if="isTurnOpen(turn.id)"
+                class="space-y-1.5 border-t border-line-1 px-2 py-1.5"
+              >
                 <div v-for="g in proposalGroupsOf(turn)" :key="g.target" class="space-y-1">
                   <AppBadge tone="accent">{{ g.label }} · {{ g.ops.length }} 条</AppBadge>
                   <div
@@ -675,9 +708,14 @@ function discardGroup(ops: DirectorOp[]): void {
                       </span>
                       <div class="min-w-0 flex-1">
                         <p v-if="op.before" class="text-fg-4 break-words">
-                          {{ isLong(row.from) && !isOpen(keyOf(op, row)) ? clip(row.from) : row.from }}
+                          {{
+                            isLong(row.from) && !isOpen(keyOf(op, row)) ? clip(row.from) : row.from
+                          }}
                         </p>
-                        <p class="break-words" :class="row.changed ? 'text-accent-hi' : 'text-fg-3'">
+                        <p
+                          class="break-words"
+                          :class="row.changed ? 'text-accent-hi' : 'text-fg-3'"
+                        >
                           <span v-if="op.before" class="text-fg-4">→ </span
                           >{{ isLong(row.to) && !isOpen(keyOf(op, row)) ? clip(row.to) : row.to }}
                         </p>
@@ -695,7 +733,11 @@ function discardGroup(ops: DirectorOp[]): void {
                       </div>
                     </div>
                     <ul v-if="op.warnings.length" class="space-y-px">
-                      <li v-for="w in op.warnings" :key="w" class="text-st-review text-2xs break-words">
+                      <li
+                        v-for="w in op.warnings"
+                        :key="w"
+                        class="text-st-review text-2xs break-words"
+                      >
                         · {{ w }}
                       </li>
                     </ul>
@@ -975,7 +1017,9 @@ function discardGroup(ops: DirectorOp[]): void {
               <p v-if="st.images_dropped" class="text-fg-4 text-2xs">
                 按设置摘掉了 {{ st.images_dropped }} 句「长什么样」：这一趟不出参考图。
               </p>
-              <p v-if="st.warning" class="text-st-review text-2xs break-words">· {{ st.warning }}</p>
+              <p v-if="st.warning" class="text-st-review text-2xs break-words">
+                · {{ st.warning }}
+              </p>
               <div
                 v-if="st.error"
                 class="border-st-failed/40 bg-st-failed/5 border px-1.5 py-1 space-y-0.5"
@@ -991,7 +1035,9 @@ function discardGroup(ops: DirectorOp[]): void {
             <!-- 参考图：排了几张，或者为什么没排。**跳过不是失败，但必须说出来** -->
             <p class="text-fg-4 text-2xs">
               参考图：<template v-if="director.lastAutopilot.images.queued"
-                >已排 {{ director.lastAutopilot.images.queued }} 张进队列，进度在底部控制台的任务框里看</template
+                >已排
+                {{ director.lastAutopilot.images.queued }}
+                张进队列，进度在底部控制台的任务框里看</template
               >
               <template v-else-if="!director.lastAutopilot.images.auto"
                 >这一趟按设置没让它出图</template
@@ -1161,18 +1207,6 @@ function discardGroup(ops: DirectorOp[]): void {
               <input v-model="onlyChanged" type="checkbox" class="accent-accent h-3 w-3" />
               只看变化的
             </label>
-            <!--
-              一键全流程会把输入框里那段原文存进工程。工程里已经有一份而且不一样时后端
-              **不覆盖**，报错并给两条出路——这颗勾就是其中一条，所以只在真有话要发时才出现。
-            -->
-            <label
-              v-if="director.autoApply && draft.trim()"
-              class="text-fg-4 flex items-center gap-1 text-2xs"
-              title="工程里已经存着一份剧本原文时，一键全流程默认不动它（报错并让你选）。勾上就用输入框里这段替换掉"
-            >
-              <input v-model="replaceScript" type="checkbox" class="accent-accent h-3 w-3" />
-              用这段替换工程里的剧本原文
-            </label>
             <AppButton
               v-if="director.hasPending"
               size="sm"
@@ -1200,16 +1234,11 @@ function discardGroup(ops: DirectorOp[]): void {
               -->
               <AppButton
                 size="sm"
-                :disabled="
-                  !director.autoApply ||
-                  director.autopiloting ||
-                  director.streaming ||
-                  director.busy
-                "
-                :title="autopilotHint"
+                :disabled="locked || director.autopiloting || director.streaming || director.busy"
+                :title="'持续完成剧本与全部分镜；未开启免确认时先交付完整草稿审阅'"
                 @click="autopilot()"
               >
-                <Wand :size="10" />{{ director.autopiloting ? '全流程跑着…' : '一键全流程' }}
+                <Wand :size="10" />制作完整分镜
               </AppButton>
               <AppButton
                 v-if="director.streaming"

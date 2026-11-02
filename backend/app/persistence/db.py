@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from pathlib import Path
 
 from sqlalchemy import MetaData, event, text
@@ -50,15 +51,41 @@ class Database:
         _apply_pragmas(self.engine)
         self._sessionmaker = async_sessionmaker(self.engine, expire_on_commit=False)
         self._write_lock = asyncio.Lock()
+        self._atomic_session: ContextVar[tuple | None] = ContextVar("atomic_session", default=None)
+
+    def _active_session(self) -> AsyncSession | None:
+        current = self._atomic_session.get()
+        return current[0] if current and current[1] is asyncio.current_task() else None
+
+    @asynccontextmanager
+    async def atomic(self) -> AsyncIterator[AsyncSession]:
+        """Compose existing services into one transaction in this task only."""
+        if self._active_session() is not None:
+            yield self._active_session()
+            return
+        async with self.write() as session:
+            token = self._atomic_session.set((session, asyncio.current_task()))
+            try:
+                yield session
+            finally:
+                self._atomic_session.reset(token)
 
     @asynccontextmanager
     async def read(self) -> AsyncIterator[AsyncSession]:
+        if session := self._active_session():
+            await session.flush()
+            yield session
+            return
         async with self._sessionmaker() as session:
             yield session
 
     @asynccontextmanager
     async def write(self) -> AsyncIterator[AsyncSession]:
         """写事务：串行化 + 自动提交/回滚。"""
+        if session := self._active_session():
+            yield session
+            await session.flush()
+            return
         async with self._write_lock, self._sessionmaker() as session:
             try:
                 from app.services.access import access, expected_revision

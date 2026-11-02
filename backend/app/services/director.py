@@ -1086,6 +1086,21 @@ class DirectorService:
                 patch = {k: shot.get(k) for k in self.SHOT_PATCH_KEYS}
                 patch["intent_json"] = dump_json(shot.get("intent") or {})
                 created = await story.create_shot(pid, row["id"], patch)
+                if shot.get("creation_props"):
+                    props_by_name = {p["name"]: p["id"] for p in await world.list_props(pid)}
+                    await story.set_shot_props(
+                        pid,
+                        created["id"],
+                        [
+                            {"prop_id": props_by_name[name], "state": "present"}
+                            for name in shot["creation_props"]
+                        ],
+                    )
+                if shot.get("frame_plan"):
+                    from app.services.frame_authoring import frames
+
+                    for frame in shot["frame_plan"]:
+                        await frames.create(pid, created["id"], frame)
                 made += 1
                 ids, pending = _split_ids(shot.get("cast"), "appearance_id")
                 if ids:

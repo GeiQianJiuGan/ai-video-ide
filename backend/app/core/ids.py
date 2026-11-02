@@ -5,6 +5,7 @@ from __future__ import annotations
 from ulid import ULID
 
 PREFIX = {
+    "creation_run": "crn",
     "frame": "frm",
     "candidate": "fvc",
     "project": "prj",

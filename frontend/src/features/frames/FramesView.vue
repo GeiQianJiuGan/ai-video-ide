@@ -6,8 +6,10 @@ import { assetsApi, type Asset } from '@/shared/api/assets'
 import { storyApi, type StoryboardLane } from '@/shared/api/story'
 import { generationApi, JOB_STATUS_LABEL, type GenerationVersion } from '@/shared/api/generation'
 import { fileUrl } from '@/shared/api/files'
+import { useShellStore } from '@/stores/shell'
 
 const route = useRoute()
+const shell = useShellStore()
 const pid = computed(() => String(route.params.pid || ''))
 const lanes = ref<StoryboardLane[]>([])
 const sid = ref('')
@@ -231,6 +233,19 @@ watch(
       if (first) await selectShot(first.id)
     }),
   { immediate: true },
+)
+watch(
+  () => shell.appliedTick,
+  () => {
+    void act(async () => {
+      await save()
+      lanes.value = await storyApi.storyboard(pid.value)
+      if (!sid.value || !shots.value.some((s) => s.id === sid.value)) {
+        const first = shots.value.find((s) => s.kind !== 'transition')
+        if (first) await selectShot(first.id)
+      } else await refresh()
+    })
+  },
 )
 const timer = window.setInterval(() => {
   if (!busy.value && sid.value) void refresh().catch(showError)

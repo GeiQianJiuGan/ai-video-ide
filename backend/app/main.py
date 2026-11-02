@@ -22,8 +22,8 @@ from app.api import describe as describe_api
 from app.api import director as director_api
 from app.api import dub as dub_api
 from app.api import files as files_api
-from app.api import fs as fs_api
 from app.api import frames as frames_api
+from app.api import fs as fs_api
 from app.api import generation as generation_api
 from app.api import images as images_api
 from app.api import ingest as ingest_api
@@ -82,6 +82,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         handshake=settings.require_handshake,
     )
     yield
+    from app.services.creation import creation
+
+    await creation.shutdown()
     # 关闭所有工程库：SQLite WAL 需要正常 dispose 才会把 -wal 合并回主文件
     await projects.close_all()
     await global_registry.close()

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from app.persistence.models import Project, utc_now
 from app.persistence.models_cast import INHERITABLE, Appearance, Character, SheetVersion
+from app.persistence.models_creation import CreationRun
 from app.persistence.models_edit import (
     ExportRecord,
     Timeline,
@@ -56,6 +57,7 @@ __all__ = [
     "FrameWorkspace",
     "FrameCard",
     "FrameCandidate",
+    "CreationRun",
     "CAPABILITIES",
     "INHERITABLE",
     "JOB_STATUS",

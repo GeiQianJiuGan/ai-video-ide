@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, File, UploadFile
 from fastapi.responses import StreamingResponse
@@ -34,6 +34,45 @@ from pydantic import BaseModel, Field
 from app.services.director import director
 
 router = APIRouter(tags=["director"])
+
+
+class CreationBody(BaseModel):
+    message: str = Field(default="", max_length=100000)
+    goal: Literal["screenplay", "storyboard"] = "screenplay"
+    mode: Literal["direct", "frames"] = "direct"
+    attachments: list[dict[str, Any]] = Field(default_factory=list)
+
+
+@router.post("/projects/{pid}/director/tasks", status_code=201)
+async def start_creation(pid: str, body: CreationBody) -> dict[str, Any]:
+    from app.services.creation import creation
+    from app.services.director import compose_message
+
+    message = compose_message(body.message, body.attachments)
+    return await creation.start(pid, message, body.goal, body.mode)
+
+
+@router.get("/projects/{pid}/director/tasks/latest")
+async def latest_creation(pid: str) -> dict[str, Any] | None:
+    from app.services.creation import creation
+
+    return await creation.latest(pid)
+
+
+@router.get("/projects/{pid}/director/tasks/{rid}")
+async def get_creation(pid: str, rid: str) -> dict[str, Any]:
+    from app.services.creation import creation
+
+    return await creation.get(pid, rid)
+
+
+@router.post("/projects/{pid}/director/tasks/{rid}/{action}")
+async def control_creation(
+    pid: str, rid: str, action: Literal["pause", "resume", "apply", "discard"]
+) -> dict[str, Any]:
+    from app.services.creation import creation
+
+    return await creation.control(pid, rid, action)
 
 
 class Attachment(BaseModel):

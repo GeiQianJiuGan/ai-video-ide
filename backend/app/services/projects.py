@@ -457,6 +457,9 @@ class ProjectService:
         from app.services.generation import generation
 
         await generation.stop_pump(pid)
+        from app.services.creation import creation
+
+        await creation.stop_project(pid)
         self._open.pop(pid, None)
         await proj.db.close()
         log.info("project.closed", id=pid)
