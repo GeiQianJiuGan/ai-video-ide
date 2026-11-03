@@ -182,7 +182,7 @@ def test_cross_shot_frames_and_missing_inputs_are_rejected(client, pid):
     response = client.post(f"{root}/shots/{other}/frame-video/generate", json=body)
     assert response.status_code == 422
     assert (
-        client.post(f"{root}/shots/{sid}/frame-video/generate", json={"prompt": "Move"}).status_code
+        client.post(f"{root}/shots/{other}/frame-video/generate", json={"prompt": "Move"}).status_code
         == 422
     )
     assert (

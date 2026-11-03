@@ -11,7 +11,7 @@
  * 三个刻意的取舍：
  *   1. **`scope` 由当前路由派生，不让用户选**。它只影响后端拼系统提示词里那一句
  *      「用户现在在哪一页」（`SCOPE_HINT`，不落库、不分会话），所以「在哪儿就是哪个 scope」
- *      是唯一说得通的口径；多一个下拉只会让人以为换了会话。剧本页 → `script`，其余 → `flow`。
+ *      是唯一说得通的口径；多一个下拉只会让人以为换了会话。制帧页单独传出图或视频上下文。
  *   2. **一个实例，一份会话**。两页各挂一个的做法在停靠栏时代会同时活着两个组件、
  *      共用一个 store，同一段话画两遍。所以那两页的内嵌栏已经撤掉，改成打开这一栏。
  *   3. **落库后不由这一栏去重拉页面**：它不知道此刻开着哪一页。改成
@@ -22,17 +22,39 @@ import { useRoute } from 'vue-router'
 import DirectorPanel from '@/features/director/DirectorPanel.vue'
 import type { DirectorScope } from '@/shared/api/director'
 import { useShellStore } from '@/stores/shell'
+import { loadProductionMode } from '@/app/productionNavigation'
 
 defineProps<{ projectId: string | null }>()
 
 const route = useRoute()
 const shell = useShellStore()
 
-/** 剧本页是「讲剧情、拆幕镜」，其余页面都更像「改结构」。 */
-const scope = computed<DirectorScope>(() => (route.name === 'story' ? 'script' : 'flow'))
+/** 制帧两页必须明确告诉导演当前修改的是画面出图还是帧图生成视频。 */
+const scope = computed<DirectorScope>(() => {
+  if (route.name === 'story') return 'script'
+  if (route.name === 'frames') return 'frames'
+  if (route.name === 'frame-video') return 'frame-video'
+  if (route.name === 'storyboard') {
+    const explicit = route.query.production
+    const mode =
+      explicit === 'frames' || explicit === 'direct'
+        ? explicit
+        : loadProductionMode(String(route.params.pid || ''))
+    if (mode === 'frames') return 'frame-video'
+  }
+  return 'flow'
+})
 
 /** chip 只把话填进输入框，所以按当前这一页给最顺手的那几句。 */
 const QUICK: Record<DirectorScope, string[]> = {
+  frames: [
+    '为制作图片的每个画面补上对应人物和场景的参考图，保留已有参考',
+    '检查制作图片中各画面的参考图是否齐全',
+  ],
+  'frame-video': [
+    '检查制帧分镜是否引用本镜头制作图片中已采用的帧图',
+    '检查哪些镜头还缺待制作或待采用的帧图',
+  ],
   script: [
     '我讲一段剧情，你拆成幕和镜头：',
     '按现在这几幕往下接一幕',
@@ -48,6 +70,8 @@ const QUICK: Record<DirectorScope, string[]> = {
 }
 
 const PLACEHOLDER: Record<DirectorScope, string> = {
+  frames: '描述要修改的图片画面或参考图。Enter 发送，Shift+Enter 换行',
+  'frame-video': '描述帧图之间的动作或需要检查的输入。Enter 发送，Shift+Enter 换行',
   script: '讲讲这段戏要什么。Enter 发送，Shift+Enter 换行',
   flow: '要它做什么？Enter 发送，Shift+Enter 换行',
 }

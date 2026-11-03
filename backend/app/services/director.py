@@ -1068,6 +1068,20 @@ class DirectorService:
         name = str(op["op"])
         after = op.get("after") or {}
         sid = str(op.get("scene_id") or "")
+        if name == "update_frame_card":
+            from app.domain.frames import FrameCardPatch
+            from app.services.frame_authoring import frames, invalid
+
+            shot_id = str(op.get("shot_id") or "")
+            card_id = str(op.get("card_id") or "")
+            workspace = await frames.get(pid, shot_id)
+            if not any(c["id"] == card_id for c in workspace["cards"]):
+                raise invalid("画面不属于本镜头，请刷新后重新提案。")
+            patch = FrameCardPatch.model_validate(
+                {k: after[k] for k in ("title", "story", "prompt", "role", "refs") if k in after}
+            ).model_dump(exclude_none=True)
+            row = await frames.update(pid, card_id, patch)
+            return {"shot_id": shot_id, "card_id": card_id, "title": row["title"]}
 
         if name == "update_screenplay":
             text = str(after.get("screenplay_md") or "")

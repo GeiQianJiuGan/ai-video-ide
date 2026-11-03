@@ -18,13 +18,18 @@
 import { ApiError, api, type ErrorPayload } from './client'
 
 /** 用户现在开着哪一页。只影响后端拼系统提示词的那一句，不落库。 */
-export type DirectorScope = 'script' | 'flow'
+export type DirectorScope = 'script' | 'flow' | 'frames' | 'frame-video'
 
 /**
  * 提案里的字段名在界面上叫什么。**放在这里而不是组件里**：剧本页与流程图页共用同一个
  * 协作栏组件，这份口径也得只有一处。对不上的直接显示原名，不猜。
  */
 export const OP_FIELD_LABEL: Record<string, string> = {
+  refs: '图片参考图',
+  reference_labels: '图片参考图',
+  card_title: '画面',
+  story: '画面剧情',
+  role: '画面用途',
   title: '标题',
   summary: '概要',
   time_of_day: '时间',
@@ -80,6 +85,7 @@ export const OP_FIELD_LABEL: Record<string, string> = {
 
 /** 写工具名 = 提案的 op。用户丢弃一条时，前端把它改成 'reject'。 */
 export const DIRECTOR_OPS = [
+  'update_frame_card',
   'update_screenplay',
   'add_scene',
   'update_scene',
@@ -104,6 +110,7 @@ export type DirectorOpName = (typeof DIRECTOR_OPS)[number]
 
 /** 每种提案在界面上叫什么。文案在这里写一遍，别在组件里散着写。 */
 export const OP_LABEL: Record<string, string> = {
+  update_frame_card: '修改制作图片画面',
   update_screenplay: '维护剧本',
   add_scene: '加一幕',
   update_scene: '改这一幕',

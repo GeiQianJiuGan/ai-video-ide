@@ -37,6 +37,7 @@ from typing import Any
 from app.ai import prompts, skills
 from app.ai.llm import client as llm
 from app.core.errors import AppError, ErrorCode
+from app.domain.frames import FrameCardPatch
 from app.generation import intent as gen_intent
 from app.generation.providers import registry
 from app.generation.providers.base import DESC_MAX
@@ -51,6 +52,7 @@ from app.services.describe import (
     NO_VISION_ASK,
     describe,
 )
+from app.services.frame_authoring import frames
 from app.services.images import images
 from app.services.sequence import sequence
 from app.services.story import story
@@ -121,6 +123,32 @@ SHOT_PLAIN_PARAMS: dict[str, dict[str, Any]] = {
 #: 工具白名单。模型只能调这里面的东西——名字不在这张表里直接报错，
 #: 不去猜「它大概是想调 add_scene」。
 TOOLS: dict[str, dict[str, Any]] = {
+    "get_frame_workspace": {
+        "kind": "read",
+        "desc": "读取本镜头在制帧 → 制作图片中的全部画面、逐帧故事、图片提示词、参考图及已采用帧，并读取制帧视频输入。",
+        "params": {"shot_id": {"type": "string"}},
+        "required": ["shot_id"],
+    },
+    "list_frame_reference_materials": {
+        "kind": "read",
+        "desc": "列出制作图片可用的人物形象、场景变体、道具设定图，包含名称、asset_id、文件是否可用和出图参考容量。将 asset_id 写入画面的 refs 才会用于生成图片。",
+        "params": {},
+    },
+    "update_frame_card": {
+        "kind": "write",
+        "desc": "提议修改制作图片中的一个画面。refs 是该画面生成图片时实际使用的有序参考图 asset_id 完整清单；补图时保留已有 refs，空数组表示清空。不会修改直出分镜，也不会自动生成图片。",
+        "params": {
+            "shot_id": {"type": "string"},
+            "card_id": {"type": "string"},
+            "title": {"type": "string", "minLength": 1, "maxLength": 200},
+            "story": {"type": "string"},
+            "prompt": {"type": "string", "description": "用于生成这张静态画面的图片提示词"},
+            "role": {"type": "string", "enum": ["first", "key", "last"]},
+            "refs": {"type": "array", "items": {"type": "string"}},
+            "why": {"type": "string"},
+        },
+        "required": ["shot_id", "card_id"],
+    },
     "list_characters": {
         "kind": "read",
         "desc": (
@@ -616,6 +644,23 @@ def _look_next_step(source: str) -> str:
 async def run_read(pid: str, name: str, args: dict[str, Any]) -> Any:
     """执行一个读工具。返回值直接回给模型，所以只给它需要的字段——
     把整张表塞回去只会挤爆上下文，还让它更容易挑错 id。"""
+    if name == "get_frame_workspace":
+        shot_id = str(args.get("shot_id") or "")
+        shot = await story.get_shot(pid, shot_id)
+        workspace = await frames.get(pid, shot_id)
+        return {
+            "shot": {k: shot[k] for k in ("id", "scene_id", "title", "description", "duration")},
+            "video": workspace["video"],
+            "cards": [
+                {
+                    k: c[k]
+                    for k in ("id", "title", "story", "prompt", "role", "refs", "adopted_asset_id")
+                }
+                for c in workspace["cards"]
+            ],
+        }
+    if name == "list_frame_reference_materials":
+        return await frames.reference_materials(pid)
     if name == "list_characters":
         out = []
         for char in await cast.list_characters(pid):
@@ -1165,6 +1210,7 @@ async def _shot_after(
 
 #: 每个写工具动的是哪一类东西。前端按 target 分组显示提案，所以这张表是它的唯一来源。
 _TARGET = {
+    "update_frame_card": "frame_card",
     "update_screenplay": "story",
     "set_link": "link",
     "add_shot": "shot",
@@ -1246,6 +1292,49 @@ async def to_op(
         "why": why,
         "warnings": [],
     }
+
+    if name == "update_frame_card":
+        shot_id = str(args.get("shot_id") or "")
+        card_id = str(args.get("card_id") or "")
+        workspace = await frames.get(pid, shot_id)
+        card = next((c for c in workspace["cards"] if c["id"] == card_id), None)
+        if card is None:
+            raise AppError(
+                ErrorCode.NOT_FOUND,
+                "没有这个制作图片画面",
+                card_id,
+                ["先用 get_frame_workspace 读取本镜头的画面 id"],
+            )
+        patch = FrameCardPatch.model_validate(
+            _clean(args, ("title", "story", "prompt", "role", "refs"))
+        ).model_dump(exclude_none=True)
+        if "refs" in patch:
+            patch["refs"] = list(dict.fromkeys(patch["refs"]))
+            for aid in patch["refs"]:
+                await frames.image(pid, aid)
+            materials = await frames.reference_materials(pid)
+            labels = {
+                r["asset_id"]: r["label"]
+                for rows in materials["groups"].values()
+                for r in rows
+                if r["asset_id"]
+            }
+            patch["reference_labels"] = [labels.get(aid, aid) for aid in patch["refs"]]
+            cap = materials["provider"]["max_refs"]
+            if cap is not None and len(patch["refs"]) > cap:
+                op["warnings"].append(
+                    f"当前图片服务最多接收 {cap} 张参考图，超出的尾部参考不会提交。"
+                )
+        op["shot_id"] = shot_id
+        op["card_id"] = card_id
+        op["before"] = {
+            "card_title": card["title"],
+            **{k: card[k] for k in patch if k != "reference_labels"},
+        }
+        if "reference_labels" in patch:
+            op["before"]["reference_labels"] = [labels.get(aid, aid) for aid in card["refs"]]
+        op["after"] = {"card_title": card["title"], **patch}
+        return op
 
     if name == "update_screenplay":
         text = str(args.get("screenplay_md") or "")

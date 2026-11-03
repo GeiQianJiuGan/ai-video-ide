@@ -3,6 +3,7 @@ import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { onBeforeRouteLeave, onBeforeRouteUpdate, useRoute } from 'vue-router'
 import {
   framesApi,
+  frameVideoDraft,
   FRAME_ROLE_LABEL,
   type FrameCard,
   type FramePlan,
@@ -120,6 +121,7 @@ async function refresh() {
   cards.value = ws.cards
   assets.value = all
   versions.value = vs
+  if (!dirty.value) video.value = frameVideoDraft(ws.video, shot.value?.duration || 4)
 }
 function loadCard() {
   const c = selected.value
@@ -318,7 +320,10 @@ watch(
       if (!sid.value || !shots.value.some((s) => s.id === sid.value)) {
         const first = shots.value.find((s) => s.kind !== 'transition')
         if (first) await selectShot(first.id)
-      } else await refresh()
+      } else {
+        await refresh()
+        if (!dirty.value) loadCard()
+      }
     })
   },
 )

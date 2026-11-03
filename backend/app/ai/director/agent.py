@@ -84,7 +84,7 @@ def _fallback_system(scope: str = "flow") -> str:
     return f"{prompts.director(scope)}\n\n{FALLBACK_SHAPE % lines}"
 
 
-async def _snapshot(pid: str) -> str:
+async def _snapshot(pid: str, *, include_frames: bool = False) -> str:
     """退化路径用：模型没法自己查，就把现状喂给它。
 
     **剧本原文的开头一段也塞进来**：这条路没有 `read_script`，不给它原文就只能凭空编。
@@ -99,6 +99,19 @@ async def _snapshot(pid: str) -> str:
         #: （update_screenplay 是整份替换，看不到现状就会把它冲成一行增量）。
         "screenplay": await run_read(pid, "read_screenplay", {}),
     }
+    if include_frames:
+        from app.persistence.models_frames import FrameCard
+        from app.services.base import db_of, fetch_all
+
+        data["frame_reference_materials"] = await run_read(
+            pid, "list_frame_reference_materials", {}
+        )
+        # 只读已有画面的镜头，避免普通拆剧本请求逐镜加载制作输入。
+        shot_ids = list(dict.fromkeys(c.shot_id for c in await fetch_all(db_of(pid), FrameCard)))
+        data["frame_workspaces"] = [
+            {"shot_id": sid, **await run_read(pid, "get_frame_workspace", {"shot_id": sid})}
+            for sid in shot_ids
+        ]
     try:
         head = await run_read(pid, "read_script", {"offset": 0, "limit": FALLBACK_SCRIPT_CHARS})
     except Exception:  # noqa: BLE001 —— 没存剧本原文很正常，不是失败
@@ -424,9 +437,13 @@ async def _without_tools(
     协作栏那一侧于是不用为两条路各写一份渲染。
     """
     try:
+        include_frames = scope in ("frames", "frame-video") or any(
+            word in message for word in ("制帧", "制作图片", "帧图")
+        )
+        snapshot = await _snapshot(pid, include_frames=include_frames)
         data = await llm.complete_json(
             _fallback_system(scope),
-            f"工程现状：\n{await _snapshot(pid)}\n\n用户的要求：{message}",
+            f"工程现状：\n{snapshot}\n\n用户的要求：{message}",
         )
     except Exception as exc:  # noqa: BLE001
         log.warning("without_tools complete_json failed: %s", exc)

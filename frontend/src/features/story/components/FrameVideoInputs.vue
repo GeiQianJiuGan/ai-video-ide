@@ -5,8 +5,10 @@ import { frameVideoDraft, framesApi, type FrameCard, type FrameVideo } from '@/s
 import { assetsApi, type Asset } from '@/shared/api/assets'
 import { fileUrl } from '@/shared/api/files'
 import AppButton from '@/shared/ui/AppButton.vue'
+import { useShellStore } from '@/stores/shell'
 
 const props = defineProps<{ pid: string; shotId: string; duration: number }>()
+const shell = useShellStore()
 const cards = ref<FrameCard[]>([])
 const assets = ref<Asset[]>([])
 const video = ref<FrameVideo>(frameVideoDraft({}, props.duration))
@@ -72,7 +74,7 @@ async function changed() {
   }
 }
 watch(
-  () => [props.pid, props.shotId],
+  () => [props.pid, props.shotId, shell.appliedTick],
   async () => {
     const ticket = ++request
     loading.value = true

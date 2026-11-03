@@ -203,8 +203,23 @@ class FrameService:
         cards.sort(key=lambda c: (c.position, c.id))
         candidates = await fetch_all(db, FrameCandidate, order_by=FrameCandidate.id)
         jobs = await fetch_all(db, Job, where=Job.target_kind == "frame_card")
+        video = load_json(rows[0].video_json, {}) if rows else {}
+        # 默认跟随本镜头的画面；只读解析，不写回草稿，也不自动采用候选。
+        if not video.get("first_card_id"):
+            first = next((c for c in cards if c.role == "first"), None) or next(
+                (c for c in cards if c.adopted_asset_id), None
+            )
+            if first is not None and first.adopted_asset_id:
+                video["first_card_id"] = first.id
+        # 已明确选择「仅使用首帧」的空串必须保留。
+        if "last_card_id" not in video:
+            last = next(
+                (c for c in reversed(cards) if c.role == "last" and c.adopted_asset_id), None
+            )
+            if last is not None:
+                video["last_card_id"] = last.id
         return {
-            "video": load_json(rows[0].video_json, {}) if rows else {},
+            "video": video,
             "cards": [
                 {
                     **as_dict(c),
@@ -296,6 +311,10 @@ class FrameService:
         from app.services.generation import generation
 
         shot = await fetch(db_of(pid), Shot, sid, "镜头")
+        workspace = await self.get(pid, sid)
+        data = {"prompt": "", "duration": shot.duration, **workspace["video"], **data}
+        if not data.get("first_card_id"):
+            data["first_card_id"] = workspace["video"].get("first_card_id", "")
         frozen = {
             "prompt": data["prompt"],
             "duration": data["duration"],

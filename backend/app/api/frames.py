@@ -6,6 +6,7 @@ from fastapi import APIRouter
 from pydantic import BaseModel, Field
 
 from app.ai.frame_plan import FramePlanDraft
+from app.domain.frames import FrameCardPatch as CardPatch
 from app.persistence.models_frames import FrameCard, FrameWorkspace
 from app.persistence.models_gen import Job
 from app.services.base import db_of, dump_json, fetch, fetch_all, load_json
@@ -25,15 +26,6 @@ class CardCreate(BaseModel):
     prompt: str = ""
     story: str = ""
     role: Literal["first", "key", "last"] = "key"
-
-
-class CardPatch(BaseModel):
-    title: str | None = Field(default=None, min_length=1, max_length=200)
-    prompt: str | None = None
-    story: str | None = None
-    role: Literal["first", "key", "last"] | None = None
-    position: int | None = Field(default=None, ge=0)
-    refs: list[str] | None = None
 
 
 class AssetBody(BaseModel):
@@ -131,12 +123,12 @@ async def save_video(pid: str, sid: str, body: VideoBody) -> dict[str, Any]:
 
 @router.post("/projects/{pid}/shots/{sid}/frame-video/plan")
 async def plan(pid: str, sid: str, body: VideoBody) -> dict[str, Any]:
-    return await frames.video(pid, sid, body.model_dump())
+    return await frames.video(pid, sid, body.model_dump(exclude_unset=True))
 
 
 @router.post("/projects/{pid}/shots/{sid}/frame-video/generate", status_code=201)
 async def video(pid: str, sid: str, body: VideoBody) -> dict[str, Any]:
-    return await frames.video(pid, sid, body.model_dump(), enqueue=True)
+    return await frames.video(pid, sid, body.model_dump(exclude_unset=True), enqueue=True)
 
 
 @router.get("/projects/{pid}/frame-capabilities")

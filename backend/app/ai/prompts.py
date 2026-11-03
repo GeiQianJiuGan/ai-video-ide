@@ -403,6 +403,15 @@ def breakdown() -> str:
 #: 用户现在开着哪一页。**只影响这一次请求拼出来的系统提示词**，不落库、不加列——
 #: 同一个会话在剧本页与流程图页共用，换页不该让历史对话变味。
 SCOPE_HINT = {
+    "frames": (
+        "用户现在在**制帧 → 制作图片**页。用户说给画面加人物、场景或参考图，"
+        "指的是画面的出图 refs。先 get_scene 找镜头，再 get_frame_workspace 读每张画面，"
+        "list_frame_reference_materials 查可用设定图，用 update_frame_card 为每张画面写 refs。"
+    ),
+    "frame-video": (
+        "用户现在在**制帧 → 制帧分镜**页。视频默认引用本镜头在制作图片中已采用的帧图，"
+        "先 get_frame_workspace 检查输入；缺图时说明需要制作并采用候选。"
+    ),
     "script": (
         "用户现在在**剧本页**：左边是他和你的对话，右边是已落库的幕与镜头。"
         "**这一页没有剧本原文那一栏**——他要的是把嘴上说的剧情变成幕与镜头，"
@@ -437,8 +446,15 @@ def director(scope: str = "flow") -> str:
         "制帧叙事技能（read_skill 按需读取）：\n"
         + skills.frame_video_catalog()
         + "\n用户讨论制帧方案时先读取此技能，规划每张图对应的剧情、静态画面及视频动作。"
-        "完整分镜任务会保存逐帧计划；普通聊天工具只提交其明确支持的字段，"
-        "不能声称已保存帧卡或生成图片。规划技能不能用作 intent.skill 或视频渲染规范。"
+        "完整分镜任务会保存逐帧计划；已有画面用 get_frame_workspace 读取，"
+        "用 update_frame_card 修改逐帧故事、图片提示词和 refs。"
+        "用户要求给制作图片的画面添加人物、场景参考时，必须把对应设定图 asset_id 写入"
+        "每张画面的 refs；只改 update_shot.character_names 或幕的地点不等于给图片加了参考图。"
+        "从 list_frame_reference_materials 选择与画面剧情对应的可用人物、场景、道具图，"
+        "保留已有参考，不存在或不可用的图明确报告，不能编造 id。"
+        "没有画面时说明需先规划画面，不能声称已修改。仅写入参考不会生成图片。"
+        "制帧分镜的视频输入使用本镜头制作图片中已采用的帧；人物、场景设定图用于出图，"
+        "不直接作为制帧视频的首尾帧。规划技能不能用作 intent.skill 或视频渲染规范。"
     )
     hint = SCOPE_HINT.get(str(scope or "").strip(), SCOPE_HINT["flow"])
     return (

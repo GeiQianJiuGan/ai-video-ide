@@ -131,6 +131,7 @@ const filePicker = ref<HTMLInputElement | null>(null)
 
 /** 提案改的是什么对象。分组标题用它。 */
 const TARGET_LABEL: Record<string, string> = {
+  frame_card: '制作图片画面',
   story: '剧本',
   scene: '幕',
   shot: '镜头',
@@ -171,6 +172,7 @@ interface DiffRow {
 
 /** before / after 并成几行。id 那种给人看没意义的字段不进 Diff。 */
 const HIDDEN_KEYS = new Set([
+  'refs',
   'from_scene_id',
   'to_scene_id',
   'from_shot_id',

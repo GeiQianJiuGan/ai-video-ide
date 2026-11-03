@@ -93,7 +93,9 @@ class ChatBody(BaseModel):
     message: str = Field(description="想让 AI 做什么，例如「在第 2 幕后面加一幕雨夜追车」")
     #: 用户现在开着哪一页。**只影响这一次请求拼的系统提示词**那一句提示，不落库——
     #: 剧本页与幕流程图共用同一个会话，换页不该让历史对话变味。
-    scope: str = Field(default="flow", description="script（剧本页）/ flow（幕流程图页）")
+    scope: str = Field(
+        default="flow", description="script / flow / frames（制作图片）/ frame-video（制帧分镜）"
+    )
     #: 随这句话一起发来的附件（可空）。抽文字在 `attach` 端点做过了，这里只带结果。
     attachments: list[Attachment] = Field(default_factory=list)
 
