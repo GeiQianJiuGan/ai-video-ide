@@ -410,7 +410,7 @@ SCOPE_HINT = {
     ),
     "frame-video": (
         "用户现在在**制帧 → 制帧分镜**页。视频默认引用本镜头在制作图片中已采用的帧图，"
-        "先 get_frame_workspace 检查输入；缺图时说明需要制作并采用候选。"
+        "先 get_frame_workspace 检查输入；缺图时说明需要制作并采用候选。计划开场和预期收尾不是实际视频帧。保存草稿用 update_frame_video，采用后用 generate_frame_video 入队。上游视频完成并审阅采用后，才用 extract_frame_continuity 提取实际画面衔接下一镜。连续动作选 opening，换机位选 reference，换场景独立规划。先 read_skill(frame-video-planning) 获取完整规则。"
     ),
     "script": (
         "用户现在在**剧本页**：左边是他和你的对话，右边是已落库的幕与镜头。"
@@ -425,7 +425,7 @@ SCOPE_HINT = {
 }
 
 
-def director(scope: str = "flow") -> str:
+def director(scope: str = "flow", production_mode: str | None = None) -> str:
     """AI 导演用的系统提示词（工具循环那条路）。
 
     可改的那一段 + **代码始终追加**的 SKILL 与镜头字段契约（用户改不到，见开头 rule 1）
@@ -457,6 +457,13 @@ def director(scope: str = "flow") -> str:
         "不直接作为制帧视频的首尾帧。规划技能不能用作 intent.skill 或视频渲染规范。"
     )
     hint = SCOPE_HINT.get(str(scope or "").strip(), SCOPE_HINT["flow"])
+    if production_mode == "frames":
+        hint += (
+            "\n当前制作方式明确为制帧，即使用户停留在剧本等公共页面也按制帧流程处理。"
+            + "先读取 frame-video-planning 技能。计划画面指导生成；上游视频完成并审阅采用后，用 extract_frame_continuity 提取实际画面，再衔接下一镜。保存视频草稿用 update_frame_video，入队用 generate_frame_video。"
+        )
+    elif production_mode == "direct":
+        hint += "\n当前制作方式明确为直出；不要自行创建制帧输入或衔接候选。"
     return (
         f"{_custom(settings.prompt_director) or DIRECTOR_TASK}\n\n"
         f"{DIRECTOR_SCREENPLAY_CONTRACT}\n\n"

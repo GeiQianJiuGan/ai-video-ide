@@ -55,6 +55,30 @@ def normalize(skill: str) -> str:
 
 def render_h3(req: VideoRequest, book: PictureBook) -> str:
     """MiniMax H3 六段。主体逻辑在 `base.render_video_prompt`，这里只转调。"""
+    if req.extra.get("frame_pipeline"):
+        # 制帧的图片编号和时间锚点由本次实际图册决定，手写正文仍保留。
+        text = req.prompt.strip()
+        text = re.sub(
+            r"\A(?:For the target video,|How the reference pictures align)[^\n]*\n\s*", "", text
+        )
+        if re.search(r"(?m)^integrated_multimodal_description:", text):
+            shots = re.findall(r"\[Shot (\d+)\]", text)
+            final = f"[Shot {shots[-1]}]" if shots else "[Shot 1]"
+            first = book.of_role("first_frame")
+            last = book.of_role("last_frame")
+            # 草稿的 Picture 1/2 是首尾帧槽位，执行时转换为真实图册编号。
+            mapping = {1: first, 2: last}
+            text = re.sub(
+                r"<?Picture ([12])>?",
+                lambda m: mapping[int(m[1])].tag if mapping[int(m[1])] else m[0],
+                text,
+            )
+            align = base._align_line(book, "[Shot 1]", f"{req.duration:.2f}")
+            if first and last and final != "[Shot 1]":
+                head, tail = align.split(";", 1)
+                align = head + ";" + tail.replace("[Shot 1]", final)
+            return (align + "\n\n" if align else "") + text
+        req.shot_no = 1
     return base.render_video_prompt(req, book)
 
 
@@ -115,6 +139,7 @@ def render_prompt(skill: str, req: VideoRequest, book: PictureBook) -> str:
     # 手动填写的完整结构不再包进 detailed_description，避免产生两套嵌套字段。
     if (
         not req.intent
+        and not req.extra.get("frame_pipeline")
         and name == "minimax-h3"
         and re.search(
             r"(?m)^\s*(integrated_multimodal_description|subject_definitions):", req.prompt

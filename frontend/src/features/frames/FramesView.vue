@@ -30,6 +30,7 @@ const cards = ref<FrameCard[]>([])
 const cid = ref('')
 const assets = ref<Asset[]>([])
 const versions = ref<GenerationVersion[]>([])
+const optimizedPrompt = ref('')
 const video = ref<FrameVideo>({ prompt: '', duration: 4, first_card_id: '', last_card_id: '' })
 const title = ref('')
 const prompt = ref('')
@@ -39,9 +40,13 @@ const refs = ref<string[]>([])
 const imported = ref('')
 const preview = ref('')
 const compare = ref(false)
+const continuityShot = ref('')
+const continuityUse = ref<'opening' | 'reference'>('opening')
+const continuityAt = ref<number | ''>('')
 const error = ref('')
 const notice = ref('')
 const busy = ref(false)
+let refreshVersion = 0
 const dirty = ref(false)
 const plan = ref<FramePlan | null>(null)
 const narrativePlan = ref<FrameNarrativePlan | null>(null)
@@ -59,6 +64,35 @@ const images = computed(() =>
   assets.value.filter((a) => !a.missing && /\.(png|jpe?g|webp|bmp)$/i.test(a.path)),
 )
 const prepared = computed(() => cards.value.filter((c) => c.adopted_asset_id))
+const activeJobs = (card: FrameCard) =>
+  card.jobs.some((job) => ['queued', 'waiting', 'running'].includes(job.status))
+const missingCards = computed(() =>
+  cards.value.filter(
+    (card) =>
+      !card.adopted_asset_id && !card.candidates.length && card.prompt.trim() && !activeJobs(card),
+  ),
+)
+const selectedIndex = computed(() => cards.value.findIndex((card) => card.id === cid.value))
+const frameStatus = (card: FrameCard) =>
+  activeJobs(card)
+    ? '正在制作'
+    : card.adopted_asset_id
+      ? '已采用'
+      : card.candidates.length
+        ? '待审阅'
+        : card.prompt.trim()
+          ? '待生成'
+          : '待编写'
+const videoBlocker = computed(() =>
+  !video.value.prompt.trim()
+    ? '请填写视频动作与声音'
+    : !prepared.value.some((card) => card.id === video.value.first_card_id)
+      ? '请先制作并采用首帧图片'
+      : video.value.last_card_id &&
+          !prepared.value.some((card) => card.id === video.value.last_card_id)
+        ? '请先制作并采用尾帧图片'
+        : '',
+)
 const canPlan = computed(
   () =>
     cards.value.length <= 8 &&
@@ -90,15 +124,22 @@ const url = (aid: string | null) => {
   return a ? fileUrl(pid.value, a.path) : ''
 }
 const showError = (e: unknown) => {
-  error.value = e instanceof Error ? e.message + ('detail' in e ? `：${e.detail}` : '') : String(e)
+  error.value =
+    e instanceof Error
+      ? e.message +
+        ('detail' in e ? `：${e.detail}` : '') +
+        ('suggestions' in e && Array.isArray(e.suggestions) ? `。${e.suggestions.join('；')}` : '')
+      : String(e)
 }
 function edit() {
   dirty.value = true
   plan.value = null
+  optimizedPrompt.value = ''
 }
 async function act(fn: () => Promise<void>) {
   if (busy.value) return
   busy.value = true
+  refreshVersion++
   error.value = ''
   notice.value = ''
   try {
@@ -112,15 +153,20 @@ async function act(fn: () => Promise<void>) {
 async function refresh() {
   if (!sid.value) return
   const target = sid.value
-  const [ws, all, vs] = await Promise.all([
+  const revision = ++refreshVersion
+  const [ws, all, vs, extractedFrames] = await Promise.all([
     framesApi.get(pid.value, target),
     assetsApi.list(pid.value),
     generationApi.versions(pid.value, target),
+    assetsApi.list(pid.value, 'frame'),
   ])
-  if (target !== sid.value) return
+  if (target !== sid.value || revision !== refreshVersion) return
   cards.value = ws.cards
-  assets.value = all
+  assets.value = [...all, ...extractedFrames]
   versions.value = vs
+  if (!preview.value && selected.value)
+    preview.value =
+      selected.value.adopted_asset_id || selected.value.candidates.at(-1)?.asset_id || ''
   if (!dirty.value) video.value = frameVideoDraft(ws.video, shot.value?.duration || 4)
 }
 function loadCard() {
@@ -134,7 +180,8 @@ function loadCard() {
 }
 async function save() {
   if (!dirty.value || !sid.value) return
-  if (cid.value)
+  refreshVersion++
+  if (cid.value) {
     await framesApi.update(pid.value, cid.value, {
       title: title.value,
       prompt: prompt.value,
@@ -142,6 +189,16 @@ async function save() {
       role: frameRole.value,
       refs: refs.value,
     })
+    const card = selected.value
+    if (card)
+      Object.assign(card, {
+        title: title.value,
+        prompt: prompt.value,
+        story: frameStory.value,
+        role: frameRole.value,
+        refs: [...refs.value],
+      })
+  }
   await framesApi.saveVideo(pid.value, sid.value, video.value)
   dirty.value = false
 }
@@ -153,6 +210,10 @@ async function selectCard(id: string) {
 }
 async function selectShot(id: string) {
   await save()
+  optimizedPrompt.value = ''
+  continuityShot.value = ''
+  continuityAt.value = ''
+  preview.value = ''
   sid.value = id
   await storyState.selectShot(pid.value, id)
   plan.value = null
@@ -205,12 +266,7 @@ async function generateMissing() {
   let queued = 0
   const failures: string[] = []
   const warnings: string[] = []
-  for (const c of cards.value.filter(
-    (c) =>
-      !c.adopted_asset_id &&
-      c.prompt.trim() &&
-      !c.jobs.some((j) => ['queued', 'waiting', 'running'].includes(j.status)),
-  )) {
+  for (const c of missingCards.value) {
     try {
       const job = await framesApi.generate(pid.value, c.id)
       warnings.push(...job.plan.warnings.map((warning) => `${c.title}：${warning}`))
@@ -234,6 +290,7 @@ async function adopt(candidateId: string) {
   await refresh()
   loadCard()
   plan.value = null
+  optimizedPrompt.value = ''
 }
 async function removeCard() {
   await save()
@@ -244,6 +301,7 @@ async function removeCard() {
   cid.value = cards.value[0]?.id || ''
   loadCard()
   plan.value = null
+  optimizedPrompt.value = ''
 }
 async function move(delta: number) {
   await save()
@@ -275,6 +333,31 @@ async function upload(e: Event) {
     preview.value = a.id
   })
   input.value = ''
+}
+async function extractContinuity() {
+  await save()
+  const source = await storyApi.shot(pid.value, continuityShot.value)
+  if (!source.current_version_id) throw new Error('请先生成并采用来源镜头的视频。')
+  const result = await framesApi.continuity(pid.value, cid.value, {
+    source_version_id: source.current_version_id,
+    at: continuityAt.value === '' ? 'end' : continuityAt.value,
+    use: continuityUse.value,
+  })
+  await refresh()
+  loadCard()
+  preview.value = result.asset_id
+  notice.value =
+    result.message + (continuityAt.value === '' ? '' : ' 请在剪辑中将上一段裁至此位置。')
+}
+async function optimizeVideo() {
+  await save()
+  const result = await framesApi.optimize(pid.value, sid.value, video.value)
+  optimizedPrompt.value = result.prompt
+}
+function applyOptimizedPrompt() {
+  video.value.prompt = optimizedPrompt.value
+  optimizedPrompt.value = ''
+  edit()
 }
 async function videoPlan() {
   await save()
@@ -330,7 +413,10 @@ watch(
 const timer = window.setInterval(() => {
   if (!busy.value && sid.value) void refresh().catch(showError)
 }, 5000)
-onBeforeUnmount(() => window.clearInterval(timer))
+onBeforeUnmount(() => {
+  refreshVersion++
+  window.clearInterval(timer)
+})
 </script>
 
 <template>
@@ -379,7 +465,16 @@ onBeforeUnmount(() => window.clearInterval(timer))
       <main v-if="sid">
         <div class="shot-heading">
           <strong>{{ shot?.title }}</strong
-          ><span>{{ cards.length }} 个画面 · {{ prepared.length }} 个已选图</span>
+          ><span>{{ cards.length }} 个画面 · {{ prepared.length }} 个已采用</span>
+          <span
+            class="progress-track"
+            role="progressbar"
+            :aria-valuenow="prepared.length"
+            :aria-valuemax="Math.max(cards.length, 1)"
+            aria-valuemin="0"
+            aria-label="画面制作进度"
+            ><i :style="{ width: `${cards.length ? (prepared.length / cards.length) * 100 : 0}%` }"
+          /></span>
         </div>
         <p v-if="shot?.description" class="shot-story">镜头剧情：{{ shot.description }}</p>
         <template v-if="mode !== 'video'">
@@ -423,10 +518,10 @@ onBeforeUnmount(() => window.clearInterval(timer))
             >
             <button
               v-if="mode === 'frames'"
-              :disabled="busy || !cards.length"
+              :disabled="busy || !missingCards.length"
               @click="act(generateMissing)"
             >
-              批量生成缺失画面</button
+              补齐未生成画面（{{ missingCards.length }}）</button
             ><label v-if="mode === 'frames'"
               ><input v-model="compare" type="checkbox" /> 对比采用图与候选</label
             >
@@ -440,7 +535,11 @@ onBeforeUnmount(() => window.clearInterval(timer))
               @click="act(() => selectCard(c.id))"
             >
               <img v-if="url(c.adopted_asset_id)" :src="url(c.adopted_asset_id)" alt="采用的画面" />
-              <span>{{ c.title }} · {{ FRAME_ROLE_LABEL[c.role] }}</span>
+              <div v-if="!url(c.adopted_asset_id)" class="frame-placeholder">
+                {{ frameStatus(c) }}
+              </div>
+              <span>{{ c.title }}</span
+              ><small>{{ FRAME_ROLE_LABEL[c.role] }} · {{ frameStatus(c) }}</small>
               <span v-if="mode === 'planning'" class="frame-story">
                 {{ c.story || '待填写对应剧情' }}
               </span>
@@ -473,11 +572,17 @@ onBeforeUnmount(() => window.clearInterval(timer))
                   :key="v.id"
                   :class="{ active: preview === v.asset_id }"
                 >
+                  <small v-if="v.continuity" :class="{ error: v.continuity.stale }"
+                    >{{ v.continuity.stale ? '来源视频已改选，请重新提取' : '来自实际成片'
+                    }}{{ v.continuity.requires_trim ? ' · 需同步裁剪上游' : '' }}</small
+                  >
                   <button @click="preview = v.asset_id">
                     <img :src="url(v.asset_id)" :alt="`候选 ${i + 1}`" />候选 {{ i + 1 }}
                   </button>
                   <button
-                    :disabled="busy || selected.adopted_asset_id === v.asset_id"
+                    :disabled="
+                      busy || selected.adopted_asset_id === v.asset_id || v.continuity?.stale
+                    "
                     @click="act(() => adopt(v.id))"
                   >
                     {{ selected.adopted_asset_id === v.asset_id ? '已采用' : '采用此图' }}
@@ -485,7 +590,8 @@ onBeforeUnmount(() => window.clearInterval(timer))
                 </article>
               </div>
             </div>
-            <aside class="inspector">
+            <fieldset class="inspector" :disabled="busy">
+              <legend>画面设置</legend>
               <label>画面名称<input v-model="title" maxlength="200" @input="edit" /></label>
               <label
                 >叙事位置<select v-model="frameRole" @change="edit">
@@ -518,33 +624,78 @@ onBeforeUnmount(() => window.clearInterval(timer))
                   :disabled="busy"
                   @change="edit"
                 />
-                <button :disabled="busy || !prompt.trim()" @click="act(generate)">
-                  生成新候选
+                <button
+                  :disabled="busy || !prompt.trim() || activeJobs(selected)"
+                  class="primary-action"
+                  @click="act(generate)"
+                >
+                  {{ activeJobs(selected) ? '图片制作中…' : '生成新候选' }}
                 </button>
                 <button v-if="preview && !refs.includes(preview)" :disabled="busy" @click="derive">
                   以预览图为参考继续修改
                 </button>
-                <div class="row">
-                  <button :disabled="busy" @click="act(() => move(-1))">前移</button
-                  ><button :disabled="busy" @click="act(() => move(1))">后移</button
-                  ><button :disabled="busy" @click="act(removeCard)">移除画面（保留素材）</button>
-                </div>
-                <label
-                  >从项目素材添加<select v-model="imported">
-                    <option value="">选择图片</option>
-                    <option v-for="a in images" :key="a.id" :value="a.id">
-                      {{ a.description || a.path }}
-                    </option>
-                  </select></label
-                >
-                <button :disabled="busy || !imported" @click="act(attach)">添加为候选</button>
-                <label
-                  >上传画面<input
-                    type="file"
-                    accept="image/png,image/jpeg,image/webp,image/bmp"
-                    :disabled="busy"
-                    @change="upload"
-                /></label>
+                <details class="secondary-tools">
+                  <summary>承接已采用的视频画面</summary>
+                  <p>连续动作可直接采用实际结束画面；换机位时仅作为参考重新构图。</p>
+                  <label
+                    >来源镜头<select v-model="continuityShot">
+                      <option value="">选择已完成的上一镜</option>
+                      <option
+                        v-for="item in shots.filter((s) => s.id !== sid && s.kind !== 'transition')"
+                        :key="item.id"
+                        :value="item.id"
+                      >
+                        {{ item.title || '未命名镜头' }}
+                      </option>
+                    </select></label
+                  >
+                  <label
+                    >衔接方式<select v-model="continuityUse">
+                      <option value="opening">连续动作：追加开场候选</option>
+                      <option value="reference">换机位：参考后重新构图</option>
+                    </select></label
+                  >
+                  <label
+                    >取帧位置（秒，留空取实际结束画面）<input
+                      v-model.number="continuityAt"
+                      type="number"
+                      min="0"
+                      step="0.01"
+                      placeholder="视频末尾"
+                  /></label>
+                  <button :disabled="busy || !continuityShot" @click="act(extractContinuity)">
+                    提取实际衔接画面
+                  </button>
+                </details>
+                <details class="secondary-tools">
+                  <summary>导入图片与画面管理</summary>
+                  <div class="row">
+                    <button :disabled="busy || selectedIndex === 0" @click="act(() => move(-1))">
+                      前移</button
+                    ><button
+                      :disabled="busy || selectedIndex === cards.length - 1"
+                      @click="act(() => move(1))"
+                    >
+                      后移</button
+                    ><button :disabled="busy" @click="act(removeCard)">移除画面（保留素材）</button>
+                  </div>
+                  <label
+                    >从项目素材添加<select v-model="imported">
+                      <option value="">选择图片</option>
+                      <option v-for="a in images" :key="a.id" :value="a.id">
+                        {{ a.description || a.path }}
+                      </option>
+                    </select></label
+                  >
+                  <button :disabled="busy || !imported" @click="act(attach)">添加为候选</button>
+                  <label
+                    >上传画面<input
+                      type="file"
+                      accept="image/png,image/jpeg,image/webp,image/bmp"
+                      :disabled="busy"
+                      @change="upload"
+                  /></label>
+                </details>
                 <p v-for="j in selected.jobs" :key="j.id">
                   {{ JOB_STATUS_LABEL[j.status] || j.status }}
                   <small v-if="j.error_json">{{ j.error_json }}</small>
@@ -552,17 +703,22 @@ onBeforeUnmount(() => window.clearInterval(timer))
               </template>
               <div v-else class="row">
                 <button :disabled="busy" @click="act(() => move(-1))">前移</button>
-                <button :disabled="busy" @click="act(() => move(1))">后移</button>
+                <button
+                  :disabled="busy || selectedIndex === cards.length - 1"
+                  @click="act(() => move(1))"
+                >
+                  后移
+                </button>
                 <button :disabled="busy" @click="act(removeCard)">移除画面（保留素材）</button>
               </div>
-            </aside>
+            </fieldset>
           </div>
           <p v-else class="empty">
             为当前镜头添加开场、关键动作或收尾画面。每个画面可保存多个候选版本。
           </p>
           <p>画面按故事顺序排列。视频使用选定首帧及可选尾帧，关键状态仅作叙事参考。</p>
         </template>
-        <div v-if="mode !== 'frames'" class="video-editor">
+        <fieldset v-if="mode !== 'frames'" class="video-editor" :disabled="busy">
           <h2>视频动作与声音</h2>
           <p>为本镜头单独描述动作推进、运镜与声音，采用图片后即可生成视频。</p>
           <label v-if="config.provider === 'comfy_preset'"
@@ -580,7 +736,7 @@ onBeforeUnmount(() => window.clearInterval(timer))
             ><small>单独保存到制帧草稿，不改变原版制作的预设。</small></label
           >
           <label
-            >首帧<select v-model="video.first_card_id" @change="edit">
+            >开场画面<select v-model="video.first_card_id" @change="edit">
               <option value="">选择开场画面</option>
               <option v-for="c in cards" :key="c.id" :value="c.id">
                 {{ c.title }}{{ c.adopted_asset_id ? '' : '（待选图）' }}
@@ -588,7 +744,10 @@ onBeforeUnmount(() => window.clearInterval(timer))
             </select></label
           >
           <label
-            >尾帧（可选）<select v-model="video.last_card_id" @change="edit">
+            >预期收尾（可选，不代表实际视频尾帧）<select
+              v-model="video.last_card_id"
+              @change="edit"
+            >
               <option value="">仅使用首帧</option>
               <option v-for="c in cards" :key="c.id" :value="c.id">
                 {{ c.title }}{{ c.adopted_asset_id ? '' : '（待选图）' }}
@@ -613,12 +772,30 @@ onBeforeUnmount(() => window.clearInterval(timer))
               @input="edit"
           /></label>
           <div class="row">
-            <button :disabled="busy" @click="act(videoPlan)">检查实际输入</button
-            ><button :disabled="busy || !canGenerateVideo" @click="act(generateVideo)">
+            <button :disabled="busy || !video.first_card_id" @click="act(optimizeVideo)">
+              按镜头 Skill 优化
+            </button>
+            <button :disabled="busy" @click="act(videoPlan)">检查输入与提示词</button
+            ><button
+              class="primary-action"
+              :disabled="busy || !canGenerateVideo"
+              :title="videoBlocker"
+              @click="act(generateVideo)"
+            >
               生成视频候选
             </button>
           </div>
+          <p v-if="videoBlocker" class="readiness-note">{{ videoBlocker }}</p>
+          <section v-if="optimizedPrompt" class="submission">
+            <strong>待采用的视频提示词</strong>
+            <textarea v-model="optimizedPrompt" rows="12" />
+            <button :disabled="busy" @click="applyOptimizedPrompt">采用到草稿</button>
+            <button :disabled="busy" @click="optimizedPrompt = ''">取消</button>
+          </section>
           <section v-if="plan" class="submission">
+            <strong>提交提示词预览</strong>
+            <textarea :value="plan.prompt_preview" readonly rows="12" />
+            <p>图片编号在执行时按工作流的实际输入顺序绑定；中间画面不自动提交。</p>
             <strong>本次提交的画面</strong>
             <div class="row">
               <figure v-for="c in plan.inputs.cards" :key="c.role">
@@ -647,7 +824,7 @@ onBeforeUnmount(() => window.clearInterval(timer))
               </button>
             </article>
           </section>
-        </div>
+        </fieldset>
       </main>
     </div>
   </div>
@@ -917,5 +1094,149 @@ textarea {
 }
 .filmstrip {
   margin-top: 12px;
+}
+</style>
+
+<style scoped>
+header {
+  background: var(--color-base-1);
+}
+.shot-heading {
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+.shot-heading strong {
+  font-size: 17px;
+}
+.shot-story {
+  border-left: 2px solid var(--color-accent);
+  padding: 8px 12px;
+  color: var(--color-fg-3);
+  line-height: 1.7;
+}
+.progress-track {
+  width: 100px;
+  height: 5px;
+  background: var(--color-base-3);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.progress-track i {
+  display: block;
+  height: 100%;
+  background: var(--color-accent);
+}
+.narrative-section {
+  padding: 14px;
+  border: 1px solid var(--color-line-1);
+  border-radius: 10px;
+}
+.filmstrip button {
+  text-align: left;
+  border-radius: 9px;
+  padding: 10px;
+}
+.filmstrip button.active {
+  background: color-mix(in srgb, var(--color-accent) 10%, var(--color-base-2));
+}
+.frame-placeholder {
+  height: 70px;
+  display: grid;
+  place-items: center;
+  background: var(--color-base-1);
+  color: var(--color-fg-3);
+  border-radius: 5px;
+}
+.inspector {
+  min-width: 0;
+  padding: 16px;
+  margin: 0;
+  border: 1px solid var(--color-line-1);
+  border-radius: 10px;
+  background: var(--color-base-2);
+}
+.inspector legend {
+  padding: 0 6px;
+  font-weight: 600;
+}
+.frame-editor {
+  grid-template-columns: minmax(0, 1fr) minmax(300px, 360px);
+}
+.planning-editor {
+  display: block;
+}
+.primary-action {
+  background: var(--color-accent);
+  color: var(--color-base-1);
+  font-weight: 600;
+}
+.secondary-tools {
+  border-top: 1px solid var(--color-line-1);
+  padding-top: 10px;
+}
+.secondary-tools summary {
+  cursor: pointer;
+  color: var(--color-fg-3);
+  padding: 6px 0;
+}
+.secondary-tools[open] {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.secondary-tools > * {
+  margin-bottom: 10px;
+}
+.video-editor {
+  border: 0;
+  padding: 0;
+  min-width: 0;
+}
+.submission {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px;
+  border: 1px solid var(--color-line-1);
+  border-radius: 10px;
+}
+.readiness-note {
+  color: var(--color-fg-3);
+  padding: 10px;
+  background: var(--color-base-2);
+  border-radius: 6px;
+}
+textarea {
+  line-height: 1.7;
+}
+button:focus-visible,
+summary:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 3px;
+}
+@media (max-width: 1000px) {
+  .frame-editor {
+    grid-template-columns: 1fr;
+  }
+}
+@media (max-width: 650px) {
+  .workspace-body {
+    flex-direction: column;
+  }
+  .shot-list {
+    width: auto;
+    max-height: 160px;
+    border-right: 0;
+    border-bottom: 1px solid var(--color-line-1);
+  }
+  main {
+    padding: 12px;
+  }
+  .planning-editor .inspector {
+    grid-template-columns: 1fr;
+  }
+  .large-preview.comparing {
+    grid-template-columns: 1fr;
+  }
 }
 </style>

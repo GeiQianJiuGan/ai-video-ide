@@ -12,3 +12,18 @@ class FrameCardPatch(BaseModel):
     role: Literal["first", "key", "last"] | None = None
     position: int | None = Field(default=None, ge=0)
     refs: list[str] | None = None
+
+
+class FrameContinuityInput(BaseModel):
+    source_version_id: str
+    # 数字为源视频绝对秒数，便于与实际裁剪位置对应。
+    at: Literal["end"] | float = "end"
+    use: Literal["opening", "reference"] = "opening"
+
+
+class FrameVideoInput(BaseModel):
+    prompt: str = ""
+    duration: float = Field(default=4, gt=0, le=60)
+    preset: str = ""
+    first_card_id: str = ""
+    last_card_id: str = ""

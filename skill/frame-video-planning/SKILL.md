@@ -63,3 +63,19 @@ description: 为制帧视频制作规划镜头剧情、有序画面及逐帧故�
   "video_prompt": "Starting with Alan at the half-open door, she releases the handle, walks toward the table at screen right and stops beside it. Her gaze settles on the envelope; she does not touch it. A slow gentle push-in preserves the movement direction and room layout, ending with her hands lowered beside the table. Sound: rain outside, a quiet door creak and two soft footsteps. No dialogue or background music."
 }
 ```
+
+## 制帧视频动作描述
+
+视频阶段继续使用工程选定的镜头制作 Skill。图片承担外观与构图信息，视频描述只保留必要锚点，重点描述起始状态、动作顺序、运镜和结束状态。使用 `[Shot 1]` 表示一个连续镜头；多张画面不等于多个 Shot，只有明确切镜才添加后续 Shot 与切换时间。首尾帧连续演化默认保持单镜头。
+
+H3 生成前可通过制帧分镜的「按镜头 Skill 优化」将动作草稿整理为完整三字段结构；结果先审阅再采用。草稿中 Picture 1/2 分别代表本次首尾帧，程序在执行时根据实际图册重绑编号及时间对齐说明。中间 key 画面不作为已输入图片引用。正文英文，对白原文保留，无配乐填写 N/A。
+
+## 画面规划与实际成片衔接
+
+first 是计划开场，last 是预期收尾，它们是生成约束，不是已生成视频的实际帧。默认允许单首帧自然演化；只有剧情要求准确终点时规划预期收尾。
+
+执行顺序：规划画面 → 制作并审阅采用开场 → 保存独立视频动作草稿 → 生成视频 → 审阅采用视频 → 从实际成片提取衔接画面 → 制作下一镜。不要在上游未完成或未采用时假造实际尾帧，也不要承诺规划阶段已完成视频。
+
+使用 get_frame_workspace 查询源镜头的 current_version_id、versions、jobs 及目标画面。通过 extract_frame_continuity 提出抽帧操作：opening 用于同机位连续动作，仅追加候选供审阅采用；reference 用于换机位，抽帧加入参考图后按下一镜剧情重新构图。换场景或跳时可独立开场，不强制继承旧构图。at 默认 end；数字为源视频绝对秒数，必须提醒剪辑时同步裁剪上游，工具不自动改动源片。来源版本改选后重新提取并审阅，不覆盖历史版本。
+
+update_frame_video 只更新制帧视频草稿，generate_frame_video 只将已保存草稿入队。草稿修改采用后重新读取，确认首尾帧、提示词与任务状态，再提议生成；不要在同一批中假设尚未采用的修改已经生效。生成任务完成后等待用户审阅采用视频，才能继续下游衔接。

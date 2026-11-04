@@ -87,7 +87,7 @@ export interface DeleteResult {
 }
 
 export const assetsApi = {
-  list: (pid: string, kind?: AssetKind) =>
+  list: (pid: string, kind?: AssetKind | 'frame') =>
     api.get<Asset[]>(`/projects/${pid}/assets${kind ? `?kind=${kind}` : ''}`),
   /** 没有任何引用的资产——可以安全回收的那一批。 */
   orphans: (pid: string) => api.get<Asset[]>(`/projects/${pid}/assets/orphans`),
@@ -103,8 +103,7 @@ export const assetsApi = {
   update: (pid: string, assetId: string, patch: { description: string }) =>
     api.patch<Asset>(`/projects/${pid}/assets/${assetId}`, patch),
   /** 还没有描述的素材。`desc_max` 也从这里来，前端不写死 120。 */
-  undescribed: (pid: string) =>
-    api.get<UndescribedList>(`/projects/${pid}/assets/undescribed`),
+  undescribed: (pid: string) => api.get<UndescribedList>(`/projects/${pid}/assets/undescribed`),
   /** 仍被引用时后端默认拒绝（CONFLICT 并列出是谁在用）；force 才强删。 */
   remove: (pid: string, assetId: string, force = false) =>
     api.del<DeleteResult>(`/projects/${pid}/assets/${assetId}?force=${force}`),

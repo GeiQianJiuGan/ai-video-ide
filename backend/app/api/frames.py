@@ -7,6 +7,8 @@ from pydantic import BaseModel, Field
 
 from app.ai.frame_plan import FramePlanDraft
 from app.domain.frames import FrameCardPatch as CardPatch
+from app.domain.frames import FrameContinuityInput
+from app.domain.frames import FrameVideoInput as VideoBody
 from app.persistence.models_frames import FrameCard, FrameWorkspace
 from app.persistence.models_gen import Job
 from app.services.base import db_of, dump_json, fetch, fetch_all, load_json
@@ -34,14 +36,6 @@ class AssetBody(BaseModel):
 
 class AdoptBody(BaseModel):
     candidate_id: str
-
-
-class VideoBody(BaseModel):
-    prompt: str = ""
-    duration: float = Field(default=4, gt=0, le=60)
-    preset: str = ""
-    first_card_id: str = ""
-    last_card_id: str = ""
 
 
 class PlanApply(FramePlanDraft):
@@ -121,6 +115,11 @@ async def save_video(pid: str, sid: str, body: VideoBody) -> dict[str, Any]:
     return await frames.save_video(pid, sid, body.model_dump())
 
 
+@router.post("/projects/{pid}/shots/{sid}/frame-video/optimize")
+async def optimize_video(pid: str, sid: str, body: VideoBody) -> dict[str, Any]:
+    return await frames.optimize_video(pid, sid, body.model_dump())
+
+
 @router.post("/projects/{pid}/shots/{sid}/frame-video/plan")
 async def plan(pid: str, sid: str, body: VideoBody) -> dict[str, Any]:
     return await frames.video(pid, sid, body.model_dump(exclude_unset=True))
@@ -150,3 +149,8 @@ async def capabilities(pid: str) -> dict[str, Any]:
         if chosen.binds == "preset"
         else [],
     }
+
+
+@router.post("/projects/{pid}/frame-cards/{cid}/continuity")
+async def extract_continuity(pid: str, cid: str, body: FrameContinuityInput) -> dict[str, Any]:
+    return await frames.extract_continuity(pid, cid, body.model_dump())

@@ -48,7 +48,7 @@ export interface RecentProject {
 }
 
 export interface CreateProjectInput {
-  dir: string
+  dir?: string
   name: string
   width: number
   height: number
@@ -155,7 +155,9 @@ export interface FrozenRoute {
  * 老任务（这次改造之前入队的那些）里没有这一项，所以回 `null` 而不是替它编一条
  * 「ComfyUI 预设」——谎报走了哪条路正是这次要修的 bug 的形状。
  */
-export function frozenRoute(params: Record<string, unknown> | null | undefined): FrozenRoute | null {
+export function frozenRoute(
+  params: Record<string, unknown> | null | undefined,
+): FrozenRoute | null {
   const raw = params?.route
   if (!raw || typeof raw !== 'object') return null
   const row = raw as Partial<FrozenRoute>

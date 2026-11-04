@@ -1,3 +1,4 @@
+import type { ProductionMode } from '@/app/productionNavigation'
 /**
  * AI 导演接口（幕流程图右栏的协作栏）。
  *
@@ -74,6 +75,11 @@ export const OP_FIELD_LABEL: Record<string, string> = {
   target_kind: '素材类型',
   target_label: '出图对象',
   target_id: '素材',
+  source_version_id: '来源视频版本',
+  at: '取帧位置',
+  use: '衔接方式',
+  first_card_id: '开场画面',
+  last_card_id: '预期收尾',
   /** 这一句落在哪一列（形象上是 traits，其余是 description）。 */
   field: '写进哪一列',
   generate_image: '顺带出一张图',
@@ -85,6 +91,9 @@ export const OP_FIELD_LABEL: Record<string, string> = {
 
 /** 写工具名 = 提案的 op。用户丢弃一条时，前端把它改成 'reject'。 */
 export const DIRECTOR_OPS = [
+  'extract_frame_continuity',
+  'update_frame_video',
+  'generate_frame_video',
   'update_frame_card',
   'update_screenplay',
   'add_scene',
@@ -110,6 +119,9 @@ export type DirectorOpName = (typeof DIRECTOR_OPS)[number]
 
 /** 每种提案在界面上叫什么。文案在这里写一遍，别在组件里散着写。 */
 export const OP_LABEL: Record<string, string> = {
+  extract_frame_continuity: '提取实际视频衔接画面',
+  update_frame_video: '修改制帧视频草稿',
+  generate_frame_video: '生成制帧视频',
   update_frame_card: '修改制作图片画面',
   update_screenplay: '维护剧本',
   add_scene: '加一幕',
@@ -341,7 +353,14 @@ export const directorApi = {
     message: string,
     scope: DirectorScope = 'flow',
     attachments: DirectorAttachment[] = [],
-  ) => api.post<DirectorChat>(`/projects/${pid}/director/chat`, { message, scope, attachments }),
+    production_mode?: ProductionMode,
+  ) =>
+    api.post<DirectorChat>(`/projects/${pid}/director/chat`, {
+      message,
+      scope,
+      attachments,
+      production_mode,
+    }),
   /**
    * 同一件事，但一边说一边给。**照旧一行库都不动**（`done` 里的 `turns` 只是聊天记录）。
    *
@@ -358,7 +377,9 @@ export const directorApi = {
     scope: DirectorScope = 'flow',
     signal?: AbortSignal,
     attachments: DirectorAttachment[] = [],
-  ): AsyncGenerator<DirectorStreamEvent> => stream(pid, message, scope, signal, attachments),
+    production_mode?: ProductionMode,
+  ): AsyncGenerator<DirectorStreamEvent> =>
+    stream(pid, message, scope, signal, attachments, production_mode),
   apply: (pid: string, ops: DirectorOp[]) =>
     api.post<DirectorApply>(`/projects/${pid}/director/apply`, { ops }),
   /**
@@ -396,9 +417,14 @@ async function* stream(
   scope: DirectorScope,
   signal?: AbortSignal,
   attachments: DirectorAttachment[] = [],
+  production_mode?: ProductionMode,
 ): AsyncGenerator<DirectorStreamEvent> {
   const path = `/projects/${pid}/director/chat/stream`
-  for await (const frame of api.stream(path, { message, scope, attachments }, signal)) {
+  for await (const frame of api.stream(
+    path,
+    { message, scope, attachments, production_mode },
+    signal,
+  )) {
     if (frame.event === 'error') {
       // 状态码是 200——错误是在流里来的。但对调用方来说它和开流前失败没有区别。
       throw new ApiError((frame.data as { error: ErrorPayload }).error, 200)

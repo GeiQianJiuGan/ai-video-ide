@@ -107,9 +107,9 @@ class ComfyTasks:
                     "当前工作流没有可写的正向提示词入口。",
                     ["为工作流绑定正向提示词入口", "更换支持提示词输入的工作流"],
                 )
-        if not book or not book.subjects:
+        if not book or (not book.subjects and not req.extra.get("frame_pipeline")):
             return
-        if not settings.video_ref_labels:
+        if not settings.video_ref_labels and not req.extra.get("frame_pipeline"):
             req.notes.append(
                 "设置里关掉了「参考素材说明」，这一版按原样发送提示词——"
                 f"模型收不到「第几张图是谁」（这一次的图册：{book.listing}）。"

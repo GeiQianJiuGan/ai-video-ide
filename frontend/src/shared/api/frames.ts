@@ -3,9 +3,9 @@ import type { ImageJob } from './images'
 
 export type FrameRole = 'first' | 'key' | 'last'
 export const FRAME_ROLE_LABEL: Record<FrameRole, string> = {
-  first: '开场',
+  first: '计划开场',
   key: '关键状态（叙事参考）',
-  last: '收尾',
+  last: '预期收尾',
 }
 
 export interface FrameCandidate {
@@ -13,6 +13,14 @@ export interface FrameCandidate {
   asset_id: string
   job_id: string | null
   snapshot: Record<string, unknown>
+  continuity?: {
+    source_version_id: string
+    source_shot_id: string
+    at: string | number
+    use: string
+    stale: boolean
+    requires_trim: boolean
+  }
 }
 export interface FrameCard {
   id: string
@@ -45,6 +53,7 @@ export interface FrameNarrativePlan {
   frame_card_ids: string[]
 }
 export interface FramePlan {
+  prompt_preview: string
   inputs: { cards: { id: string; title: string; asset_id: string; role: string }[] }
   unused_cards: string[]
 }
@@ -64,6 +73,15 @@ export function frameVideoDraft(video: Partial<FrameVideo>, duration: number): F
 }
 const base = (pid: string) => `/projects/${pid}`
 export const framesApi = {
+  continuity: (
+    pid: string,
+    cid: string,
+    body: { source_version_id: string; at: 'end' | number; use: 'opening' | 'reference' },
+  ) =>
+    api.post<{ asset_id: string; message: string }>(
+      `${base(pid)}/frame-cards/${cid}/continuity`,
+      body,
+    ),
   referenceMaterials: (pid: string) =>
     api.get<FrameReferenceMaterials>(`${base(pid)}/frame-reference-materials`),
   proposePlan: (pid: string, sid: string) =>
@@ -92,6 +110,8 @@ export const framesApi = {
     api.post<ImageJob>(`${base(pid)}/frame-cards/${cid}/generate`),
   saveVideo: (pid: string, sid: string, body: FrameVideo) =>
     api.put(`${base(pid)}/shots/${sid}/frame-video`, body),
+  optimize: (pid: string, sid: string, body: FrameVideo) =>
+    api.post<{ prompt: string }>(`${base(pid)}/shots/${sid}/frame-video/optimize`, body),
   plan: (pid: string, sid: string, body: FrameVideo) =>
     api.post<FramePlan>(`${base(pid)}/shots/${sid}/frame-video/plan`, body),
   video: (pid: string, sid: string, body: FrameVideo) =>

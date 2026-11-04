@@ -44,6 +44,7 @@ const connected = computed(() => sys.health !== null)
 
 /** 弹窗开关。两个动作互斥，同时开两张表单没有意义。 */
 const creating = ref(false)
+const customLocation = ref(false)
 const opening = ref(false)
 
 /**
@@ -86,7 +87,10 @@ function picked(path: string): void {
 
 const canCreate = computed(
   () =>
-    connected.value && !proj.busy && form.value.dir.trim() !== '' && form.value.name.trim() !== '',
+    connected.value &&
+    !proj.busy &&
+    form.value.name.trim() !== '' &&
+    (!customLocation.value || form.value.dir.trim() !== ''),
 )
 
 /**
@@ -96,15 +100,6 @@ const canCreate = computed(
 const inDialog = computed(() => creating.value || opening.value)
 const pageError = computed(() => (inDialog.value ? null : proj.lastError))
 
-/** 工程目录的组成部分：一个项目 = 一个自包含的目录，可整体拷走。 */
-const LAYOUT: { path: string; body: string }[] = [
-  { path: 'project.aivs.json', body: '工程清单：名称、分辨率、帧率、默认 Workflow' },
-  { path: 'project.db', body: 'SQLite（WAL）：Character / Scene / Shot / Version 的唯一真源' },
-  { path: 'assets/', body: '角色表、场景参考、道具图等落盘素材' },
-  { path: 'generations/', body: '每次生成的输出与参数快照，永不覆盖' },
-  { path: 'proxies/', body: '720p 代理流，仅用于时间线预览' },
-]
-
 async function enter(pid: string): Promise<void> {
   await router.push({ name: 'dashboard', params: { pid } })
 }
@@ -113,7 +108,7 @@ async function create(): Promise<void> {
   try {
     const project = await proj.create({
       ...form.value,
-      dir: form.value.dir.trim(),
+      dir: customLocation.value ? form.value.dir.trim() : undefined,
       name: form.value.name.trim(),
     })
     creating.value = false
@@ -136,6 +131,8 @@ async function open(dir: string): Promise<void> {
 /** 打开弹窗前先清掉上一次的失败，否则一进来就看到一条与本次无关的红字。 */
 function startCreate(): void {
   proj.clearError()
+  customLocation.value = false
+  form.value.dir = ''
   creating.value = true
 }
 
@@ -262,27 +259,13 @@ onMounted(() => void proj.refreshRecent())
       </ul>
     </AppPanel>
 
-    <!-- 新建：目录 + 名称 + 画布参数，附带「这个目录里会长出什么」 -->
+    <!-- 新建默认只填名称，画布和自定义路径按需展开。 -->
     <AppDialog
       v-model:open="creating"
       title="新建项目"
-      subtitle="POST /projects · 目录不存在会被创建"
+      subtitle="输入项目名称即可开始，项目会自动保存到默认位置"
     >
       <form id="create-project" class="space-y-2 p-3" @submit.prevent="create">
-        <label class="block">
-          <span class="text-fg-3 text-2xs">工程目录（绝对路径，不存在会被创建）</span>
-          <div class="mt-0.5 flex items-center gap-1.5">
-            <input
-              v-model="form.dir"
-              type="text"
-              placeholder="E:/aivs/我的片子"
-              class="border-line-1 bg-base-2 text-fg-1 placeholder:text-fg-4 focus:border-accent/60 h-row min-w-0 flex-1 rounded-sm border px-2 font-mono text-xs outline-none"
-            />
-            <AppButton type="button" title="浏览本机文件夹" @click="browse('create')">
-              <FolderSearch :size="12" />浏览…
-            </AppButton>
-          </div>
-        </label>
         <label class="block">
           <span class="text-fg-3 text-2xs">项目名称</span>
           <input
@@ -292,60 +275,74 @@ onMounted(() => void proj.refreshRecent())
             class="border-line-1 bg-base-2 text-fg-1 placeholder:text-fg-4 focus:border-accent/60 mt-0.5 h-row w-full rounded-sm border px-2 text-xs outline-none"
           />
         </label>
-        <div class="grid grid-cols-4 gap-1.5">
+        <details class="text-fg-3 text-2xs">
+          <summary class="cursor-pointer py-1">画布设置（{{ form.width }} × {{ form.height }} · {{ form.fps }} fps）</summary>
+          <div class="grid grid-cols-4 gap-1.5">
+            <label class="block">
+              <span class="text-fg-3 text-2xs">宽</span>
+              <input
+                v-model.number="form.width"
+                type="number"
+                min="64"
+                max="8192"
+                class="border-line-1 bg-base-2 text-fg-1 focus:border-accent/60 mt-0.5 h-row tnum w-full rounded-sm border px-2 text-xs outline-none"
+              />
+            </label>
+            <label class="block">
+              <span class="text-fg-3 text-2xs">高</span>
+              <input
+                v-model.number="form.height"
+                type="number"
+                min="64"
+                max="8192"
+                class="border-line-1 bg-base-2 text-fg-1 focus:border-accent/60 mt-0.5 h-row tnum w-full rounded-sm border px-2 text-xs outline-none"
+              />
+            </label>
+            <label class="block">
+              <span class="text-fg-3 text-2xs">帧率</span>
+              <input
+                v-model.number="form.fps"
+                type="number"
+                min="1"
+                max="240"
+                step="0.001"
+                class="border-line-1 bg-base-2 text-fg-1 focus:border-accent/60 mt-0.5 h-row tnum w-full rounded-sm border px-2 text-xs outline-none"
+              />
+            </label>
+            <label class="block">
+              <span class="text-fg-3 text-2xs">时长单位</span>
+              <select
+                v-model="form.duration_unit"
+                class="border-line-1 bg-base-2 text-fg-1 focus:border-accent/60 mt-0.5 h-row w-full rounded-sm border px-1 text-xs outline-none"
+              >
+                <option value="frames">帧</option>
+                <option value="seconds">秒</option>
+              </select>
+            </label>
+          </div>
+        </details>
+        <details
+          :open="customLocation"
+          class="text-fg-4 text-2xs"
+          @toggle="customLocation = ($event.target as HTMLDetailsElement).open"
+        >
+          <summary class="cursor-pointer py-1">自定义存储位置</summary>
           <label class="block">
-            <span class="text-fg-3 text-2xs">宽</span>
-            <input
-              v-model.number="form.width"
-              type="number"
-              min="64"
-              max="8192"
-              class="border-line-1 bg-base-2 text-fg-1 focus:border-accent/60 mt-0.5 h-row tnum w-full rounded-sm border px-2 text-xs outline-none"
-            />
+            <span class="text-fg-3 text-2xs">项目文件夹（绝对路径）</span>
+            <div class="mt-0.5 flex items-center gap-1.5">
+              <input
+                v-model="form.dir"
+                type="text"
+                placeholder="E:/aivs/我的片子"
+                class="border-line-1 bg-base-2 text-fg-1 placeholder:text-fg-4 focus:border-accent/60 h-row min-w-0 flex-1 rounded-sm border px-2 font-mono text-xs outline-none"
+              />
+              <AppButton type="button" title="浏览本机文件夹" @click="browse('create')">
+                <FolderSearch :size="12" />选择文件夹
+              </AppButton>
+            </div>
           </label>
-          <label class="block">
-            <span class="text-fg-3 text-2xs">高</span>
-            <input
-              v-model.number="form.height"
-              type="number"
-              min="64"
-              max="8192"
-              class="border-line-1 bg-base-2 text-fg-1 focus:border-accent/60 mt-0.5 h-row tnum w-full rounded-sm border px-2 text-xs outline-none"
-            />
-          </label>
-          <label class="block">
-            <span class="text-fg-3 text-2xs">帧率</span>
-            <input
-              v-model.number="form.fps"
-              type="number"
-              min="1"
-              max="240"
-              step="0.001"
-              class="border-line-1 bg-base-2 text-fg-1 focus:border-accent/60 mt-0.5 h-row tnum w-full rounded-sm border px-2 text-xs outline-none"
-            />
-          </label>
-          <label class="block">
-            <span class="text-fg-3 text-2xs">时长单位</span>
-            <select
-              v-model="form.duration_unit"
-              class="border-line-1 bg-base-2 text-fg-1 focus:border-accent/60 mt-0.5 h-row w-full rounded-sm border px-1 text-xs outline-none"
-            >
-              <option value="frames">帧</option>
-              <option value="seconds">秒</option>
-            </select>
-          </label>
-        </div>
-        <p class="text-fg-4 text-2xs">目录里若已有别的工程会被拒绝，一个字节都不会被覆盖。</p>
-
-        <div class="border-line-1 border-t pt-2">
-          <p class="text-fg-3 text-2xs">建好之后这个目录里会有：</p>
-          <ul class="mt-1 space-y-0.5">
-            <li v-for="item in LAYOUT" :key="item.path" class="flex gap-1.5 text-2xs">
-              <span class="text-fg-2 w-36 shrink-0 font-mono">{{ item.path }}</span>
-              <span class="text-fg-4 min-w-0 flex-1">{{ item.body }}</span>
-            </li>
-          </ul>
-        </div>
+          <p class="mt-1 text-2xs">请选择本项目专用文件夹；收起此选项后使用默认存储位置。</p>
+        </details>
       </form>
 
       <ErrorPanel
@@ -382,13 +379,11 @@ onMounted(() => void proj.refreshRecent())
               class="border-line-1 bg-base-2 text-fg-1 placeholder:text-fg-4 focus:border-accent/60 h-row min-w-0 flex-1 rounded-sm border px-2 font-mono text-xs outline-none"
             />
             <AppButton type="button" title="浏览本机文件夹" @click="browse('open')">
-              <FolderSearch :size="12" />浏览…
+              <FolderSearch :size="12" />选择文件夹
             </AppButton>
           </div>
         </label>
-        <p class="text-fg-4 text-2xs">
-          旧版本工程会在打开时自动升级 schema，升级结果显示在底部状态条上。
-        </p>
+        <p class="text-fg-4 text-2xs">选择已有项目所在的文件夹，也可以直接粘贴文件夹路径。</p>
       </form>
 
       <ErrorPanel

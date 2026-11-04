@@ -121,3 +121,28 @@ def test_invalid_narrative_has_bounded_repairs_and_no_writes(client, pid, monkey
     assert response.status_code == 422
     assert len(repairs) == 3 and repairs[1] and repairs[2]
     assert client.get(f"{root}/frames").json() == {"cards": [], "video": {}}
+
+
+def test_video_optimization_is_review_only_and_rejects_unbound_picture(client, pid, monkeypatch):
+    mock_planner(monkeypatch)
+    sid = a_shot(client, pid)
+    root = f"/api/v1/projects/{pid}"
+    plan = client.post(f"{root}/shots/{sid}/frame-plan/propose").json()
+    ws = client.post(f"{root}/shots/{sid}/frame-plan/apply", json=plan).json()
+    body = {**ws["video"], "last_card_id": ""}
+    result = {
+        "prompt": "integrated_multimodal_description: [Shot 1] Begin in Picture 1 and walk forward.\n"
+        "overall_soundscape: Footsteps.\nnon_diegetic_music: N/A"
+    }
+
+    async def complete(system, user):
+        assert "integrated_multimodal_description" in system
+        return result
+
+    monkeypatch.setattr(llm, "complete_json", complete)
+    response = client.post(f"{root}/shots/{sid}/frame-video/optimize", json=body)
+    assert response.status_code == 200, response.text
+    assert response.json() == result
+    assert client.get(f"{root}/shots/{sid}/frames").json() == ws
+    result["prompt"] = result["prompt"].replace("Picture 1", "Picture 2")
+    assert client.post(f"{root}/shots/{sid}/frame-video/optimize", json=body).status_code == 422

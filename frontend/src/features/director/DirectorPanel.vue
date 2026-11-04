@@ -43,9 +43,7 @@
  *  10. **落库回执里那几句话必须显示出来**。落成了的那张提案卡会走掉，于是「同一批新建的
  *      角色接上了没有」「参考图排上没排上」「哪个名字对不上」只剩这里能说了。只给一行
  *      「已落库 N 条」等于把降级藏起来（硬约束 4）——少接一个人不该让用户等到成片才发现。
- *  11. **一键全流程是另一件事，不是「发送」的一种**。它自己就是四步落库（核心剧本 →
- *      人物 / 地点 / 道具 → 拆幕 → 按幕拆分镜），所以入口刻意分开，而且免确认模式关着时
- *      是禁用的——**禁用的原因写在 tooltip 里**（那句话来自后端的 `auto.hint`，前端不写第二份）。
+ *  11. 完整创作与讨论共用发送入口，按目标分派到持久化任务或对话服务。
  *  12. **那一趟的回执照原样摊开**。`stages` 每一步做了什么、被打断的那一步的四要素错误、
  *      参考图排了几张 / 为什么没排、超出上限的幕——跳过不是失败，但必须说出来。
  *      `halted` 也不是失败：前面几步落进库的数据一条都没回滚。
@@ -84,16 +82,19 @@ import {
   type DirectorScope,
   type DirectorTurn,
 } from '@/shared/api/director'
+import type { ProductionMode } from '@/app/productionNavigation'
 import { useDirectorStore } from '@/stores/director'
 import CreationTaskCard from './CreationTaskCard.vue'
-import { inferCreationGoal } from '@/app/creationGoal'
+import { resolveComposerGoal, canSubmitComposer, type ComposerGoal } from '@/app/creationGoal'
 const creationCard = ref<InstanceType<typeof CreationTaskCard> | null>(null)
-const creationGoal = ref('auto')
+const creationGoal = ref<ComposerGoal>('auto')
+const submitting = ref(false)
 const props = withDefaults(
   defineProps<{
     pid: string
     /** 用户现在开着哪一页。只影响后端拼的系统提示词。 */
     scope?: DirectorScope
+    productionMode?: ProductionMode
     title?: string
     placeholder?: string
     emptyBody?: string
@@ -104,6 +105,7 @@ const props = withDefaults(
   }>(),
   {
     scope: 'flow',
+    productionMode: undefined,
     title: 'AI 导演',
     placeholder: '要它做什么？Enter 发送，Shift+Enter 换行',
     emptyBody:
@@ -316,19 +318,33 @@ const orphanFails = computed(() => [
 ])
 /** 一键全流程跑动时那几步各自叫什么。**口径只有后端一份**，前端不写第二张阶段表。 */
 const stageLine = computed(() => (director.auto?.stages ?? []).map((s) => s.label).join(' → '))
-/**
- * 「一键全流程」那颗按钮上的整句话。**禁用的原因必须写在上面**，不能只灰掉一颗按钮
- * ——那句话来自后端的 `auto.hint`（免确认关着时它说的就是「去设置页打开」）。
- */
-
-const locked = computed(() => director.busy || director.autopiloting || creationCard.value?.working)
+/** 统一点击与回车的互斥条件，附件解析时也不提交半份输入。 */
+const locked = computed(
+  () =>
+    submitting.value ||
+    director.attaching ||
+    director.busy ||
+    director.autopiloting ||
+    Boolean(creationCard.value?.working),
+)
+const resolvedGoal = computed(() => resolveComposerGoal(creationGoal.value, draft.value))
+const sendHint = computed(() => {
+  if (resolvedGoal.value === 'chat') return '讨论与局部修改 · 按当前审阅设置处理'
+  const source = !draft.value.trim() && !director.attached.length ? '使用项目已有内容 · ' : ''
+  return (
+    source +
+    (resolvedGoal.value === 'storyboard'
+      ? '完整分镜任务 · 生成剧本与分镜计划，图片和视频另行制作'
+      : '完整剧本任务 · 自动保存进度，可暂停与恢复')
+  )
+})
 /**
  * 空态那段话。**免确认模式开着时默认那句是假话**（「按下采用之前，库里什么都不会变」），
  * 所以那时换成这个模式下真正会发生的事——空态往往是新用户唯一会读完的一段字。
  */
 const emptyText = computed(() =>
   director.autoApply
-    ? '免确认模式开着：它想好之后会直接落库，右栏不会有待审的卡，落了什么在这里逐条说明。要逐条审就去设置页的「AI 导演」里关掉它。完整创作会自动分批完成并检查后保存；下方可以选择仅写剧本或制作完整分镜。'
+    ? '免确认模式已开启，改动会自动保存并展示记录。输入需求后直接发送；发送目标可自动识别，也可指定完整剧本、完整分镜或局部修改。'
     : '描述创作目标，系统会持续完成完整剧本或分镜，并交付草稿审阅。讨论和局部修改仍可逐条采用。',
 )
 
@@ -425,48 +441,39 @@ async function refreshCreationHistory() {
   await director.load(props.pid).catch(() => {})
 }
 
+function onComposerEnter(event: KeyboardEvent): void {
+  if (event.isComposing) return
+  event.preventDefault()
+  void send()
+}
+
+/** 按钮和 Enter 共用此入口；完整创作仍保留任务进度和审阅流程。 */
 async function send(): Promise<void> {
+  if (locked.value || !canSend.value) return
   const text = draft.value.trim()
-  // 只挂附件、不打字也能发——附件也是输入（与后端 `stream_precheck` 的空判据一致）。
-  if (!text && !director.attached.length) return
-  const goal = creationGoal.value === 'auto' ? inferCreationGoal(text) : creationGoal.value
-  if (goal !== 'chat') {
-    const ok = await creationCard.value?.start(
-      text,
-      goal === 'storyboard' ? 'storyboard' : 'screenplay',
-      [...director.attached],
-    )
-    if (ok) {
-      draft.value = ''
-      director.attached = []
-      await refreshCreationHistory()
+  const goal = resolvedGoal.value
+  submitting.value = true
+  try {
+    if (goal !== 'chat') {
+      const ok = await creationCard.value?.start(text, goal, [...director.attached])
+      if (ok) {
+        draft.value = ''
+        director.attached = []
+        creationGoal.value = 'auto'
+        await refreshCreationHistory()
+      }
+      return
     }
-    return
-  }
-  draft.value = ''
-  await director.send(props.pid, text, props.scope)
-}
-
-/** 能不能发：有话说，或者至少挂了一份附件。 */
-const canSend = computed(() => Boolean(draft.value.trim()) || director.attached.length > 0)
-
-/**
- * 一键全流程。**它不产提案，四步都直接落库**，所以入口与「发送」刻意分开。
- *
- * 输入框里那段话就是这一章的原文（附件抽出来的文字也在里面）；**空着就用工程里已经存的那份**。
- * 落成之后才清输入框——那段话已经进 `Story.raw_text` 了，留着只会让人以为还没发出去；
- * 被拦下来时（与库里那份不一样、免确认没开）**一个字都不动**，用户接着勾那颗替换再来一次。
- */
-async function autopilot(): Promise<void> {
-  const ok = await creationCard.value?.start(draft.value.trim(), 'storyboard', [
-    ...director.attached,
-  ])
-  if (ok) {
     draft.value = ''
-    director.attached = []
-    await refreshCreationHistory()
+    await director.send(props.pid, text, props.scope, props.productionMode)
+  } finally {
+    submitting.value = false
   }
 }
+
+const canSend = computed(() =>
+  canSubmitComposer(creationGoal.value, draft.value, director.attached.length),
+)
 
 function pickFile(): void {
   filePicker.value?.click()
@@ -573,20 +580,6 @@ function discardGroup(ops: DirectorOp[]): void {
         @applied="emit('applied')"
         @settled="refreshCreationHistory"
       />
-      <label class="text-fg-3 mx-2 my-1 flex shrink-0 items-center gap-2 text-xs"
-        >本次目标
-        <select
-          v-model="creationGoal"
-          :disabled="locked"
-          class="bg-base-2 border-line-1 text-fg-1 min-w-0 flex-1 rounded border px-2 py-1"
-        >
-          <option value="auto">自动识别</option>
-          <option value="screenplay">编写完整剧本</option>
-          <option value="storyboard">制作完整分镜</option>
-          <option value="chat">讨论与局部修改</option>
-        </select>
-      </label>
-
       <!-- 没配 LLM：一条引导，不是红叉。手动编排本来就能走完全程 -->
       <div v-if="director.history && !director.configured" class="min-h-0 flex-1 overflow-auto p-2">
         <EmptyState
@@ -1112,10 +1105,7 @@ function discardGroup(ops: DirectorOp[]): void {
           </p>
 
           <!-- chip 只把话填进输入框，不直接发送：发出去之前用户还能改 -->
-          <div
-            v-if="quickActions.length && !director.streaming && !director.autopiloting"
-            class="flex flex-wrap gap-1"
-          >
+          <div v-if="quickActions.length && !locked" class="flex flex-wrap gap-1">
             <button
               v-for="q in quickActions"
               :key="q"
@@ -1147,6 +1137,7 @@ function discardGroup(ops: DirectorOp[]): void {
                 <button
                   class="text-fg-4 hover:text-fg-2 shrink-0"
                   title="把这份附件从待发送列表里拿掉——它就不会跟着下一条消息走了"
+                  :disabled="locked"
                   @click="director.forgetAttachment(att.filename)"
                 >
                   <X :size="10" />
@@ -1160,14 +1151,32 @@ function discardGroup(ops: DirectorOp[]): void {
               </ul>
             </div>
           </div>
+          <label class="text-fg-3 my-1 flex shrink-0 items-center gap-2 text-xs"
+            >{{
+              productionMode === 'frames' ? '制帧' : productionMode === 'direct' ? '直出' : '发送'
+            }}
+            · 目标
+            <select
+              v-model="creationGoal"
+              :disabled="locked"
+              class="bg-base-2 border-line-1 text-fg-1 min-w-0 flex-1 rounded border px-2 py-1"
+            >
+              <option value="auto">自动识别</option>
+              <option value="screenplay">编写完整剧本</option>
+              <option value="storyboard">制作完整分镜</option>
+              <option value="chat">讨论与局部修改</option>
+            </select>
+          </label>
+
+          <p class="text-fg-4 text-2xs" aria-live="polite">{{ sendHint }}</p>
           <textarea
             ref="composer"
             v-model="draft"
             rows="3"
             :placeholder="placeholder"
-            :disabled="director.streaming || director.autopiloting"
+            :disabled="locked"
             class="border-line-1 bg-base-2 text-fg-1 placeholder:text-fg-4 w-full resize-none border px-1.5 py-1 text-2xs leading-relaxed outline-none focus:border-accent/50 disabled:opacity-50"
-            @keydown.enter.exact.prevent="send()"
+            @keydown.enter.exact="onComposerEnter"
           />
 
           <!-- 停靠栏能被拖窄，所以这一排允许换行——挤成一行会把「发送」推出去 -->
@@ -1187,12 +1196,7 @@ function discardGroup(ops: DirectorOp[]): void {
             <AppButton
               size="sm"
               variant="ghost"
-              :disabled="
-                !director.attachInfo ||
-                director.attaching ||
-                director.streaming ||
-                director.autopiloting
-              "
+              :disabled="!director.attachInfo || locked"
               :title="
                 director.attachInfo
                   ? `一份 Word / Excel / PPT / 文本 → 一张附件卡，随消息一起发送（最大 ${director.attachInfo.max_mb} MB，最多 ${director.attachInfo.max_chars} 字）。${director.attachInfo.note}`
@@ -1229,19 +1233,6 @@ function discardGroup(ops: DirectorOp[]): void {
               <Check :size="10" />全部采用
             </AppButton>
             <div class="ml-auto flex items-center gap-1.5">
-              <!--
-                一键全流程：核心剧本 → 人物 / 地点 / 道具 → 拆幕 → 按幕拆分镜，**四步都真落库**。
-                所以它和「发送」是两件事，且免确认模式关着时禁用——**为什么禁用写在 tooltip 里**
-                （那句话来自后端的 `auto.hint`，前端不写第二份文案）。
-              -->
-              <AppButton
-                size="sm"
-                :disabled="locked || director.autopiloting || director.streaming || director.busy"
-                :title="'持续完成剧本与全部分镜；未开启免确认时先交付完整草稿审阅'"
-                @click="autopilot()"
-              >
-                <Wand :size="10" />制作完整分镜
-              </AppButton>
               <AppButton
                 v-if="director.streaming"
                 size="sm"
@@ -1255,6 +1246,7 @@ function discardGroup(ops: DirectorOp[]): void {
                 size="sm"
                 variant="primary"
                 :disabled="!canSend || locked"
+                :title="sendHint"
                 @click="send()"
               >
                 <Send :size="10" />发送

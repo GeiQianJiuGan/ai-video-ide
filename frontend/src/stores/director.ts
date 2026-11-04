@@ -1,3 +1,4 @@
+import type { ProductionMode } from '@/app/productionNavigation'
 /**
  * AI 导演协作栏 store（剧本页与幕流程图页共用这一份）。
  *
@@ -114,7 +115,9 @@ export const useDirectorStore = defineStore('director', () => {
    * （免确认 / 一键全流程落完的那几条正是这一种——待审列表已归零，但改动前后照样看得见）。
    */
   const livePendingTurnId = computed(() => {
-    const last = [...turns.value].reverse().find((t) => t.role === 'proposal' || t.role === 'applied')
+    const last = [...turns.value]
+      .reverse()
+      .find((t) => t.role === 'proposal' || t.role === 'applied')
     return last && last.role === 'proposal' ? last.id : ''
   })
   const llm = computed(() => history.value?.llm ?? null)
@@ -220,6 +223,7 @@ export const useDirectorStore = defineStore('director', () => {
     pid: string,
     message: string,
     scope: DirectorScope = 'flow',
+    productionMode?: ProductionMode,
   ): Promise<boolean> {
     if (streaming.value || autopiloting.value) return false
     const ctl = new AbortController()
@@ -239,7 +243,14 @@ export const useDirectorStore = defineStore('director', () => {
     attached.value = []
     let ok = false
     try {
-      for await (const event of directorApi.chatStream(pid, message, scope, ctl.signal, atts)) {
+      for await (const event of directorApi.chatStream(
+        pid,
+        message,
+        scope,
+        ctl.signal,
+        atts,
+        productionMode,
+      )) {
         if (event.event === 'delta') live.value += event.data.text
         else if (event.event === 'tool') noteTool(event.data)
         else if (event.event === 'op') pending.value = [...pending.value, event.data]

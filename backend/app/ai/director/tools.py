@@ -37,7 +37,7 @@ from typing import Any
 from app.ai import prompts, skills
 from app.ai.llm import client as llm
 from app.core.errors import AppError, ErrorCode
-from app.domain.frames import FrameCardPatch
+from app.domain.frames import FrameCardPatch, FrameContinuityInput, FrameVideoInput
 from app.generation import intent as gen_intent
 from app.generation.providers import registry
 from app.generation.providers.base import DESC_MAX
@@ -123,6 +123,36 @@ SHOT_PLAIN_PARAMS: dict[str, dict[str, Any]] = {
 #: 工具白名单。模型只能调这里面的东西——名字不在这张表里直接报错，
 #: 不去猜「它大概是想调 add_scene」。
 TOOLS: dict[str, dict[str, Any]] = {
+    "extract_frame_continuity": {
+        "kind": "write",
+        "desc": "从另一个镜头当前已采用的真实视频提取衔接画面。opening 追加候选供审阅采用，reference 添加为下一镜重新构图的首位参考。不会自动采用图片，不改写视频。数字 at 为源视频绝对秒数，使用后须同步裁剪源片。",
+        "params": {
+            "card_id": {"type": "string"},
+            "source_version_id": {"type": "string"},
+            "at": {
+                "anyOf": [{"type": "string", "enum": ["end"]}, {"type": "number", "minimum": 0}]
+            },
+            "use": {"type": "string", "enum": ["opening", "reference"]},
+            "why": {"type": "string"},
+        },
+        "required": ["card_id", "source_version_id", "use"],
+    },
+    "update_frame_video": {
+        "kind": "write",
+        "desc": "修改制帧视频草稿，仅操作制帧输入。开场为计划画面或审阅采用的实际衔接帧；尾帧仅在需要锁定终点时选择。",
+        "params": {
+            "shot_id": {"type": "string"},
+            **FrameVideoInput.model_json_schema()["properties"],
+            "why": {"type": "string"},
+        },
+        "required": ["shot_id"],
+    },
+    "generate_frame_video": {
+        "kind": "write",
+        "desc": "按已保存的制帧草稿将视频入队。先 get_frame_workspace 检查采用图片与任务状态；生成完成仍需审阅采用视频，再为下游提取真实画面。不要用直出入口代替。",
+        "params": {"shot_id": {"type": "string"}, "why": {"type": "string"}},
+        "required": ["shot_id"],
+    },
     "get_frame_workspace": {
         "kind": "read",
         "desc": "读取本镜头在制帧 → 制作图片中的全部画面、逐帧故事、图片提示词、参考图及已采用帧，并读取制帧视频输入。",
@@ -648,13 +678,32 @@ async def run_read(pid: str, name: str, args: dict[str, Any]) -> Any:
         shot_id = str(args.get("shot_id") or "")
         shot = await story.get_shot(pid, shot_id)
         workspace = await frames.get(pid, shot_id)
+        from app.persistence.models_gen import Job
+        from app.services.base import as_dict, db_of, fetch_all
+        from app.services.generation import generation
+
         return {
+            "current_version_id": shot.get("current_version_id"),
+            "versions": await generation.list_versions(pid, shot_id),
+            "jobs": [
+                as_dict(job)
+                for job in await fetch_all(db_of(pid), Job, where=Job.shot_id == shot_id)
+            ],
             "shot": {k: shot[k] for k in ("id", "scene_id", "title", "description", "duration")},
             "video": workspace["video"],
             "cards": [
                 {
                     k: c[k]
-                    for k in ("id", "title", "story", "prompt", "role", "refs", "adopted_asset_id")
+                    for k in (
+                        "id",
+                        "title",
+                        "story",
+                        "prompt",
+                        "role",
+                        "refs",
+                        "adopted_asset_id",
+                        "candidates",
+                    )
                 }
                 for c in workspace["cards"]
             ],
@@ -1210,6 +1259,9 @@ async def _shot_after(
 
 #: 每个写工具动的是哪一类东西。前端按 target 分组显示提案，所以这张表是它的唯一来源。
 _TARGET = {
+    "extract_frame_continuity": "frame_card",
+    "update_frame_video": "shot",
+    "generate_frame_video": "shot",
     "update_frame_card": "frame_card",
     "update_screenplay": "story",
     "set_link": "link",
@@ -1292,6 +1344,33 @@ async def to_op(
         "why": why,
         "warnings": [],
     }
+
+    if name == "extract_frame_continuity":
+        card_id = str(args.get("card_id") or "")
+        data = FrameContinuityInput.model_validate(
+            _clean(args, ("source_version_id", "at", "use"))
+        ).model_dump()
+        card, version, at, use = await frames.continuity_source(pid, card_id, data)
+        op.update(card_id=card_id, shot_id=card.shot_id, after={**data, "card_title": card.title})
+        if data["at"] != "end":
+            op["warnings"].append(
+                "自定义衔接位置需要在剪辑中同步裁剪上一段视频；此操作不修改源视频。"
+            )
+        return op
+    if name in ("update_frame_video", "generate_frame_video"):
+        shot_id = str(args.get("shot_id") or "")
+        workspace = await frames.get(pid, shot_id)
+        op["shot_id"] = shot_id
+        op["before"] = workspace["video"]
+        if name == "update_frame_video":
+            fields = FrameVideoInput.model_fields
+            op["after"] = FrameVideoInput.model_validate(
+                {**workspace["video"], **_clean(args, fields)}
+            ).model_dump()
+        else:
+            await frames.video(pid, shot_id, {})
+            op["after"] = {"shot_id": shot_id}
+        return op
 
     if name == "update_frame_card":
         shot_id = str(args.get("shot_id") or "")

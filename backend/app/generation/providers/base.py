@@ -556,7 +556,7 @@ def render_video_prompt(req: VideoRequest, book: PictureBook) -> str:
     parts.append(f"overall_soundscape:\n{_soundscape(req)}")
 
     # 背景音乐约束
-    parts.append("non_diegetic_music:\nnone")
+    parts.append("non_diegetic_music:\n" + ("N/A" if req.extra.get("frame_pipeline") else "none"))
 
     return "\n\n".join(parts)
 
@@ -759,7 +759,7 @@ def _detail(req: VideoRequest, shot: str, book: PictureBook | None = None) -> st
         visual = _bind_subjects(visual, book)
 
     camera = str((req.segments or {}).get("camera_motion") or "").strip()
-    body = f"{shot} {visual}".strip()
+    body = visual if "[Shot 1]" in visual else f"{shot} {visual}".strip()
     return f"{body} Camera Motion: {camera}" if camera else body
 
 

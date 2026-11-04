@@ -69,7 +69,7 @@ SKILL 全文这条路上取不到（这个端不支持工具），照清单里�
 FALLBACK_SCRIPT_CHARS = 4000
 
 
-def _fallback_system(scope: str = "flow") -> str:
+def _fallback_system(scope: str = "flow", production_mode: str | None = None) -> str:
     """不支持工具的端用的系统提示词。
 
     形状那一段（`FALLBACK_SHAPE`）永远由代码拼在最后，用户改不到——和
@@ -81,7 +81,7 @@ def _fallback_system(scope: str = "flow") -> str:
         for name, spec in TOOLS.items()
         if spec["kind"] == "write"
     )
-    return f"{prompts.director(scope)}\n\n{FALLBACK_SHAPE % lines}"
+    return f"{prompts.director(scope, production_mode)}\n\n{FALLBACK_SHAPE % lines}"
 
 
 async def _snapshot(pid: str, *, include_frames: bool = False) -> str:
@@ -126,6 +126,7 @@ async def propose(
     message: str,
     history: list[dict[str, Any]],
     scope: str = "flow",
+    production_mode: str | None = None,
 ) -> dict[str, Any]:
     """跑一轮协作，**不落库**。返回 `{reply, ops, rounds, over_limit, degraded}`。
 
@@ -133,7 +134,9 @@ async def propose(
     循环只有那一份。
     """
     result: dict[str, Any] = {}
-    async for event in collaborate(pid, message, history, scope=scope, live=False):
+    async for event in collaborate(
+        pid, message, history, scope=scope, live=False, production_mode=production_mode
+    ):
         if event["kind"] == "result":
             result = event["result"]
     return result
@@ -191,6 +194,7 @@ async def collaborate(
     scope: str = "flow",
     *,
     live: bool = True,
+    production_mode: str | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """跑一轮协作，把过程当事件流吐出来。**一行库都不改。**
 
@@ -207,11 +211,13 @@ async def collaborate(
     """
     llm.require_configured()
     if not llm.supports_tools():
-        async for event in _without_tools(pid, message, scope):
+        async for event in _without_tools(pid, message, scope, production_mode):
             yield event
         return
 
-    messages: list[dict[str, Any]] = [{"role": "system", "content": prompts.director(scope)}]
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": prompts.director(scope, production_mode)}
+    ]
     messages.extend(history)
     messages.append({"role": "user", "content": message})
     ops: list[dict[str, Any]] = []
@@ -429,7 +435,7 @@ async def _run_one(
 
 
 async def _without_tools(
-    pid: str, message: str, scope: str = "flow"
+    pid: str, message: str, scope: str = "flow", production_mode: str | None = None
 ) -> AsyncIterator[dict[str, Any]]:
     """不支持 function calling 的端：一次性产出 ops 数组，再走同一套翻译。
 
@@ -437,12 +443,14 @@ async def _without_tools(
     协作栏那一侧于是不用为两条路各写一份渲染。
     """
     try:
-        include_frames = scope in ("frames", "frame-video") or any(
-            word in message for word in ("制帧", "制作图片", "帧图")
+        include_frames = (
+            production_mode == "frames"
+            or scope in ("frames", "frame-video")
+            or any(word in message for word in ("制帧", "制作图片", "帧图"))
         )
         snapshot = await _snapshot(pid, include_frames=include_frames)
         data = await llm.complete_json(
-            _fallback_system(scope),
+            _fallback_system(scope, production_mode),
             f"工程现状：\n{snapshot}\n\n用户的要求：{message}",
         )
     except Exception as exc:  # noqa: BLE001

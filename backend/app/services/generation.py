@@ -1218,7 +1218,11 @@ class GenerationService:
             #: 适配器照原样送，不替他重写。
             segments=ai_prompts.shot_segments(prompt),
             shot_no=ai_prompts.shot_no_of(prompt),
-            extra={**(params.get("extra") or {}), "preset": params.get("preset")},
+            extra={
+                **(params.get("extra") or {}),
+                "preset": params.get("preset"),
+                "frame_pipeline": params.get("creation_pipeline") == "frames",
+            },
         )
         task_id = await provider.submit(req, client_id=f"aivs-{pid}")
         # 冻结「实际喂了哪几个参考素材」与适配器的降级说明。`_execute` 在这之后才收集
@@ -1457,7 +1461,11 @@ class GenerationService:
             source_video=source,
             duration=float(params.get("duration") or version.duration or 4.0),
             seed=params.get("seed"),
-            extra={**(params.get("extra") or {}), "preset": params.get("preset")},
+            extra={
+                **(params.get("extra") or {}),
+                "preset": params.get("preset"),
+                "frame_pipeline": params.get("creation_pipeline") == "frames",
+            },
         )
         task_id = await provider.submit(req, client_id=f"aivs-{pid}")
         if req.notes:

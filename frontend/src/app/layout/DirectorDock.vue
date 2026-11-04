@@ -22,12 +22,20 @@ import { useRoute } from 'vue-router'
 import DirectorPanel from '@/features/director/DirectorPanel.vue'
 import type { DirectorScope } from '@/shared/api/director'
 import { useShellStore } from '@/stores/shell'
-import { loadProductionMode } from '@/app/productionNavigation'
+import { loadProductionMode, productionModeForRoute } from '@/app/productionNavigation'
 
 defineProps<{ projectId: string | null }>()
 
 const route = useRoute()
 const shell = useShellStore()
+
+const productionMode = computed(
+  () =>
+    productionModeForRoute(String(route.name || '')) ||
+    (route.query.production === 'frames' || route.query.production === 'direct'
+      ? route.query.production
+      : loadProductionMode(String(route.params.pid || ''))),
+)
 
 /** 制帧两页必须明确告诉导演当前修改的是画面出图还是帧图生成视频。 */
 const scope = computed<DirectorScope>(() => {
@@ -109,6 +117,7 @@ function startResize(e: PointerEvent): void {
       class="min-h-0 flex-1"
       :pid="projectId"
       :scope="scope"
+      :production-mode="productionMode"
       title="AI 导演"
       :placeholder="PLACEHOLDER[scope]"
       :quick-actions="QUICK[scope]"

@@ -244,8 +244,13 @@ class HttpApiProvider:
         from app.generation.mentions import resolve_request
 
         resolve_request(req, book)
-        body["prompt"] = req.prompt
-        req.sent_prompt = req.prompt
+        from app.generation.renderers import render_prompt
+
+        sent = (
+            render_prompt(req.skill, req, book) if req.extra.get("frame_pipeline") else req.prompt
+        )
+        body["prompt"] = sent
+        req.sent_prompt = sent
         if book:
             body["pictures"] = [p.to_dict() for p in book.items]
         # 参考素材整组带过去：这条合同由我们定，所以它天生支持多个，不存在槽位不够的问题。

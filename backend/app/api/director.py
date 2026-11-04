@@ -90,6 +90,7 @@ class Attachment(BaseModel):
 
 
 class ChatBody(BaseModel):
+    production_mode: Literal["direct", "frames"] | None = None
     message: str = Field(description="想让 AI 做什么，例如「在第 2 幕后面加一幕雨夜追车」")
     #: 用户现在开着哪一页。**只影响这一次请求拼的系统提示词**那一句提示，不落库——
     #: 剧本页与幕流程图共用同一个会话，换页不该让历史对话变味。
@@ -115,7 +116,11 @@ async def history(pid: str) -> dict[str, Any]:
 async def chat(pid: str, body: ChatBody) -> dict[str, Any]:
     """产出提案。落库的是「提案」这条记录，不是提案里的改动。"""
     return await director.chat(
-        pid, body.message, body.scope, [a.model_dump() for a in body.attachments]
+        pid,
+        body.message,
+        body.scope,
+        [a.model_dump() for a in body.attachments],
+        production_mode=body.production_mode,
     )
 
 
@@ -139,7 +144,9 @@ async def chat_stream(pid: str, body: ChatBody) -> StreamingResponse:
     await director.stream_precheck(pid, body.message, atts)
 
     async def frames() -> AsyncIterator[bytes]:
-        async for event in director.chat_stream(pid, body.message, body.scope, atts):
+        async for event in director.chat_stream(
+            pid, body.message, body.scope, atts, production_mode=body.production_mode
+        ):
             yield _sse(event["event"], event["data"])
 
     return StreamingResponse(

@@ -393,6 +393,7 @@ class DirectorService:
         message: str,
         scope: str = "flow",
         attachments: list[dict[str, Any]] | None = None,
+        production_mode: str | None = None,
     ) -> dict[str, Any]:
         """说一句话（可带附件），拿回一份提案。**不改任何业务数据。**
 
@@ -413,7 +414,13 @@ class DirectorService:
         text, atts = await self.stream_precheck(pid, message, attachments)
         await self._add_turn(pid, "user", {"text": text, "attachments": atts})
         history = await self._llm_history(pid)
-        out = await agent.propose(pid, compose_message(text, atts), history, scope=scope)
+        out = await agent.propose(
+            pid,
+            compose_message(text, atts),
+            history,
+            scope=scope,
+            **({"production_mode": production_mode} if production_mode else {}),
+        )
         turns = await self._persist(pid, out)
         auto = await self._auto_applied(pid, out["ops"])
         if out["over_limit"]:
@@ -456,6 +463,7 @@ class DirectorService:
         message: str,
         scope: str = "flow",
         attachments: list[dict[str, Any]] | None = None,
+        production_mode: str | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         """说一句话，把过程当 SSE 事件吐出来。**一行业务数据都不改。**
 
@@ -479,7 +487,11 @@ class DirectorService:
         out: dict[str, Any] = {}
         try:
             async for event in agent.collaborate(
-                pid, compose_message(text, atts), history, scope=scope
+                pid,
+                compose_message(text, atts),
+                history,
+                scope=scope,
+                **({"production_mode": production_mode} if production_mode else {}),
             ):
                 kind = event["kind"]
                 if kind == "delta":
@@ -1068,6 +1080,28 @@ class DirectorService:
         name = str(op["op"])
         after = op.get("after") or {}
         sid = str(op.get("scene_id") or "")
+        if name in ("extract_frame_continuity", "update_frame_video", "generate_frame_video"):
+            from app.domain.frames import FrameContinuityInput, FrameVideoInput
+            from app.services.frame_authoring import frames
+
+            if name == "extract_frame_continuity":
+                return await frames.extract_continuity(
+                    pid,
+                    str(op.get("card_id") or ""),
+                    FrameContinuityInput.model_validate(after).model_dump(),
+                )
+            shot_id = str(op.get("shot_id") or "")
+            workspace = await frames.get(pid, shot_id)
+            if op.get("before") is not None and workspace["video"] != op["before"]:
+                from app.services.frame_authoring import invalid
+
+                raise invalid("制帧视频草稿已变化，请重新读取并提案，避免覆盖新的编辑。")
+            if name == "update_frame_video":
+                return await frames.save_video(
+                    pid, shot_id, FrameVideoInput.model_validate(after).model_dump()
+                )
+            return await frames.video(pid, shot_id, {}, enqueue=True)
+
         if name == "update_frame_card":
             from app.domain.frames import FrameCardPatch
             from app.services.frame_authoring import frames, invalid
