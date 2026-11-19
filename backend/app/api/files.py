@@ -126,18 +126,15 @@ async def project_file(
     if w is not None:
         target = await thumbs.thumb(root, target, w) or target
     elif preview:
-        target = await preview_of(pid, root, target) or target
+        target = await preview_of(pid, root, target, rel) or target
     return respond(target)
 
 
-async def preview_of(pid: str, root: Path, target: Path) -> Path | None:
+async def preview_of(pid: str, root: Path, target: Path, rel: str) -> Path | None:
     """视频已经有预览代理（时间线生成的）就给代理路径；没有给 None，调用方回原片。"""
     if not is_video_path(target.name):
         return None
-    try:
-        rel = target.relative_to(root.resolve()).as_posix()
-    except ValueError:
-        return None
+    rel = rel.strip().replace("\\", "/")
     async with db_of(pid).read() as session:
         found = await session.execute(select(Asset.id).where(Asset.path == rel))
         asset_id = found.scalars().first()

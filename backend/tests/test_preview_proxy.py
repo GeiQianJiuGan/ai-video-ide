@@ -102,7 +102,7 @@ async def test_files_endpoint_serves_the_proxy_only_when_asked(tmp_path: Path) -
     )
     root = projects.get(pid).dir
     original = (root / src["path"]).resolve()
-    assert await preview_of(pid, root, original) is None, "还没生成代理时回原片"
+    assert await preview_of(pid, root, original, src["path"]) is None, "还没生成代理时回原片"
 
     out = await timeline_service.ensure_proxy(pid, src["id"])
-    assert await preview_of(pid, root, original) == root / out["proxy_path"]
+    assert await preview_of(pid, root, original, src["path"]) == root / out["proxy_path"]
