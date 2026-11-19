@@ -140,7 +140,11 @@ async def preview_of(pid: str, root: Path, target: Path, rel: str) -> Path | Non
         asset_id = found.scalars().first()
     if not asset_id:
         return None
-    proxy = root / preview_proxy_rel(asset_id)
+    # 代理路径同样过一遍越界检查：proxies/ 里若有指向工程外的符号链接，不能借它读出去
+    try:
+        proxy = resolve_within(root, preview_proxy_rel(asset_id))
+    except AppError:
+        return None
     return proxy if proxy.is_file() else None
 
 

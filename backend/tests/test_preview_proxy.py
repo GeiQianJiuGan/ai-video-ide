@@ -106,3 +106,21 @@ async def test_files_endpoint_serves_the_proxy_only_when_asked(tmp_path: Path) -
 
     out = await timeline_service.ensure_proxy(pid, src["id"])
     assert await preview_of(pid, root, original, src["path"]) == root / out["proxy_path"]
+
+
+async def test_preview_never_follows_a_symlink_out_of_the_project(tmp_path: Path) -> None:
+    from app.api.files import preview_of
+
+    binary = ffmpeg_or_skip()
+    pid = await make_project(tmp_path)
+    src = await asset_service.register_path(
+        pid, "generated_video", str(await make_clip(binary, tmp_path / "raw" / "链.mp4"))
+    )
+    root = projects.get(pid).dir
+    outside = tmp_path / "secret.mp4"
+    outside.write_bytes(b"secret")
+    link = root / preview_proxy_rel(src["id"])
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(outside)
+    original = (root / src["path"]).resolve()
+    assert await preview_of(pid, root, original, src["path"]) is None, "越界的代理必须当作没有"
