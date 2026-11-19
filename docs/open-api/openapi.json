@@ -5207,7 +5207,7 @@
           "files"
         ],
         "summary": "Project File",
-        "description": "读工程目录内的文件，rel 就是 Asset.path。",
+        "description": "读工程目录内的文件，rel 就是 Asset.path。\n\n带 `w` 且是图片时给一份缩略图（见 `services/thumbs.py`），做不出来就回原图。",
         "operationId": "project_file_api_v1_projects__pid__files__rel__get",
         "parameters": [
           {
@@ -5226,6 +5226,24 @@
             "schema": {
               "type": "string",
               "title": "Rel"
+            }
+          },
+          {
+            "name": "w",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "maximum": 8192,
+                  "minimum": 1
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "W"
             }
           }
         ],
