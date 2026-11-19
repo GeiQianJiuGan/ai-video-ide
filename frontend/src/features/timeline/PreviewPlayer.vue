@@ -58,13 +58,15 @@ const front = ref(0)
 interface SlotState {
   /** 装的是哪个片段（换段判断认它）。 */
   clip: string
+  /** 装的是哪份原素材（换版本时片段 id 不变，靠它识别）。 */
+  asset: string
   /** 装的是哪个文件。src 相同就只 seek，不重新加载（切开的两段共用文件）。 */
   url: string
   /** metadata 还没到时先记下要 seek 到哪，`loadedmetadata` 里补。 */
   seek: number
 }
-const state0: SlotState = { clip: '', url: '', seek: 0 }
-const state1: SlotState = { clip: '', url: '', seek: 0 }
+const state0: SlotState = { clip: '', asset: '', url: '', seek: 0 }
+const state1: SlotState = { clip: '', asset: '', url: '', seek: 0 }
 
 function slotAt(i: number): HTMLVideoElement | null {
   return i === 0 ? el0.value : el1.value
@@ -245,12 +247,15 @@ function assign(i: number, clip: Clip | null, time: number): void {
       slot.url = ''
     }
     slot.clip = ''
+    slot.asset = ''
     return
   }
   const url = fileUrl(props.pid, mediaPath(clip))
   // 正在播的这一段刚好生成好了代理：不在半路换文件（会重新缓冲），下次装载时再用
-  const keepPlaying = slot.clip === clip.id && Boolean(slot.url) && !el.paused
+  const keepPlaying =
+    slot.clip === clip.id && slot.asset === clip.asset_path && Boolean(slot.url) && !el.paused
   slot.clip = clip.id
+  slot.asset = clip.asset_path
   slot.seek = time
   if (slot.url === url || keepPlaying) {
     if (el.readyState >= 1 && Math.abs(el.currentTime - time) > 0.04) trySeek(el, time)
