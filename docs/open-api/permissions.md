@@ -73,4 +73,4 @@ allowed_origins 是 JSON 数组，供浏览器 Origin 校验；不授予 API 权
 
 `GET /integration/audit?project_id=...&limit=50&offset=0` 为管理员提供变更请求记录：Key ID、项目、HTTP 方法、对象路径、状态码和 request_id；不记录 Key、文件正文或完整提示词。请求返回 X-Request-ID 用于关联。
 
-上传请求默认最大 500 MB，可用 `AIVS_UPLOAD_LIMIT_MB` 调整。所有 Key 共享服务存储和调度资源；服务部署可在外层代理进一步设置请求速率及磁盘配额。外部 AI 默认上传字节，不提供任意远程 URL 抓取入口。
+上传请求默认最大 10240 MB（10 GB，含 multipart 表单数据），可用 `AIVS_UPLOAD_LIMIT_MB` 调整，修改后需重启后端。浏览器上传前从 `/integration/capabilities` 获取实际限制并检查文件大小；后端同时检查实际收到的请求字节（包括无 Content-Length 的分块上传）。Nginx 示例默认也为 10 GB，调高后端限制时需同步调整代理的 `client_max_body_size`。工程素材上传分块写盘并计算摘要，不把整段视频读入内存。所有 Key 共享服务存储和调度资源；服务部署可在外层代理进一步设置请求速率及磁盘配额。外部 AI 默认上传字节，不提供任意远程 URL 抓取入口。

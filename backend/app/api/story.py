@@ -24,6 +24,9 @@ class StoryBody(BaseModel):
 
 
 class SceneBody(BaseModel):
+    clear_shot_prompts: bool = Field(
+        default=False, description="保存共用提示词时批量清空本幕镜头的独立提示词"
+    )
     title: str | None = None
     summary: str | None = None
     source_text: str | None = None

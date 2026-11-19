@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter
 from pydantic import BaseModel, Field
@@ -25,6 +25,7 @@ class LinkBody(BaseModel):
 
 
 class RunBody(BaseModel):
+    scope: Literal["all", "unfinished"] = "all"
     mode: str = Field(default="parallel", description="parallel 各幕并发 / sequential 单线程续接")
     priority: int = 100
     allow_ref_drop: bool = Field(
@@ -144,4 +145,6 @@ async def plan(pid: str, body: RunBody) -> dict[str, Any]:
 @router.post("/projects/{pid}/sequence/run", status_code=201)
 async def run(pid: str, body: RunBody) -> dict[str, Any]:
     """按账单入队。返回里带上那份账单，界面上「说好的」与「做了的」能对上。"""
-    return await sequence.run(pid, body.mode, body.priority, allow_ref_drop=body.allow_ref_drop)
+    return await sequence.run(
+        pid, body.mode, body.priority, allow_ref_drop=body.allow_ref_drop, scope=body.scope
+    )

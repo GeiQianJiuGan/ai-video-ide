@@ -113,9 +113,9 @@ _SHOT_FRAME = ImageSkill(
     name="shot_frame",
     title="镜头画面",
     when="制作有完整人物、环境和构图的视频画面。",
-    fixed="一张完整的单镜头画面。遵循所述景别、机位、人物姿态、场景、道具和光线；参考设定图保持身份与服装一致。只呈现一个时刻，不画四视图、设定板、拼图或分格，无文字与水印。",
-    lead="这一时刻的画面",
-    note="人物可以出场；描述静态画面，动作发展另写在视频描述中。",
+    fixed="",
+    lead="",
+    note="直接使用用户填写的图片提示词，不添加固定前缀或引导语。人物可以出场；动作发展另写在视频描述中。",
 )
 IMAGE_SKILLS: dict[str, ImageSkill] = {
     s.name: s for s in (_CHAR_SHEET, _SCENE_SIMPLE, _PROP_REF, _SHOT_FRAME)
@@ -160,6 +160,17 @@ def image_get(name: str) -> ImageSkill:
 def image_render(name: str) -> str:
     """一份出图 SKILL 的全文（`read_skill` 取的就是这个）。"""
     skill = image_get(name)
+    if not skill.fixed and not skill.lead:
+        return "\n".join(
+            [
+                f"# SKILL {skill.name} · {skill.title}",
+                f"什么时候用：{skill.when}",
+                "直接填写完整的图片提示词，系统不添加固定前缀或引导语。",
+                skill.note,
+                f"负向（系统自动加）：{IMAGE_NEGATIVE}"
+                + (f", {skill.negative}" if skill.negative else ""),
+            ]
+        )
     lines = [
         f"# SKILL {skill.name} · {skill.title}",
         "",
@@ -202,7 +213,8 @@ def render_image_prompt(name: str, user_text: str) -> tuple[str, str]:
     """
     skill = image_get(name)
     text = str(user_text or "").strip()
-    positive = f"{skill.fixed}\n{skill.lead}：{text}" if text else skill.fixed
+    description = f"{skill.lead}：{text}" if skill.lead and text else text
+    positive = "\n".join(part for part in (skill.fixed, description) if part)
     negative = f"{IMAGE_NEGATIVE}, {skill.negative}" if skill.negative else IMAGE_NEGATIVE
     return positive, negative
 

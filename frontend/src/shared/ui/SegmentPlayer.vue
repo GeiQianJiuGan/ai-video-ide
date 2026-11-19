@@ -178,7 +178,15 @@ function stamp(n: number): string {
   return `${m}:${String(Math.floor(s % 60)).padStart(2, '0')}.${Math.floor((s % 1) * 10)}`
 }
 
-defineExpose({ play, pause, restart })
+function currentPosition(): number {
+  pause()
+  return el.value?.currentTime ?? segIn.value + local.value
+}
+function previewPosition(value: number): void {
+  pause()
+  seekTo(value)
+}
+defineExpose({ play, pause, restart, currentPosition, previewPosition })
 </script>
 
 <template>

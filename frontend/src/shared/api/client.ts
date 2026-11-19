@@ -159,7 +159,8 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
   }
 
   if (!resp.ok) {
-    if (resp.status === 401 && !path.startsWith('/auth/')) window.dispatchEvent(new Event('aivs:unauthorized'))
+    if (resp.status === 401 && !path.startsWith('/auth/'))
+      window.dispatchEvent(new Event('aivs:unauthorized'))
     const wrapped = jsonOk ? (parsed as { error?: ErrorPayload } | null) : null
     if (!wrapped?.error) throw offContractError(resp.status, text)
     throw new ApiError(wrapped.error, resp.status)
@@ -179,7 +180,24 @@ export const api = {
    * 而且 Content-Type 必须由浏览器自己带 boundary，手写就传不上去。
    * 错误处理与 request() 完全一致，失败同样是 ApiError。
    */
-  upload: <T>(path: string, file: File, fields: Record<string, string> = {}) => {
+  upload: async <T>(path: string, file: File, fields: Record<string, string> = {}) => {
+    // 每次读取实际配置；后端重启或管理员更改限制后不沿用旧值。
+    const { upload_limit_mb: limit } = await request<{ upload_limit_mb: number }>(
+      'GET',
+      '/integration/capabilities',
+    )
+    if (file.size > limit * 1024 * 1024) {
+      throw new ApiError(
+        {
+          code: 'VALIDATION_ERROR',
+          title: '上传超过限制',
+          detail: `文件大小 ${(file.size / 1024 / 1024).toFixed(1)} MB，上传请求上限为 ${limit} MB（含表单数据）。`,
+          suggestions: ['缩小文件，或调整 AIVS_UPLOAD_LIMIT_MB 后重启后端'],
+          related_ids: { upload_limit_mb: limit },
+        },
+        413,
+      )
+    }
     const form = new FormData()
     form.append('file', file, file.name)
     for (const [k, v] of Object.entries(fields)) if (v) form.append(k, v)

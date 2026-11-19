@@ -11,8 +11,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import shutil
+import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 from sqlalchemy import select
 
@@ -74,7 +75,8 @@ TRANSIENT_KINDS = frozenset({"frame", "clip_audio"})
 def sniff_size(path: Path) -> tuple[int | None, int | None]:
     """不依赖第三方库读图片宽高：只认 PNG / JPEG / GIF 头，认不出就返回 None。"""
     try:
-        head = path.read_bytes()[: 64 * 1024]
+        with path.open("rb") as source:
+            head = source.read(64 * 1024)
     except OSError:
         return None, None
     if head[:8] == b"\x89PNG\r\n\x1a\n" and len(head) >= 24:
@@ -177,7 +179,8 @@ def source_file(src: str) -> Path:
 
 def sha1_of_file(path: Path) -> str:
     try:
-        return hashlib.sha1(path.read_bytes()).hexdigest()
+        with path.open("rb") as source:
+            return hashlib.file_digest(source, "sha1").hexdigest()
     except OSError as exc:
         raise AppError(
             ErrorCode.VALIDATION_ERROR,
@@ -185,6 +188,35 @@ def sha1_of_file(path: Path) -> str:
             f"{path}: {type(exc).__name__}: {exc}",
             ["确认文件未被其他程序占用"],
         ) from exc
+
+
+def stage_upload(directory: Path, stream: BinaryIO, filename: str) -> tuple[Path, str]:
+    """分块复制并计算摘要；失败时清理临时文件，不把整段视频装进内存。"""
+    staged = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=directory, suffix=".upload", delete=False) as dest:
+            staged = Path(dest.name)
+            stream.seek(0)
+            digest = hashlib.sha1()
+            total = 0
+            while chunk := stream.read(1024 * 1024):
+                dest.write(chunk)
+                digest.update(chunk)
+                total += len(chunk)
+        if not total:
+            require_bytes(b"", filename)
+        return staged, digest.hexdigest()
+    except BaseException as exc:
+        if staged is not None:
+            staged.unlink(missing_ok=True)
+        if isinstance(exc, OSError):
+            raise AppError(
+                ErrorCode.DISK_FULL if exc.errno == 28 else ErrorCode.VALIDATION_ERROR,
+                "资产写入失败",
+                f"{filename}: {type(exc).__name__}: {exc}",
+                ["确认磁盘空间充足", "确认目录未被安全软件锁定"],
+            ) from exc
+        raise
 
 
 class AssetService:
@@ -205,6 +237,21 @@ class AssetService:
         target = self._target_dir(pid, kind) / content_name(sha1, Path(filename).suffix)
         write_file(target, data)
         return await self._insert(pid, kind, target, sha1, source, filename)
+
+    async def register_upload(
+        self, pid: str, kind: str, filename: str, stream: BinaryIO
+    ) -> dict[str, Any]:
+        directory = self._target_dir(pid, kind)
+        staged, sha1 = await asyncio.to_thread(stage_upload, directory, stream, filename)
+        try:
+            existing = await self.by_sha1(pid, sha1)
+            if existing is not None:
+                return existing
+            target = directory / content_name(sha1, Path(filename).suffix)
+            await asyncio.to_thread(staged.replace, target)
+            return await self._insert(pid, kind, target, sha1, "manual", filename)
+        finally:
+            await asyncio.to_thread(staged.unlink, missing_ok=True)
 
     async def register_path(
         self, pid: str, kind: str, src: str, source: str = "manual", copy: bool = True
@@ -232,7 +279,7 @@ class AssetService:
                 ],
                 {"path": str(src)},
             )
-        data_sha = sha1_of_file(path)
+        data_sha = await asyncio.to_thread(sha1_of_file, path)
         existing = await self.by_sha1(pid, data_sha)
         if existing is not None:
             return existing
@@ -242,9 +289,9 @@ class AssetService:
             target = self._target_dir(pid, kind) / content_name(data_sha, path.suffix)
             try:
                 if target.resolve() != path.resolve():
-                    shutil.copy2(path, target)
+                    await asyncio.to_thread(shutil.copy2, path, target)
             except OSError:
-                shutil.copy2(path, target)
+                await asyncio.to_thread(shutil.copy2, path, target)
         return await self._insert(pid, kind, target, data_sha, source, path.name)
 
     async def _insert(

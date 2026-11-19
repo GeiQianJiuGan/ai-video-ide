@@ -684,6 +684,7 @@ class SequenceService:
         priority: int = 100,
         *,
         allow_ref_drop: bool = False,
+        scope: str = "all",
     ) -> dict[str, Any]:
         """按账单入队。跳过的每一条都带结构化原因，绝不静默少做一件事。
 
@@ -692,6 +693,15 @@ class SequenceService:
         """
         self._require_mode(mode)
         bill = await self.plan(pid, mode)
+        from app.services.video_batch import video_batch_state
+
+        done, active = await video_batch_state(pid)
+        bill["ref_drops"] = [
+            entry
+            for entry in bill["ref_drops"]
+            if entry.get("shot_id") not in active
+            and not (scope == "unfinished" and entry.get("shot_id") in done)
+        ]
         if bill["ref_drops"] and not allow_ref_drop:
             raise over_capacity_error(bill["ref_drops"])
         # 一次编排 = 队列里一条可展开的任务。批次身份在这里定死（`batch_label` 说的是
@@ -699,12 +709,16 @@ class SequenceService:
         batch_id = new_id("job_batch")
         if mode == "sequential":
             return {
-                **await self._run_sequential(pid, priority, allow_ref_drop, batch_id=batch_id),
+                **await self._run_sequential(
+                    pid, priority, allow_ref_drop, batch_id=batch_id, scope=scope
+                ),
                 "plan": bill,
                 "batch_id": batch_id,
             }
         return {
-            **await self._run_parallel(pid, bill, priority, allow_ref_drop, batch_id=batch_id),
+            **await self._run_parallel(
+                pid, bill, priority, allow_ref_drop, batch_id=batch_id, scope=scope
+            ),
             "plan": bill,
             "batch_id": batch_id,
         }
@@ -731,7 +745,11 @@ class SequenceService:
         allow_ref_drop: bool = False,
         *,
         batch_id: str | None = None,
+        scope: str = "all",
     ) -> dict[str, Any]:
+        from app.services.video_batch import video_batch_state
+
+        done, active = await video_batch_state(pid)
         db = db_of(pid)
         queued: list[str] = []
         skipped: list[dict[str, Any]] = []
@@ -744,6 +762,22 @@ class SequenceService:
                 if s.scene_id == row["scene_id"] and s.kind != "transition"
             ]
             for shot in shots:
+                reason = (
+                    "正在生成"
+                    if shot.id in active
+                    else "已有生成视频"
+                    if scope == "unfinished" and shot.id in done
+                    else ""
+                )
+                if reason:
+                    skipped.append(
+                        {
+                            "shot_id": shot.id,
+                            "index_no": shot.index_no,
+                            "error": {"title": reason, "detail": reason},
+                        }
+                    )
+                    continue
                 seq += 1
                 try:
                     job = await generation.enqueue_shot(
@@ -794,8 +828,12 @@ class SequenceService:
         allow_ref_drop: bool = False,
         *,
         batch_id: str | None = None,
+        scope: str = "all",
     ) -> dict[str, Any]:
         """把全片的镜头串成一条链再入队。链头要真首帧，其余等上游末帧。"""
+        from app.services.video_batch import video_batch_state
+
+        done, active = await video_batch_state(pid)
         db = db_of(pid)
         scenes = await fetch_all(db, Scene, order_by=Scene.index_no)
         shots = await fetch_all(db, Shot, order_by=Shot.index_no)
@@ -811,7 +849,11 @@ class SequenceService:
             )
         for i, shot in enumerate(chain):
             want = chain[i - 1].id if i else None
-            if shot.prev_shot_id != want:
+            if (
+                shot.id not in active
+                and not (scope == "unfinished" and shot.id in done)
+                and shot.prev_shot_id != want
+            ):
                 await story.update_shot(pid, shot.id, {"prev_shot_id": want})
 
         queued: list[str] = []
@@ -819,6 +861,23 @@ class SequenceService:
         previous_job_id: str | None = None
         label = f"单线程续接 · {len(chain)} 个镜头"
         for i, shot in enumerate(chain):
+            reason = (
+                "正在生成"
+                if shot.id in active
+                else "已有生成视频"
+                if scope == "unfinished" and shot.id in done
+                else ""
+            )
+            if reason:
+                previous_job_id = active.get(shot.id)
+                skipped.append(
+                    {
+                        "shot_id": shot.id,
+                        "index_no": shot.index_no,
+                        "error": {"title": reason, "detail": reason},
+                    }
+                )
+                continue
             try:
                 # 链头必须自己有首帧，所以照常过门槛；后面的首帧要等上游出片，
                 # 硬检查只会把整条链拒在门外——它们的等待由 wait_reason 表达。

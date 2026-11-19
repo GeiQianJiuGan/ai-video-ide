@@ -33,17 +33,26 @@ from __future__ import annotations
 
 import asyncio
 import re
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
+
+from sqlalchemy import func, select
 
 from app.core import ffmpeg as ffmpeg_tool
 from app.core.config import settings
 from app.core.errors import AppError, ErrorCode
+from app.core.ids import new_id
 from app.core.logging import get_logger
-from app.persistence.models_world import Asset
+from app.events.bus import Channel, bus
+from app.persistence.models import utc_now
+from app.persistence.models_frames import FrameCard
+from app.persistence.models_gen import GenerationVersion
+from app.persistence.models_story import Scene, Shot
+from app.persistence.models_world import Asset, AssetRef
 from app.services.assets import assets, kind_of_suffix
 from app.services.audio import audio as audio_service
-from app.services.base import db_of, fetch, project_of
+from app.services.base import as_dict, db_of, dump_json, fetch, project_of
 from app.services.story import story
 
 log = get_logger("ingest")
@@ -63,6 +72,9 @@ METHOD_LABEL = {
 
 
 class IngestService:
+    def __init__(self) -> None:
+        self._scan_cache: OrderedDict[tuple, list[float]] = OrderedDict()
+
     # --- 第一步：把源文件登记进来 ---
 
     async def register(self, pid: str, src: str, *, copy: bool = True) -> dict[str, Any]:
@@ -126,6 +138,7 @@ class IngestService:
         cuts: list[float] | None = None,
         range_in: float | None = None,
         range_out: float | None = None,
+        fast_scan: bool = True,
     ) -> dict[str, Any]:
         """切成几段、每段哪儿到哪儿、用哪一级方法认出来的。**一行都不落库。**
 
@@ -159,7 +172,9 @@ class IngestService:
         if cuts is not None:
             points, used = sorted({max(0.0, float(c)) for c in cuts}), "manual"
         else:
-            points, used = await self._detect(path, method, threshold, window, low, high)
+            points, used = await self._detect(
+                path, method, threshold, window, low, high, fast_scan=fast_scan
+            )
         #: 片头片尾里的切点直接扔掉：那一截不属于任何镜头，留着只会切出一个空段。
         points = [p for p in points if low < p < (high or p + 1)]
         merged, dropped = self._merge(points, floor, high, low)
@@ -172,6 +187,7 @@ class IngestService:
             "duration": total or None,
             "size_mb": size_mb,
             "method": used,
+            "fast_scan": fast_scan,
             "method_label": METHOD_LABEL.get(used, used),
             "threshold": float(
                 threshold if threshold is not None else settings.ingest_scene_threshold
@@ -253,6 +269,11 @@ class IngestService:
         range_out: float | None = None,
         param_mode: str = "shared",
         position: int | None = None,
+        production_mode: str = "direct",
+        frames_per_shot: int = 2,
+        image_prompt: str = "",
+        video_prompt: str = "",
+        fast_scan: bool = True,
     ) -> dict[str, Any]:
         """按账单落库：一幕 `kind="ingested"` + 每段一个镜头 + 每段一版（带区间）。
 
@@ -273,6 +294,7 @@ class IngestService:
             cuts=cuts,
             range_in=range_in,
             range_out=range_out,
+            fast_scan=fast_scan,
         )
         if not bill["segments"]:
             raise AppError(
@@ -285,69 +307,168 @@ class IngestService:
                 ],
                 {"asset_id": asset_id},
             )
-        scene = await story.create_scene(
-            pid,
-            {
-                "title": (title or "").strip() or f"导入：{Path(bill['path']).name}",
-                "kind": "ingested",
-                #: **共用参数是默认**：镜头上留空 = 继承幕级那一份，改一处三十段跟着变。
-                "param_mode": param_mode,
-                "prompt": prompt or "",
-                "source_asset_id": asset_id,
-                "notes": (
-                    f"从 {Path(bill['path']).name} 自动切段（{bill['method_label']}），"
-                    f"共 {bill['total']} 段。"
-                    #: 片头片尾是「为什么第一段不是从 0 秒开始」的唯一解释，记在幕上，
-                    #: 不然过两天回来看只会觉得少了一截。
-                    + (
-                        f"已去掉片头 {bill['trimmed_head']:.2f} 秒"
-                        f" / 片尾 {bill['trimmed_tail']:.2f} 秒。"
-                        if bill["trimmed_head"] or bill["trimmed_tail"]
-                        else ""
-                    )
-                ),
-            },
-        )
-        shots = []
-        for index, seg in enumerate(bill["segments"], start=1):
-            shot = await story.create_shot(
+        # 先抽取全部参考画面；抽帧失败时不留下半套幕和镜头。
+        extracted: list[list[dict]] = []
+        if production_mode == "frames":
+            from app.services.frames import frames as extractor
+
+            if not 1 <= frames_per_shot <= 8:
+                raise ValueError("frames_per_shot must be between 1 and 8")
+            all_positions = []
+            for seg in bill["segments"]:
+                low, high = seg["in_point"], seg["out_point"]
+                # 留在每段区间内，避开结尾切点，防止抽到下一段。
+                span = max(0.0, high - low - min(0.1, (high - low) / 2))
+                for i in range(frames_per_shot):
+                    at = round(low + span * i / max(1, frames_per_shot - 1), 3)
+                    all_positions.append(at)
+            all_frames = await extractor.extract_many(pid, asset_id, all_positions)
+            for offset in range(0, len(all_frames), frames_per_shot):
+                extracted.append(
+                    [
+                        {"asset_id": frame["id"], "at": at}
+                        for frame, at in zip(
+                            all_frames[offset : offset + frames_per_shot],
+                            all_positions[offset : offset + frames_per_shot],
+                            strict=True,
+                        )
+                    ]
+                )
+        async with db_of(pid).atomic():
+            scene = await story.create_scene(
                 pid,
-                scene["id"],
                 {
-                    "title": f"第 {index} 段",
-                    #: 镜头级 prompt 一律留空：填了就是「这一段独立」，
-                    #: 而默认要的是继承幕上那一份（`param_mode="shared"` 也不预填）。
-                    "duration": seg["duration"],
-                    "status": "generated",
+                    "title": (title or "").strip() or f"导入：{Path(bill['path']).name}",
+                    "kind": "ingested",
+                    #: **共用参数是默认**：镜头上留空 = 继承幕级那一份，改一处三十段跟着变。
+                    "param_mode": param_mode,
+                    "prompt": prompt or "",
+                    "source_asset_id": asset_id,
+                    "notes": (
+                        f"从 {Path(bill['path']).name} 自动切段（{bill['method_label']}），"
+                        f"共 {bill['total']} 段。"
+                        #: 片头片尾是「为什么第一段不是从 0 秒开始」的唯一解释，记在幕上，
+                        #: 不然过两天回来看只会觉得少了一截。
+                        + (
+                            f"已去掉片头 {bill['trimmed_head']:.2f} 秒"
+                            f" / 片尾 {bill['trimmed_tail']:.2f} 秒。"
+                            if bill["trimmed_head"] or bill["trimmed_tail"]
+                            else ""
+                        )
+                    ),
                 },
             )
-            version = await generation.add_version(
-                pid,
-                shot["id"],
-                asset_id=asset_id,
-                kind="video",
-                source="imported",
-                duration=seg["duration"],
-                in_point=seg["in_point"],
-                out_point=seg["out_point"],
-                params={
-                    "imported_from_asset_id": asset_id,
-                    "segment_index": index,
-                    "cut_method": bill["method"],
-                },
+            if production_mode == "frames":
+                from app.services.frame_authoring import frames
+
+                await frames.save_shared_prompts(
+                    pid,
+                    scene["id"],
+                    {
+                        "image_prompt": image_prompt,
+                        "video_prompt": video_prompt,
+                    },
+                )
+            # 同一源片的镜头、版本、引用和画面一次写入，避免每段重查整个镜头表。
+            from app.services.params import prefill
+
+            rows, versions, references, cards = [], [], [], []
+            async with db_of(pid).write() as session:
+                highest = await session.scalar(select(func.max(Shot.index_no))) or 0
+                scene_row = await session.get(Scene, scene["id"])
+                defaults = prefill(scene_row)
+                for index, seg in enumerate(bill["segments"], start=1):
+                    shot_id, version_id = new_id("shot"), new_id("generation_version")
+                    shot = Shot(
+                        id=shot_id,
+                        scene_id=scene["id"],
+                        index_no=highest + index,
+                        title=f"第 {index} 段",
+                        **{k: v for k, v in defaults.items() if k != "duration"},
+                        duration=seg["duration"],
+                        status="generated",
+                        current_version_id=version_id,
+                        created_at=utc_now(),
+                        updated_at=utc_now(),
+                    )
+                    rows.append(shot)
+                    versions.append(
+                        GenerationVersion(
+                            id=version_id,
+                            shot_id=shot_id,
+                            version_no=1,
+                            asset_id=asset_id,
+                            kind="video",
+                            source="imported",
+                            status="done",
+                            duration=seg["duration"],
+                            in_point=seg["in_point"],
+                            out_point=seg["out_point"],
+                            params_json=dump_json(
+                                {
+                                    "imported_from_asset_id": asset_id,
+                                    "segment_index": index,
+                                    "cut_method": bill["method"],
+                                }
+                            ),
+                        )
+                    )
+                    references.append(
+                        AssetRef(
+                            id=new_id("asset_ref"),
+                            asset_id=asset_id,
+                            owner_kind="shot",
+                            owner_id=shot_id,
+                            role="version",
+                        )
+                    )
+                    if production_mode == "frames":
+                        for frame_index, frame in enumerate(extracted[index - 1]):
+                            role = (
+                                "first"
+                                if frame_index == 0
+                                else "last"
+                                if frame_index == frames_per_shot - 1
+                                else "key"
+                            )
+                            cards.append(
+                                FrameCard(
+                                    id=new_id("frame"),
+                                    shot_id=shot_id,
+                                    position=frame_index,
+                                    title=f"源片画面 {frame_index + 1}",
+                                    role=role,
+                                    refs_json=dump_json([frame["asset_id"]]),
+                                    story=f"源视频 {frame['at']:.3f} 秒的画面（本段 {seg['in_point']:.3f}–{seg['out_point']:.3f} 秒）",
+                                )
+                            )
+                session.add_all(rows)
+                await session.flush()
+                session.add_all([*versions, *references, *cards])
+            shots = [
+                {**as_dict(shot), "version_id": version.id, **seg}
+                for shot, version, seg in zip(rows, versions, bill["segments"], strict=True)
+            ]
+            moved = 0
+            if position is not None:
+                moved = await self._insert_at(pid, scene["id"], position)
+            result = {
+                "plan": bill,
+                "scene": await story.get_scene(pid, scene["id"]),
+                "shots": shots,
+                "created": len(shots),
+                #: 插到中间时有多少幕被推后。顺序是用户的东西，动了必须说出来。
+                "scenes_shifted": moved,
+            }
+        for version in versions:
+            bus.emit(
+                Channel.VERSION,
+                "version.created",
+                {"id": version.id, "shot_id": version.shot_id, "version_no": 1},
+                project_id=pid,
             )
-            shots.append({**shot, "version_id": version["id"], **seg})
-        moved = 0
-        if position is not None:
-            moved = await self._insert_at(pid, scene["id"], position)
-        return {
-            "plan": bill,
-            "scene": await story.get_scene(pid, scene["id"]),
-            "shots": shots,
-            "created": len(shots),
-            #: 插到中间时有多少幕被推后。顺序是用户的东西，动了必须说出来。
-            "scenes_shifted": moved,
-        }
+        generation.ensure_pump(pid)
+        return result
 
     # --- 切点 ---
 
@@ -359,21 +480,30 @@ class IngestService:
         window: float,
         low: float,
         high: float,
+        *,
+        fast_scan: bool = True,
     ) -> tuple[list[float], str]:
         """三级降级找切点。**每一级都要能说出自己是哪一级**（账单里的 `method`）。
 
-        前两级扫的是整个文件（FFmpeg 的时间戳本来就是绝对的，片头片尾里的切点由调用方
-        过滤掉）；兜底那一级铺的窗口**只铺保留区间**，不然会从第 0 秒开始铺，切点全都
-        落在片头里。
+        三种方法都只处理保留区间；检测返回源文件绝对时间。
         """
         want = method if method in ("scene", "silence", "fixed") else "auto"
         level = float(threshold if threshold is not None else settings.ingest_scene_threshold)
         if want in ("auto", "scene"):
-            points = await self._scan(path, f"select='gt(scene,{level})',showinfo", _PTS)
+            scale = (
+                "scale=w='min(640,iw)':h='min(360,ih)':force_original_aspect_ratio=decrease,"
+                if fast_scan
+                else ""
+            )
+            points = await self._scan(
+                path, f"{scale}select='gt(scene,{level})',showinfo", _PTS, low=low, high=high
+            )
             if points or want == "scene":
                 return points, "scene"
         if want in ("auto", "silence"):
-            points = await self._scan(path, "silencedetect=n=-30dB:d=0.6", _SILENCE_END, audio=True)
+            points = await self._scan(
+                path, "silencedetect=n=-30dB:d=0.6", _SILENCE_END, audio=True, low=low, high=high
+            )
             if points or want == "silence":
                 return points, "silence"
         if high <= low:
@@ -383,7 +513,14 @@ class IngestService:
         return [round(low + step * i, 3) for i in range(1, int(span // step) + 1)], "fixed"
 
     async def _scan(
-        self, path: Path, filter_spec: str, pattern: re.Pattern[str], *, audio: bool = False
+        self,
+        path: Path,
+        filter_spec: str,
+        pattern: re.Pattern[str],
+        *,
+        audio: bool = False,
+        low: float = 0,
+        high: float = 0,
     ) -> list[float]:
         """跑一遍 FFmpeg 只为读 stderr 上的时间戳（`-f null` 不写任何文件）。
 
@@ -393,11 +530,20 @@ class IngestService:
         最终会在 `plan` 的 warnings 里说出来。
         """
         binary = ffmpeg_tool.require("ffmpeg")
+        stat = await asyncio.to_thread(path.stat)
+        key = (str(path), stat.st_size, stat.st_mtime_ns, filter_spec, audio, low, high)
+        if key in self._scan_cache:
+            self._scan_cache.move_to_end(key)
+            return list(self._scan_cache[key])
         args = [
             binary,
             "-hide_banner",
+            "-ss",
+            str(low),
             "-i",
             str(path),
+            *(["-t", str(high - low)] if high > low else []),
+            "-vn" if audio else "-an",
             "-af" if audio else "-vf",
             filter_spec,
             "-f",
@@ -407,12 +553,22 @@ class IngestService:
         proc = await asyncio.create_subprocess_exec(
             *args, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
         )
-        _, stderr = await proc.communicate()
+        try:
+            _, stderr = await proc.communicate()
+        except BaseException:
+            if proc.returncode is None:
+                proc.kill()
+            await proc.communicate()
+            raise
         text = (stderr or b"").decode("utf-8", "replace")
         if proc.returncode != 0:
             log.info("ingest.detect_failed", path=path.name, filter=filter_spec)
             return []
-        return sorted({round(float(m), 3) for m in pattern.findall(text)})
+        points = sorted({round(low + float(m), 3) for m in pattern.findall(text)})
+        self._scan_cache[key] = points
+        while len(self._scan_cache) > 16:
+            self._scan_cache.popitem(last=False)
+        return list(points)
 
     def _merge(
         self, points: list[float], floor: float, total: float, start: float = 0.0

@@ -25,6 +25,7 @@ import AppButton from '@/shared/ui/AppButton.vue'
 import AppBadge from '@/shared/ui/AppBadge.vue'
 import ErrorPanel from '@/shared/ui/ErrorPanel.vue'
 import VideoTrimmer from './VideoTrimmer.vue'
+import FramePromptTemplates from '@/features/frames/FramePromptTemplates.vue'
 import { ApiError } from '@/shared/api/client'
 import { assetsApi } from '@/shared/api/assets'
 import { fileUrl } from '@/shared/api/files'
@@ -38,6 +39,7 @@ import {
 const props = defineProps<{
   open: boolean
   pid: string
+  productionMode?: 'direct' | 'frames'
 }>()
 
 const emit = defineEmits<{
@@ -76,6 +78,7 @@ const trimSrc = computed(() => {
 
 // Step 3 状态
 const selectedMethod = ref('auto')
+const fastScan = ref(true)
 const threshold = ref(0.3)
 const minSegment = ref(1.0)
 const maxSegment = ref<number | undefined>(10.0)
@@ -86,6 +89,9 @@ const planResult = ref<IngestPlanResult | null>(null)
 const sceneTitle = ref('')
 const paramMode = ref<'shared' | 'per_shot'>('shared')
 const scenePrompt = ref('')
+const imagePrompt = ref('')
+const videoPrompt = ref('')
+const framesPerShot = ref(2)
 
 /** 保留区间总长——账单那条时间条量的是它，不是整个文件（不然裁掉的那截会占着宽度）。 */
 const keptSpan = computed(() => {
@@ -111,6 +117,11 @@ watch(
       rangeOut.value = null
       sceneTitle.value = ''
       scenePrompt.value = ''
+      imagePrompt.value = ''
+      videoPrompt.value = ''
+      framesPerShot.value = 2
+      paramMode.value = 'shared'
+      fastScan.value = true
       maxSegment.value = 10.0
       try {
         methodsList.value = await ingestApi.methods()
@@ -180,6 +191,7 @@ async function fetchPlan() {
     planResult.value = await ingestApi.plan(props.pid, {
       asset_id: registeredAsset.value.id,
       method: selectedMethod.value,
+      fast_scan: fastScan.value,
       threshold: threshold.value,
       min_segment: minSegment.value,
       max_segment: maxSegment.value && maxSegment.value > 0 ? maxSegment.value : undefined,
@@ -206,12 +218,17 @@ async function handleRun() {
       title: sceneTitle.value.trim() || undefined,
       prompt: scenePrompt.value.trim() || undefined,
       param_mode: paramMode.value,
+      production_mode: props.productionMode || 'direct',
+      frames_per_shot: framesPerShot.value,
+      image_prompt: imagePrompt.value,
+      video_prompt: videoPrompt.value,
       method: selectedMethod.value,
       threshold: threshold.value,
       min_segment: minSegment.value,
       max_segment: maxSegment.value && maxSegment.value > 0 ? maxSegment.value : undefined,
       chunk_seconds: chunkSeconds.value,
       cuts: planResult.value.cuts,
+      fast_scan: fastScan.value,
       range_in: rangeIn.value > 0 ? rangeIn.value : undefined,
       range_out: rangeOut.value ?? undefined,
     })
@@ -236,7 +253,7 @@ function fmtSec(sec: number | null | undefined): string {
   <AppDialog
     :open="open"
     title="导入长视频加工与切段"
-    subtitle="零文件复制：自动切分段落为独立镜头并保留区间"
+    :subtitle="productionMode === 'frames' ? '长视频切段 → 每段抽帧作为参考 → 制作图片 → 制帧分镜' : '自动切分段落为独立镜头并保留区间'"
     size="lg"
     @update:open="emit('update:open', $event)"
   >
@@ -414,6 +431,9 @@ function fmtSec(sec: number | null | undefined): string {
 
       <!-- Step 3: 切段配置与账单 -->
       <div v-else-if="step === 3" class="space-y-3">
+        <label v-if="selectedMethod === 'auto' || selectedMethod === 'scene'" class="flex items-center gap-2 text-xs text-fg-3">
+          <input v-model="fastScan" type="checkbox" :disabled="busy" />快速分析切点（仅缩小分析画面，保留原片及抽帧画质）
+        </label>
         <!-- 视频探测摘要 -->
         <div v-if="registeredAsset" class="border-line-1 bg-base-2 flex items-center justify-between border p-2 text-2xs">
           <div class="flex items-center gap-1.5">
@@ -555,6 +575,23 @@ function fmtSec(sec: number | null | undefined): string {
 
       <!-- Step 4: 幕参数设置 -->
       <div v-else-if="step === 4" class="space-y-3">
+        <div v-if="productionMode === 'frames'" class="border-line-1 bg-base-2 border p-3 space-y-3 text-xs">
+          <label class="block">每段抽取画面数
+            <input v-model.number="framesPerShot" type="number" min="1" max="8" class="border-line-1 bg-base-1 ml-2 w-16 border p-1" />
+          </label>
+          <p class="text-fg-4">将在每段有效区间内均匀抽帧，建立独立画面并用作制图参考。生成图片后审阅采用；视频可选择首帧和尾帧，中间画面用于叙事参考。</p>
+          <div>
+            <label for="ingest-image-prompt">本幕共用图片提示词</label>
+            <FramePromptTemplates :disabled="busy" @apply="imagePrompt = $event" />
+            <textarea id="ingest-image-prompt" v-model="imagePrompt" :disabled="busy" rows="3" placeholder="保持参考画面的构图与人物，将画面转换为指定风格。" class="border-line-1 bg-base-1 mt-1 w-full border p-2" />
+          </div>
+          <div>
+            <label for="ingest-video-prompt">本幕共用分镜视频提示词</label>
+            <FramePromptTemplates kind="video" :disabled="busy" @apply="videoPrompt = $event" />
+            <textarea id="ingest-video-prompt" v-model="videoPrompt" :disabled="busy" rows="3" placeholder="描述统一的动作、运镜、对白与声音要求。" class="border-line-1 bg-base-1 mt-1 w-full border p-2" />
+          </div>
+          <p class="text-fg-4">留空的画面和镜头自动继承共用提示词；后续可在「制作图片」或「制帧分镜」修改。</p>
+        </div>
         <label class="block">
           <span class="text-fg-3 text-2xs font-medium">生成的幕标题</span>
           <input
@@ -564,7 +601,7 @@ function fmtSec(sec: number | null | undefined): string {
           />
         </label>
 
-        <div class="border-line-1 bg-base-2 p-2.5 border space-y-2">
+        <div v-if="productionMode !== 'frames'" class="border-line-1 bg-base-2 p-2.5 border space-y-2">
           <span class="text-fg-3 text-2xs font-medium block">参数模式 (Param Mode)</span>
           <div class="flex gap-4 text-xs">
             <label class="flex items-center gap-1.5 cursor-pointer">
@@ -581,7 +618,7 @@ function fmtSec(sec: number | null | undefined): string {
           </p>
         </div>
 
-        <label class="block">
+        <label v-if="productionMode !== 'frames'" class="block">
           <span class="text-fg-3 text-2xs font-medium">整幕共用 Prompt（可选）</span>
           <textarea
             v-model="scenePrompt"
@@ -634,7 +671,7 @@ function fmtSec(sec: number | null | undefined): string {
           :disabled="busy"
           @click="handleRun"
         >
-          <CheckCircle2 :size="12" />确认导入分镜 ({{ planResult?.total || 0 }} 镜)
+          <CheckCircle2 :size="12" />{{ busy ? '正在处理…' : productionMode === 'frames' ? `切段并抽取 ${(planResult?.total || 0) * framesPerShot} 张参考画面` : `确认导入分镜 (${planResult?.total || 0} 镜)` }}
         </AppButton>
       </div>
     </template>

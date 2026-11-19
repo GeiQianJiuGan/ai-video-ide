@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field
 
 from app.ai.frame_plan import FramePlanDraft
 from app.domain.frames import FrameCardPatch as CardPatch
-from app.domain.frames import FrameContinuityInput
+from app.domain.frames import FrameContinuityInput, SourceFrameInput
 from app.domain.frames import FrameVideoInput as VideoBody
 from app.persistence.models_frames import FrameCard, FrameWorkspace
 from app.persistence.models_gen import Job
@@ -16,6 +16,32 @@ from app.services.frame_authoring import frames, invalid
 from app.services.images import images
 
 router = APIRouter(tags=["frames"])
+
+
+@router.get("/projects/{pid}/shots/{sid}/frame-source")
+async def frame_source(pid: str, sid: str) -> dict:
+    return await frames.source_video(pid, sid)
+
+
+@router.post("/projects/{pid}/shots/{sid}/source-frames", status_code=201)
+async def select_source_frame(pid: str, sid: str, body: SourceFrameInput) -> dict:
+    return await frames.select_source_frame(pid, sid, body.model_dump())
+
+
+class SharedPromptsBody(BaseModel):
+    image_prompt: str = ""
+    video_prompt: str = ""
+    clear_overrides: bool = False
+
+
+@router.get("/projects/{pid}/scenes/{scene_id}/frame-prompts")
+async def shared_prompts(pid: str, scene_id: str) -> dict:
+    return await frames.shared_prompts(pid, scene_id)
+
+
+@router.put("/projects/{pid}/scenes/{scene_id}/frame-prompts")
+async def save_shared_prompts(pid: str, scene_id: str, body: SharedPromptsBody) -> dict:
+    return await frames.save_shared_prompts(pid, scene_id, body.model_dump())
 
 
 @router.get("/projects/{pid}/frame-reference-materials")
@@ -108,6 +134,20 @@ async def generate(pid: str, cid: str) -> dict[str, Any]:
         skill="shot_frame",
         ref_asset_ids=load_json(card.refs_json, []),
     )
+
+
+class BatchGenerateBody(BaseModel):
+    scope: Literal["all", "unfinished"] = "unfinished"
+
+
+@router.post("/projects/{pid}/frames/generate-all")
+async def generate_all(pid: str, body: BatchGenerateBody = BatchGenerateBody()) -> dict[str, Any]:
+    return await frames.generate_all(pid, body.scope)
+
+
+@router.post("/projects/{pid}/frame-video/generate-all")
+async def generate_all_videos(pid: str, body: BatchGenerateBody) -> dict[str, Any]:
+    return await frames.generate_all_videos(pid, body.scope)
 
 
 @router.put("/projects/{pid}/shots/{sid}/frame-video")

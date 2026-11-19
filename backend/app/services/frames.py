@@ -125,6 +125,36 @@ def derived_frames(rows: list[Asset], source_asset_id: str) -> list[Asset]:
 
 
 class FrameService:
+    async def extract_many(
+        self, pid: str, asset_id: str, positions: list[float]
+    ) -> list[dict[str, Any]]:
+        """最多四个解码进程；登记串行，避免相同画面并发产生重复资产。"""
+        asset = await fetch(db_of(pid), Asset, asset_id, "资产")
+        proj = project_of(pid)
+        src = proj.dir / asset.path
+        if not src.is_file() or asset_module.kind_of_suffix(src.suffix) != "video":
+            # 保持单帧入口原有的错误说明。
+            await self.extract(pid, asset_id, positions[0] if positions else 0)
+        target_dir = asset_module.ensure_dir(proj.dir / asset_module.KIND_DIR["frame"], "帧目录")
+        pending = iter(dict.fromkeys(positions))
+
+        async def worker():
+            for at in pending:
+                target = target_dir / f"{Path(asset.path).stem}_{_label(at)}.png"
+                if not target.is_file():  # noqa: ASYNC240 - 本地缓存检查
+                    await self._run(asset_id, src, target, at)
+
+        tasks = [asyncio.create_task(worker()) for _ in range(min(4, len(positions)))]
+        try:
+            await asyncio.gather(*tasks)
+        except BaseException:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+        async with db_of(pid).atomic():
+            return [await self.extract(pid, asset_id, at) for at in positions]
+
     async def extract(self, pid: str, asset_id: str, at: str | float = "end") -> dict[str, Any]:
         """抽一帧并登记成临时资源。`at` 是 "end" / "start" / 秒数。返回资产字典 + `reused`。"""
         db = db_of(pid)
@@ -188,11 +218,32 @@ class FrameService:
             pick = ["-update", "1"]
         elif at != "start":
             seek = ["-ss", f"{float(at):.3f}"]
-        args = [binary, "-y", *seek, "-i", str(src), *pick, "-q:v", "2", str(target)]
+        args = [
+            binary,
+            "-y",
+            "-threads",
+            "1",
+            *seek,
+            "-i",
+            str(src),
+            *pick,
+            "-threads",
+            "1",
+            "-q:v",
+            "2",
+            str(target),
+        ]
         proc = await asyncio.create_subprocess_exec(
             *args, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
         )
-        _, stderr = await proc.communicate()
+        try:
+            _, stderr = await proc.communicate()
+        except BaseException:
+            if proc.returncode is None:
+                proc.kill()
+            await proc.communicate()
+            target.unlink(missing_ok=True)  # noqa: ASYNC240 - 取消后移除半成品
+            raise
         if proc.returncode != 0 or not target.is_file():  # noqa: ASYNC240 - 本地文件检查，开销可忽略
             target.unlink(missing_ok=True)  # noqa: ASYNC240 - 同上；半成品必须删掉，否则下次会被当成已抽好的帧
             raise AppError(

@@ -81,7 +81,11 @@ def test_skills_listing(client: TestClient, pid: str) -> None:
     assert [row["name"] for row in body["items"]] == ["char_sheet", "scene_simple", "prop_ref", "shot_frame"]
     for row in body["items"]:
         # 前端只渲染，不在组件里抄第二份文案
-        assert row["title"] and row["when"] and row["fixed"] and row["lead"]
+        assert row["title"] and row["when"]
+        if row["name"] == "shot_frame":
+            assert row["fixed"] == row["lead"] == ""
+        else:
+            assert row["fixed"] and row["lead"]
     assert body["rule"]
     assert "四视图" in body["items"][0]["fixed"]
 

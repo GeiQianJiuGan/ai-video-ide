@@ -26,6 +26,8 @@ export interface FrameCard {
   id: string
   title: string
   prompt: string
+  effective_prompt?: string
+  shared_prompt?: string
   story: string
   role: FrameRole
   position: number
@@ -35,6 +37,7 @@ export interface FrameCard {
   jobs: { id: string; status: string; error_json: string | null }[]
 }
 export interface FrameVideo {
+  shared_prompt?: string
   preset?: string
   prompt: string
   duration: number
@@ -44,6 +47,19 @@ export interface FrameVideo {
 export interface FrameWorkspace {
   cards: FrameCard[]
   video: Partial<FrameVideo>
+}
+export interface FrameSourceVideo {
+  source_version_id: string
+  asset_id: string
+  path: string
+  in_point: number
+  out_point: number
+  duration: number
+}
+export interface SharedFramePrompts {
+  image_prompt: string
+  video_prompt: string
+  clear_overrides: boolean
 }
 export interface FrameNarrativePlan {
   frames: { title: string; role: FrameRole; story: string; prompt: string }[]
@@ -73,6 +89,42 @@ export function frameVideoDraft(video: Partial<FrameVideo>, duration: number): F
 }
 const base = (pid: string) => `/projects/${pid}`
 export const framesApi = {
+  generateAllVideos: (pid: string, scope: 'all' | 'unfinished') =>
+    api.post<{
+      queued: string[]
+      batch_id: string
+      skipped: { shot_id: string; index_no: number; error: { title: string; detail: string } }[]
+    }>(`${base(pid)}/frame-video/generate-all`, { scope }),
+  generateAll: (pid: string, scope: 'all' | 'unfinished' = 'unfinished') =>
+    api.post<{
+      queued: { card_id: string; title: string; job_id: string; warnings: string[] }[]
+      skipped: { card_id: string; title: string; reason: string }[]
+      failed: {
+        card_id: string
+        title: string
+        error: { title: string; detail: string; suggestions: string[] }
+      }[]
+    }>(`${base(pid)}/frames/generate-all`, { scope }),
+  sourceVideo: (pid: string, sid: string) =>
+    api.get<FrameSourceVideo>(`${base(pid)}/shots/${sid}/frame-source`),
+  selectSourceFrame: (
+    pid: string,
+    sid: string,
+    body: { source_version_id: string; at: number; card_id: string },
+  ) =>
+    api.post<{ card_id: string; asset_id: string; path: string; at: number }>(
+      `${base(pid)}/shots/${sid}/source-frames`,
+      body,
+    ),
+  sharedPrompts: (pid: string, sceneId: string) =>
+    api.get<{ image_prompt: string; video_prompt: string }>(
+      `${base(pid)}/scenes/${sceneId}/frame-prompts`,
+    ),
+  saveSharedPrompts: (
+    pid: string,
+    sceneId: string,
+    body: { image_prompt: string; video_prompt: string; clear_overrides: boolean },
+  ) => api.put(`${base(pid)}/scenes/${sceneId}/frame-prompts`, body),
   continuity: (
     pid: string,
     cid: string,

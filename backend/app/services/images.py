@@ -191,9 +191,10 @@ class ImageService:
         skill: str | None = None,
         ref_asset_ids: list[str] | None = None,
         priority: int = 100,
+        batch: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """写一行任务。**照 `generation.enqueue_task()` 那 20 行**，不新造队列。"""
-        from app.services.generation import generation
+        from app.services.generation import _batch_fields, generation
 
         bill = await self._prepare(pid, target_kind, target_id, prompt, skill, ref_asset_ids)
         err = bill.pop("_error")
@@ -209,6 +210,7 @@ class ImageService:
             kind="i2i" if bill["refs"] else "t2i",
             status="queued",
             priority=priority,
+            **_batch_fields(batch),
             params_json=dump_json(
                 {
                     "target_kind": bill["target_kind"],
@@ -365,6 +367,11 @@ class ImageService:
         spec = _spec(target_kind)
         db = db_of(pid)
         await fetch(db, spec.model, target_id, spec.what)
+        if spec.kind == "frame_card" and not prompt.strip():
+            from app.services.frame_authoring import frames
+
+            card = await fetch(db, spec.model, target_id, spec.what)
+            prompt = await frames.image_prompt(pid, card)
         label = await self._label(pid, spec, target_id)
         name = str(skill or "").strip() or skills.image_pick(spec.kind)
         positive, negative = skills.render_image_prompt(name, prompt)

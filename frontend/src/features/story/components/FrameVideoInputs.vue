@@ -1,13 +1,25 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { onBeforeRouteLeave, onBeforeRouteUpdate } from 'vue-router'
-import { frameVideoDraft, framesApi, type FrameCard, type FrameVideo } from '@/shared/api/frames'
+import {
+  frameVideoDraft,
+  framesApi,
+  type FrameCard,
+  type FrameVideo,
+  type SharedFramePrompts,
+} from '@/shared/api/frames'
 import { assetsApi, type Asset } from '@/shared/api/assets'
 import { fileUrl } from '@/shared/api/files'
 import AppButton from '@/shared/ui/AppButton.vue'
 import { useShellStore } from '@/stores/shell'
+import { frameCardImageState, frameVideoChecks } from '@/features/frames/frameVideoReadiness'
 
-const props = defineProps<{ pid: string; shotId: string; duration: number }>()
+const props = defineProps<{
+  pid: string
+  shotId: string
+  duration: number
+  sourceVideo?: boolean
+}>()
 const shell = useShellStore()
 const cards = ref<FrameCard[]>([])
 const assets = ref<Asset[]>([])
@@ -15,6 +27,8 @@ const video = ref<FrameVideo>(frameVideoDraft({}, props.duration))
 const presets = ref<{ name: string; first_frame_ok: boolean; flf_ready: boolean }[]>([])
 const loaded = ref<{ pid: string; sid: string } | null>(null)
 const error = ref('')
+const loadError = ref('')
+const configError = ref('')
 const dirty = ref(false)
 const loading = ref(false)
 const checking = ref(false)
@@ -28,21 +42,27 @@ const selected = computed(() =>
     .map((id) => cards.value.find((c) => c.id === id))
     .filter((c): c is FrameCard => !!c),
 )
-const ready = computed(
-  () =>
-    !loading.value &&
-    loaded.value?.sid === props.shotId &&
-    !!video.value.prompt.trim() &&
-    cards.value.some((c) => c.id === video.value.first_card_id && c.adopted_asset_id) &&
-    (!video.value.last_card_id ||
-      cards.value.some((c) => c.id === video.value.last_card_id && c.adopted_asset_id)),
+const checks = computed(() =>
+  frameVideoChecks({ ...video.value, duration: props.duration }, cards.value, assets.value),
 )
+const inputBlocker = computed(() => {
+  if (loading.value) return '正在读取制帧输入，请稍候。'
+  if (loadError.value) return `制帧输入读取失败：${loadError.value}。请点击「刷新输入」。`
+  if (loaded.value?.pid !== props.pid || loaded.value?.sid !== props.shotId)
+    return '制帧输入尚未读取，请点击「刷新输入」。'
+  return checks.value.find((check) => !check.ready)?.detail || ''
+})
+const ready = computed(() => !inputBlocker.value)
 const url = (card: FrameCard) => {
   const asset = assets.value.find((a) => a.id === card.adopted_asset_id)
   return asset ? fileUrl(props.pid, asset.path) : ''
 }
 const message = (e: unknown) =>
-  e instanceof Error ? e.message + ('detail' in e ? `：${e.detail}` : '') : String(e)
+  e instanceof Error
+    ? e.message +
+      ('detail' in e ? `：${e.detail}` : '') +
+      ('suggestions' in e && Array.isArray(e.suggestions) ? `。${e.suggestions.join('；')}` : '')
+    : String(e)
 function markDirty() {
   revision++
   dirty.value = true
@@ -73,42 +93,65 @@ async function changed() {
     error.value = message(e)
   }
 }
-watch(
-  () => [props.pid, props.shotId, shell.appliedTick],
-  async () => {
-    const ticket = ++request
-    loading.value = true
-    error.value = ''
-    try {
-      await save()
-      const pid = props.pid,
-        sid = props.shotId
-      const [workspace, all, cap] = await Promise.all([
-        framesApi.get(pid, sid),
-        assetsApi.list(pid),
-        framesApi.capabilities(pid),
-      ])
-      if (ticket !== request) return
-      loaded.value = { pid, sid }
-      video.value = {
-        ...frameVideoDraft(workspace.video, props.duration),
-        duration: props.duration,
-      }
-      cards.value = workspace.cards
-      assets.value = all
-      presets.value = cap.presets
-      inputPlan.value = null
-    } catch (e) {
-      error.value = message(e)
-    } finally {
-      if (ticket === request) loading.value = false
+async function loadInputs() {
+  const ticket = ++request
+  const pid = props.pid,
+    sid = props.shotId
+  loading.value = true
+  error.value = ''
+  loadError.value = ''
+  configError.value = ''
+  try {
+    await save()
+    const [workspace, all, extracted, cap] = await Promise.all([
+      framesApi.get(pid, sid),
+      assetsApi.list(pid),
+      assetsApi.list(pid, 'frame'),
+      framesApi.capabilities(pid).then(
+        (data) => ({ data, error: '' }),
+        (e: unknown) => ({ data: null, error: message(e) }),
+      ),
+    ])
+    if (ticket !== request) return
+    loaded.value = { pid, sid }
+    video.value = {
+      ...frameVideoDraft(workspace.video, props.duration),
+      duration: props.duration,
     }
-  },
-  { immediate: true },
-)
+    cards.value = workspace.cards
+    assets.value = [...all, ...extracted]
+    presets.value = cap.data?.presets || []
+    configError.value = cap.error
+    inputPlan.value = null
+  } catch (e) {
+    if (ticket === request) loadError.value = message(e)
+  } finally {
+    if (ticket === request) loading.value = false
+  }
+}
+watch(() => [props.pid, props.shotId, shell.appliedTick], loadInputs, { immediate: true })
+async function reload() {
+  if (!loading.value && !checking.value) await loadInputs()
+}
+function onFocus() {
+  if (!document.hidden) void reload()
+}
+onMounted(() => window.addEventListener('focus', onFocus))
+onBeforeUnmount(() => {
+  request++
+  window.removeEventListener('focus', onFocus)
+})
 async function check() {
   checking.value = true
   try {
+    if (!ready.value) {
+      error.value =
+        checks.value
+          .filter((item) => !item.ready)
+          .map((item) => `${item.label}：${item.detail}`)
+          .join('；') || inputBlocker.value
+      return
+    }
     await save()
     inputPlan.value = await framesApi.plan(props.pid, props.shotId, {
       ...video.value,
@@ -131,14 +174,45 @@ async function leave() {
 }
 onBeforeRouteLeave(leave)
 onBeforeRouteUpdate(leave)
-defineExpose({ save, ready })
+function applySharedPrompts(data: SharedFramePrompts) {
+  video.value.shared_prompt = data.video_prompt.trim()
+  if (data.clear_overrides) video.value.prompt = ''
+  inputPlan.value = null
+}
+defineExpose({ save, ready, blocker: inputBlocker, reload, applySharedPrompts })
 </script>
 
 <template>
   <section class="border-line-1 border-t pt-2 space-y-2" aria-label="制帧视频输入">
     <p v-if="error" role="alert" class="text-st-failed text-2xs">{{ error }}</p>
+    <p v-if="loadError" role="alert" class="text-st-failed text-2xs">{{ loadError }}</p>
+    <div class="flex items-center justify-between">
+      <strong class="text-fg-2 text-2xs">生成条件检查</strong>
+      <AppButton size="sm" variant="ghost" :disabled="loading || checking" @click="reload"
+        >刷新输入</AppButton
+      >
+    </div>
     <p v-if="loading" class="text-fg-4 text-2xs">正在读取制帧输入…</p>
-    <template v-else>
+    <template v-else-if="loaded?.pid === pid && loaded?.sid === shotId">
+      <ul class="space-y-1 text-2xs" aria-label="制帧生成条件">
+        <li
+          v-for="item in checks"
+          :key="item.key"
+          :class="item.ready ? 'text-fg-3' : 'text-st-review'"
+        >
+          <strong>{{ item.ready ? '✓' : '待补齐' }} · {{ item.label }}</strong
+          >：{{ item.detail }}
+        </li>
+      </ul>
+      <RouterLink
+        v-if="checks.some((item) => !item.ready && (item.key === 'first' || item.key === 'last'))"
+        :to="{ name: 'frames', params: { pid }, query: { shot: shotId } }"
+        class="text-accent text-2xs block"
+        >去制作图片，审阅并采用候选 →</RouterLink
+      >
+      <p v-if="configError" class="text-st-review text-2xs">
+        视频配置读取失败：{{ configError }}。可点击「检查实际输入」查看原因。
+      </p>
       <div class="flex items-center justify-between">
         <span class="text-fg-3 text-2xs font-medium">Prompt 指令</span>
         <span class="text-accent text-3xs">制帧视频描述</span>
@@ -148,7 +222,11 @@ defineExpose({ save, ready })
         rows="4"
         aria-label="制帧视频提示词"
         class="border-line-1 bg-base-2 text-fg-1 w-full border p-1.5 text-2xs"
-        placeholder="描述帧图之间的动作、运镜、对白与声音"
+        :placeholder="
+          video.shared_prompt
+            ? `留空继承本幕：${video.shared_prompt}`
+            : '描述帧图之间的动作、运镜、对白与声音'
+        "
         @input="markDirty"
         @change="changed"
       />
@@ -161,6 +239,12 @@ defineExpose({ save, ready })
         >
       </div>
       <p class="text-fg-4 text-3xs">视频采用制作图片中已选定的帧图。</p>
+      <RouterLink
+        v-if="sourceVideo"
+        :to="{ name: 'frames', params: { pid }, query: { shot: shotId, pick_frame: '1' } }"
+        class="text-accent text-2xs block"
+        >从本段视频选择制图画面</RouterLink
+      >
       <label class="block text-2xs"
         >首帧<select
           v-model="video.first_card_id"
@@ -169,7 +253,7 @@ defineExpose({ save, ready })
         >
           <option value="">选择帧图</option>
           <option v-for="card in cards" :key="card.id" :value="card.id">
-            {{ card.title }}{{ card.adopted_asset_id ? '' : '（待制作）' }}
+            {{ card.title }}（{{ frameCardImageState(card) }}）
           </option>
         </select></label
       >
@@ -181,7 +265,7 @@ defineExpose({ save, ready })
         >
           <option value="">仅使用首帧</option>
           <option v-for="card in cards" :key="card.id" :value="card.id">
-            {{ card.title }}{{ card.adopted_asset_id ? '' : '（待制作）' }}
+            {{ card.title }}（{{ frameCardImageState(card) }}）
           </option>
         </select></label
       >
@@ -220,12 +304,16 @@ defineExpose({ save, ready })
           </option>
         </select></label
       >
-      <AppButton size="sm" variant="ghost" :disabled="checking || !ready" @click="check"
+      <AppButton size="sm" variant="ghost" :disabled="checking || loading" @click="check"
         >检查实际输入</AppButton
       >
+      <p v-if="ready && !inputPlan" class="text-fg-4 text-3xs">
+        基础输入已齐全；「检查实际输入」可进一步验证生成服务、工作流与图片来源。
+      </p>
       <p v-if="inputPlan" class="text-fg-4 text-3xs">
         首尾帧输入已通过检查；其余 {{ inputPlan.unused_cards.length }} 个画面本次不提交。
       </p>
     </template>
+    <p v-else class="text-fg-4 text-2xs">尚未读到本镜头的制帧输入，请点击「刷新输入」。</p>
   </section>
 </template>

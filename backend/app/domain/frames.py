@@ -27,3 +27,9 @@ class FrameVideoInput(BaseModel):
     preset: str = ""
     first_card_id: str = ""
     last_card_id: str = ""
+
+
+class SourceFrameInput(BaseModel):
+    source_version_id: str
+    at: float = Field(ge=0, allow_inf_nan=False)
+    card_id: str = ""

@@ -13,6 +13,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from sqlalchemy import update
+
 from app.ai import prompts
 from app.ai.llm import client as llm
 from app.core.config import settings
@@ -632,6 +634,10 @@ class StoryService:
                 # 表达不出来。传 `{}` 就是把幕级参数清空，镜头从此没有可继承的值。
                 row.params_json = dump_json(patch["params"]) if patch["params"] else None
             row.updated_at = utc_now()
+            if patch.get("clear_shot_prompts"):
+                await session.execute(
+                    update(Shot).where(Shot.scene_id == sid).values(prompt="", updated_at=utc_now())
+                )
         if locations is not None:
             await self._write_scene_locations(pid, sid, locations)
         return await self.get_scene(pid, sid)

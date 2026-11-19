@@ -10,6 +10,7 @@ import {
   type FrameRole,
   type FrameNarrativePlan,
   type FrameVideo,
+  type SharedFramePrompts,
 } from '@/shared/api/frames'
 import { assetsApi, type Asset } from '@/shared/api/assets'
 import { storyApi, type StoryboardLane } from '@/shared/api/story'
@@ -18,6 +19,11 @@ import { fileUrl } from '@/shared/api/files'
 import { useShellStore } from '@/stores/shell'
 import { useStoryStore } from '@/stores/story'
 import FrameReferencePicker from './FrameReferencePicker.vue'
+import IngestVideoModal from '@/features/story/components/IngestVideoModal.vue'
+import FrameSharedPrompts from './FrameSharedPrompts.vue'
+import SourceFramePicker from './SourceFramePicker.vue'
+import GenerationScopeDialog from '@/shared/ui/GenerationScopeDialog.vue'
+import { frameVideoChecks } from './frameVideoReadiness'
 
 const props = defineProps<{ planning?: boolean }>()
 const route = useRoute()
@@ -46,6 +52,10 @@ const continuityAt = ref<number | ''>('')
 const error = ref('')
 const notice = ref('')
 const busy = ref(false)
+const ingestOpen = ref(false)
+const sharedOpen = ref(false)
+const sourcePickerOpen = ref(false)
+const currentLane = computed(() => lanes.value.find((lane) => lane.shots.some((s) => s.id === sid.value)))
 let refreshVersion = 0
 const dirty = ref(false)
 const plan = ref<FramePlan | null>(null)
@@ -69,7 +79,7 @@ const activeJobs = (card: FrameCard) =>
 const missingCards = computed(() =>
   cards.value.filter(
     (card) =>
-      !card.adopted_asset_id && !card.candidates.length && card.prompt.trim() && !activeJobs(card),
+      !card.adopted_asset_id && !card.candidates.length && (card.prompt.trim() || card.effective_prompt) && !activeJobs(card),
   ),
 )
 const selectedIndex = computed(() => cards.value.findIndex((card) => card.id === cid.value))
@@ -80,19 +90,11 @@ const frameStatus = (card: FrameCard) =>
       ? '已采用'
       : card.candidates.length
         ? '待审阅'
-        : card.prompt.trim()
+        : card.prompt.trim() || card.effective_prompt
           ? '待生成'
           : '待编写'
-const videoBlocker = computed(() =>
-  !video.value.prompt.trim()
-    ? '请填写视频动作与声音'
-    : !prepared.value.some((card) => card.id === video.value.first_card_id)
-      ? '请先制作并采用首帧图片'
-      : video.value.last_card_id &&
-          !prepared.value.some((card) => card.id === video.value.last_card_id)
-        ? '请先制作并采用尾帧图片'
-        : '',
-)
+const videoChecks = computed(() => frameVideoChecks(video.value, cards.value, assets.value))
+const videoBlocker = computed(() => videoChecks.value.find((item) => !item.ready)?.detail || '')
 const canPlan = computed(
   () =>
     cards.value.length <= 8 &&
@@ -109,12 +111,7 @@ const canPlan = computed(
         !c.adopted_asset_id,
     ),
 )
-const canGenerateVideo = computed(
-  () =>
-    !!video.value.prompt.trim() &&
-    prepared.value.some((c) => c.id === video.value.first_card_id) &&
-    (!video.value.last_card_id || prepared.value.some((c) => c.id === video.value.last_card_id)),
-)
+const canGenerateVideo = computed(() => !videoBlocker.value)
 const frameVersions = computed(() =>
   versions.value.filter((v) => v.params.creation_pipeline === 'frames'),
 )
@@ -166,7 +163,7 @@ async function refresh() {
   versions.value = vs
   if (!preview.value && selected.value)
     preview.value =
-      selected.value.adopted_asset_id || selected.value.candidates.at(-1)?.asset_id || ''
+      selected.value.adopted_asset_id || selected.value.candidates.at(-1)?.asset_id || selected.value.refs[0] || ''
   if (!dirty.value) video.value = frameVideoDraft(ws.video, shot.value?.duration || 4)
 }
 function loadCard() {
@@ -176,7 +173,7 @@ function loadCard() {
   frameStory.value = c?.story || ''
   frameRole.value = c?.role || 'key'
   refs.value = [...(c?.refs || [])]
-  preview.value = c?.adopted_asset_id || c?.candidates.at(-1)?.asset_id || ''
+  preview.value = c?.adopted_asset_id || c?.candidates.at(-1)?.asset_id || c?.refs[0] || ''
 }
 async function save() {
   if (!dirty.value || !sid.value) return
@@ -238,6 +235,49 @@ async function add() {
   cid.value = cards.value.at(-1)?.id || ''
   loadCard()
 }
+async function reloadWorkspace() {
+  await save()
+  lanes.value = await storyApi.storyboard(pid.value)
+  if (sid.value) {
+    await refresh()
+    loadCard()
+  } else if (shots.value[0]) {
+    await selectShot(shots.value[0].id)
+  }
+}
+async function openShared() {
+  await save()
+  sharedOpen.value = true
+}
+function sharedPromptsSaved(data: SharedFramePrompts) {
+  for (const card of cards.value) {
+    if (data.clear_overrides) card.prompt = ''
+    card.shared_prompt = data.image_prompt.trim()
+    card.effective_prompt = card.prompt.trim() || card.shared_prompt
+  }
+  video.value.shared_prompt = data.video_prompt.trim()
+  if (data.clear_overrides) {
+    prompt.value = ''
+    video.value.prompt = ''
+  }
+  plan.value = null
+  notice.value = '本幕共用提示词已保存。'
+}
+async function openSourcePicker() {
+  await save()
+  sourcePickerOpen.value = true
+}
+async function sourceFrameSelected(result: { card_id: string; asset_id: string }) {
+  try {
+    await refresh()
+    cid.value = result.card_id
+    loadCard()
+    preview.value = result.asset_id
+    error.value = ''
+  } catch (e) {
+    showError(e)
+  }
+}
 async function proposeNarrative() {
   await save()
   notice.value = '正在按镜头剧情规划画面；完成后请审阅采用。'
@@ -278,11 +318,25 @@ async function generateMissing() {
   await refresh()
   notice.value = `已入队 ${queued} 个画面。${[...warnings, ...failures].join('；')}`
 }
+const generationScopeOpen = ref(false)
+async function generateAll(scope: 'all' | 'unfinished') {
+  generationScopeOpen.value = false
+  await save()
+  const result = await framesApi.generateAll(pid.value, scope)
+  await refresh()
+  notice.value = `全项目：已入队 ${result.queued.length} 张，跳过 ${result.skipped.length} 张，失败 ${result.failed.length} 张。首次生成结果自动采用。`
+  batchDetails.value = [
+    ...result.skipped.map((item) => `${item.title}：${item.reason}`),
+    ...result.failed.map((item) => `${item.title}：${item.error.title}，${item.error.detail}；${item.error.suggestions.join('；')}`),
+    ...result.queued.flatMap((item) => item.warnings.map((warning) => `${item.title}：${warning}`)),
+  ]
+}
+const batchDetails = ref<string[]>([])
 async function generate() {
   await save()
   const job = await framesApi.generate(pid.value, cid.value)
   await refresh()
-  notice.value = '图片任务已入队，完成后会出现在候选中。' + job.plan.warnings.join('；')
+  notice.value = '图片任务已入队，首次生成结果自动采用，后续版本可手动改选。' + job.plan.warnings.join('；')
 }
 async function adopt(candidateId: string) {
   await save()
@@ -391,6 +445,7 @@ watch(
         shots.value.find((s) => s.id === requested) ||
         shots.value.find((s) => s.kind !== 'transition')
       if (first) await selectShot(first.id)
+      if (first && route.query.pick_frame === '1' && currentLane.value?.kind === 'ingested') sourcePickerOpen.value = true
     }),
   { immediate: true },
 )
@@ -421,6 +476,7 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="frame-workspace">
+    <GenerationScopeDialog v-model:open="generationScopeOpen" title="一键生成图片" @choose="(scope) => act(() => generateAll(scope))" />
     <header>
       <div>
         <h1>
@@ -433,6 +489,10 @@ onBeforeUnmount(() => {
         }}</small>
       </div>
       <nav>
+        <button v-if="mode === 'frames'" class="primary-action" :disabled="busy || !shots.length" @click="generationScopeOpen = true">一键生成图片</button>
+        <button :disabled="busy" @click="ingestOpen = true">长视频制帧 / 导入切段</button>
+        <button v-if="currentLane?.kind === 'ingested'" :disabled="busy" @click="act(openSourcePicker)">从本段视频选画面</button>
+        <button :disabled="busy || !currentLane" @click="act(openShared)">本幕共用提示词</button>
         <RouterLink
           v-if="mode !== 'planning'"
           :to="{ name: 'storyboard', params: { pid }, query: { production: 'frames', shot: sid } }"
@@ -445,9 +505,14 @@ onBeforeUnmount(() => {
     </header>
     <p v-if="error" role="alert" class="error">{{ error }}</p>
     <p v-if="notice" role="status" class="notice">{{ notice }}</p>
+    <details v-if="batchDetails.length" class="notice">
+      <summary>查看批量生成明细（{{ batchDetails.length }} 项）</summary>
+      <p v-for="(detail, index) in batchDetails" :key="index">{{ detail }}</p>
+    </details>
+    <p v-if="mode === 'frames'" class="readiness-note">一键生成覆盖全项目画面，点击后可选择全部生成或仅生成未完成。首次生成成功后自动采用，之后可在候选中改选。</p>
     <div class="workspace-body">
       <aside class="shot-list">
-        <p v-if="!shots.length">先在剧本或分镜中创建镜头。</p>
+        <p v-if="!shots.length">可导入长视频切段并抽帧，或先在剧本、分镜中创建镜头。</p>
         <section v-for="lane in lanes" :key="lane.id">
           <h3>{{ lane.title }}</h3>
           <button
@@ -534,8 +599,8 @@ onBeforeUnmount(() => {
               :disabled="busy"
               @click="act(() => selectCard(c.id))"
             >
-              <img v-if="url(c.adopted_asset_id)" :src="url(c.adopted_asset_id)" alt="采用的画面" />
-              <div v-if="!url(c.adopted_asset_id)" class="frame-placeholder">
+              <img v-if="url(c.adopted_asset_id || c.refs[0] || null)" :src="url(c.adopted_asset_id || c.refs[0] || null)" :alt="c.adopted_asset_id ? '采用的画面' : '制图参考画面'" />
+              <div v-else class="frame-placeholder">
                 {{ frameStatus(c) }}
               </div>
               <span>{{ c.title }}</span
@@ -544,7 +609,7 @@ onBeforeUnmount(() => {
                 {{ c.story || '待填写对应剧情' }}
               </span>
               <small v-if="mode === 'planning'" class="frame-prompt"
-                >图片提示词：{{ c.prompt || '待填写' }}</small
+                >图片提示词：{{ c.effective_prompt || c.prompt || '待填写' }}</small
               ><small
                 >{{ c.adopted_asset_id ? '已选图' : '待选图' }} ·
                 {{ c.candidates.length }} 个候选</small
@@ -566,6 +631,7 @@ onBeforeUnmount(() => {
                 <img v-if="url(preview)" :src="url(preview)" alt="当前画面预览" />
                 <p v-else>生成图片或从项目素材中添加候选</p>
               </div>
+              <p v-if="selected.refs.includes(preview) && !selected.adopted_asset_id" class="reference-note">制图参考画面 · 生成并采用图片后用于制作视频</p>
               <div class="candidates">
                 <article
                   v-for="(v, i) in selected.candidates"
@@ -611,8 +677,8 @@ onBeforeUnmount(() => {
               <label
                 >图片提示词<textarea
                   v-model="prompt"
+                  :placeholder="selected.shared_prompt ? `留空继承本幕：${selected.shared_prompt}` : '描述这张图片的静态画面'"
                   rows="7"
-                  placeholder="描述这一时刻的人物、姿态、景别、机位、场景、道具与光线。"
                   @input="edit"
                 />
               </label>
@@ -625,7 +691,7 @@ onBeforeUnmount(() => {
                   @change="edit"
                 />
                 <button
-                  :disabled="busy || !prompt.trim() || activeJobs(selected)"
+                  :disabled="busy || !(prompt.trim() || selected.shared_prompt) || activeJobs(selected)"
                   class="primary-action"
                   @click="act(generate)"
                 >
@@ -757,8 +823,8 @@ onBeforeUnmount(() => {
           <label
             >动作、运镜、对白与声音<textarea
               v-model="video.prompt"
+              :placeholder="video.shared_prompt ? `留空继承本幕：${video.shared_prompt}` : '描述动作、运镜与声音'"
               rows="7"
-              placeholder="从首帧的当前状态开始，描述接下来发生的动作与镜头变化。"
               @input="edit"
             />
           </label>
@@ -827,6 +893,9 @@ onBeforeUnmount(() => {
         </fieldset>
       </main>
     </div>
+    <IngestVideoModal v-model:open="ingestOpen" :pid="pid" production-mode="frames" @done="act(reloadWorkspace)" />
+    <FrameSharedPrompts v-model:open="sharedOpen" :pid="pid" :scene-id="currentLane?.id || ''" @done="sharedPromptsSaved" />
+    <SourceFramePicker v-model:open="sourcePickerOpen" :pid="pid" :shot-id="sid" :cards="cards" @done="sourceFrameSelected" />
   </div>
 </template>
 

@@ -182,7 +182,9 @@ def test_cross_shot_frames_and_missing_inputs_are_rejected(client, pid):
     response = client.post(f"{root}/shots/{other}/frame-video/generate", json=body)
     assert response.status_code == 422
     assert (
-        client.post(f"{root}/shots/{other}/frame-video/generate", json={"prompt": "Move"}).status_code
+        client.post(
+            f"{root}/shots/{other}/frame-video/generate", json={"prompt": "Move"}
+        ).status_code
         == 422
     )
     assert (
@@ -222,6 +224,7 @@ def test_frame_skill_and_unsupported_reference_service(client, pid, monkeypatch)
     response = client.post(f"{root}/images/plan", json=body)
     assert response.status_code == 200, response.text
     assert response.json()["skill"]["name"] == "shot_frame"
+    assert response.json()["prompt"] == body["prompt"]
     assert "画面里没有人物" not in response.json()["prompt"]
     assert "person, people" not in response.json()["negative_prompt"]
     from app.generation.providers import image
@@ -233,6 +236,7 @@ def test_frame_skill_and_unsupported_reference_service(client, pid, monkeypatch)
     assert params["ref_asset_ids"] == []
     assert params["dropped_ref_asset_ids"] == [aid]
     assert queued.json()["plan"]["warnings"]
+    assert params["prompt"] == body["prompt"]
 
 
 def test_frame_preset_override_and_strict_frame_inputs(client, pid):

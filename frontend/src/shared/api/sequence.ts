@@ -408,6 +408,6 @@ export const sequenceApi = {
   /** 只出账单，不入队任何任务。 */
   plan: (pid: string, mode: SequenceMode) =>
     api.post<SequencePlan>(`/projects/${pid}/sequence/plan`, { mode }),
-  run: (pid: string, mode: SequenceMode, priority = 100) =>
-    api.post<SequenceRun>(`/projects/${pid}/sequence/run`, { mode, priority }),
+  run: (pid: string, mode: SequenceMode, priority = 100, scope: 'all' | 'unfinished' = 'all') =>
+    api.post<SequenceRun>(`/projects/${pid}/sequence/run`, { mode, priority, scope }),
 }

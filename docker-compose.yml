@@ -22,6 +22,7 @@ services:
       - AIVS_SESSION_SECURE_COOKIE=${AIVS_SESSION_SECURE_COOKIE:-true}
       - AIVS_ALLOWED_ORIGINS=${AIVS_ALLOWED_ORIGINS:-[]}
       - AIVS_DEV_CORS=false
+      - AIVS_UPLOAD_LIMIT_MB=${AIVS_UPLOAD_LIMIT_MB:-10240}
       # 外部 ComfyUI 算力机地址（局域网 IP 或公网 IP）
       - AIVS_COMFY_BASE_URL=${AIVS_COMFY_BASE_URL:-http://127.0.0.1:8188}
       # LLM 与其它 API 配置（可选）

@@ -67,8 +67,7 @@ async def upload_asset(
     kind: str = Form(default="upload"),
     file: UploadFile = File(...),
 ) -> dict[str, Any]:
-    data = await file.read()
-    return await assets.register_bytes(pid, kind, file.filename or "upload.bin", data)
+    return await assets.register_upload(pid, kind, file.filename or "upload.bin", file.file)
 
 
 @router.post("/projects/{pid}/assets/register", status_code=201)

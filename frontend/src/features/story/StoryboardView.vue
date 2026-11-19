@@ -36,6 +36,7 @@ import {
 import AppButton from '@/shared/ui/AppButton.vue'
 import AppBadge from '@/shared/ui/AppBadge.vue'
 import AppDialog from '@/shared/ui/AppDialog.vue'
+import GenerationScopeDialog from '@/shared/ui/GenerationScopeDialog.vue'
 import ConfirmErrorDialog from '@/shared/ui/ConfirmErrorDialog.vue'
 import EmptyState from '@/shared/ui/EmptyState.vue'
 import ErrorPanel from '@/shared/ui/ErrorPanel.vue'
@@ -54,12 +55,28 @@ import { generationApi } from '@/shared/api/generation'
 import { enqueueStoryboardVideo } from './storyboardGeneration'
 import type { ProductionMode } from '@/app/productionNavigation'
 import FrameVideoInputs from './components/FrameVideoInputs.vue'
+import FrameSharedPrompts from '@/features/frames/FrameSharedPrompts.vue'
+import { framesApi, type SharedFramePrompts } from '@/shared/api/frames'
 import { LINK_MODES, LINK_MODE_LABEL, SHOT_LINK_MODES, SHOT_LINK_MODE_LABEL, sequenceApi, type TransitionRun } from '@/shared/api/sequence'
 
 const route = useRoute()
 const props = withDefaults(defineProps<{ mode?: ProductionMode }>(), { mode: 'direct' })
 const isFrames = computed(() => props.mode === 'frames')
 const frameInputs = ref<InstanceType<typeof FrameVideoInputs> | null>(null)
+const sharedPromptsOpen = ref(false)
+const sharedSceneId = ref('')
+async function openSharedPrompts(sceneId: string) {
+  try {
+    await frameInputs.value?.save()
+    sharedSceneId.value = sceneId
+    sharedPromptsOpen.value = true
+  } catch (err) {
+    enqueueError.value = err instanceof ApiError ? err : null
+  }
+}
+function sharedPromptsSaved(data: SharedFramePrompts) {
+  if (currentLane.value?.id === sharedSceneId.value) frameInputs.value?.applySharedPrompts(data)
+}
 const router = useRouter()
 const story = useStoryStore()
 const consolePanel = useConsoleStore()
@@ -186,11 +203,13 @@ function openShot(shotId: string): void {
 async function adoptVersion(versionId: string): Promise<void> { await generationApi.setCurrent(pid.value, versionId).catch(() => {}); await reload() }
 async function reload(): Promise<void> {
   if (!pid.value) return
+  try { await frameInputs.value?.save() } catch (err) { enqueueError.value = err instanceof ApiError ? err : null; return }
   await story.loadBoard(pid.value).catch(() => {})
   const requested = String(route.query.shot || '')
   if (requested && requested !== story.selectedShotId && allCards.value.some(c => c.id === requested)) await story.selectShot(pid.value, requested)
   // 幕列表换了以后旧的锚点可能已经不在了，回落到第一幕，别让锚点条整条不高亮
   if (!story.lanes.some((l) => l.id === activeLaneId.value)) activeLaneId.value = story.lanes[0]?.id ?? ''
+  await frameInputs.value?.reload()
 }
 onMounted(reload)
 watch(pid, reload)
@@ -220,6 +239,13 @@ async function extractPosters(): Promise<void> {
   try { posterResult.value = await storyApi.extractPosters(pid.value); await reload() } catch (err) { posterError.value = err instanceof ApiError ? err : null } finally { posterBusy.value = false }
 }
 const enqueuing = ref(false)
+const shotGenerationBlocker = computed(() => {
+  if (enqueuing.value) return '正在提交生成请求，请稍候。'
+  if (story.busy) return '正在读取或保存镜头信息，请稍候。'
+  if (!story.shot) return '请先选择一个镜头。'
+  if (isFrames.value) return frameInputs.value?.blocker || (frameInputs.value?.ready ? '' : '正在初始化制帧输入，请稍候。')
+  return ''
+})
 const enqueueError = ref<ApiError | null>(null)
 const enqueueNote = ref('')
 const skipped = ref<Array<{ shot_id?: string; index_no?: number; error?: { title?: string; detail?: string } | null }>>([])
@@ -249,6 +275,7 @@ async function generateFrameCards(cards: StoryboardCard[]): Promise<void> {
   finally { enqueuing.value = false }
 }
 async function generateShot(allowRefDrop = false): Promise<void> {
+  if (shotGenerationBlocker.value) return
   const shot = story.shot; if (!shot) return
   const targetPid = pid.value, mode = props.mode
   resetEnqueue(); enqueuing.value = true
@@ -264,12 +291,26 @@ async function generateScene(allowRefDrop = false): Promise<void> {
   catch (err) { enqueueError.value = err instanceof ApiError ? err : null; pendingDrop.value = confirmFlagOf(err) ? 'scene' : null }
   finally { enqueuing.value = false }
 }
-async function runSequential(): Promise<void> {
-  if (isFrames.value) { await generateFrameCards(realCards.value); return }
+const generationScopeOpen = ref(false)
+function runSequential(): void { generationScopeOpen.value = true }
+async function confirmSequential(scope: 'all' | 'unfinished'): Promise<void> {
+  generationScopeOpen.value = false
+  if (isFrames.value) {
+    resetEnqueue(); enqueuing.value = true
+    try {
+      await frameInputs.value?.save()
+      const out = await framesApi.generateAllVideos(pid.value, scope)
+      skipped.value = out.skipped
+      enqueueNote.value = `制帧视频已入队 ${out.queued.length} 个，跳过 ${out.skipped.length} 个；已合并为一个批次。`
+      await reload()
+    } catch (err) { enqueueError.value = err instanceof ApiError ? err : null }
+    finally { enqueuing.value = false }
+    return
+  }
   resetEnqueue(); enqueuing.value = true
   try {
     const plan = await sequenceApi.plan(pid.value, 'sequential')
-    const out = await sequenceApi.run(pid.value, 'sequential')
+    const out = await sequenceApi.run(pid.value, 'sequential', 100, scope)
     enqueueNote.value = `单线程续接已入队：${out.queued.length} / ${plan.total_jobs} 个 Shot；下一条会等待上一条产出末帧`
     skipped.value = out.skipped
     await reload()
@@ -444,6 +485,7 @@ async function confirmDeleteScene(): Promise<void> {
 
 <template>
   <div class="flex min-h-0 flex-1 flex-col">
+    <GenerationScopeDialog v-model:open="generationScopeOpen" title="连续生成视频" @choose="confirmSequential" />
     <FeatureHeader :title="isFrames ? '制帧分镜' : '直出分镜'" :purpose="isFrames ? '按镜头规划视频、比较与采用版本；视频输入取自制作图片中已采用的帧图。' : '按镜头规划剧情与视频提示词，直接生成视频并比较版本。'">
       <template #actions>
         <AppButton size="sm" variant="ghost" @click="isFrames ? runSequential() : router.push({ name: 'flow', params: { pid } })"
@@ -514,6 +556,7 @@ async function confirmDeleteScene(): Promise<void> {
               <AppBadge v-if="lane.shots.length > realShots(lane).length">{{ lane.shots.length - realShots(lane).length }} 段转场</AppBadge>
               <AppBadge v-if="!lane.location_variant_id" tone="warn">未挂地点</AppBadge>
               <div class="ml-auto flex items-center gap-1">
+                <AppButton v-if="isFrames" size="sm" variant="ghost" @click.stop="openSharedPrompts(lane.id)">共用制帧提示词</AppButton>
                 <AppButton size="sm" variant="ghost" class="text-accent hover:bg-accent-dim/30 border border-accent/30" title="配置本幕共用 Prompt、出场人物与地点" @click.stop="openSceneConfig(lane)">
                   <Sliders :size="10" />本幕设定
                 </AppButton>
@@ -622,7 +665,7 @@ async function confirmDeleteScene(): Promise<void> {
           </section>
 
           <!-- Prompt 编辑与共用继承关系 -->
-          <FrameVideoInputs v-if="isFrames" ref="frameInputs" :pid="pid" :shot-id="story.shot.id" :duration="story.shot.duration" />
+          <FrameVideoInputs v-if="isFrames" ref="frameInputs" :pid="pid" :shot-id="story.shot.id" :duration="story.shot.duration" :source-video="currentLane?.kind === 'ingested'" />
           <section v-else class="border-line-1 border-t pt-2 space-y-1">
             <div class="flex items-center justify-between">
               <span class="text-fg-3 text-2xs font-medium">Prompt 指令</span>
@@ -701,7 +744,7 @@ async function confirmDeleteScene(): Promise<void> {
             <p class="text-fg-4 text-3xs">道具与深度上下文账单可双击进入单 Shot 工作台配置。</p>
           </section>
 
-          <section class="border-line-1 border-t pt-2"><div class="flex items-center gap-1"><p class="text-fg-3 flex-1 text-2xs">已生成版本</p><AppBadge>{{ story.shot.versions.length }} 个</AppBadge></div><div v-if="story.shot.versions.length" class="mt-1 space-y-1"><div v-for="version in story.shot.versions" :key="version.id" class="border-line-1 bg-base-2 border p-1"><div class="flex items-center gap-1"><span class="text-fg-2 tnum text-2xs">v{{ version.version_no }}</span><AppBadge v-if="version.id === story.shot.current_version_id" tone="ok">已采纳</AppBadge><span class="text-fg-4 flex-1 text-right text-2xs">{{ fmtDuration(version.duration) }}</span></div><div class="mt-1 flex gap-1"><AppButton v-if="allCards.some((card) => card.id === story.shot?.id)" size="sm" variant="ghost" @click="previewVersion(allCards.find((card) => card.id === story.shot?.id)!, version.id)">预览</AppButton><AppButton v-if="version.id !== story.shot.current_version_id" size="sm" variant="primary" @click="adoptVersion(version.id)">采纳</AppButton></div></div></div><p v-else class="text-fg-4 mt-1 text-2xs">尚无版本。</p><div class="mt-1 flex gap-1"><AppButton size="sm" variant="primary" :disabled="enqueuing || story.busy || (isFrames && !frameInputs?.ready)" @click="generateShot()"><Sparkles :size="10" />生成 Shot</AppButton><AppButton size="sm" variant="ghost" @click="openShot(story.shot.id)">打开工作台</AppButton></div></section>
+          <section class="border-line-1 border-t pt-2"><div class="flex items-center gap-1"><p class="text-fg-3 flex-1 text-2xs">已生成版本</p><AppBadge>{{ story.shot.versions.length }} 个</AppBadge></div><div v-if="story.shot.versions.length" class="mt-1 space-y-1"><div v-for="version in story.shot.versions" :key="version.id" class="border-line-1 bg-base-2 border p-1"><div class="flex items-center gap-1"><span class="text-fg-2 tnum text-2xs">v{{ version.version_no }}</span><AppBadge v-if="version.id === story.shot.current_version_id" tone="ok">已采纳</AppBadge><span class="text-fg-4 flex-1 text-right text-2xs">{{ fmtDuration(version.duration) }}</span></div><div class="mt-1 flex gap-1"><AppButton v-if="allCards.some((card) => card.id === story.shot?.id)" size="sm" variant="ghost" @click="previewVersion(allCards.find((card) => card.id === story.shot?.id)!, version.id)">预览</AppButton><AppButton v-if="version.id !== story.shot.current_version_id" size="sm" variant="primary" @click="adoptVersion(version.id)">采纳</AppButton></div></div></div><p v-else class="text-fg-4 mt-1 text-2xs">尚无版本。</p><div class="mt-1 flex gap-1"><AppButton size="sm" variant="primary" :disabled="!!shotGenerationBlocker" :title="shotGenerationBlocker || '按本镜头的实际输入生成视频'" aria-describedby="shot-generation-status" @click="generateShot()"><Sparkles :size="10" />生成 Shot</AppButton><AppButton size="sm" variant="ghost" @click="openShot(story.shot.id)">打开工作台</AppButton></div><p v-if="shotGenerationBlocker" id="shot-generation-status" role="status" class="text-st-review mt-1 text-2xs">暂不能生成：{{ shotGenerationBlocker }}</p></section>
         </div>
       </aside>
     </div>
@@ -727,7 +770,8 @@ async function confirmDeleteScene(): Promise<void> {
     </div>
 
     <!-- 长视频导入加工切段弹窗 -->
-    <IngestVideoModal v-model:open="ingestModalOpen" :pid="pid" @done="reload()" />
+    <IngestVideoModal v-model:open="ingestModalOpen" :pid="pid" :production-mode="mode" @done="reload()" />
+    <FrameSharedPrompts v-model:open="sharedPromptsOpen" :pid="pid" :scene-id="sharedSceneId" @done="sharedPromptsSaved" />
 
     <!-- 整幕 AI 批量配音弹窗 -->
     <DubModal

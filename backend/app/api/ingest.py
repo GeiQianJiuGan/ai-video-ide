@@ -12,7 +12,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter
 from pydantic import BaseModel, Field
@@ -32,6 +32,9 @@ class RegisterBody(BaseModel):
 
 
 class PlanBody(BaseModel):
+    fast_scan: bool = Field(
+        default=True, description="使用缩小画面分析切点；不降低原片或抽帧分辨率"
+    )
     asset_id: str = Field(description="已登记的源视频资产 id（先调 ingest/register）")
     method: str = Field(default="auto", description="auto / scene / silence / fixed")
     threshold: float | None = Field(default=None, description="画面切换灵敏度，越小切得越碎")
@@ -52,6 +55,10 @@ class PlanBody(BaseModel):
 
 
 class RunBody(PlanBody):
+    production_mode: Literal["direct", "frames"] = "direct"
+    frames_per_shot: int = Field(default=2, ge=1, le=8)
+    image_prompt: str = ""
+    video_prompt: str = ""
     title: str | None = Field(default=None, description="这一幕叫什么；留空按源文件名")
     prompt: str | None = Field(
         default=None, description="整幕共用的 prompt（镜头留空就继承它，改一处全段跟着变）"
@@ -97,6 +104,7 @@ async def plan(pid: str, body: PlanBody) -> dict[str, Any]:
         cuts=body.cuts,
         range_in=body.range_in,
         range_out=body.range_out,
+        fast_scan=body.fast_scan,
     )
 
 
@@ -118,4 +126,9 @@ async def run(pid: str, body: RunBody) -> dict[str, Any]:
         range_out=body.range_out,
         param_mode=body.param_mode,
         position=body.position,
+        production_mode=body.production_mode,
+        frames_per_shot=body.frames_per_shot,
+        image_prompt=body.image_prompt,
+        video_prompt=body.video_prompt,
+        fast_scan=body.fast_scan,
     )

@@ -58,6 +58,7 @@ export interface IngestPlanResult {
 }
 
 export interface IngestPlanParams {
+  fast_scan?: boolean
   asset_id: string
   method?: string
   threshold?: number
@@ -74,6 +75,10 @@ export interface IngestPlanParams {
 }
 
 export interface IngestRunParams extends IngestPlanParams {
+  production_mode?: 'direct' | 'frames'
+  frames_per_shot?: number
+  image_prompt?: string
+  video_prompt?: string
   title?: string
   prompt?: string
   param_mode?: 'shared' | 'per_shot'

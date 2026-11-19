@@ -2,6 +2,8 @@
 
 from typing import Any
 
+from sqlalchemy import case, func, select, update
+
 from app.ai import prompts
 from app.ai.frame_plan import FramePlanDraft
 from app.ai.llm import client as llm
@@ -12,7 +14,7 @@ from app.generation.providers import presets
 from app.persistence.models_frames import FrameCandidate, FrameCard, FrameWorkspace
 from app.persistence.models_gen import Job
 from app.persistence.models_global import GlobalWorkflow
-from app.persistence.models_story import Shot
+from app.persistence.models_story import Scene, Shot
 from app.persistence.models_world import Asset
 from app.services import route
 from app.services.assets import assets
@@ -27,6 +29,243 @@ def invalid(detail: str) -> AppError:
 
 
 class FrameService:
+    async def generate_all_videos(self, pid: str, scope: str = "unfinished") -> dict[str, Any]:
+        from app.services.video_batch import video_batch_state
+
+        done, active = await video_batch_state(pid)
+        shots = await fetch_all(db_of(pid), Shot, order_by=Shot.index_no)
+        batch_id = new_id("job_batch")
+        result: dict[str, Any] = {"queued": [], "skipped": [], "batch_id": batch_id}
+        for shot in shots:
+            if shot.kind == "transition":
+                continue
+            reason = (
+                "正在生成"
+                if shot.id in active
+                else "已有生成视频"
+                if scope == "unfinished" and shot.id in done
+                else ""
+            )
+            if reason:
+                result["skipped"].append(
+                    {
+                        "shot_id": shot.id,
+                        "index_no": shot.index_no,
+                        "error": {"title": reason, "detail": reason},
+                    }
+                )
+                continue
+            try:
+                job = await self.video(
+                    pid,
+                    shot.id,
+                    {},
+                    enqueue=True,
+                    batch={
+                        "id": batch_id,
+                        "label": "连续生成制帧视频",
+                        "kind": "frame_videos",
+                        "seq": len(result["queued"]) + 1,
+                    },
+                )
+                result["queued"].append(job["id"])
+            except AppError as exc:
+                result["skipped"].append(
+                    {"shot_id": shot.id, "index_no": shot.index_no, "error": exc.to_dict()}
+                )
+        return result
+
+    async def generate_all(self, pid: str, scope: str = "unfinished") -> dict[str, Any]:
+        """为全项目尚无结果的画面入队；单项失败不阻断其他画面。"""
+        from app.services.images import images
+
+        db = db_of(pid)
+        cards = await fetch_all(db, FrameCard, order_by=FrameCard.position)
+        jobs = await fetch_all(db, Job, where=Job.target_kind == "frame_card")
+        candidates = await fetch_all(db, FrameCandidate)
+        active = {j.target_id for j in jobs if j.status in {"queued", "waiting", "running"}}
+        generated = {c.card_id for c in candidates if c.job_id}
+        batch_id = new_id("job_batch")
+        result: dict[str, Any] = {"queued": [], "skipped": [], "failed": [], "batch_id": batch_id}
+        for card in cards:
+            entry = {"card_id": card.id, "title": card.title, "shot_id": card.shot_id}
+            reason = (
+                "正在生成"
+                if card.id in active
+                else "已有采用或生成结果"
+                if scope == "unfinished" and (card.adopted_asset_id or card.id in generated)
+                else ""
+            )
+            if reason:
+                result["skipped"].append({**entry, "reason": reason})
+                continue
+            try:
+                prompt = await self.image_prompt(pid, card)
+                if not prompt.strip():
+                    result["skipped"].append(
+                        {**entry, "reason": "缺少图片提示词，请填写独立或本幕共用提示词"}
+                    )
+                    continue
+                job = await images.enqueue(
+                    pid,
+                    "frame_card",
+                    card.id,
+                    prompt=prompt,
+                    skill="shot_frame",
+                    ref_asset_ids=load_json(card.refs_json, []),
+                    batch={
+                        "id": batch_id,
+                        "label": "一键制作图片",
+                        "kind": "frame_images",
+                        "seq": len(result["queued"]) + 1,
+                    },
+                )
+                result["queued"].append(
+                    {**entry, "job_id": job["id"], "warnings": job["plan"]["warnings"]}
+                )
+            except AppError as exc:
+                result["failed"].append({**entry, "error": exc.to_dict()})
+        return result
+
+    async def source_video(self, pid: str, sid: str) -> dict[str, Any]:
+        from app.persistence.models_gen import GenerationVersion
+
+        await fetch(db_of(pid), Shot, sid, "镜头")
+        versions = await fetch_all(
+            db_of(pid),
+            GenerationVersion,
+            where=GenerationVersion.shot_id == sid,
+            order_by=GenerationVersion.version_no,
+        )
+        version = next(
+            (
+                v
+                for v in reversed(versions)
+                if v.source == "imported"
+                and v.kind == "video"
+                and v.status == "done"
+                and v.asset_id
+            ),
+            None,
+        )
+        if version is None:
+            raise invalid("本镜头没有可选帧的源视频，请先导入长视频并切段。")
+        asset = await fetch(db_of(pid), Asset, version.asset_id, "源视频")
+        if not (project_of(pid).dir / asset.path).is_file():
+            raise invalid("源视频文件已丢失，请恢复源文件后再选帧。")
+        low = float(version.in_point or 0)
+        high = float(
+            version.out_point if version.out_point is not None else low + (version.duration or 0)
+        )
+        if high <= low:
+            raise invalid("本段视频缺少有效区间，无法选帧。")
+        return {
+            "source_version_id": version.id,
+            "asset_id": asset.id,
+            "path": asset.path,
+            "in_point": low,
+            "out_point": high,
+            "duration": high - low,
+        }
+
+    async def select_source_frame(self, pid: str, sid: str, data: dict[str, Any]) -> dict:
+        from app.domain.frames import SourceFrameInput
+        from app.services.frames import frames as extractor
+
+        body = SourceFrameInput.model_validate(data)
+
+        async def validate():
+            source = await self.source_video(pid, sid)
+            if source["source_version_id"] != body.source_version_id:
+                raise invalid("源片段已变化，请重新打开选帧窗口。")
+            if not source["in_point"] <= body.at < source["out_point"]:
+                raise invalid("所选时间必须位于本段视频区间内，不能选到其他片段。")
+            if body.card_id:
+                card = await fetch(db_of(pid), FrameCard, body.card_id, "画面")
+                if card.shot_id != sid:
+                    raise invalid("只能更换当前镜头内画面的制图参考。")
+            return source
+
+        source = await validate()
+        extracted = await extractor.extract(pid, source["asset_id"], body.at)
+        async with db_of(pid).atomic():
+            await validate()
+            if body.card_id:
+                card = await fetch(db_of(pid), FrameCard, body.card_id, "画面")
+                references = load_json(card.refs_json, [])
+                # 已有源片参考由本次选择替换；人物、场景等其他参考保持原顺序。
+                kept = []
+                for aid in references:
+                    ref = await fetch(db_of(pid), Asset, aid, "参考图")
+                    if load_json(ref.meta_json, {}).get("from_asset_id") != source["asset_id"]:
+                        kept.append(aid)
+                card_id = card.id
+            else:
+                existing = await fetch_all(db_of(pid), FrameCard, where=FrameCard.shot_id == sid)
+                card = await self.create(
+                    pid,
+                    sid,
+                    {
+                        "title": f"选定画面 {len(existing) + 1}",
+                        "role": "first" if not existing else "key",
+                        "story": f"从源视频 {body.at:.3f} 秒选择的画面。",
+                    },
+                )
+                card_id, kept = card["id"], []
+            await self.update(pid, card_id, {"refs": list(dict.fromkeys([extracted["id"], *kept]))})
+        return {
+            "card_id": card_id,
+            "asset_id": extracted["id"],
+            "path": extracted["path"],
+            "at": body.at,
+        }
+
+    async def shared_prompts(self, pid: str, scene_id: str) -> dict[str, str]:
+        scene = await fetch(db_of(pid), Scene, scene_id, "幕")
+        params = load_json(scene.params_json, {})
+        if not isinstance(params, dict):
+            params = {}
+        return {
+            key: str(params.get(f"frame_{key}") or "") for key in ("image_prompt", "video_prompt")
+        }
+
+    async def save_shared_prompts(self, pid: str, scene_id: str, data: dict) -> dict:
+        async with db_of(pid).atomic():
+            await fetch(db_of(pid), Scene, scene_id, "幕")
+            async with db_of(pid).write() as session:
+                scene = await session.get(Scene, scene_id)
+                params = load_json(scene.params_json, {})
+                if not isinstance(params, dict):
+                    params = {}
+                for key in ("image_prompt", "video_prompt"):
+                    params[f"frame_{key}"] = data[key].strip()
+                scene.params_json = dump_json(params)
+            if data.get("clear_overrides"):
+                ids = select(Shot.id).where(Shot.scene_id == scene_id)
+                async with db_of(pid).write() as session:
+                    await session.execute(
+                        update(FrameCard)
+                        .where(FrameCard.shot_id.in_(ids))
+                        .values(prompt="")
+                        .execution_options(synchronize_session=False)
+                    )
+                    valid_video = case(
+                        (func.json_valid(FrameWorkspace.video_json), FrameWorkspace.video_json),
+                        else_="{}",
+                    )
+                    await session.execute(
+                        update(FrameWorkspace)
+                        .where(FrameWorkspace.shot_id.in_(ids))
+                        .values(video_json=func.json_set(valid_video, "$.prompt", ""))
+                        .execution_options(synchronize_session=False)
+                    )
+        return await self.shared_prompts(pid, scene_id)
+
+    async def image_prompt(self, pid: str, card: FrameCard) -> str:
+        shot = await fetch(db_of(pid), Shot, card.shot_id, "镜头")
+        shared = await self.shared_prompts(pid, shot.scene_id)
+        return card.prompt.strip() or shared["image_prompt"]
+
     async def reference_materials(self, pid: str) -> dict[str, Any]:
         from app.persistence.models_cast import Appearance, Character, SheetVersion
         from app.persistence.models_world import (
@@ -192,7 +431,8 @@ class FrameService:
 
     async def get(self, pid: str, sid: str) -> dict[str, Any]:
         db = db_of(pid)
-        await fetch(db, Shot, sid, "镜头")
+        shot = await fetch(db, Shot, sid, "镜头")
+        shared = await self.shared_prompts(pid, shot.scene_id)
         rows = await fetch_all(db, FrameWorkspace, where=FrameWorkspace.shot_id == sid)
         cards = await fetch_all(
             db,
@@ -204,6 +444,9 @@ class FrameService:
         candidates = await fetch_all(db, FrameCandidate, order_by=FrameCandidate.id)
         jobs = await fetch_all(db, Job, where=Job.target_kind == "frame_card")
         video = load_json(rows[0].video_json, {}) if rows else {}
+        video.pop("shared_prompt", None)
+        if shared["video_prompt"]:
+            video["shared_prompt"] = shared["video_prompt"]
         shot_rows = {s.id: s for s in await fetch_all(db, Shot)}
         continuity = {}
         for candidate in candidates:
@@ -236,6 +479,8 @@ class FrameService:
                 {
                     **as_dict(c),
                     "refs": load_json(c.refs_json, []),
+                    "effective_prompt": c.prompt.strip() or shared["image_prompt"],
+                    "shared_prompt": shared["image_prompt"],
                     "candidates": [
                         {
                             **as_dict(v),
@@ -283,6 +528,7 @@ class FrameService:
             return as_dict(row)
 
     async def save_video(self, pid: str, sid: str, data: dict[str, Any]) -> dict[str, Any]:
+        data = {key: value for key, value in data.items() if key != "shared_prompt"}
         await fetch(db_of(pid), Shot, sid, "镜头")
         async with db_of(pid).write() as session:
             row = await session.get(FrameWorkspace, sid)
@@ -305,6 +551,17 @@ class FrameService:
             snapshot_json=dump_json(snapshot or {"source": "imported"}),
         )
         async with db_of(pid).write() as session:
+            # 同一事务判断并采用第一份生成结果，避免并发完成覆盖用户选择。
+            current = await session.get(FrameCard, cid)
+            if current is None:
+                raise invalid("画面不存在。")
+            previous = await session.scalar(
+                select(FrameCandidate.id)
+                .where(FrameCandidate.card_id == cid, FrameCandidate.job_id.is_not(None))
+                .limit(1)
+            )
+            if job_id and previous is None and not current.adopted_asset_id:
+                current.adopted_asset_id = aid
             session.add(row)
         await assets.link(pid, aid, "shot", card.shot_id, role="frame_workspace")
         return as_dict(row)
@@ -411,6 +668,10 @@ class FrameService:
         llm.require_configured()
         shot = await fetch(db_of(pid), Shot, sid, "镜头")
         workspace = await self.get(pid, sid)
+        data = {
+            **data,
+            "prompt": data.get("prompt", "").strip() or workspace["video"].get("shared_prompt", ""),
+        }
         selected = []
         for key in ("first_card_id", "last_card_id"):
             cid = data.get(key)
@@ -421,7 +682,9 @@ class FrameService:
             card = next((c for c in workspace["cards"] if c["id"] == cid), None)
             if not card:
                 raise invalid("选择的画面不属于当前镜头。")
-            selected.append({"role": key, "story": card["story"], "prompt": card["prompt"]})
+            selected.append(
+                {"role": key, "story": card["story"], "prompt": card["effective_prompt"]}
+            )
         result = await llm.complete_json(
             "按所附镜头制作 Skill 优化制帧视频提示词。只返回 JSON 对象，字段 prompt。"
             "输出三个完整 H3 核心字段，不输出图片对齐首行（程序按真实输入补齐）。"
@@ -470,13 +733,20 @@ class FrameService:
         return {"prompt": prompt}
 
     async def video(
-        self, pid: str, sid: str, data: dict[str, Any], *, enqueue: bool = False
+        self,
+        pid: str,
+        sid: str,
+        data: dict[str, Any],
+        *,
+        enqueue: bool = False,
+        batch: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         from app.services.generation import generation
 
         shot = await fetch(db_of(pid), Shot, sid, "镜头")
         workspace = await self.get(pid, sid)
         data = {"prompt": "", "duration": shot.duration, **workspace["video"], **data}
+        data["prompt"] = data["prompt"].strip() or workspace["video"].get("shared_prompt", "")
         if not data.get("first_card_id"):
             data["first_card_id"] = workspace["video"].get("first_card_id", "")
         frozen = {
@@ -571,7 +841,9 @@ class FrameService:
                     if c["id"] not in {x["id"] for x in frozen["cards"]}
                 ],
             }
-        return await generation.enqueue_shot(pid, sid, kind=capability, frame_inputs=frozen)
+        return await generation.enqueue_shot(
+            pid, sid, kind=capability, frame_inputs=frozen, batch=batch
+        )
 
 
 frames = FrameService()

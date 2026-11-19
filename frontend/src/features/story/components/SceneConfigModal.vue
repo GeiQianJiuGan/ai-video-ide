@@ -121,28 +121,16 @@ async function handleSave(): Promise<void> {
     // 1. 更新 Scene 属性
     await storyApi.updateScene(props.pid, sid, {
       title: title.value.trim() || undefined,
-      summary: summary.value.trim() || undefined,
-      prompt: prompt.value.trim() || undefined,
+      summary: summary.value.trim(),
+      prompt: prompt.value.trim(),
       param_mode: paramMode.value,
       location_variant_id: selectedLocationVariantId.value || undefined,
+      clear_shot_prompts: clearShotOverrides.value,
     })
 
     // 2. 更新 Scene Cast
-    await storyApi.setSceneCast(props.pid, sid, selectedCastIds.value)
-
-    // 3. 更新 Scene Location
-    if (selectedLocationVariantId.value) {
-      await storyApi.setSceneLocations(props.pid, sid, [selectedLocationVariantId.value])
-    }
-
-    // 4. 如果勾选了清空 Shot 的独立覆盖，让所有 Shot 全部继承本幕 Prompt
-    if (clearShotOverrides.value && props.lane.shots.length > 0) {
-      await Promise.all(
-        props.lane.shots.map((shot) =>
-          storyApi.updateShot(props.pid, shot.id, { prompt: '' }).catch(() => {}),
-        ),
-      )
-    }
+    if (JSON.stringify(selectedCastIds.value) !== JSON.stringify(props.lane.cast_appearance_ids || []))
+      await storyApi.setSceneCast(props.pid, sid, selectedCastIds.value)
 
     emit('done')
     emit('update:open', false)

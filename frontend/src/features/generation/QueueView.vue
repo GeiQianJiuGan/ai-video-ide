@@ -44,6 +44,18 @@ const statusFilter = ref('')
 const rows = computed(() =>
   statusFilter.value ? queue.jobs.filter((j) => j.status === statusFilter.value) : queue.jobs,
 )
+const expanded = ref<Record<string, boolean>>({})
+const groups = computed(() => {
+  const visibleIds = new Set(rows.value.map((job) => job.id))
+  return queue.rows
+    .map((group) => ({
+      ...group,
+      visibleJobs: (group.batch ? group.members : group.job ? [group.job] : []).filter((job) =>
+        visibleIds.has(job.id),
+      ),
+    }))
+    .filter((group) => group.visibleJobs.length)
+})
 const selected = computed<Job | null>(
   () => queue.jobs.find((j) => j.id === selectedId.value) ?? null,
 )
@@ -153,7 +165,9 @@ async function bump(job: Job): Promise<void> {
         title="一键取消队列中所有排队中、等待中与运行中的任务"
         @click="queue.cancelAll(pid)"
       >
-        <Ban :size="10" />一键取消全部<span v-if="queue.active" class="tnum ml-0.5">({{ queue.active }})</span>
+        <Ban :size="10" />一键取消全部<span v-if="queue.active" class="tnum ml-0.5"
+          >({{ queue.active }})</span
+        >
       </AppButton>
       <span class="text-fg-4 text-2xs">筛选</span>
       <select
@@ -223,85 +237,117 @@ async function bump(job: Job): Promise<void> {
               </tr>
             </thead>
             <tbody>
-              <tr
-                v-for="job in rows"
-                :key="job.id"
-                class="hover:bg-base-2 cursor-pointer"
-                :class="job.id === selectedId ? 'bg-accent-dim/40' : ''"
-                @click="selectedId = job.id"
-              >
-                <td class="border-line-1 border-b py-1 pr-1 align-top">
-                  <AppBadge :tone="TONE[job.status] ?? 'neutral'">
-                    {{ JOB_STATUS_LABEL[job.status] ?? job.status }}
-                  </AppBadge>
-                  <span v-if="job.attempt > 1" class="text-fg-4 tnum ml-1">
-                    第 {{ job.attempt }} 次
-                  </span>
-                </td>
-                <td class="border-line-1 text-fg-2 border-b py-1 pr-1 align-top">
-                  <button
-                    class="text-left"
-                    :class="job.shot_id ? 'hover:text-accent' : 'cursor-default'"
-                    :disabled="!job.shot_id"
-                    @click.stop="goShot(job.shot_id)"
-                  >
-                    {{ job.label }}
-                  </button>
-                  <p v-if="job.wait_reason" class="text-st-review">{{ job.wait_reason }}</p>
-                </td>
-                <td class="border-line-1 text-fg-3 border-b py-1 pr-1 align-top">{{ job.kind }}</td>
-                <td class="border-line-1 border-b py-1 pr-1 align-top">
-                  <div class="bg-base-3 h-1 w-20">
-                    <div
-                      class="bg-accent h-1"
-                      :style="{ width: `${Math.round(job.progress * 100)}%` }"
-                    />
-                  </div>
-                  <span class="text-fg-4 tnum">{{ Math.round(job.progress * 100) }}%</span>
-                </td>
-                <td class="border-line-1 text-fg-3 tnum border-b py-1 pr-1 align-top">
-                  {{ job.priority }}
-                </td>
-                <td class="border-line-1 text-fg-3 tnum border-b py-1 pr-1 align-top">
-                  {{ elapsed(job) }}
-                </td>
-                <td class="border-line-1 border-b py-1 align-top">
-                  <div class="flex items-center gap-1">
+              <template v-for="group in groups" :key="group.key">
+                <tr v-if="group.batch" class="bg-base-2">
+                  <td colspan="7" class="border-line-1 border-b p-2">
+                    <div class="flex items-center gap-2">
+                      <button
+                        :aria-expanded="!!expanded[group.key]"
+                        @click="expanded[group.key] = !expanded[group.key]"
+                      >
+                        {{ expanded[group.key] ? '收起' : '展开' }} · {{ group.batch.label }}
+                      </button>
+                      <AppBadge :tone="TONE[group.batch.status] ?? 'neutral'">{{
+                        JOB_STATUS_LABEL[group.batch.status] ?? group.batch.status
+                      }}</AppBadge>
+                      <span>{{ group.batch.settled }} / {{ group.batch.total }} 项已结束</span>
+                      <AppButton size="sm" @click="queue.cancelBatch(pid, group.batch.id)"
+                        >取消未完成</AppButton
+                      >
+                      <AppButton
+                        v-if="group.batch.counts.failed || group.batch.counts.canceled"
+                        size="sm"
+                        @click="queue.retryBatch(pid, group.batch.id)"
+                        >重试失败项</AppButton
+                      >
+                    </div>
+                    <p v-if="group.batch.error" class="text-st-failed">
+                      {{ group.batch.error.title }}：{{ group.batch.error.detail }}
+                    </p>
+                  </td>
+                </tr>
+                <tr
+                  v-for="job in group.batch && !expanded[group.key] ? [] : group.visibleJobs"
+                  :key="job.id"
+                  class="hover:bg-base-2 cursor-pointer"
+                  :class="job.id === selectedId ? 'bg-accent-dim/40' : ''"
+                  @click="selectedId = job.id"
+                >
+                  <td class="border-line-1 border-b py-1 pr-1 align-top">
+                    <AppBadge :tone="TONE[job.status] ?? 'neutral'">
+                      {{ JOB_STATUS_LABEL[job.status] ?? job.status }}
+                    </AppBadge>
+                    <span v-if="job.attempt > 1" class="text-fg-4 tnum ml-1">
+                      第 {{ job.attempt }} 次
+                    </span>
+                  </td>
+                  <td class="border-line-1 text-fg-2 border-b py-1 pr-1 align-top">
                     <button
-                      v-if="['queued', 'waiting'].includes(job.status)"
-                      class="text-fg-4 hover:text-accent"
-                      title="提到队首（把优先级调到当前最小值之前）"
-                      @click.stop="bump(job)"
+                      class="text-left"
+                      :class="job.shot_id ? 'hover:text-accent' : 'cursor-default'"
+                      :disabled="!job.shot_id"
+                      @click.stop="goShot(job.shot_id)"
                     >
-                      <ArrowUp :size="10" />
+                      {{ job.label }}
                     </button>
-                    <button
-                      v-if="['queued', 'waiting', 'running'].includes(job.status)"
-                      class="text-fg-4 hover:text-st-failed"
-                      title="取消这个任务。已经产生的版本不会被删"
-                      @click.stop="queue.cancel(pid, job.id)"
-                    >
-                      <Ban :size="10" />
-                    </button>
-                    <button
-                      v-if="['failed', 'canceled'].includes(job.status)"
-                      class="text-fg-4 hover:text-accent"
-                      title="沿用原参数重跑"
-                      @click.stop="queue.retry(pid, job.id)"
-                    >
-                      <RotateCcw :size="10" />
-                    </button>
-                    <button
-                      v-if="['failed', 'canceled', 'done'].includes(job.status)"
-                      class="text-fg-4 hover:text-st-failed"
-                      title="从列表中删除这条记录"
-                      @click.stop="queue.deleteJob(pid, job.id)"
-                    >
-                      <Trash2 :size="10" />
-                    </button>
-                  </div>
-                </td>
-              </tr>
+                    <p v-if="job.wait_reason" class="text-st-review">{{ job.wait_reason }}</p>
+                  </td>
+                  <td class="border-line-1 text-fg-3 border-b py-1 pr-1 align-top">
+                    {{ job.kind }}
+                  </td>
+                  <td class="border-line-1 border-b py-1 pr-1 align-top">
+                    <div class="bg-base-3 h-1 w-20">
+                      <div
+                        class="bg-accent h-1"
+                        :style="{ width: `${Math.round(job.progress * 100)}%` }"
+                      />
+                    </div>
+                    <span class="text-fg-4 tnum">{{ Math.round(job.progress * 100) }}%</span>
+                  </td>
+                  <td class="border-line-1 text-fg-3 tnum border-b py-1 pr-1 align-top">
+                    {{ job.priority }}
+                  </td>
+                  <td class="border-line-1 text-fg-3 tnum border-b py-1 pr-1 align-top">
+                    {{ elapsed(job) }}
+                  </td>
+                  <td class="border-line-1 border-b py-1 align-top">
+                    <div class="flex items-center gap-1">
+                      <button
+                        v-if="['queued', 'waiting'].includes(job.status)"
+                        class="text-fg-4 hover:text-accent"
+                        title="提到队首（把优先级调到当前最小值之前）"
+                        @click.stop="bump(job)"
+                      >
+                        <ArrowUp :size="10" />
+                      </button>
+                      <button
+                        v-if="['queued', 'waiting', 'running'].includes(job.status)"
+                        class="text-fg-4 hover:text-st-failed"
+                        title="取消这个任务。已经产生的版本不会被删"
+                        @click.stop="queue.cancel(pid, job.id)"
+                      >
+                        <Ban :size="10" />
+                      </button>
+                      <button
+                        v-if="['failed', 'canceled'].includes(job.status)"
+                        class="text-fg-4 hover:text-accent"
+                        title="沿用原参数重跑"
+                        @click.stop="queue.retry(pid, job.id)"
+                      >
+                        <RotateCcw :size="10" />
+                      </button>
+                      <button
+                        v-if="['failed', 'canceled', 'done'].includes(job.status)"
+                        class="text-fg-4 hover:text-st-failed"
+                        title="从列表中删除这条记录"
+                        @click.stop="queue.deleteJob(pid, job.id)"
+                      >
+                        <Trash2 :size="10" />
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              </template>
             </tbody>
           </table>
         </div>
@@ -353,8 +399,8 @@ async function bump(job: Job): Promise<void> {
               <!-- 走的是哪条路先单独摆一行：排查失败时它是第一个要看的东西，埋在
                    下面那坨 JSON 里等于没有。老任务没有这一项，如实说「没记录」。 -->
               <p v-if="frozen" class="text-fg-2 mt-1 text-2xs">
-                走的是「{{ frozen.label }}」· {{ ROUTE_SOURCE_LABEL[frozen.source] }} ·
-                能力 {{ frozen.capability }}
+                走的是「{{ frozen.label }}」· {{ ROUTE_SOURCE_LABEL[frozen.source] }} · 能力
+                {{ frozen.capability }}
                 <span v-if="frozen.preset"><br />预设：{{ frozen.preset }}</span>
                 <span v-if="frozen.workflow_name"><br />绑的图：{{ frozen.workflow_name }}</span>
                 <span v-if="frozen.base_url"><br />地址：{{ frozen.base_url }}</span>

@@ -405,7 +405,7 @@ export interface PosterResult {
 }
 
 export type StoryPatch = Partial<Pick<Story, 'title' | 'raw_text' | 'mode'>>
-export type ScenePatch = Partial<
+export type ScenePatch = { clear_shot_prompts?: boolean } & Partial<
   Pick<
     Scene,
     | 'title'

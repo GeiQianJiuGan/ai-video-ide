@@ -199,7 +199,9 @@ class AccessMiddleware:
             scope["state"]["request_id"] = request_id
             mutation = method not in {"GET", "HEAD", "OPTIONS"}
             lock = self.locks.setdefault(pid or "__global__", asyncio.Lock())
-            if mutation:
+            # 切段预检只读且会长时间运行 FFmpeg，不应占用项目的写入锁。
+            read_only_plan = method == "POST" and route_path == "/api/v1/projects/{pid}/ingest/plan"
+            if mutation and not read_only_plan:
                 async with lock:
                     await self.dispatch(
                         scope, receive, send, principal, pid, route_path, request_id
@@ -271,6 +273,7 @@ class AccessMiddleware:
             (method + scope["path"] + "?" + scope.get("query_string", b"").decode()).encode()
         )
         total = 0
+        oversized = False
         if mutation:
             while True:
                 message = await receive()
@@ -280,18 +283,24 @@ class AccessMiddleware:
                 body = message.get("body", b"")
                 total += len(body)
                 if total > settings.upload_limit_mb * 1024 * 1024:
-                    spool.close()
-                    raise AppError(
-                        ErrorCode.VALIDATION_ERROR,
-                        "上传超过限制",
-                        f"请求不能超过 {settings.upload_limit_mb} MB。",
-                        ["缩小文件或由管理员调整上传限制"],
-                        status_code=413,
-                    )
-                spool.write(body)
-                fingerprint.update(body)
+                    oversized = True
+                # 超限后只接收并丢弃余下请求，不再写盘。提前关闭尚在上传的连接
+                # 会使 Node/Vite 收到 ECONNRESET，掩盖真正的 413 错误。
+                if not oversized:
+                    spool.write(body)
+                    fingerprint.update(body)
                 if not message.get("more_body"):
                     break
+            if oversized:
+                spool.close()
+                raise AppError(
+                    ErrorCode.VALIDATION_ERROR,
+                    "上传超过限制",
+                    f"请求不能超过 {settings.upload_limit_mb} MB（含表单数据）。",
+                    ["缩小文件，或调整 AIVS_UPLOAD_LIMIT_MB 后重启后端"],
+                    {"upload_limit_mb": settings.upload_limit_mb},
+                    status_code=413,
+                )
             spool.seek(0)
         if idem and headers.get("content-type", "").startswith("multipart/form-data"):
             # 浏览器和 SDK 重试会生成不同 boundary；按字段和文件内容识别同一次上传。
