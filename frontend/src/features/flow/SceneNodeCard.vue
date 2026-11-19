@@ -77,7 +77,7 @@ const promptText = computed(() => (props.node.prompt ?? '').trim())
         :src="videoSrc"
         :poster="poster"
         controls
-        preload="metadata"
+        :preload="poster ? 'none' : 'metadata'"
         class="max-h-full max-w-full"
       />
       <div v-else class="px-2 text-center">

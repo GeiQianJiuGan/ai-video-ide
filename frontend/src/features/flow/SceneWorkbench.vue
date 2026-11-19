@@ -1119,7 +1119,7 @@ function cancelDrop(): void {
                     :src="versionVideo(v)"
                     :poster="versionPoster(v) || undefined"
                     controls
-                    preload="metadata"
+                    :preload="versionPoster(v) ? 'none' : 'metadata'"
                     class="max-h-full max-w-full"
                   />
                   <img
