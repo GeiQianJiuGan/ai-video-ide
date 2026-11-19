@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import asyncio
+import secrets
 import sys
 from pathlib import Path
 from typing import Any
@@ -41,6 +42,19 @@ from app.services.audio import audio as audio_service
 from app.services.base import as_dict, db_of, dump_json, fetch, fetch_all, load_json, project_of
 
 log = get_logger("timeline")
+
+#: 浏览器能直接播、值得做预览代理的扩展名。
+VIDEO_SUFFIXES = frozenset({".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi"})
+
+
+def is_video_path(path: str) -> bool:
+    return Path(path).suffix.lower() in VIDEO_SUFFIXES
+
+
+def preview_proxy_rel(asset_id: str) -> str:
+    """预览代理在工程目录里的相对路径。按 asset id 命名，不会和同名文件撞车。"""
+    return f"proxies/{asset_id}_preview.mp4"
+
 
 #: 吸附阈值（秒）：剪短片段后自动贴到前一段末尾，中间不留黑帧。
 SNAP = 0.08
@@ -208,6 +222,17 @@ class TimelineService:
         versions = {v.id: v for v in await fetch_all(db, GenerationVersion)}
         kind_by_track = {t.id: t.kind for t in tracks}
         known_clips = {c.id for c in clips}
+        proj_dir = project_of(pid).dir
+        proxies: dict[str, str | None] = {}
+
+        def proxy_of(asset: Asset | None) -> str | None:
+            if asset is None or not is_video_path(asset.path):
+                return None
+            if asset.id not in proxies:
+                rel = preview_proxy_rel(asset.id)
+                proxies[asset.id] = rel if (proj_dir / rel).is_file() else None
+            return proxies[asset.id]
+
         # 「这段画面的声音已经拆出去了」是双向的：源片段要能指到那条音频，
         # 音频要能说出自己是从哪来的。两边都在这里一次算好，前端不再自己配对。
         detached: dict[str, str] = {}
@@ -237,6 +262,8 @@ class TimelineService:
                     "shot_index_no": shot.index_no if shot else None,
                     "version_no": version.version_no if version else None,
                     "asset_path": asset.path if asset else None,
+                    #: 预览代理（低码率 + faststart）。只给预览器用，导出永远走 asset_path。
+                    "proxy_path": proxy_of(asset),
                     "source_duration": source_duration,
                     "missing_file": bool(clip.asset_id) and asset is None,
                     #: 这段画面的声音被拆到了哪个片段上（没拆过是 None）。
@@ -1569,10 +1596,23 @@ class TimelineService:
         return ffmpeg_tool.require("ffmpeg")
 
     async def ensure_proxy(self, pid: str, asset_id: str) -> dict[str, Any]:
-        """为预览生成 720p 代理。代理只用于播放，导出永远走原始素材。"""
+        """为预览生成一份轻量代理：最高 720p、码率封顶、保留音轨、moov 前置。
+
+        AI 成片动辄 1080p / 15–25 Mbps，线上部署时浏览器边下边播必然卡；代理把码率压到
+        约 2 Mbps，并用 `+faststart` 让浏览器拿到文件头就能起播。代理只用于播放，
+        导出永远走原始素材。先写临时文件再改名，并发请求不会读到半截文件。
+        """
         db = db_of(pid)
         proj = project_of(pid)
         asset = await fetch(db, Asset, asset_id, "资产")
+        if not is_video_path(asset.path):
+            raise AppError(
+                ErrorCode.VALIDATION_ERROR,
+                "只有视频需要预览代理",
+                f"{asset.path} 不是视频文件。",
+                ["图片与音频在预览里直接读原文件"],
+                {"asset_id": asset_id},
+            )
         src = proj.dir / asset.path
         if not src.is_file():
             raise AppError(
@@ -1582,48 +1622,59 @@ class TimelineService:
                 ["从备份恢复该文件", "或重新生成对应镜头"],
                 {"asset_id": asset_id},
             )
-        target = proj.dir / "proxies" / f"{Path(asset.path).stem}_720p.mp4"
+        rel = preview_proxy_rel(asset_id)
+        target = proj.dir / rel
         if target.is_file():
-            return {"asset_id": asset_id, "proxy_path": target.as_posix(), "reused": True}
+            return {"asset_id": asset_id, "proxy_path": rel, "reused": True}
         target.parent.mkdir(parents=True, exist_ok=True)
+        partial = target.with_name(f"{target.stem}.{secrets.token_hex(4)}.part.mp4")
         args = [
             self._ffmpeg(),
             "-y",
             "-i",
             str(src),
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:0?",
             "-vf",
-            "scale=-2:720",
+            "scale=-2:'min(720,ih)'",
             "-c:v",
             "libx264",
             "-preset",
             "veryfast",
             "-crf",
             "26",
-            "-an",
-            str(target),
+            "-maxrate",
+            "2M",
+            "-bufsize",
+            "4M",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "96k",
+            "-movflags",
+            "+faststart",
+            str(partial),
         ]
         proc = await asyncio.create_subprocess_exec(
             *args, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
         )
         _, stderr = await proc.communicate()
-        if proc.returncode != 0:
+        if proc.returncode != 0 or not partial.is_file():
+            partial.unlink(missing_ok=True)
             raise AppError(
                 ErrorCode.FFMPEG_ERROR,
                 "代理生成失败",
                 f"FFmpeg 退出码 {proc.returncode}。",
-                ["预览可以直接播放原始素材", "确认该文件的编码可被 FFmpeg 读取"],
+                ["预览可以切到「原画」直接播放原始素材", "确认该文件的编码可被 FFmpeg 读取"],
                 {"asset_id": asset_id, "raw": (stderr or b"").decode("utf-8", "replace")[-2000:]},
             )
-        registered = await asset_service.register_path(
-            pid, "proxy", str(target), source="proxy", copy=False
-        )
+        partial.replace(target)
         log.info("timeline.proxy_built", project_id=pid, asset_id=asset_id)
-        return {
-            "asset_id": asset_id,
-            "proxy_asset_id": registered["id"],
-            "proxy_path": target.as_posix(),
-            "reused": False,
-        }
+        return {"asset_id": asset_id, "proxy_path": rel, "reused": False}
 
     async def build_command(self, pid: str, out_path: str | None = None) -> dict[str, Any]:
         """产出 FFmpeg 命令。用原始素材而不是代理。

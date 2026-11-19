@@ -27,6 +27,7 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { Pause, Play, SkipBack } from '@lucide/vue'
 import { fileUrl } from '@/shared/api/files'
+import { timelineApi } from '@/shared/api/timeline'
 import type { Clip, Timeline } from '@/shared/api/timeline'
 
 const props = defineProps<{
@@ -76,6 +77,39 @@ function stateAt(i: number): SlotState {
   return i === 0 ? state0 : state1
 }
 
+/**
+ * 画质：「流畅」优先播预览代理（≤720p、约 2 Mbps、moov 前置），「原画」直接播原素材。
+ * 原素材动辄 1080p / 20 Mbps，线上部署隔着公网边下边播必然卡；本机（桌面壳 / localhost）
+ * 读盘不受带宽限制，默认原画。选择记在 localStorage，只是偏好、坏了就回到默认。
+ */
+type Quality = 'smooth' | 'original'
+const QUALITY_KEY = 'aivs.preview.quality'
+
+function defaultQuality(): Quality {
+  const host = window.location.hostname
+  const desktop = Boolean((window as unknown as { __AIVS_ENDPOINT__?: unknown }).__AIVS_ENDPOINT__)
+  const local = desktop || ['localhost', '127.0.0.1', '[::1]', ''].includes(host)
+  return local ? 'original' : 'smooth'
+}
+
+function readQuality(): Quality {
+  try {
+    const saved = window.localStorage.getItem(QUALITY_KEY)
+    if (saved === 'smooth' || saved === 'original') return saved
+  } catch {
+    /* localStorage 不可用就用默认 */
+  }
+  return defaultQuality()
+}
+
+const quality = ref<Quality>(readQuality())
+/** 本次会话里新生成的代理（asset id → 相对路径），不必为它重新拉整条时间线。 */
+const built = ref<Record<string, string>>({})
+/** 生成失败的资产：这几段播原画，不反复重试。 */
+const failedIds = ref<string[]>([])
+const building = ref<{ done: number; total: number } | null>(null)
+let alive = true
+
 /** 音频元素按片段 id 存：`v-for` 里拿不到稳定的下标，删一段会串。 */
 const audioEls = new Map<string, HTMLAudioElement>()
 /** 播不了要说出来（大多是浏览器解不了这个编码，导出照旧能用 FFmpeg 走完）。 */
@@ -95,6 +129,16 @@ const total = computed(() => props.timeline?.duration_total ?? 0)
 
 function playable(clip: Clip): boolean {
   return Boolean(clip.asset_path) && !clip.missing_file
+}
+
+function proxyOf(clip: Clip): string | null {
+  return clip.proxy_path ?? (clip.asset_id ? (built.value[clip.asset_id] ?? null) : null)
+}
+
+/** 这一段实际播哪个文件：流畅模式下有代理就播代理，没有就先播原画。 */
+function mediaPath(clip: Clip): string {
+  const proxy = quality.value === 'smooth' ? proxyOf(clip) : null
+  return proxy ?? clip.asset_path ?? ''
 }
 
 const activeIdx = computed(() =>
@@ -203,10 +247,12 @@ function assign(i: number, clip: Clip | null, time: number): void {
     slot.clip = ''
     return
   }
-  const url = fileUrl(props.pid, clip.asset_path)
+  const url = fileUrl(props.pid, mediaPath(clip))
+  // 正在播的这一段刚好生成好了代理：不在半路换文件（会重新缓冲），下次装载时再用
+  const keepPlaying = slot.clip === clip.id && Boolean(slot.url) && !el.paused
   slot.clip = clip.id
   slot.seek = time
-  if (slot.url === url) {
+  if (slot.url === url || keepPlaying) {
     if (el.readyState >= 1 && Math.abs(el.currentTime - time) > 0.04) trySeek(el, time)
     return
   }
@@ -521,7 +567,71 @@ watch(total, (value) => {
 })
 
 onMounted(reconcile)
+/**
+ * 流畅模式下缺代理的视频段：从播放头所在那段往后**逐个**生成（一次一个，不把服务器
+ * CPU 打满），生成好的段下次装载就换用。失败的记下来播原画，不反复重试。
+ */
+const missing = computed<string[]>(() => {
+  if (quality.value !== 'smooth') return []
+  const start = Math.max(0, activeIdx.value)
+  const ordered = [...program.value.slice(start), ...program.value.slice(0, start)]
+  const ids: string[] = []
+  for (const clip of ordered) {
+    const id = clip.asset_id
+    if (!id || !playable(clip) || proxyOf(clip) || failedIds.value.includes(id)) continue
+    if (!ids.includes(id)) ids.push(id)
+  }
+  return ids
+})
+
+let pumping = false
+async function pump(): Promise<void> {
+  if (pumping) return
+  pumping = true
+  let done = 0
+  try {
+    while (alive && quality.value === 'smooth') {
+      const id = missing.value[0]
+      if (!id) break
+      building.value = { done, total: done + missing.value.length }
+      try {
+        const out = await timelineApi.ensureProxy(props.pid, id)
+        built.value = { ...built.value, [id]: out.proxy_path }
+      } catch {
+        failedIds.value = [...failedIds.value, id]
+      }
+      done += 1
+    }
+  } finally {
+    pumping = false
+    building.value = null
+  }
+}
+
+watch(
+  () => missing.value.length,
+  (count) => {
+    if (count > 0) void pump()
+  },
+  { immediate: true },
+)
+
+function setQuality(next: Quality): void {
+  if (next === quality.value) return
+  const resume = playing.value
+  pause()
+  quality.value = next
+  try {
+    window.localStorage.setItem(QUALITY_KEY, next)
+  } catch {
+    /* 存不下只是下次回到默认 */
+  }
+  reconcile()
+  if (resume) void play()
+}
+
 onBeforeUnmount(() => {
+  alive = false
   pause()
   if (preloadTimer) {
     clearTimeout(preloadTimer)
@@ -613,11 +723,30 @@ function stamp(n: number): string {
         @input="onScrub(($event.target as HTMLInputElement).value)"
       />
       <span class="text-fg-3 tnum shrink-0 text-2xs">{{ stamp(at) }} / {{ stamp(total) }}</span>
+      <button
+        class="border-line-1 text-fg-2 hover:text-fg-1 shrink-0 border px-1 text-2xs"
+        :title="
+          quality === 'smooth'
+            ? '流畅：播 720p 预览代理，线上不卡。点一下切到原画'
+            : '原画：直接播原素材（码率高，线上可能卡）。点一下切到流畅'
+        "
+        @click="setQuality(quality === 'smooth' ? 'original' : 'smooth')"
+      >
+        {{ quality === 'smooth' ? '流畅' : '原画' }}
+      </button>
     </div>
 
     <div class="border-line-1 space-y-px border-t px-1.5 py-1">
       <p class="text-fg-4 text-2xs">
         逐段实时预览：下一段会提前预载，换段基本无缝；转场 / 特效在这里不渲染——最终效果看导出。
+      </p>
+      <p v-if="building" class="text-fg-4 text-2xs">
+        正在生成流畅预览 {{ building.done }}/{{
+          building.total
+        }}：生成好的段立刻换用，没好的先播原画。
+      </p>
+      <p v-if="quality === 'smooth' && failedIds.length" class="text-st-review text-2xs">
+        {{ failedIds.length }} 个素材的流畅预览没生成出来，这几段播原画。
       </p>
       <p v-if="gapSeconds > 0.05" class="text-fg-4 text-2xs">
         历史数据中仍有 {{ gapSeconds.toFixed(2) }} 秒视频空档；编辑视频轨时会自动贴紧。
