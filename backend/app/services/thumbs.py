@@ -75,6 +75,14 @@ class ThumbService:
                 self._locks.pop(target, None)
 
     async def _render(self, binary: str, src: Path, target: Path, width: int) -> Path | None:
+        try:
+            return await self._render_unsafe(binary, src, target, width)
+        except OSError as exc:
+            # 缓存目录不可写 / 磁盘满：缩略图只是加速，退回原图
+            log.warning("thumbs.cache_unwritable", src=str(src), error=str(exc))
+            return None
+
+    async def _render_unsafe(self, binary: str, src: Path, target: Path, width: int) -> Path | None:
         target.parent.mkdir(parents=True, exist_ok=True)
         partial = target.with_name(f"{target.stem}.{secrets.token_hex(4)}.part.webp")
         args = [
@@ -94,14 +102,10 @@ class ThumbService:
             "80",
             str(partial),
         ]
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *args, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
-            )
-            _, stderr = await proc.communicate()
-        except OSError as exc:
-            log.warning("thumbs.spawn_failed", src=str(src), error=str(exc))
-            return None
+        proc = await asyncio.create_subprocess_exec(
+            *args, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
+        )
+        _, stderr = await proc.communicate()
         if proc.returncode != 0 or not partial.is_file() or partial.stat().st_size == 0:
             partial.unlink(missing_ok=True)
             log.warning(

@@ -173,3 +173,20 @@ def test_thumbnail_without_ffmpeg_or_for_non_images_serves_the_original(
     bad = client.get(f"/api/v1/projects/{pid}/files/{rel}", params={"w": 0})
     assert bad.status_code == 422
     assert error_of(bad)["code"] == "VALIDATION_ERROR"
+
+
+async def test_thumbnail_cache_unwritable_falls_back_to_the_original(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """缓存目录建不出来（只读盘 / 磁盘满）时退回原图，而不是让图片请求 500。"""
+    from app.services import thumbs as thumbs_module
+
+    src = tmp_path / "图.png"
+    src.write_bytes(PNG_1PX)
+
+    def boom(*_: object, **__: object) -> None:
+        raise PermissionError("只读")
+
+    monkeypatch.setattr(Path, "mkdir", boom)
+    service = thumbs_module.ThumbService()
+    assert await service._render("ffmpeg", src, tmp_path / "cache" / "x_128.webp", 128) is None
