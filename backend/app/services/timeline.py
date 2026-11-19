@@ -1638,7 +1638,7 @@ class TimelineService:
             "-map",
             "0:a:0?",
             "-vf",
-            "scale=-2:'min(720,ih)'",
+            "scale=-2:'trunc(min(720,ih)/2)*2'",
             "-c:v",
             "libx264",
             "-preset",
