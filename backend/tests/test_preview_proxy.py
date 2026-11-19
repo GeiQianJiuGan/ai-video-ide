@@ -89,3 +89,20 @@ async def test_proxy_refuses_non_video_assets(tmp_path: Path) -> None:
         assert err.suggestions
     else:
         raise AssertionError("图片不该被转成视频代理")
+
+
+async def test_files_endpoint_serves_the_proxy_only_when_asked(tmp_path: Path) -> None:
+    """`?preview=true` 有代理播代理、没有回原片；不带参数永远是原片（导出 / 下载认它）。"""
+    from app.api.files import preview_of
+
+    binary = ffmpeg_or_skip()
+    pid = await make_project(tmp_path)
+    src = await asset_service.register_path(
+        pid, "generated_video", str(await make_clip(binary, tmp_path / "raw" / "片.mp4"))
+    )
+    root = projects.get(pid).dir
+    original = (root / src["path"]).resolve()
+    assert await preview_of(pid, root, original) is None, "还没生成代理时回原片"
+
+    out = await timeline_service.ensure_proxy(pid, src["id"])
+    assert await preview_of(pid, root, original) == root / out["proxy_path"]

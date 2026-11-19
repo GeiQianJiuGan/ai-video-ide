@@ -30,17 +30,20 @@ function withToken(url: string): string {
 export type ThumbWidth = 128 | 256 | 512 | 1024
 
 const IMAGE_RE = /\.(png|jpe?g|webp|bmp)$/i
+const VIDEO_RE = /\.(mp4|mov|m4v|webm|mkv|avi)$/i
 
 /**
  * 工程目录内的文件，rel 就是 Asset.path。
  *
- * `thumb` 只对图片生效：后端缩一份 WebP 缓存起来再给（AI 出的 PNG 动辄几 MB，
- * 40 px 的格子没必要下原图）。视频 / 音频忽略它，照旧走原文件。
+ * `variant` 是缩略图宽度时只对图片生效：后端缩一份 WebP 缓存起来再给（AI 出的 PNG
+ * 动辄几 MB，40 px 的格子没必要下原图）。是 `'preview'` 时只对视频生效：已有预览代理
+ * 就播代理（低码率、moov 前置），没有照旧播原片。导出与下载永远用不带参数的原文件。
  */
-export function fileUrl(pid: string, rel: string, thumb?: ThumbWidth): string {
+export function fileUrl(pid: string, rel: string, variant?: ThumbWidth | 'preview'): string {
   if (!pid || !rel) return ''
   const url = `${endpoint.baseUrl}/projects/${encodeURIComponent(pid)}/files/${encodePath(rel)}`
-  return withQuery(url, thumb && IMAGE_RE.test(rel) ? { w: String(thumb) } : {})
+  if (variant === 'preview') return withQuery(url, VIDEO_RE.test(rel) ? { preview: 'true' } : {})
+  return withQuery(url, variant && IMAGE_RE.test(rel) ? { w: String(variant) } : {})
 }
 
 /** 素材库目录内的文件（Phase 3 起可用）。 */

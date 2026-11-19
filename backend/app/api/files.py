@@ -17,11 +17,14 @@ from typing import Annotated
 
 from fastapi import APIRouter, Query
 from fastapi.responses import FileResponse
+from sqlalchemy import select
 
 from app.core.errors import AppError, ErrorCode
-from app.services.base import project_of
+from app.persistence.models_world import Asset
+from app.services.base import db_of, project_of
 from app.services.library import library
 from app.services.thumbs import thumbs
+from app.services.timeline import is_video_path, preview_proxy_rel
 
 #: 部分系统的 mimetypes 表里没有 webp（缩略图格式），补上，否则会被当成下载文件。
 mimetypes.add_type("image/webp", ".webp")
@@ -108,17 +111,40 @@ def serve(root: Path, rel: str, what: str) -> FileResponse:
 
 @router.get("/projects/{pid}/files/{rel:path}")
 async def project_file(
-    pid: str, rel: str, w: Annotated[int | None, Query(ge=1, le=8192)] = None
+    pid: str,
+    rel: str,
+    w: Annotated[int | None, Query(ge=1, le=8192)] = None,
+    preview: bool = False,
 ) -> FileResponse:
     """读工程目录内的文件，rel 就是 Asset.path。
 
     带 `w` 且是图片时给一份缩略图（见 `services/thumbs.py`），做不出来就回原图。
+    带 `preview=true` 且是视频时，已有预览代理就给代理（低码率、moov 前置），没有回原片。
     """
     root = project_of(pid).dir
     target = locate(root, rel, "工程目录")
     if w is not None:
         target = await thumbs.thumb(root, target, w) or target
+    elif preview:
+        target = await preview_of(pid, root, target) or target
     return respond(target)
+
+
+async def preview_of(pid: str, root: Path, target: Path) -> Path | None:
+    """视频已经有预览代理（时间线生成的）就给代理路径；没有给 None，调用方回原片。"""
+    if not is_video_path(target.name):
+        return None
+    try:
+        rel = target.relative_to(root.resolve()).as_posix()
+    except ValueError:
+        return None
+    async with db_of(pid).read() as session:
+        found = await session.execute(select(Asset.id).where(Asset.path == rel))
+        asset_id = found.scalars().first()
+    if not asset_id:
+        return None
+    proxy = root / preview_proxy_rel(asset_id)
+    return proxy if proxy.is_file() else None
 
 
 @router.get("/library/files/{rel:path}")

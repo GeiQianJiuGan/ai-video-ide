@@ -220,7 +220,7 @@ function slotUrl(path: string | null): string {
  * 而版本的资产几乎总是一段 `.mp4`，于是每一格都是一个坏图标。
  */
 function versionVideo(v: GenerationVersion): string {
-  return v.video_path ? fileUrl(pid.value, v.video_path) : ''
+  return v.video_path ? fileUrl(pid.value, v.video_path, 'preview') : ''
 }
 
 function versionPoster(v: GenerationVersion): string {

@@ -338,7 +338,7 @@ function slotUrl(path: string | null): string {
  * 那样得到的是「限制了播放时间的长片」而不是单段预览。
  */
 function versionVideo(v: GenerationVersion): string {
-  return v.video_path ? fileUrl(pid.value, v.video_path) : ''
+  return v.video_path ? fileUrl(pid.value, v.video_path, 'preview') : ''
 }
 
 function versionPoster(v: GenerationVersion): string {

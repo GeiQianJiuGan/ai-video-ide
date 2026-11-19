@@ -116,7 +116,7 @@ const frameVersions = computed(() =>
   versions.value.filter((v) => v.params.creation_pipeline === 'frames'),
 )
 const asset = (aid: string | null) => assets.value.find((a) => a.id === aid)
-const url = (aid: string | null, thumb?: ThumbWidth) => {
+const url = (aid: string | null, thumb?: ThumbWidth | 'preview') => {
   const a = asset(aid)
   return a ? fileUrl(pid.value, a.path, thumb) : ''
 }
@@ -880,7 +880,7 @@ onBeforeUnmount(() => {
               <strong>版本 {{ v.version_no }}</strong
               ><video
                 v-if="url(v.asset_id)"
-                :src="url(v.asset_id)"
+                :src="url(v.asset_id, 'preview')"
                 controls
                 preload="metadata"
               /><button

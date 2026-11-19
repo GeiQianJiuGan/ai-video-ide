@@ -25,6 +25,15 @@ describe('fileUrl', () => {
     )
   })
 
+  it('视频要预览代理时带 preview，图片忽略它', () => {
+    expect(fileUrl('prj_1', 'v/c.mp4', 'preview')).toBe(
+      '/api/v1/projects/prj_1/files/v/c.mp4?preview=true&token=tok+en',
+    )
+    expect(fileUrl('prj_1', 'a/b.png', 'preview')).toBe(
+      '/api/v1/projects/prj_1/files/a/b.png?token=tok+en',
+    )
+  })
+
   it('缺 pid 或路径给空串', () => {
     expect(fileUrl('', 'a.png')).toBe('')
     expect(fileUrl('prj_1', '')).toBe('')
