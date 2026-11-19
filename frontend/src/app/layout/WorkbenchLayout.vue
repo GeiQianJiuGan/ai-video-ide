@@ -45,10 +45,19 @@ const viewRevision = ref(0)
 
 const pid = computed(() => (route.params.pid as string | undefined) ?? null)
 
-watch(() => sys.events.at(-1), (event) => {
-  if (event?.event === 'project.external_changed' && event.project_id === pid.value) externalChange.value = true
-})
-watch(() => route.fullPath, () => { externalChange.value = false })
+watch(
+  () => sys.events.at(-1),
+  (event) => {
+    if (event?.event === 'project.external_changed' && event.project_id === pid.value)
+      externalChange.value = true
+  },
+)
+watch(
+  () => route.fullPath,
+  () => {
+    externalChange.value = false
+  },
+)
 
 async function refreshExternalChanges() {
   // 通过路由的离开守卫先保存当前草稿，再重新进入页面读取外部修改。
@@ -91,7 +100,9 @@ onMounted(() => {
     if (wiz.shouldAutoOpen) wiz.open = true
   })
   // 依赖状态可能在应用运行期间变化（用户启动了 ComfyUI），低频复查
-  poll = window.setInterval(() => void sys.refresh(), 15_000)
+  poll = window.setInterval(() => {
+    if (!document.hidden) void sys.refresh()
+  }, 15_000)
   window.addEventListener('keydown', onKeydown)
 })
 
@@ -108,9 +119,14 @@ onUnmounted(() => {
     <div class="flex min-h-0 flex-1">
       <ActivityBar />
       <main class="bg-base-0 flex min-h-0 min-w-0 flex-1 flex-col">
-        <div v-if="externalChange" class="border-b border-indigo-400/30 bg-indigo-500/10 px-4 py-2 text-xs">
+        <div
+          v-if="externalChange"
+          class="border-b border-indigo-400/30 bg-indigo-500/10 px-4 py-2 text-xs"
+        >
           外部 AI 更新了当前项目。
-          <button class="ml-3 text-indigo-300 underline" @click="refreshExternalChanges">保存当前草稿并刷新</button>
+          <button class="ml-3 text-indigo-300 underline" @click="refreshExternalChanges">
+            保存当前草稿并刷新
+          </button>
           <button class="ml-3 text-slate-400" @click="externalChange = false">稍后查看</button>
         </div>
         <RouterView :key="viewRevision" />

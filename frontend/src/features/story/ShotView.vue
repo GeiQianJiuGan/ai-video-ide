@@ -315,7 +315,7 @@ const transitionPeers = computed(() => {
  * 按 id 查只会得到一个空白格。
  */
 function itemUrl(item: ContextItem): string {
-  return item.asset_path && !item.missing_file ? fileUrl(pid.value, item.asset_path) : ''
+  return item.asset_path && !item.missing_file ? fileUrl(pid.value, item.asset_path, 256) : ''
 }
 
 /** 图片走 `<img>`、视频走 `<video>`、音频走 `<audio>`：把 `.mp4` 塞进 `<img>` 只会得到坏图标。 */
@@ -325,7 +325,7 @@ function mediaOf(item: ContextItem): string {
 
 /** 槽位缩略图。资产被删掉时后端给 null，此时要显示「指定的图已不在」而不是空白。 */
 function slotUrl(path: string | null): string {
-  return path ? fileUrl(pid.value, path) : ''
+  return path ? fileUrl(pid.value, path, 256) : ''
 }
 
 /**
@@ -342,7 +342,7 @@ function versionVideo(v: GenerationVersion): string {
 }
 
 function versionPoster(v: GenerationVersion): string {
-  return v.thumbnail_path ? fileUrl(pid.value, v.thumbnail_path) : ''
+  return v.thumbnail_path ? fileUrl(pid.value, v.thumbnail_path, 512) : ''
 }
 
 const currentLane = computed(() => {

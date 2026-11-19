@@ -115,7 +115,7 @@ watch(
   { immediate: true },
 )
 const timer = window.setInterval(() => {
-  void refresh()
+  if (!document.hidden) void refresh()
 }, 2000)
 onBeforeUnmount(() => {
   stopped = true

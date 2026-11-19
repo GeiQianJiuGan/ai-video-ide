@@ -13,13 +13,18 @@ from __future__ import annotations
 
 import mimetypes
 from pathlib import Path
+from typing import Annotated
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Query
 from fastapi.responses import FileResponse
 
 from app.core.errors import AppError, ErrorCode
 from app.services.base import project_of
 from app.services.library import library
+from app.services.thumbs import thumbs
+
+#: 部分系统的 mimetypes 表里没有 webp（缩略图格式），补上，否则会被当成下载文件。
+mimetypes.add_type("image/webp", ".webp")
 
 router = APIRouter(tags=["files"])
 
@@ -60,8 +65,8 @@ def resolve_within(root: Path, rel: str) -> Path:
     return target
 
 
-def serve(root: Path, rel: str, what: str) -> FileResponse:
-    """读取 root 之内的一个文件。缺文件是结构化 404，不是空响应。"""
+def locate(root: Path, rel: str, what: str) -> Path:
+    """把 rel 落到 root 之内一个确实存在的文件上。缺文件是结构化 404，不是空响应。"""
     target = resolve_within(root, rel)
     if not target.exists():
         raise AppError(
@@ -79,6 +84,10 @@ def serve(root: Path, rel: str, what: str) -> FileResponse:
             ["检查请求的路径"],
             {"path": rel},
         )
+    return target
+
+
+def respond(target: Path) -> FileResponse:
     mime, _ = mimetypes.guess_type(target.name)
     return FileResponse(
         target,
@@ -92,10 +101,24 @@ def serve(root: Path, rel: str, what: str) -> FileResponse:
     )
 
 
+def serve(root: Path, rel: str, what: str) -> FileResponse:
+    """读取 root 之内的一个文件。"""
+    return respond(locate(root, rel, what))
+
+
 @router.get("/projects/{pid}/files/{rel:path}")
-async def project_file(pid: str, rel: str) -> FileResponse:
-    """读工程目录内的文件，rel 就是 Asset.path。"""
-    return serve(project_of(pid).dir, rel, "工程目录")
+async def project_file(
+    pid: str, rel: str, w: Annotated[int | None, Query(ge=1, le=8192)] = None
+) -> FileResponse:
+    """读工程目录内的文件，rel 就是 Asset.path。
+
+    带 `w` 且是图片时给一份缩略图（见 `services/thumbs.py`），做不出来就回原图。
+    """
+    root = project_of(pid).dir
+    target = locate(root, rel, "工程目录")
+    if w is not None:
+        target = await thumbs.thumb(root, target, w) or target
+    return respond(target)
 
 
 @router.get("/library/files/{rel:path}")

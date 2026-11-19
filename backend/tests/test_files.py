@@ -107,3 +107,69 @@ def test_img_src_may_carry_the_token_in_the_query(
     assert client.get(url, headers={"X-AIVS-Token": "tok-1"}).status_code == 200
     # 放宽只针对文件读取：普通接口不能用 query token 绕过
     assert client.get(f"/api/v1/projects/{pid}/assets?token=tok-1").status_code == 401
+
+
+async def _png(binary: str, target: Path, size: str = "800x600") -> None:
+    import asyncio
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    proc = await asyncio.create_subprocess_exec(
+        binary,
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+        f"testsrc=size={size}",
+        "-frames:v",
+        "1",
+        str(target),
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    await proc.communicate()
+
+
+def test_thumbnail_is_a_small_cached_webp_and_falls_back_to_the_original(
+    client: TestClient, pid: str, project_dir: Path
+) -> None:
+    """清单里的小方块不该下几 MB 的原图：`?w=` 给缩略图，缓存进 cache/thumbs/。"""
+    import asyncio
+
+    from app.core import ffmpeg as ffmpeg_tool
+
+    found = ffmpeg_tool.locate("ffmpeg")
+    if not found.available or not found.path:
+        pytest.skip("这台机器上没有 FFmpeg")
+    src = project_dir / "assets" / "uploads" / "大图.png"
+    asyncio.run(_png(found.path, src))
+    assert src.is_file()
+    rel = "assets/uploads/大图.png"
+
+    resp = client.get(f"/api/v1/projects/{pid}/files/{rel}", params={"w": 200})
+    assert resp.status_code == 200, resp.text
+    assert resp.headers["content-type"] == "image/webp"
+    assert resp.content[:4] == b"RIFF" and resp.content[8:12] == b"WEBP"
+    assert len(resp.content) < src.stat().st_size
+    cached = list((project_dir / "cache" / "thumbs").glob("*_256.webp"))
+    assert len(cached) == 1, "200 要归到 256 那一档"
+    assert not list(cached[0].parent.glob("*.part.webp"))
+
+    again = client.get(f"/api/v1/projects/{pid}/files/{rel}", params={"w": 256})
+    assert again.content == resp.content, "同一档直接读缓存"
+
+    original = client.get(f"/api/v1/projects/{pid}/files/{rel}")
+    assert original.headers["content-type"].startswith("image/png")
+
+
+def test_thumbnail_without_ffmpeg_or_for_non_images_serves_the_original(
+    client: TestClient, pid: str, no_ffmpeg: None
+) -> None:
+    asset_id = upload_png(client, pid, "upload", "thumb.png")
+    rel = _asset(client, pid, asset_id)["path"]
+    resp = client.get(f"/api/v1/projects/{pid}/files/{rel}", params={"w": 128})
+    assert resp.status_code == 200
+    assert resp.content == PNG_1PX + b"thumb.png", "缩略图做不出来就回原图，不能显示不出来"
+
+    bad = client.get(f"/api/v1/projects/{pid}/files/{rel}", params={"w": 0})
+    assert bad.status_code == 422
+    assert error_of(bad)["code"] == "VALIDATION_ERROR"

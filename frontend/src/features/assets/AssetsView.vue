@@ -14,8 +14,8 @@
  *
  * **网格是一页一页长出来的**（`PAGE` + 哨兵），而不是一次把全部资产铺进 DOM。
  * 这一页列的是整个工程的落盘文件——跑过几轮生成之后成片、抽帧、代理动辄上千条，
- * 而每个格子里那张 `<img>` 指的是**原图**（这一页没有缩略图服务，`/files/{rel}` 给的是
- * 落盘那张）：一张 1024×1024 的 PNG 解码出来是 4 MB 位图，几百张一起进 DOM 就是
+ * 而每个格子里那张 `<img>` 即使走 256px 缩略图（`/files/{rel}?w=256`），解码后也是位图，
+ * 几百张一起进 DOM 就是
  * 「点进来卡住半秒」的来源。所以两件事一起做：**只挂当前这几页**（DOM 节点有界）+
  * `loading="lazy"`（滚不到的那些连字节都不请求）。筛选换了就回到第一页——
  * 「已显示 X / Y」那一行照实写出来，绝不假装列完了。
@@ -68,7 +68,7 @@ const isImage = (a: Asset): boolean =>
   (a.mime ?? '').startsWith('image/') || (!a.mime && IMAGE_EXT.test(a.path))
 
 function thumb(a: Asset): string {
-  return a.missing ? '' : fileUrl(pid.value, a.path)
+  return a.missing ? '' : fileUrl(pid.value, a.path, 256)
 }
 
 /** 删除结果拼成一句话：磁盘文件删掉没有、强删破了几处、连带删了几张临时帧，都要说出来。 */
@@ -341,7 +341,7 @@ function goOwner(ownerKind: string, ownerId: string): void {
                 <button class="block w-full text-left" @click="store.loadRefs(pid, a.id)">
                   <span class="bg-base-3 flex h-20 items-center justify-center overflow-hidden">
                     <!--
-                      这里指的是原图（没有缩略图服务）：lazy 让滚不到的那些一个字节都不请求，
+                      这里请求 256px 缩略图（后端缓存的 WebP）：lazy 让滚不到的那些一个字节都不请求，
                       decoding=async 把解码挪出主线程——否则一屏几十张 4K 图会卡住滚动。
                     -->
                     <img
