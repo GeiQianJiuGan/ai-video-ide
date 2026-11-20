@@ -152,7 +152,10 @@ async function reload(): Promise<void> {
 onMounted(reload)
 watch(pid, reload)
 onMounted(() => window.addEventListener('click', closeClipMenu))
-onUnmounted(() => window.removeEventListener('click', closeClipMenu))
+onUnmounted(() => {
+  window.removeEventListener('click', closeClipMenu)
+  clearTimeout(rebuildTimer)
+})
 
 /** 选中的片段被删掉后不要留一块空的检查器。 */
 watch(
@@ -292,9 +295,29 @@ async function moveAudioToNewTrack(): Promise<void> {
   closeClipMenu()
 }
 
+/** 「全部重铺」会丢掉装配片段上的手工编辑：第一下只是武装，3 秒内再点才真的重铺。 */
+const rebuildArmed = ref(false)
+let rebuildTimer: ReturnType<typeof setTimeout> | undefined
+
 async function assemble(replace: boolean): Promise<void> {
+  if (replace && !rebuildArmed.value) {
+    rebuildArmed.value = true
+    clearTimeout(rebuildTimer)
+    rebuildTimer = setTimeout(() => (rebuildArmed.value = false), 3000)
+    return
+  }
+  rebuildArmed.value = false
+  clearTimeout(rebuildTimer)
   await tl.assemble(pid.value, replace).catch(() => {})
 }
+
+const assembleTitle = computed(() => {
+  const base =
+    '按 Scene / Shot 顺序把每个镜头的当前版本对位铺到视频轨：手工裁切、静音、音量和你自己加的素材都会保留；没有当前版本的镜头会被跳过并写明理由'
+  if (tl.syncPending === 0) return `时间线已和分镜同步。${base}`
+  if (tl.syncPending) return `分镜里有 ${tl.syncPending} 处改动还没同步到时间线。${base}`
+  return base
+})
 
 async function saveStart(value: string): Promise<void> {
   const clip = selected.value
@@ -735,18 +758,21 @@ function goShot(shotId: string | null): void {
         size="sm"
         variant="primary"
         :disabled="tl.busy"
-        title="按 Scene / Shot 顺序把每个镜头的当前版本铺到视频轨上；没有当前版本的镜头会被跳过并写明理由"
-        @click="assemble(true)"
+        :title="assembleTitle"
+        @click="assemble(false)"
       >
-        <Wand2 :size="10" />自动装配
+        <Wand2 :size="10" />自动装配<template v-if="tl.syncPending"
+          >（{{ tl.syncPending }} 处待同步）</template
+        >
       </AppButton>
       <AppButton
         size="sm"
+        :variant="rebuildArmed ? 'danger' : 'default'"
         :disabled="tl.busy"
-        title="不清空现有轨道，把还没铺的镜头追加到末尾"
-        @click="assemble(false)"
+        title="删掉所有自动装配铺的片段再从头铺一遍：这些片段上的手工裁切、静音、音量都会丢（你自己加的素材不受影响）。可以撤销"
+        @click="assemble(true)"
       >
-        追加装配
+        {{ rebuildArmed ? '再点一次确认重铺' : '全部重铺' }}
       </AppButton>
       <AppButton
         size="sm"

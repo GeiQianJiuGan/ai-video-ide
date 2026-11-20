@@ -106,6 +106,16 @@ export interface AssembleResult {
   timeline: Timeline
 }
 
+/** 装配账单（只读）：现在按「自动装配」会新增 / 更新 / 删除 / 挪动几段。全为空 = 时间线已和分镜同步。 */
+export interface AssemblePlan {
+  add: unknown[]
+  update: unknown[]
+  remove: unknown[]
+  move: unknown[]
+  skipped: AssembleResult['skipped']
+  preserved: number
+}
+
 export interface Transition {
   id: string
   timeline_id: string
@@ -196,8 +206,9 @@ export const timelineApi = {
   ensureProxy: (pid: string, assetId: string) =>
     api.post<ProxyResult>(`/projects/${pid}/assets/${assetId}/proxy`),
   /** `replace=true` 清空视频轨后重铺；false 追加。 */
-  assemble: (pid: string, replace = true) =>
+  assemble: (pid: string, replace = false) =>
     api.post<AssembleResult>(`/projects/${pid}/timeline/assemble`, { replace }),
+  assemblePlan: (pid: string) => api.post<AssemblePlan>(`/projects/${pid}/timeline/assemble/plan`),
   undo: (pid: string) => api.post<Timeline>(`/projects/${pid}/timeline/undo`),
   redo: (pid: string) => api.post<Timeline>(`/projects/${pid}/timeline/redo`),
 

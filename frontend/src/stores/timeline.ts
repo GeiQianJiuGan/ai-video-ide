@@ -36,6 +36,8 @@ export const useTimelineStore = defineStore('timeline', () => {
   /** 最近一次装配被跳过的镜头，带结构化理由。 */
   const skipped = ref<AssembleResult['skipped']>([])
   const placedCount = ref<number | null>(null)
+  /** 分镜里还没同步到时间线的改动数（新增 / 更新 / 删除 / 挪动）；`null` = 没拉到账单。 */
+  const syncPending = ref<number | null>(null)
   /** 导出预检结果；`null` 表示还没预检过。 */
   const plan = ref<ExportPlan | null>(null)
   /** 最近一次「拆出声音」的结果，界面要据此说明新开了轨 / 复用了文件。 */
@@ -94,15 +96,32 @@ export const useTimelineStore = defineStore('timeline', () => {
     ])
     transitions.value = tr
     exports.value = ex
+    await refreshSyncPlan(pid)
   }
 
-  async function assemble(pid: string, replace = true): Promise<void> {
+  /**
+   * 默认对位调和：只更新装配铺过的片段，手工裁切 / 静音 / 音量与用户自己加的素材都保留。
+   * `replace=true` 才是「全部重铺」，装配片段上的手工编辑会丢。
+   */
+  async function assemble(pid: string, replace = false): Promise<void> {
     await guarded(async () => {
       const out = await timelineApi.assemble(pid, replace)
       timeline.value = out.timeline
       skipped.value = out.skipped
       placedCount.value = out.placed.length
     })
+    await refreshSyncPlan(pid)
+  }
+
+  /** 账单拉不到只是少一个提示，不算错误、不占 busy。 */
+  async function refreshSyncPlan(pid: string): Promise<void> {
+    try {
+      const plan = await timelineApi.assemblePlan(pid)
+      syncPending.value =
+        plan.add.length + plan.update.length + plan.remove.length + plan.move.length
+    } catch {
+      syncPending.value = null
+    }
   }
 
   /** 撤销栈为空时后端回 CONFLICT——照常显示，不吞。 */
@@ -307,6 +326,7 @@ export const useTimelineStore = defineStore('timeline', () => {
     exports,
     skipped,
     placedCount,
+    syncPending,
     plan,
     lastDetach,
     busy,
@@ -319,6 +339,7 @@ export const useTimelineStore = defineStore('timeline', () => {
     audioTracks,
     load,
     assemble,
+    refreshSyncPlan,
     undo,
     redo,
     move,
