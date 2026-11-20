@@ -788,3 +788,33 @@ def test_open_export_folder_uses_the_platform_file_manager(
     assert Path(resp.json()["path"]) == target
     assert target.is_dir()
     assert calls and str(target) in calls[0][0]
+
+
+def test_dropping_a_video_inserts_where_it_lands(
+    client: TestClient, pid: str, fake_probe: None
+) -> None:
+    """拖进视频轨的素材落在哪就插到哪（按落点在前后片段的哪一半），不能一律跑到末尾。"""
+    first, second = make_clips(client, pid, 4.0, 4.0)
+    video = track_named(client, pid, "V1")
+    dropped = client.post(
+        f"/api/v1/projects/{pid}/tracks/{video['id']}/clips",
+        json={
+            "asset_id": upload_png(client, pid, "upload", "drop.mp4"),
+            "start": 3.0,
+            "duration": 2.0,
+        },
+    )
+    assert dropped.status_code == 201, dropped.text
+    order = [(c["id"], c["start"]) for c in track_named(client, pid, "V1")["clips"]]
+    assert order == [
+        (first["id"], 0.0),
+        (dropped.json()["clip_id"], 4.0),
+        (second["id"], 6.0),
+    ]
+
+    appended = client.post(
+        f"/api/v1/projects/{pid}/tracks/{video['id']}/clips",
+        json={"asset_id": upload_png(client, pid, "upload", "tail.mp4"), "duration": 1.0},
+    )
+    assert appended.status_code == 201, appended.text
+    assert clip_in(appended.json()["timeline"], appended.json()["clip_id"])["start"] == 10.0

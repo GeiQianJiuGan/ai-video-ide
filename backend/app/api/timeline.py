@@ -63,7 +63,9 @@ class TrackPatchBody(BaseModel):
 
 class AddClipBody(BaseModel):
     asset_id: str
-    start: float = 0.0
+    start: float | None = Field(
+        default=None, ge=0, description="视频轨按它决定插到哪两段之间；留空则接在最后"
+    )
     duration: float | None = Field(default=None, description="留空则用资产时长或 ffprobe 探测")
     label: str | None = None
 

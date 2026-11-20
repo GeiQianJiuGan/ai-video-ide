@@ -1055,11 +1055,14 @@ class TimelineService:
         track_id: str,
         asset_id: str,
         *,
-        start: float = 0.0,
+        start: float | None = None,
         duration: float | None = None,
         label: str | None = None,
     ) -> dict[str, Any]:
         """把一个已登记的资产放到轨道上（导入的配乐 / 音效走这条路）。
+
+        视频轨是连续铺开的：给了 start 就按它落在哪个片段的前半 / 后半插到那里（和拖动片段
+        同一套规则），不给就接在最后。音频轨照 start 放，不给就是 0 秒。
 
         长度按「显式给的 → 资产上记的 → ffprobe 探出来的」取，**一个都拿不到就报错**：
         随便填 4 秒会让用户以为音乐只有 4 秒长，那是猜出来的假数据。
@@ -1106,16 +1109,21 @@ class TimelineService:
             track_id=track_id,
             asset_id=asset_id,
             index_no=0,
-            start=self._snap_to_neighbours(float(start), await self._siblings(pid, track_id, None)),
+            start=self._snap_to_neighbours(
+                float(start or 0.0), await self._siblings(pid, track_id, None)
+            ),
             duration=float(length),
             in_point=0.0,
             out_point=float(length),
             label=(label or "").strip() or _asset_label(asset),
         )
+        video_siblings: list[TimelineClip] = []
         if track.kind == "video":
-            siblings = await self._siblings(pid, track_id, None)
-            if siblings:
-                row.start = max(c.start + c.duration for c in siblings)
+            video_siblings = sorted(
+                await self._siblings(pid, track_id, None), key=lambda c: c.start
+            )
+            if video_siblings:
+                row.start = max(c.start + c.duration for c in video_siblings)
         else:
             self._ensure_free(
                 row.start,
@@ -1125,7 +1133,13 @@ class TimelineService:
             )
         async with db.write() as session:
             session.add(row)
-        if track.kind == "video":
+        if track.kind == "video" and start is not None and video_siblings:
+            desired = max(0.0, float(start))
+            position = sum(1 for c in video_siblings if desired >= c.start + c.duration / 2)
+            order = [c.id for c in video_siblings]
+            order.insert(position, row.id)
+            await self._write_contiguous_order(pid, track_id, order)
+        elif track.kind == "video":
             await self._close_gaps(pid, track_id)
         else:
             await self._reindex(pid, track_id)
