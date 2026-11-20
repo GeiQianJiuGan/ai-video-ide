@@ -232,7 +232,7 @@ export const useTimelineStore = defineStore('timeline', () => {
   async function addBlankClip(
     pid: string,
     trackId: string,
-    body: { duration: number; label?: string | null },
+    body: { start?: number; duration: number; label?: string | null },
   ): Promise<string> {
     const out = await guarded(() => timelineApi.addBlankClip(pid, trackId, body))
     timeline.value = out.timeline

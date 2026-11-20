@@ -257,7 +257,10 @@ async function dropMaterial(event: DragEvent, track: Track): Promise<void> {
   const clipId =
     payload.type === 'blank'
       ? await tl
-          .addBlankClip(pid.value, track.id, { duration: payload.duration ?? blankDuration.value })
+          .addBlankClip(pid.value, track.id, {
+            start,
+            duration: payload.duration ?? blankDuration.value,
+          })
           .catch(() => '')
       : await tl
           .addClip(pid.value, track.id, { asset_id: payload.assetId ?? '', start })

@@ -244,8 +244,11 @@ export const timelineApi = {
     trackId: string,
     body: { asset_id: string; start?: number; duration?: number | null; label?: string | null },
   ) => api.post<AddClipResult>(`/projects/${pid}/tracks/${trackId}/clips`, body),
-  addBlankClip: (pid: string, trackId: string, body: { duration: number; label?: string | null }) =>
-    api.post<BlankClipResult>(`/projects/${pid}/tracks/${trackId}/blank-clips`, body),
+  addBlankClip: (
+    pid: string,
+    trackId: string,
+    body: { start?: number; duration: number; label?: string | null },
+  ) => api.post<BlankClipResult>(`/projects/${pid}/tracks/${trackId}/blank-clips`, body),
   resizeBlankClip: (pid: string, clipId: string, duration: number) =>
     api.post<Timeline>(`/projects/${pid}/clips/${clipId}/blank-duration`, { duration }),
   moveToAudioTrack: (pid: string, clipId: string, trackId: string) =>

@@ -818,3 +818,19 @@ def test_dropping_a_video_inserts_where_it_lands(
     )
     assert appended.status_code == 201, appended.text
     assert clip_in(appended.json()["timeline"], appended.json()["clip_id"])["start"] == 10.0
+
+
+def test_dropping_a_blank_inserts_where_it_lands(
+    client: TestClient, pid: str, fake_probe: None
+) -> None:
+    """黑场同样落在哪插到哪；不给 start 仍接在最后。"""
+    first, second = make_clips(client, pid, 4.0, 4.0)
+    video = track_named(client, pid, "V1")
+    url = f"/api/v1/projects/{pid}/tracks/{video['id']}/blank-clips"
+    blank = client.post(url, json={"start": 1.0, "duration": 1.0})
+    assert blank.status_code == 201, blank.text
+    order = [(c["id"], c["start"]) for c in track_named(client, pid, "V1")["clips"]]
+    assert order == [(blank.json()["clip_id"], 0.0), (first["id"], 1.0), (second["id"], 5.0)]
+
+    tail = client.post(url, json={"duration": 2.0})
+    assert clip_in(tail.json()["timeline"], tail.json()["clip_id"])["start"] == 9.0
