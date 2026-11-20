@@ -88,3 +88,11 @@ def test_undescribed_skips_transient_frames(client: TestClient, pid: str) -> Non
     ids = [i["id"] for i in client.get(f"{API}/projects/{pid}/assets/undescribed").json()["items"]]
     assert normal in ids
     assert frame not in ids
+
+
+def test_upload_records_mime_from_suffix(client: TestClient, pid: str) -> None:
+    """登记时按后缀写上 mime：界面靠它区分音频 / 视频图标，空着就只能靠各处自己猜后缀。"""
+    asset_id = upload_png(client, pid, "upload", "clip.mp4")
+    assets = client.get(f"/api/v1/projects/{pid}/assets").json()
+    row = next(a for a in assets if a["id"] == asset_id)
+    assert row["mime"] == "video/mp4"

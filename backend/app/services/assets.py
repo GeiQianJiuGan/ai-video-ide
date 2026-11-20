@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import mimetypes
 import shutil
 import tempfile
 from pathlib import Path
@@ -307,7 +308,7 @@ class AssetService:
             id=new_id("asset"),
             kind=kind,
             path=rel,
-            mime=None,
+            mime=mimetypes.guess_type(target.name)[0],
             width=width,
             height=height,
             size_bytes=target.stat().st_size,  # noqa: ASYNC240 - 本地磁盘元数据，开销可忽略
