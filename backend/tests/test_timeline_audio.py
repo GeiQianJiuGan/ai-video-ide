@@ -834,3 +834,16 @@ def test_dropping_a_blank_inserts_where_it_lands(
 
     tail = client.post(url, json={"duration": 2.0})
     assert clip_in(tail.json()["timeline"], tail.json()["clip_id"])["start"] == 9.0
+
+
+def test_assemble_plan_is_empty_right_after_assembling(
+    client: TestClient, pid: str, fake_probe: None
+) -> None:
+    """刚装配完，账单里不该再有「更新」——否则界面上的「N 处待同步」永远消不掉。"""
+    make_clips(client, pid, 3.0, 2.0)
+    plan = client.post(f"/api/v1/projects/{pid}/timeline/assemble/plan").json()
+    assert (plan["add"], plan["update"], plan["remove"], plan["move"]) == ([], [], [], [])
+
+    again = client.post(f"/api/v1/projects/{pid}/timeline/assemble", json={"replace": False})
+    assert again.status_code == 200, again.text
+    assert again.json()["updated"] == []
