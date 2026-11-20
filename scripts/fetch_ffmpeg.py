@@ -68,8 +68,30 @@ def download(url: str, target: Path) -> None:
         raise SystemExit(
             f"下载失败：{exc}\n"
             "  · 确认网络可达，或用 --url 指向内网镜像 / 已下载好的压缩包\n"
-            "  · 也可以手工把 ffmpeg 与 ffprobe 放进 bin/，本脚本只是个便利工具"
+            "  · 也可以手工把 ffmpeg 与 ffprobe 放进 bin/，本脚本只是个便利工具\n"
+            "  · 已经用包管理器装了（如 macOS 的 brew install ffmpeg）：加 --from-system 直接拷过来"
         ) from exc
+
+
+def copy_from_system(exe_suffix: str) -> None:
+    """从 PATH 上拷一份 ffmpeg / ffprobe 进 bin/。官方静态构建下不下来时的退路（开发用）；
+    包管理器装的通常是动态链接的，打安装包前仍应换成静态构建。"""
+    found = {tool: shutil.which(tool) for tool in TOOLS}
+    missing = [tool for tool, path in found.items() if not path]
+    if missing:
+        raise SystemExit(
+            f"PATH 上没找到：{', '.join(missing)}\n"
+            "  · macOS：brew install ffmpeg\n"
+            "  · Linux：apt install ffmpeg\n"
+            "  · 装好后再跑一次 --from-system"
+        )
+    BIN_DIR.mkdir(parents=True, exist_ok=True)
+    for tool, src in found.items():
+        dst = BIN_DIR / f"{tool}{exe_suffix}"
+        shutil.copy2(Path(src).resolve(), dst)
+        if os.name != "nt":
+            dst.chmod(0o755)
+        print(f"就位（来自 {src}）：{dst.relative_to(REPO_ROOT)} · {verify(dst)}")
 
 
 def extract(archive: Path, into: Path) -> None:
@@ -145,6 +167,11 @@ def main() -> int:
     parser.add_argument("--url", help="压缩包地址或本地文件路径；默认按平台选官方构建")
     parser.add_argument("--force", action="store_true", help="已存在也重新下载")
     parser.add_argument(
+        "--from-system",
+        action="store_true",
+        help="不下载，直接拷 PATH 上已装的 ffmpeg / ffprobe（如 brew 装的）",
+    )
+    parser.add_argument(
         "--for-tauri",
         action="store_true",
         help="同时按 <tool>-<target-triple> 复制进 tauri/bin/，供打包时 externalBin 分发",
@@ -153,6 +180,11 @@ def main() -> int:
 
     key = platform_key()
     exe_suffix = ".exe" if key == "windows" else ""
+    if args.from_system:
+        copy_from_system(exe_suffix)
+        if args.for_tauri:
+            stage_for_tauri(exe_suffix)
+        return 0
     BIN_DIR.mkdir(parents=True, exist_ok=True)
 
     existing = [t for t in TOOLS if (BIN_DIR / f"{t}{exe_suffix}").is_file()]
