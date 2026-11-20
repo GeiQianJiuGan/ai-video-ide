@@ -10,7 +10,7 @@ from app.persistence.models_story import Shot
 from app.services.base import db_of, fetch, load_json
 from app.services.generation import generation
 from app.services.images import images
-from tests.conftest import PNG_1PX, upload_png
+from tests.conftest import PNG_1PX, error_of, upload_png
 from tests.test_shot_frame_slots import a_shot
 
 
@@ -277,3 +277,15 @@ def test_remove_card_clears_only_its_frame_draft_binding(client, pid):
     ws = client.get(f"{root}/shots/{sid}/frames").json()
     assert ws["cards"] == [] and ws["video"]["first_card_id"] == ""
     assert any(a["id"] == aid for a in client.get(f"{root}/assets").json())
+
+
+def test_missing_card_is_not_found_and_errors_say_what_to_do(client, pid):
+    """不存在的画面是 404 NOT_FOUND；常见的「输入不完整」给出具体去哪改，而不是一句通用话。"""
+    resp = client.patch(f"/api/v1/projects/{pid}/frame-cards/frm_missing", json={"title": "x"})
+    assert resp.status_code == 404
+    assert error_of(resp)["code"] == "NOT_FOUND"
+
+    shot = a_shot(client, pid)
+    source = client.get(f"/api/v1/projects/{pid}/shots/{shot}/frame-source")
+    assert source.status_code == 422
+    assert any("导入" in tip for tip in error_of(source)["suggestions"])
