@@ -72,7 +72,7 @@ function label(id: string) {
 }
 function url(id: string) {
   const asset = props.assets.find((a) => a.id === id)
-  return asset ? fileUrl(props.pid, asset.path) : ''
+  return asset ? fileUrl(props.pid, asset.path, 256) : ''
 }
 </script>
 

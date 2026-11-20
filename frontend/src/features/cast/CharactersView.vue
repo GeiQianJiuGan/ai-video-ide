@@ -169,7 +169,7 @@ function thumb(assetId: string | null | undefined): string {
   if (!assetId) return ''
   const asset = assetById.value.get(assetId)
   if (!asset || asset.missing) return ''
-  return fileUrl(pid.value, asset.path)
+  return fileUrl(pid.value, asset.path, 512)
 }
 
 async function loadAssets(): Promise<void> {
@@ -676,7 +676,7 @@ async function saveCharacterField(key: string, value: string): Promise<void> {
               title="使用项目中的这张图片"
               @click="createAssetId = asset.id"
             >
-              <img :src="fileUrl(pid, asset.path)" alt="" class="size-full object-cover" />
+              <img :src="fileUrl(pid, asset.path, 256)" alt="" class="size-full object-cover" />
             </button>
           </div>
         </section>

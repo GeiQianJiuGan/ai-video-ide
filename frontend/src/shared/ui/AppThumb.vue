@@ -9,9 +9,9 @@
  *      只是生成时喂不出参考图——那句话由旁边的徽标去说，不是这里。
  *   3. **只画图片**。后端的 `thumbnail_path` 已经按后缀过滤过（`story.py::_image_path`），
  *      所以这里可以放心用 `<img>`；把 `.mp4` 喂给它只会得到一个坏图标。
- *   4. **懒加载 + 异步解码**。这个方块最大 40px，而它指的是**原图**（没有缩略图服务），
- *      一张 1024² 的 PNG 解码出来是 4 MB 位图。清单动辄几十上百行，滚不到的那些
- *      不该请求、更不该在主线程上解码。
+ *   4. **缩略图 + 懒加载 + 异步解码**。这个方块最大 40px，所以请求 128px 的缩略图
+ *      （`fileUrl(…, 128)`，后端缓存一份 WebP），不下几 MB 的原图。清单动辄几十上百行，
+ *      滚不到的那些不该请求、更不该在主线程上解码。
  */
 import { computed } from 'vue'
 import { ImageOff } from '@lucide/vue'
@@ -32,7 +32,7 @@ const props = withDefaults(
 const SIZE = { xs: 'size-3.5', sm: 'size-6', md: 'size-10' } as const
 const ICON = { xs: 8, sm: 10, md: 14 } as const
 
-const src = computed(() => (props.path ? fileUrl(props.pid, props.path) : ''))
+const src = computed(() => (props.path ? fileUrl(props.pid, props.path, 128) : ''))
 </script>
 
 <template>

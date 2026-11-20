@@ -666,7 +666,7 @@ def test_export_command_uses_the_bundled_ffmpeg(client: TestClient, pid: str) ->
 def test_proxy_needs_ffmpeg_and_says_when_the_source_is_gone(
     client: TestClient, pid: str, project_dir: Path, no_ffmpeg: None
 ) -> None:
-    asset_id = upload_png(client, pid, "generated_video", "proxy.png")
+    asset_id = upload_png(client, pid, "generated_video", "proxy.mp4")
     resp = client.post(f"/api/v1/projects/{pid}/assets/{asset_id}/proxy")
     assert resp.status_code == 400
     assert error_of(resp)["code"] == "FFMPEG_MISSING"

@@ -118,7 +118,7 @@ function thumb(assetId: string | null | undefined): string {
   if (!assetId) return ''
   const asset = assetById.value.get(assetId)
   if (!asset || asset.missing) return ''
-  return fileUrl(pid.value, asset.path)
+  return fileUrl(pid.value, asset.path, 512)
 }
 
 async function loadAssets(): Promise<void> {
@@ -609,7 +609,7 @@ async function saveVariantField(key: keyof VariantPatch, value: string): Promise
               title="使用项目中的这张图片"
               @click="createAssetId = asset.id"
             >
-              <img :src="fileUrl(pid, asset.path)" alt="" class="size-full object-cover" />
+              <img :src="fileUrl(pid, asset.path, 256)" alt="" class="size-full object-cover" />
             </button>
           </div>
         </section>
@@ -645,9 +645,7 @@ async function saveVariantField(key: keyof VariantPatch, value: string): Promise
           只解除这一张与变体的关联；如果删的是当前那张，后端会把最近的一张顶上来。
           底层素材文件保留在资产库里，不会被删。
         </p>
-        <p class="text-fg-4 text-2xs">
-          默认场景的当前那张不能删——后端会拒绝并说明。
-        </p>
+        <p class="text-fg-4 text-2xs">默认场景的当前那张不能删——后端会拒绝并说明。</p>
       </div>
       <template #footer>
         <div class="ml-auto flex items-center gap-2">
