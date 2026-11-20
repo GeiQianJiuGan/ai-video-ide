@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import mimetypes
 import shutil
 import tempfile
 from pathlib import Path
@@ -98,6 +99,19 @@ def sniff_size(path: Path) -> tuple[int | None, int | None]:
                 )
             i += 2 + length
     return None, None
+
+
+def mime_of(path: Path) -> str | None:
+    """按后缀猜 mime，但必须和 `kind_of_suffix` 认的媒体类型一致，否则留空。
+
+    系统的 mimetypes 表各平台不同（`.3gp` 可能被认成 `audio/3gpp`，`.svg` 是 `image/svg+xml`
+    但不能当参考图用）；界面先看 mime 再看后缀，写错比不写更糟。
+    """
+    guessed = mimetypes.guess_type(path.name)[0]
+    media = kind_of_suffix(path.suffix)
+    if guessed and media in ("image", "video", "audio") and guessed.startswith(f"{media}/"):
+        return guessed
+    return None
 
 
 def kind_of_suffix(suffix: str) -> str:
@@ -307,7 +321,7 @@ class AssetService:
             id=new_id("asset"),
             kind=kind,
             path=rel,
-            mime=None,
+            mime=mime_of(target),
             width=width,
             height=height,
             size_bytes=target.stat().st_size,  # noqa: ASYNC240 - 本地磁盘元数据，开销可忽略
