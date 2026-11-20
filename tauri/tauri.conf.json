@@ -4,9 +4,9 @@
   "version": "0.1.0",
   "identifier": "com.aivs.studio",
   "build": {
-    "beforeDevCommand": "npm --prefix ../frontend run dev",
+    "beforeDevCommand": { "script": "npm run dev", "cwd": "../frontend" },
     "devUrl": "http://localhost:5173",
-    "beforeBuildCommand": "npm --prefix ../frontend run build",
+    "beforeBuildCommand": { "script": "npm run build", "cwd": "../frontend" },
     "frontendDist": "../frontend/dist"
   },
   "app": {

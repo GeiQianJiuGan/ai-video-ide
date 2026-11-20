@@ -22,9 +22,22 @@ from app.services.base import as_dict, db_of, dump_json, fetch, fetch_all, load_
 from app.services.global_registry import global_registry
 
 
-def invalid(detail: str) -> AppError:
+def missing_card(cid: str) -> AppError:
     return AppError(
-        ErrorCode.VALIDATION_ERROR, "制帧输入不完整", detail, ["检查画面、提示词和工作流配置后重试"]
+        ErrorCode.NOT_FOUND,
+        "画面不存在",
+        f"未找到 id 为 {cid} 的画面（可能已被删除）。",
+        ["刷新列表后重试", "确认没有在别处删除它"],
+        {"id": cid},
+    )
+
+
+def invalid(detail: str, suggestions: list[str] | None = None) -> AppError:
+    return AppError(
+        ErrorCode.VALIDATION_ERROR,
+        "制帧输入不完整",
+        detail,
+        suggestions or ["按上面的提示调整后重试"],
     )
 
 
@@ -149,7 +162,10 @@ class FrameService:
             None,
         )
         if version is None:
-            raise invalid("本镜头没有可选帧的源视频，请先导入长视频并切段。")
+            raise invalid(
+                "本镜头没有可选帧的源视频，请先导入长视频并切段。",
+                ["在「制作图片 → 长视频制帧 / 导入切段」导入成片", "或直接上传图片作为画面候选"],
+            )
         asset = await fetch(db_of(pid), Asset, version.asset_id, "源视频")
         if not (project_of(pid).dir / asset.path).is_file():
             raise invalid("源视频文件已丢失，请恢复源文件后再选帧。")
@@ -519,7 +535,7 @@ class FrameService:
         async with db_of(pid).write() as session:
             row = await session.get(FrameCard, cid)
             if row is None:
-                raise invalid("画面不存在。")
+                raise missing_card(cid)
             for key in ("title", "prompt", "story", "role", "position"):
                 if key in data:
                     setattr(row, key, data[key])
@@ -554,7 +570,7 @@ class FrameService:
             # 同一事务判断并采用第一份生成结果，避免并发完成覆盖用户选择。
             current = await session.get(FrameCard, cid)
             if current is None:
-                raise invalid("画面不存在。")
+                raise missing_card(cid)
             previous = await session.scalar(
                 select(FrameCandidate.id)
                 .where(FrameCandidate.card_id == cid, FrameCandidate.job_id.is_not(None))
@@ -579,7 +595,7 @@ class FrameService:
         async with db_of(pid).write() as session:
             card = await session.get(FrameCard, cid)
             if card is None:
-                raise invalid("画面不存在。")
+                raise missing_card(cid)
             card.adopted_asset_id = candidate.asset_id
             if origin.get("source") == "video_continuity" and origin.get("use") == "opening":
                 workspace = await session.get(FrameWorkspace, card.shot_id)
@@ -756,7 +772,10 @@ class FrameService:
             "preset": data.get("preset", ""),
         }
         if not data["prompt"].strip():
-            raise invalid("请填写动作、运镜与声音描述。")
+            raise invalid(
+                "请填写动作、运镜与声音描述。",
+                ["在「制帧分镜」右侧填写本镜头的视频描述", "或在幕标题旁设置共用制帧视频提示词"],
+            )
         for key, role in (("first_card_id", "first_frame"), ("last_card_id", "last_frame")):
             cid = data.get(key)
             if not cid:
@@ -813,7 +832,13 @@ class FrameService:
             if "first_frame" not in bindings or (
                 data.get("last_card_id") and "last_frame" not in bindings
             ):
-                raise invalid("工作流没有绑定本次所需的首尾帧入口。")
+                raise invalid(
+                    "工作流没有绑定本次所需的首尾帧入口。",
+                    [
+                        "换一份带首帧（及尾帧）入口的视频预设",
+                        "或在 ComfyUI 图里给对应 LoadImage 节点标上 AIVS_ 入口标题",
+                    ],
+                )
         if not enqueue:
             from app.generation.providers.base import Picture, PictureBook, VideoRequest
             from app.generation.renderers import render_prompt
