@@ -138,6 +138,10 @@
 | POST | `/api/v1/projects/{pid}/director/autopilot` | admin | Autopilot |
 | POST | `/api/v1/projects/{pid}/director/chat` | admin | Chat |
 | POST | `/api/v1/projects/{pid}/director/chat/stream` | admin | Chat Stream |
+| POST | `/api/v1/projects/{pid}/director/tasks` | admin | Start Creation |
+| GET | `/api/v1/projects/{pid}/director/tasks/latest` | admin | Latest Creation |
+| GET | `/api/v1/projects/{pid}/director/tasks/{rid}` | admin | Get Creation |
+| POST | `/api/v1/projects/{pid}/director/tasks/{rid}/{action}` | admin | Control Creation |
 | POST | `/api/v1/projects/{pid}/dub/plan` | admin | Plan |
 | POST | `/api/v1/projects/{pid}/dub/run` | generate | Run |
 | POST | `/api/v1/projects/{pid}/export` | admin | Export |
@@ -146,6 +150,16 @@
 | POST | `/api/v1/projects/{pid}/exports/open-folder` | admin | Open Export Folder |
 | GET | `/api/v1/projects/{pid}/files/{rel}` | admin | Project File |
 | GET | `/api/v1/projects/{pid}/flow` | read | Flow Graph |
+| GET | `/api/v1/projects/{pid}/frame-capabilities` | admin | Capabilities |
+| PATCH | `/api/v1/projects/{pid}/frame-cards/{cid}` | admin | Update |
+| DELETE | `/api/v1/projects/{pid}/frame-cards/{cid}` | delete | Remove |
+| POST | `/api/v1/projects/{pid}/frame-cards/{cid}/adopt` | library, write | Adopt |
+| POST | `/api/v1/projects/{pid}/frame-cards/{cid}/candidates` | admin | Candidate |
+| POST | `/api/v1/projects/{pid}/frame-cards/{cid}/continuity` | admin | Extract Continuity |
+| POST | `/api/v1/projects/{pid}/frame-cards/{cid}/generate` | generate | Generate |
+| GET | `/api/v1/projects/{pid}/frame-reference-materials` | admin | Reference Materials |
+| POST | `/api/v1/projects/{pid}/frame-video/generate-all` | generate | Generate All Videos |
+| POST | `/api/v1/projects/{pid}/frames/generate-all` | generate | Generate All |
 | POST | `/api/v1/projects/{pid}/images/generate` | generate | Generate |
 | POST | `/api/v1/projects/{pid}/images/plan` | admin | Plan |
 | GET | `/api/v1/projects/{pid}/images/skills` | read | Skills |
@@ -203,6 +217,8 @@
 | GET | `/api/v1/projects/{pid}/scenes` | read | List Scenes |
 | POST | `/api/v1/projects/{pid}/scenes` | write | Create Scene |
 | PUT | `/api/v1/projects/{pid}/scenes/order` | write | Reorder Scenes |
+| GET | `/api/v1/projects/{pid}/scenes/{scene_id}/frame-prompts` | read | Shared Prompts |
+| PUT | `/api/v1/projects/{pid}/scenes/{scene_id}/frame-prompts` | write | Save Shared Prompts |
 | POST | `/api/v1/projects/{pid}/scenes/{scene_id}/generate` | generate | Enqueue Scene |
 | GET | `/api/v1/projects/{pid}/scenes/{sid}` | read | Get Scene |
 | PATCH | `/api/v1/projects/{pid}/scenes/{sid}` | write | Update Scene |
@@ -240,6 +256,16 @@
 | POST | `/api/v1/projects/{pid}/shots/{shot_id}/split` | write | Split Shot |
 | GET | `/api/v1/projects/{pid}/shots/{shot_id}/versions` | read | List Versions |
 | POST | `/api/v1/projects/{pid}/shots/{shot_id}/versions` | write | Add Manual Version |
+| POST | `/api/v1/projects/{pid}/shots/{sid}/frame-plan/apply` | write | Apply Frame Plan |
+| POST | `/api/v1/projects/{pid}/shots/{sid}/frame-plan/propose` | generate | Propose Frame Plan |
+| GET | `/api/v1/projects/{pid}/shots/{sid}/frame-source` | read | Frame Source |
+| PUT | `/api/v1/projects/{pid}/shots/{sid}/frame-video` | write | Save Video |
+| POST | `/api/v1/projects/{pid}/shots/{sid}/frame-video/generate` | generate | Video |
+| POST | `/api/v1/projects/{pid}/shots/{sid}/frame-video/optimize` | write | Optimize Video |
+| POST | `/api/v1/projects/{pid}/shots/{sid}/frame-video/plan` | write | Plan |
+| GET | `/api/v1/projects/{pid}/shots/{sid}/frames` | read | Workspace |
+| POST | `/api/v1/projects/{pid}/shots/{sid}/frames` | write | Create |
+| POST | `/api/v1/projects/{pid}/shots/{sid}/source-frames` | write | Select Source Frame |
 | GET | `/api/v1/projects/{pid}/story` | read | Get Story |
 | PATCH | `/api/v1/projects/{pid}/story` | write | Save Story |
 | GET | `/api/v1/projects/{pid}/storyboard` | read | Storyboard |

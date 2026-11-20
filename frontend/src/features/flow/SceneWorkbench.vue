@@ -201,7 +201,7 @@ const sceneVariant = computed(
  * 上游末帧是抽出来的临时帧（`cache/frames/`），它压根不在总账里（`TRANSIENT_KINDS`）。
  */
 function itemUrl(item: ContextItem): string {
-  return item.asset_path && !item.missing_file ? fileUrl(pid.value, item.asset_path) : ''
+  return item.asset_path && !item.missing_file ? fileUrl(pid.value, item.asset_path, 256) : ''
 }
 
 /** 图片走 `<img>`、视频走 `<video>`、音频走 `<audio>`：把 `.mp4` 塞进 `<img>` 只会得到坏图标。 */
@@ -211,7 +211,7 @@ function mediaOf(item: ContextItem): string {
 
 /** 槽位缩略图。资产被删掉时后端给 null，此时要显示「指定的图已不在」而不是空白。 */
 function slotUrl(path: string | null): string {
-  return path ? fileUrl(pid.value, path) : ''
+  return path ? fileUrl(pid.value, path, 256) : ''
 }
 
 /**
@@ -220,11 +220,11 @@ function slotUrl(path: string | null): string {
  * 而版本的资产几乎总是一段 `.mp4`，于是每一格都是一个坏图标。
  */
 function versionVideo(v: GenerationVersion): string {
-  return v.video_path ? fileUrl(pid.value, v.video_path) : ''
+  return v.video_path ? fileUrl(pid.value, v.video_path, 'preview') : ''
 }
 
 function versionPoster(v: GenerationVersion): string {
-  return v.thumbnail_path ? fileUrl(pid.value, v.thumbnail_path) : ''
+  return v.thumbnail_path ? fileUrl(pid.value, v.thumbnail_path, 256) : ''
 }
 
 function fmt(n: number | null | undefined): string {
@@ -1119,7 +1119,7 @@ function cancelDrop(): void {
                     :src="versionVideo(v)"
                     :poster="versionPoster(v) || undefined"
                     controls
-                    preload="metadata"
+                    :preload="versionPoster(v) ? 'none' : 'metadata'"
                     class="max-h-full max-w-full"
                   />
                   <img

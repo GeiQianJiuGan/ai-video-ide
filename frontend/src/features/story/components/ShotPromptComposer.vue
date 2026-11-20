@@ -445,7 +445,7 @@ onMounted(render)
                 >
                   <img
                     v-if="r.media === 'image' && r.path"
-                    :src="fileUrl(pid, r.path)"
+                    :src="fileUrl(pid, r.path, 256)"
                     alt=""
                   /><span
                     ><strong>@{{ r.alias }}</strong> {{ r.label

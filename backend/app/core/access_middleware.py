@@ -199,8 +199,11 @@ class AccessMiddleware:
             scope["state"]["request_id"] = request_id
             mutation = method not in {"GET", "HEAD", "OPTIONS"}
             lock = self.locks.setdefault(pid or "__global__", asyncio.Lock())
-            # 切段预检只读且会长时间运行 FFmpeg，不应占用项目的写入锁。
-            read_only_plan = method == "POST" and route_path == "/api/v1/projects/{pid}/ingest/plan"
+            # 切段预检、预览代理转码会长时间运行 FFmpeg 且不写工程库，不应占用项目的写入锁。
+            read_only_plan = method == "POST" and route_path in {
+                "/api/v1/projects/{pid}/ingest/plan",
+                "/api/v1/projects/{pid}/assets/{asset_id}/proxy",
+            }
             if mutation and not read_only_plan:
                 async with lock:
                     await self.dispatch(

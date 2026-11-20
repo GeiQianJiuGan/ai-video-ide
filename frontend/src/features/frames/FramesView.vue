@@ -15,7 +15,7 @@ import {
 import { assetsApi, type Asset } from '@/shared/api/assets'
 import { storyApi, type StoryboardLane } from '@/shared/api/story'
 import { generationApi, JOB_STATUS_LABEL, type GenerationVersion } from '@/shared/api/generation'
-import { fileUrl } from '@/shared/api/files'
+import { fileUrl, type ThumbWidth } from '@/shared/api/files'
 import { useShellStore } from '@/stores/shell'
 import { useStoryStore } from '@/stores/story'
 import FrameReferencePicker from './FrameReferencePicker.vue'
@@ -116,9 +116,9 @@ const frameVersions = computed(() =>
   versions.value.filter((v) => v.params.creation_pipeline === 'frames'),
 )
 const asset = (aid: string | null) => assets.value.find((a) => a.id === aid)
-const url = (aid: string | null) => {
+const url = (aid: string | null, thumb?: ThumbWidth | 'preview') => {
   const a = asset(aid)
-  return a ? fileUrl(pid.value, a.path) : ''
+  return a ? fileUrl(pid.value, a.path, thumb) : ''
 }
 const showError = (e: unknown) => {
   error.value =
@@ -465,8 +465,9 @@ watch(
     })
   },
 )
+// 标签页在后台时不轮询：四个接口每 5 秒一轮，线上开着不看也在白白占带宽
 const timer = window.setInterval(() => {
-  if (!busy.value && sid.value) void refresh().catch(showError)
+  if (!busy.value && sid.value && !document.hidden) void refresh().catch(showError)
 }, 5000)
 onBeforeUnmount(() => {
   refreshVersion++
@@ -599,7 +600,7 @@ onBeforeUnmount(() => {
               :disabled="busy"
               @click="act(() => selectCard(c.id))"
             >
-              <img v-if="url(c.adopted_asset_id || c.refs[0] || null)" :src="url(c.adopted_asset_id || c.refs[0] || null)" :alt="c.adopted_asset_id ? '采用的画面' : '制图参考画面'" />
+              <img v-if="url(c.adopted_asset_id || c.refs[0] || null)" :src="url(c.adopted_asset_id || c.refs[0] || null, 512)" :alt="c.adopted_asset_id ? '采用的画面' : '制图参考画面'" />
               <div v-else class="frame-placeholder">
                 {{ frameStatus(c) }}
               </div>
@@ -643,7 +644,7 @@ onBeforeUnmount(() => {
                     }}{{ v.continuity.requires_trim ? ' · 需同步裁剪上游' : '' }}</small
                   >
                   <button @click="preview = v.asset_id">
-                    <img :src="url(v.asset_id)" :alt="`候选 ${i + 1}`" />候选 {{ i + 1 }}
+                    <img :src="url(v.asset_id, 256)" :alt="`候选 ${i + 1}`" />候选 {{ i + 1 }}
                   </button>
                   <button
                     :disabled="
@@ -865,7 +866,7 @@ onBeforeUnmount(() => {
             <strong>本次提交的画面</strong>
             <div class="row">
               <figure v-for="c in plan.inputs.cards" :key="c.role">
-                <img :src="url(c.asset_id)" :alt="c.title" />
+                <img :src="url(c.asset_id, 512)" :alt="c.title" />
                 <figcaption>
                   {{ c.role === 'first_frame' ? '首帧' : '尾帧' }} · {{ c.title }}
                 </figcaption>
@@ -879,7 +880,7 @@ onBeforeUnmount(() => {
               <strong>版本 {{ v.version_no }}</strong
               ><video
                 v-if="url(v.asset_id)"
-                :src="url(v.asset_id)"
+                :src="url(v.asset_id, 'preview')"
                 controls
                 preload="metadata"
               /><button

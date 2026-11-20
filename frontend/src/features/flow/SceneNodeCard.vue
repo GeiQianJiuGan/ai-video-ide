@@ -35,11 +35,11 @@ const emit = defineEmits<{
 }>()
 
 const videoSrc = computed(() =>
-  props.node.video_path ? fileUrl(props.pid, props.node.video_path) : '',
+  props.node.video_path ? fileUrl(props.pid, props.node.video_path, 'preview') : '',
 )
 /** 视频的封面图只能是图片资产；没有就不给 poster，让播放器自己抽第一帧。 */
 const poster = computed(() =>
-  props.node.thumbnail_path ? fileUrl(props.pid, props.node.thumbnail_path) : undefined,
+  props.node.thumbnail_path ? fileUrl(props.pid, props.node.thumbnail_path, 512) : undefined,
 )
 const promptText = computed(() => (props.node.prompt ?? '').trim())
 </script>
@@ -77,7 +77,7 @@ const promptText = computed(() => (props.node.prompt ?? '').trim())
         :src="videoSrc"
         :poster="poster"
         controls
-        preload="metadata"
+        :preload="poster ? 'none' : 'metadata'"
         class="max-h-full max-w-full"
       />
       <div v-else class="px-2 text-center">

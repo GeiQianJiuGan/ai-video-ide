@@ -53,6 +53,8 @@ export interface Clip {
   shot_index_no: number | null
   version_no: number | null
   asset_path: string | null
+  /** 预览代理（低码率、moov 前置）的相对路径，还没生成是 null。只给预览器用，导出永远走原素材。 */
+  proxy_path: string | null
   /** 原素材总时长。裁切边界绝不能越过它。 */
   source_duration: number
   /** 所属轨道的类型，省得每次回头去 tracks 里找。 */
@@ -63,6 +65,12 @@ export interface Clip {
   source_missing: boolean
   /** 登记过但文件已经不在磁盘上——导出前必须先处理。 */
   missing_file: boolean
+}
+
+export interface ProxyResult {
+  asset_id: string
+  proxy_path: string
+  reused: boolean
 }
 
 export interface Track {
@@ -184,6 +192,9 @@ export interface TrimBody {
 
 export const timelineApi = {
   get: (pid: string) => api.get<Timeline>(`/projects/${pid}/timeline`),
+  /** 给一个视频资产生成预览代理（已有就直接返回）。 */
+  ensureProxy: (pid: string, assetId: string) =>
+    api.post<ProxyResult>(`/projects/${pid}/assets/${assetId}/proxy`),
   /** `replace=true` 清空视频轨后重铺；false 追加。 */
   assemble: (pid: string, replace = true) =>
     api.post<AssembleResult>(`/projects/${pid}/timeline/assemble`, { replace }),
@@ -201,10 +212,7 @@ export const timelineApi = {
     clipId: string,
     body: { in_point: number; out_point: number },
   ) =>
-    api.post<IsolateAudioResult>(
-      `/projects/${pid}/clips/${clipId}/isolate-audio-selection`,
-      body,
-    ),
+    api.post<IsolateAudioResult>(`/projects/${pid}/clips/${clipId}/isolate-audio-selection`, body),
   remove: (pid: string, clipId: string, ripple = true) =>
     api.del<Timeline>(`/projects/${pid}/clips/${clipId}?ripple=${ripple}`),
   /** 清空这一段的内容：位置与长度留着，变成黑场（视频轨）/ 静音（音频轨）占位。 */
@@ -236,11 +244,8 @@ export const timelineApi = {
     trackId: string,
     body: { asset_id: string; start?: number; duration?: number | null; label?: string | null },
   ) => api.post<AddClipResult>(`/projects/${pid}/tracks/${trackId}/clips`, body),
-  addBlankClip: (
-    pid: string,
-    trackId: string,
-    body: { duration: number; label?: string | null },
-  ) => api.post<BlankClipResult>(`/projects/${pid}/tracks/${trackId}/blank-clips`, body),
+  addBlankClip: (pid: string, trackId: string, body: { duration: number; label?: string | null }) =>
+    api.post<BlankClipResult>(`/projects/${pid}/tracks/${trackId}/blank-clips`, body),
   resizeBlankClip: (pid: string, clipId: string, duration: number) =>
     api.post<Timeline>(`/projects/${pid}/clips/${clipId}/blank-duration`, { duration }),
   moveToAudioTrack: (pid: string, clipId: string, trackId: string) =>

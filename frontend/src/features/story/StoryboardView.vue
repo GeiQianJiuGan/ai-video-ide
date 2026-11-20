@@ -152,7 +152,7 @@ function statusTone(status: string): 'neutral' | 'accent' | 'ok' | 'warn' {
   return 'neutral'
 }
 function file(path: string | null): string {
-  return path ? fileUrl(pid.value, path) : ''
+  return path ? fileUrl(pid.value, path, 512) : ''
 }
 function thumb(card: StoryboardCard): string {
   return file(card.thumbnail_path)

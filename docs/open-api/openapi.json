@@ -5207,7 +5207,7 @@
           "files"
         ],
         "summary": "Project File",
-        "description": "读工程目录内的文件，rel 就是 Asset.path。",
+        "description": "读工程目录内的文件，rel 就是 Asset.path。\n\n带 `w` 且是图片时给一份缩略图（见 `services/thumbs.py`），做不出来就回原图。\n带 `preview=true` 且是视频时，已有预览代理就给代理（低码率、moov 前置），没有回原片。",
         "operationId": "project_file_api_v1_projects__pid__files__rel__get",
         "parameters": [
           {
@@ -5226,6 +5226,34 @@
             "schema": {
               "type": "string",
               "title": "Rel"
+            }
+          },
+          {
+            "name": "w",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "maximum": 8192,
+                  "minimum": 1
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "W"
+            }
+          },
+          {
+            "name": "preview",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false,
+              "title": "Preview"
             }
           }
         ],
@@ -7968,7 +7996,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/AdoptBody"
+                "$ref": "#/components/schemas/app__api__library__AdoptBody"
               }
             }
           }
@@ -8057,7 +8085,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/AdoptBody"
+                "$ref": "#/components/schemas/app__api__library__AdoptBody"
               }
             }
           }
@@ -14594,6 +14622,1928 @@
         ]
       }
     },
+    "/api/v1/projects/{pid}/shots/{sid}/frame-source": {
+      "get": {
+        "tags": [
+          "frames"
+        ],
+        "summary": "Frame Source",
+        "operationId": "frame_source_api_v1_projects__pid__shots__sid__frame_source_get",
+        "parameters": [
+          {
+            "name": "pid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Pid"
+            }
+          },
+          {
+            "name": "sid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Sid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Frame Source Api V1 Projects  Pid  Shots  Sid  Frame Source Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "凭证无效或缺失"
+          },
+          "403": {
+            "description": "权限或项目范围不足"
+          }
+        },
+        "x-required-scopes": [
+          "read"
+        ],
+        "x-project-scoped": true,
+        "security": [
+          {
+            "ApiKeyBearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/projects/{pid}/shots/{sid}/source-frames": {
+      "post": {
+        "tags": [
+          "frames"
+        ],
+        "summary": "Select Source Frame",
+        "operationId": "select_source_frame_api_v1_projects__pid__shots__sid__source_frames_post",
+        "parameters": [
+          {
+            "name": "pid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Pid"
+            }
+          },
+          {
+            "name": "sid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Sid"
+            }
+          },
+          {
+            "name": "If-Match",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "最近读取响应的项目 ETag；不匹配返回 412。"
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "maxLength": 128
+            },
+            "description": "同一 Key 内唯一；完全相同请求可重放结果，内容不同返回 409。"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SourceFrameInput"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Select Source Frame Api V1 Projects  Pid  Shots  Sid  Source Frames Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "凭证无效或缺失"
+          },
+          "403": {
+            "description": "权限或项目范围不足"
+          }
+        },
+        "x-required-scopes": [
+          "write"
+        ],
+        "x-project-scoped": true,
+        "security": [
+          {
+            "ApiKeyBearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/projects/{pid}/scenes/{scene_id}/frame-prompts": {
+      "get": {
+        "tags": [
+          "frames"
+        ],
+        "summary": "Shared Prompts",
+        "operationId": "shared_prompts_api_v1_projects__pid__scenes__scene_id__frame_prompts_get",
+        "parameters": [
+          {
+            "name": "pid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Pid"
+            }
+          },
+          {
+            "name": "scene_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Scene Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Shared Prompts Api V1 Projects  Pid  Scenes  Scene Id  Frame Prompts Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "凭证无效或缺失"
+          },
+          "403": {
+            "description": "权限或项目范围不足"
+          }
+        },
+        "x-required-scopes": [
+          "read"
+        ],
+        "x-project-scoped": true,
+        "security": [
+          {
+            "ApiKeyBearer": []
+          }
+        ]
+      },
+      "put": {
+        "tags": [
+          "frames"
+        ],
+        "summary": "Save Shared Prompts",
+        "operationId": "save_shared_prompts_api_v1_projects__pid__scenes__scene_id__frame_prompts_put",
+        "parameters": [
+          {
+            "name": "pid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Pid"
+            }
+          },
+          {
+            "name": "scene_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Scene Id"
+            }
+          },
+          {
+            "name": "If-Match",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "最近读取响应的项目 ETag；不匹配返回 412。"
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "maxLength": 128
+            },
+            "description": "同一 Key 内唯一；完全相同请求可重放结果，内容不同返回 409。"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SharedPromptsBody"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Save Shared Prompts Api V1 Projects  Pid  Scenes  Scene Id  Frame Prompts Put"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "凭证无效或缺失"
+          },
+          "403": {
+            "description": "权限或项目范围不足"
+          }
+        },
+        "x-required-scopes": [
+          "write"
+        ],
+        "x-project-scoped": true,
+        "security": [
+          {
+            "ApiKeyBearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/projects/{pid}/frame-reference-materials": {
+      "get": {
+        "tags": [
+          "frames"
+        ],
+        "summary": "Reference Materials",
+        "operationId": "reference_materials_api_v1_projects__pid__frame_reference_materials_get",
+        "parameters": [
+          {
+            "name": "pid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Pid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Reference Materials Api V1 Projects  Pid  Frame Reference Materials Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "凭证无效或缺失"
+          },
+          "403": {
+            "description": "权限或项目范围不足"
+          }
+        },
+        "x-required-scopes": [
+          "admin"
+        ],
+        "x-project-scoped": true,
+        "security": [
+          {
+            "ApiKeyBearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/projects/{pid}/shots/{sid}/frame-plan/propose": {
+      "post": {
+        "tags": [
+          "frames"
+        ],
+        "summary": "Propose Frame Plan",
+        "operationId": "propose_frame_plan_api_v1_projects__pid__shots__sid__frame_plan_propose_post",
+        "parameters": [
+          {
+            "name": "pid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Pid"
+            }
+          },
+          {
+            "name": "sid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Sid"
+            }
+          },
+          {
+            "name": "If-Match",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "最近读取响应的项目 ETag；不匹配返回 412。"
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "maxLength": 128
+            },
+            "description": "同一 Key 内唯一；完全相同请求可重放结果，内容不同返回 409。"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Propose Frame Plan Api V1 Projects  Pid  Shots  Sid  Frame Plan Propose Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "凭证无效或缺失"
+          },
+          "403": {
+            "description": "权限或项目范围不足"
+          }
+        },
+        "x-required-scopes": [
+          "generate"
+        ],
+        "x-project-scoped": true,
+        "security": [
+          {
+            "ApiKeyBearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/projects/{pid}/shots/{sid}/frame-plan/apply": {
+      "post": {
+        "tags": [
+          "frames"
+        ],
+        "summary": "Apply Frame Plan",
+        "operationId": "apply_frame_plan_api_v1_projects__pid__shots__sid__frame_plan_apply_post",
+        "parameters": [
+          {
+            "name": "pid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Pid"
+            }
+          },
+          {
+            "name": "sid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Sid"
+            }
+          },
+          {
+            "name": "If-Match",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "最近读取响应的项目 ETag；不匹配返回 412。"
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "maxLength": 128
+            },
+            "description": "同一 Key 内唯一；完全相同请求可重放结果，内容不同返回 409。"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PlanApply"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Apply Frame Plan Api V1 Projects  Pid  Shots  Sid  Frame Plan Apply Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "凭证无效或缺失"
+          },
+          "403": {
+            "description": "权限或项目范围不足"
+          }
+        },
+        "x-required-scopes": [
+          "write"
+        ],
+        "x-project-scoped": true,
+        "security": [
+          {
+            "ApiKeyBearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/projects/{pid}/shots/{sid}/frames": {
+      "get": {
+        "tags": [
+          "frames"
+        ],
+        "summary": "Workspace",
+        "operationId": "workspace_api_v1_projects__pid__shots__sid__frames_get",
+        "parameters": [
+          {
+            "name": "pid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Pid"
+            }
+          },
+          {
+            "name": "sid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Sid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Workspace Api V1 Projects  Pid  Shots  Sid  Frames Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "凭证无效或缺失"
+          },
+          "403": {
+            "description": "权限或项目范围不足"
+          }
+        },
+        "x-required-scopes": [
+          "read"
+        ],
+        "x-project-scoped": true,
+        "security": [
+          {
+            "ApiKeyBearer": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "frames"
+        ],
+        "summary": "Create",
+        "operationId": "create_api_v1_projects__pid__shots__sid__frames_post",
+        "parameters": [
+          {
+            "name": "pid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Pid"
+            }
+          },
+          {
+            "name": "sid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Sid"
+            }
+          },
+          {
+            "name": "If-Match",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "最近读取响应的项目 ETag；不匹配返回 412。"
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "maxLength": 128
+            },
+            "description": "同一 Key 内唯一；完全相同请求可重放结果，内容不同返回 409。"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CardCreate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Create Api V1 Projects  Pid  Shots  Sid  Frames Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "凭证无效或缺失"
+          },
+          "403": {
+            "description": "权限或项目范围不足"
+          }
+        },
+        "x-required-scopes": [
+          "write"
+        ],
+        "x-project-scoped": true,
+        "security": [
+          {
+            "ApiKeyBearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/projects/{pid}/frame-cards/{cid}": {
+      "patch": {
+        "tags": [
+          "frames"
+        ],
+        "summary": "Update",
+        "operationId": "update_api_v1_projects__pid__frame_cards__cid__patch",
+        "parameters": [
+          {
+            "name": "pid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Pid"
+            }
+          },
+          {
+            "name": "cid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Cid"
+            }
+          },
+          {
+            "name": "If-Match",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "最近读取响应的项目 ETag；不匹配返回 412。"
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "maxLength": 128
+            },
+            "description": "同一 Key 内唯一；完全相同请求可重放结果，内容不同返回 409。"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FrameCardPatch"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Update Api V1 Projects  Pid  Frame Cards  Cid  Patch"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "凭证无效或缺失"
+          },
+          "403": {
+            "description": "权限或项目范围不足"
+          }
+        },
+        "x-required-scopes": [
+          "admin"
+        ],
+        "x-project-scoped": true,
+        "security": [
+          {
+            "ApiKeyBearer": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "frames"
+        ],
+        "summary": "Remove",
+        "operationId": "remove_api_v1_projects__pid__frame_cards__cid__delete",
+        "parameters": [
+          {
+            "name": "pid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Pid"
+            }
+          },
+          {
+            "name": "cid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Cid"
+            }
+          },
+          {
+            "name": "If-Match",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "最近读取响应的项目 ETag；不匹配返回 412。"
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "maxLength": 128
+            },
+            "description": "同一 Key 内唯一；完全相同请求可重放结果，内容不同返回 409。"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "title": "Response Remove Api V1 Projects  Pid  Frame Cards  Cid  Delete"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "凭证无效或缺失"
+          },
+          "403": {
+            "description": "权限或项目范围不足"
+          }
+        },
+        "x-required-scopes": [
+          "delete"
+        ],
+        "x-project-scoped": true,
+        "security": [
+          {
+            "ApiKeyBearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/projects/{pid}/frame-cards/{cid}/candidates": {
+      "post": {
+        "tags": [
+          "frames"
+        ],
+        "summary": "Candidate",
+        "operationId": "candidate_api_v1_projects__pid__frame_cards__cid__candidates_post",
+        "parameters": [
+          {
+            "name": "pid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Pid"
+            }
+          },
+          {
+            "name": "cid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Cid"
+            }
+          },
+          {
+            "name": "If-Match",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "最近读取响应的项目 ETag；不匹配返回 412。"
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "maxLength": 128
+            },
+            "description": "同一 Key 内唯一；完全相同请求可重放结果，内容不同返回 409。"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AssetBody"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Candidate Api V1 Projects  Pid  Frame Cards  Cid  Candidates Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "凭证无效或缺失"
+          },
+          "403": {
+            "description": "权限或项目范围不足"
+          }
+        },
+        "x-required-scopes": [
+          "admin"
+        ],
+        "x-project-scoped": true,
+        "security": [
+          {
+            "ApiKeyBearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/projects/{pid}/frame-cards/{cid}/adopt": {
+      "post": {
+        "tags": [
+          "frames"
+        ],
+        "summary": "Adopt",
+        "operationId": "adopt_api_v1_projects__pid__frame_cards__cid__adopt_post",
+        "parameters": [
+          {
+            "name": "pid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Pid"
+            }
+          },
+          {
+            "name": "cid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Cid"
+            }
+          },
+          {
+            "name": "If-Match",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "最近读取响应的项目 ETag；不匹配返回 412。"
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "maxLength": 128
+            },
+            "description": "同一 Key 内唯一；完全相同请求可重放结果，内容不同返回 409。"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/app__api__frames__AdoptBody"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Adopt Api V1 Projects  Pid  Frame Cards  Cid  Adopt Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "凭证无效或缺失"
+          },
+          "403": {
+            "description": "权限或项目范围不足"
+          }
+        },
+        "x-required-scopes": [
+          "library",
+          "write"
+        ],
+        "x-project-scoped": true,
+        "security": [
+          {
+            "ApiKeyBearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/projects/{pid}/frame-cards/{cid}/generate": {
+      "post": {
+        "tags": [
+          "frames"
+        ],
+        "summary": "Generate",
+        "operationId": "generate_api_v1_projects__pid__frame_cards__cid__generate_post",
+        "parameters": [
+          {
+            "name": "pid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Pid"
+            }
+          },
+          {
+            "name": "cid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Cid"
+            }
+          },
+          {
+            "name": "If-Match",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "最近读取响应的项目 ETag；不匹配返回 412。"
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "maxLength": 128
+            },
+            "description": "同一 Key 内唯一；完全相同请求可重放结果，内容不同返回 409。"
+          }
+        ],
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Generate Api V1 Projects  Pid  Frame Cards  Cid  Generate Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "凭证无效或缺失"
+          },
+          "403": {
+            "description": "权限或项目范围不足"
+          }
+        },
+        "x-required-scopes": [
+          "generate"
+        ],
+        "x-project-scoped": true,
+        "security": [
+          {
+            "ApiKeyBearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/projects/{pid}/frames/generate-all": {
+      "post": {
+        "tags": [
+          "frames"
+        ],
+        "summary": "Generate All",
+        "operationId": "generate_all_api_v1_projects__pid__frames_generate_all_post",
+        "parameters": [
+          {
+            "name": "pid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Pid"
+            }
+          },
+          {
+            "name": "If-Match",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "最近读取响应的项目 ETag；不匹配返回 412。"
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "maxLength": 128
+            },
+            "description": "同一 Key 内唯一；完全相同请求可重放结果，内容不同返回 409。"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BatchGenerateBody",
+                "default": {
+                  "scope": "unfinished"
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Generate All Api V1 Projects  Pid  Frames Generate All Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "凭证无效或缺失"
+          },
+          "403": {
+            "description": "权限或项目范围不足"
+          }
+        },
+        "x-required-scopes": [
+          "generate"
+        ],
+        "x-project-scoped": true,
+        "security": [
+          {
+            "ApiKeyBearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/projects/{pid}/frame-video/generate-all": {
+      "post": {
+        "tags": [
+          "frames"
+        ],
+        "summary": "Generate All Videos",
+        "operationId": "generate_all_videos_api_v1_projects__pid__frame_video_generate_all_post",
+        "parameters": [
+          {
+            "name": "pid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Pid"
+            }
+          },
+          {
+            "name": "If-Match",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "最近读取响应的项目 ETag；不匹配返回 412。"
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "maxLength": 128
+            },
+            "description": "同一 Key 内唯一；完全相同请求可重放结果，内容不同返回 409。"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BatchGenerateBody"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Generate All Videos Api V1 Projects  Pid  Frame Video Generate All Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "凭证无效或缺失"
+          },
+          "403": {
+            "description": "权限或项目范围不足"
+          }
+        },
+        "x-required-scopes": [
+          "generate"
+        ],
+        "x-project-scoped": true,
+        "security": [
+          {
+            "ApiKeyBearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/projects/{pid}/shots/{sid}/frame-video": {
+      "put": {
+        "tags": [
+          "frames"
+        ],
+        "summary": "Save Video",
+        "operationId": "save_video_api_v1_projects__pid__shots__sid__frame_video_put",
+        "parameters": [
+          {
+            "name": "pid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Pid"
+            }
+          },
+          {
+            "name": "sid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Sid"
+            }
+          },
+          {
+            "name": "If-Match",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "最近读取响应的项目 ETag；不匹配返回 412。"
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "maxLength": 128
+            },
+            "description": "同一 Key 内唯一；完全相同请求可重放结果，内容不同返回 409。"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FrameVideoInput"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Save Video Api V1 Projects  Pid  Shots  Sid  Frame Video Put"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "凭证无效或缺失"
+          },
+          "403": {
+            "description": "权限或项目范围不足"
+          }
+        },
+        "x-required-scopes": [
+          "write"
+        ],
+        "x-project-scoped": true,
+        "security": [
+          {
+            "ApiKeyBearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/projects/{pid}/shots/{sid}/frame-video/optimize": {
+      "post": {
+        "tags": [
+          "frames"
+        ],
+        "summary": "Optimize Video",
+        "operationId": "optimize_video_api_v1_projects__pid__shots__sid__frame_video_optimize_post",
+        "parameters": [
+          {
+            "name": "pid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Pid"
+            }
+          },
+          {
+            "name": "sid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Sid"
+            }
+          },
+          {
+            "name": "If-Match",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "最近读取响应的项目 ETag；不匹配返回 412。"
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "maxLength": 128
+            },
+            "description": "同一 Key 内唯一；完全相同请求可重放结果，内容不同返回 409。"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FrameVideoInput"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Optimize Video Api V1 Projects  Pid  Shots  Sid  Frame Video Optimize Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "凭证无效或缺失"
+          },
+          "403": {
+            "description": "权限或项目范围不足"
+          }
+        },
+        "x-required-scopes": [
+          "write"
+        ],
+        "x-project-scoped": true,
+        "security": [
+          {
+            "ApiKeyBearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/projects/{pid}/shots/{sid}/frame-video/plan": {
+      "post": {
+        "tags": [
+          "frames"
+        ],
+        "summary": "Plan",
+        "operationId": "plan_api_v1_projects__pid__shots__sid__frame_video_plan_post",
+        "parameters": [
+          {
+            "name": "pid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Pid"
+            }
+          },
+          {
+            "name": "sid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Sid"
+            }
+          },
+          {
+            "name": "If-Match",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "最近读取响应的项目 ETag；不匹配返回 412。"
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "maxLength": 128
+            },
+            "description": "同一 Key 内唯一；完全相同请求可重放结果，内容不同返回 409。"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FrameVideoInput"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Plan Api V1 Projects  Pid  Shots  Sid  Frame Video Plan Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "凭证无效或缺失"
+          },
+          "403": {
+            "description": "权限或项目范围不足"
+          }
+        },
+        "x-required-scopes": [
+          "write"
+        ],
+        "x-project-scoped": true,
+        "security": [
+          {
+            "ApiKeyBearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/projects/{pid}/shots/{sid}/frame-video/generate": {
+      "post": {
+        "tags": [
+          "frames"
+        ],
+        "summary": "Video",
+        "operationId": "video_api_v1_projects__pid__shots__sid__frame_video_generate_post",
+        "parameters": [
+          {
+            "name": "pid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Pid"
+            }
+          },
+          {
+            "name": "sid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Sid"
+            }
+          },
+          {
+            "name": "If-Match",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "最近读取响应的项目 ETag；不匹配返回 412。"
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "maxLength": 128
+            },
+            "description": "同一 Key 内唯一；完全相同请求可重放结果，内容不同返回 409。"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FrameVideoInput"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Video Api V1 Projects  Pid  Shots  Sid  Frame Video Generate Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "凭证无效或缺失"
+          },
+          "403": {
+            "description": "权限或项目范围不足"
+          }
+        },
+        "x-required-scopes": [
+          "generate"
+        ],
+        "x-project-scoped": true,
+        "security": [
+          {
+            "ApiKeyBearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/projects/{pid}/frame-capabilities": {
+      "get": {
+        "tags": [
+          "frames"
+        ],
+        "summary": "Capabilities",
+        "operationId": "capabilities_api_v1_projects__pid__frame_capabilities_get",
+        "parameters": [
+          {
+            "name": "pid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Pid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Capabilities Api V1 Projects  Pid  Frame Capabilities Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "凭证无效或缺失"
+          },
+          "403": {
+            "description": "权限或项目范围不足"
+          }
+        },
+        "x-required-scopes": [
+          "admin"
+        ],
+        "x-project-scoped": true,
+        "security": [
+          {
+            "ApiKeyBearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/projects/{pid}/frame-cards/{cid}/continuity": {
+      "post": {
+        "tags": [
+          "frames"
+        ],
+        "summary": "Extract Continuity",
+        "operationId": "extract_continuity_api_v1_projects__pid__frame_cards__cid__continuity_post",
+        "parameters": [
+          {
+            "name": "pid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Pid"
+            }
+          },
+          {
+            "name": "cid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Cid"
+            }
+          },
+          {
+            "name": "If-Match",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "最近读取响应的项目 ETag；不匹配返回 412。"
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "maxLength": 128
+            },
+            "description": "同一 Key 内唯一；完全相同请求可重放结果，内容不同返回 409。"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FrameContinuityInput"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Extract Continuity Api V1 Projects  Pid  Frame Cards  Cid  Continuity Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "凭证无效或缺失"
+          },
+          "403": {
+            "description": "权限或项目范围不足"
+          }
+        },
+        "x-required-scopes": [
+          "admin"
+        ],
+        "x-project-scoped": true,
+        "security": [
+          {
+            "ApiKeyBearer": []
+          }
+        ]
+      }
+    },
     "/api/v1/projects/{pid}/describe/plan": {
       "post": {
         "tags": [
@@ -15771,6 +17721,330 @@
                   "type": "object",
                   "additionalProperties": true,
                   "title": "Response Run Api V1 Projects  Pid  Ingest Run Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "凭证无效或缺失"
+          },
+          "403": {
+            "description": "权限或项目范围不足"
+          }
+        },
+        "x-required-scopes": [
+          "admin"
+        ],
+        "x-project-scoped": true,
+        "security": [
+          {
+            "ApiKeyBearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/projects/{pid}/director/tasks": {
+      "post": {
+        "tags": [
+          "director"
+        ],
+        "summary": "Start Creation",
+        "operationId": "start_creation_api_v1_projects__pid__director_tasks_post",
+        "parameters": [
+          {
+            "name": "pid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Pid"
+            }
+          },
+          {
+            "name": "If-Match",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "最近读取响应的项目 ETag；不匹配返回 412。"
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "maxLength": 128
+            },
+            "description": "同一 Key 内唯一；完全相同请求可重放结果，内容不同返回 409。"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreationBody"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Start Creation Api V1 Projects  Pid  Director Tasks Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "凭证无效或缺失"
+          },
+          "403": {
+            "description": "权限或项目范围不足"
+          }
+        },
+        "x-required-scopes": [
+          "admin"
+        ],
+        "x-project-scoped": true,
+        "security": [
+          {
+            "ApiKeyBearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/projects/{pid}/director/tasks/latest": {
+      "get": {
+        "tags": [
+          "director"
+        ],
+        "summary": "Latest Creation",
+        "operationId": "latest_creation_api_v1_projects__pid__director_tasks_latest_get",
+        "parameters": [
+          {
+            "name": "pid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Pid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "type": "object",
+                      "additionalProperties": true
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "title": "Response Latest Creation Api V1 Projects  Pid  Director Tasks Latest Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "凭证无效或缺失"
+          },
+          "403": {
+            "description": "权限或项目范围不足"
+          }
+        },
+        "x-required-scopes": [
+          "admin"
+        ],
+        "x-project-scoped": true,
+        "security": [
+          {
+            "ApiKeyBearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/projects/{pid}/director/tasks/{rid}": {
+      "get": {
+        "tags": [
+          "director"
+        ],
+        "summary": "Get Creation",
+        "operationId": "get_creation_api_v1_projects__pid__director_tasks__rid__get",
+        "parameters": [
+          {
+            "name": "pid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Pid"
+            }
+          },
+          {
+            "name": "rid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Rid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Get Creation Api V1 Projects  Pid  Director Tasks  Rid  Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "凭证无效或缺失"
+          },
+          "403": {
+            "description": "权限或项目范围不足"
+          }
+        },
+        "x-required-scopes": [
+          "admin"
+        ],
+        "x-project-scoped": true,
+        "security": [
+          {
+            "ApiKeyBearer": []
+          }
+        ]
+      }
+    },
+    "/api/v1/projects/{pid}/director/tasks/{rid}/{action}": {
+      "post": {
+        "tags": [
+          "director"
+        ],
+        "summary": "Control Creation",
+        "operationId": "control_creation_api_v1_projects__pid__director_tasks__rid___action__post",
+        "parameters": [
+          {
+            "name": "pid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Pid"
+            }
+          },
+          {
+            "name": "rid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Rid"
+            }
+          },
+          {
+            "name": "action",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "enum": [
+                "pause",
+                "resume",
+                "apply",
+                "discard"
+              ],
+              "type": "string",
+              "title": "Action"
+            }
+          },
+          {
+            "name": "If-Match",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "最近读取响应的项目 ETag；不匹配返回 412。"
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "maxLength": 128
+            },
+            "description": "同一 Key 内唯一；完全相同请求可重放结果，内容不同返回 409。"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Control Creation Api V1 Projects  Pid  Director Tasks  Rid   Action  Post"
                 }
               }
             }
@@ -21573,26 +23847,6 @@
         ],
         "title": "AddClipBody"
       },
-      "AdoptBody": {
-        "properties": {
-          "kind": {
-            "type": "string",
-            "title": "Kind",
-            "description": "asset / character / location / prop"
-          },
-          "library_id": {
-            "type": "string",
-            "title": "Library Id",
-            "description": "库里那条记录的 id"
-          }
-        },
-        "type": "object",
-        "required": [
-          "kind",
-          "library_id"
-        ],
-        "title": "AdoptBody"
-      },
       "AssembleBody": {
         "properties": {
           "replace": {
@@ -21604,6 +23858,19 @@
         },
         "type": "object",
         "title": "AssembleBody"
+      },
+      "AssetBody": {
+        "properties": {
+          "asset_id": {
+            "type": "string",
+            "title": "Asset Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "asset_id"
+        ],
+        "title": "AssetBody"
       },
       "Attachment": {
         "properties": {
@@ -21716,6 +23983,21 @@
         },
         "type": "object",
         "title": "AutopilotBody"
+      },
+      "BatchGenerateBody": {
+        "properties": {
+          "scope": {
+            "type": "string",
+            "enum": [
+              "all",
+              "unfinished"
+            ],
+            "title": "Scope",
+            "default": "unfinished"
+          }
+        },
+        "type": "object",
+        "title": "BatchGenerateBody"
       },
       "BindBody": {
         "properties": {
@@ -21879,6 +24161,41 @@
         ],
         "title": "Body_upload_preset_file_api_v1_settings_presets_upload_post"
       },
+      "CardCreate": {
+        "properties": {
+          "title": {
+            "type": "string",
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Title"
+          },
+          "prompt": {
+            "type": "string",
+            "title": "Prompt",
+            "default": ""
+          },
+          "story": {
+            "type": "string",
+            "title": "Story",
+            "default": ""
+          },
+          "role": {
+            "type": "string",
+            "enum": [
+              "first",
+              "key",
+              "last"
+            ],
+            "title": "Role",
+            "default": "key"
+          }
+        },
+        "type": "object",
+        "required": [
+          "title"
+        ],
+        "title": "CardCreate"
+      },
       "CastBody": {
         "properties": {
           "appearance_ids": {
@@ -21999,6 +24316,21 @@
       },
       "ChatBody": {
         "properties": {
+          "production_mode": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "direct",
+                  "frames"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Production Mode"
+          },
           "message": {
             "type": "string",
             "title": "Message",
@@ -22007,7 +24339,7 @@
           "scope": {
             "type": "string",
             "title": "Scope",
-            "description": "script（剧本页）/ flow（幕流程图页）",
+            "description": "script / flow / frames（制作图片）/ frame-video（制帧分镜）",
             "default": "flow"
           },
           "attachments": {
@@ -22037,6 +24369,44 @@
           "dir"
         ],
         "title": "ConfigureBody"
+      },
+      "CreationBody": {
+        "properties": {
+          "message": {
+            "type": "string",
+            "maxLength": 100000,
+            "title": "Message",
+            "default": ""
+          },
+          "goal": {
+            "type": "string",
+            "enum": [
+              "screenplay",
+              "storyboard"
+            ],
+            "title": "Goal",
+            "default": "screenplay"
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "direct",
+              "frames"
+            ],
+            "title": "Mode",
+            "default": "direct"
+          },
+          "attachments": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "array",
+            "title": "Attachments"
+          }
+        },
+        "type": "object",
+        "title": "CreationBody"
       },
       "CrumbOut": {
         "properties": {
@@ -22408,6 +24778,194 @@
         },
         "type": "object",
         "title": "ExportPlanBody"
+      },
+      "FrameCardPatch": {
+        "properties": {
+          "title": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 200,
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
+          "prompt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Prompt"
+          },
+          "story": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Story"
+          },
+          "role": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "first",
+                  "key",
+                  "last"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Role"
+          },
+          "position": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Position"
+          },
+          "refs": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Refs"
+          }
+        },
+        "type": "object",
+        "title": "FrameCardPatch"
+      },
+      "FrameContinuityInput": {
+        "properties": {
+          "source_version_id": {
+            "type": "string",
+            "title": "Source Version Id"
+          },
+          "at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "const": "end"
+              },
+              {
+                "type": "number"
+              }
+            ],
+            "title": "At",
+            "default": "end"
+          },
+          "use": {
+            "type": "string",
+            "enum": [
+              "opening",
+              "reference"
+            ],
+            "title": "Use",
+            "default": "opening"
+          }
+        },
+        "type": "object",
+        "required": [
+          "source_version_id"
+        ],
+        "title": "FrameContinuityInput"
+      },
+      "FrameDraft": {
+        "properties": {
+          "title": {
+            "type": "string",
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Title"
+          },
+          "role": {
+            "type": "string",
+            "enum": [
+              "first",
+              "key",
+              "last"
+            ],
+            "title": "Role"
+          },
+          "story": {
+            "type": "string",
+            "minLength": 10,
+            "title": "Story"
+          },
+          "prompt": {
+            "type": "string",
+            "minLength": 10,
+            "title": "Prompt"
+          }
+        },
+        "type": "object",
+        "required": [
+          "title",
+          "role",
+          "story",
+          "prompt"
+        ],
+        "title": "FrameDraft"
+      },
+      "FrameVideoInput": {
+        "properties": {
+          "prompt": {
+            "type": "string",
+            "title": "Prompt",
+            "default": ""
+          },
+          "duration": {
+            "type": "number",
+            "maximum": 60.0,
+            "exclusiveMinimum": 0.0,
+            "title": "Duration",
+            "default": 4
+          },
+          "preset": {
+            "type": "string",
+            "title": "Preset",
+            "default": ""
+          },
+          "first_card_id": {
+            "type": "string",
+            "title": "First Card Id",
+            "default": ""
+          },
+          "last_card_id": {
+            "type": "string",
+            "title": "Last Card Id",
+            "default": ""
+          }
+        },
+        "type": "object",
+        "title": "FrameVideoInput"
       },
       "GenerateBody": {
         "properties": {
@@ -23011,8 +25569,50 @@
         ],
         "title": "PathBody"
       },
+      "PlanApply": {
+        "properties": {
+          "frames": {
+            "items": {
+              "$ref": "#/components/schemas/FrameDraft"
+            },
+            "type": "array",
+            "maxItems": 8,
+            "minItems": 1,
+            "title": "Frames"
+          },
+          "video_prompt": {
+            "type": "string",
+            "minLength": 10,
+            "title": "Video Prompt"
+          },
+          "shot_updated_at": {
+            "type": "string",
+            "title": "Shot Updated At"
+          },
+          "frame_card_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Frame Card Ids"
+          }
+        },
+        "type": "object",
+        "required": [
+          "frames",
+          "video_prompt",
+          "shot_updated_at"
+        ],
+        "title": "PlanApply"
+      },
       "PlanBody": {
         "properties": {
+          "fast_scan": {
+            "type": "boolean",
+            "title": "Fast Scan",
+            "description": "使用缩小画面分析切点；不降低原片或抽帧分辨率",
+            "default": true
+          },
           "asset_id": {
             "type": "string",
             "title": "Asset Id",
@@ -23746,6 +26346,12 @@
       },
       "SceneBody": {
         "properties": {
+          "clear_shot_prompts": {
+            "type": "boolean",
+            "title": "Clear Shot Prompts",
+            "description": "保存共用提示词时批量清空本幕镜头的独立提示词",
+            "default": false
+          },
           "title": {
             "anyOf": [
               {
@@ -23891,6 +26497,27 @@
           "key"
         ],
         "title": "SessionBody"
+      },
+      "SharedPromptsBody": {
+        "properties": {
+          "image_prompt": {
+            "type": "string",
+            "title": "Image Prompt",
+            "default": ""
+          },
+          "video_prompt": {
+            "type": "string",
+            "title": "Video Prompt",
+            "default": ""
+          },
+          "clear_overrides": {
+            "type": "boolean",
+            "title": "Clear Overrides",
+            "default": false
+          }
+        },
+        "type": "object",
+        "title": "SharedPromptsBody"
       },
       "ShotBody": {
         "properties": {
@@ -24119,6 +26746,30 @@
           "mode"
         ],
         "title": "ShotLinkBody"
+      },
+      "SourceFrameInput": {
+        "properties": {
+          "source_version_id": {
+            "type": "string",
+            "title": "Source Version Id"
+          },
+          "at": {
+            "type": "number",
+            "minimum": 0.0,
+            "title": "At"
+          },
+          "card_id": {
+            "type": "string",
+            "title": "Card Id",
+            "default": ""
+          }
+        },
+        "type": "object",
+        "required": [
+          "source_version_id",
+          "at"
+        ],
+        "title": "SourceFrameInput"
       },
       "SplitBody": {
         "properties": {
@@ -24944,6 +27595,19 @@
         ],
         "title": "ImportBody"
       },
+      "app__api__frames__AdoptBody": {
+        "properties": {
+          "candidate_id": {
+            "type": "string",
+            "title": "Candidate Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "candidate_id"
+        ],
+        "title": "AdoptBody"
+      },
       "app__api__ingest__RegisterBody": {
         "properties": {
           "path": {
@@ -24966,6 +27630,12 @@
       },
       "app__api__ingest__RunBody": {
         "properties": {
+          "fast_scan": {
+            "type": "boolean",
+            "title": "Fast Scan",
+            "description": "使用缩小画面分析切点；不降低原片或抽帧分辨率",
+            "default": true
+          },
           "asset_id": {
             "type": "string",
             "title": "Asset Id",
@@ -25066,6 +27736,32 @@
             "title": "Range Out",
             "description": "片尾开始的位置（秒）。这之后的时间不进任何镜头"
           },
+          "production_mode": {
+            "type": "string",
+            "enum": [
+              "direct",
+              "frames"
+            ],
+            "title": "Production Mode",
+            "default": "direct"
+          },
+          "frames_per_shot": {
+            "type": "integer",
+            "maximum": 8.0,
+            "minimum": 1.0,
+            "title": "Frames Per Shot",
+            "default": 2
+          },
+          "image_prompt": {
+            "type": "string",
+            "title": "Image Prompt",
+            "default": ""
+          },
+          "video_prompt": {
+            "type": "string",
+            "title": "Video Prompt",
+            "default": ""
+          },
           "title": {
             "anyOf": [
               {
@@ -25114,6 +27810,26 @@
           "asset_id"
         ],
         "title": "RunBody"
+      },
+      "app__api__library__AdoptBody": {
+        "properties": {
+          "kind": {
+            "type": "string",
+            "title": "Kind",
+            "description": "asset / character / location / prop"
+          },
+          "library_id": {
+            "type": "string",
+            "title": "Library Id",
+            "description": "库里那条记录的 id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "kind",
+          "library_id"
+        ],
+        "title": "AdoptBody"
       },
       "app__api__library__AppearanceBody": {
         "properties": {
@@ -25591,6 +28307,15 @@
       },
       "app__api__sequence__RunBody": {
         "properties": {
+          "scope": {
+            "type": "string",
+            "enum": [
+              "all",
+              "unfinished"
+            ],
+            "title": "Scope",
+            "default": "all"
+          },
           "mode": {
             "type": "string",
             "title": "Mode",

@@ -392,6 +392,7 @@ def test_export_warns_about_an_emptied_audio_clip(
     client: TestClient, pid: str, fake_probe: None
 ) -> None:
     """空音频段不进混音是对的，但不能悄悄发生——导出预检里必须有这一句。"""
+    ffmpeg_or_skip()  # 导出预检要先找到 FFmpeg，CI 上没有就跳过
     make_clips(client, pid, 4.0)
     placed = add_music(client, pid, duration=2.0)
     assert placed.status_code == 201, placed.text

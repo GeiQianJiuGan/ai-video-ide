@@ -251,9 +251,9 @@ token}` 写进 `.runtime/endpoint.json` → 壳校验后用 `window.__AIVS_ENDPO
 提供 `/fs/roots`、`/fs/dirs`、`/fs/mkdir`——浏览器拿不到绝对路径，所以目录树必须由后端给，
 `shared/ui/DirPicker.vue` 在浏览器与 Tauri 里走同一套；**只列目录，不返回任何文件内容**。
 
-**内置 FFmpeg**（`app/core/ffmpeg.py` 是唯一的查找入口，三个调用点
-`services/timeline.py::_ffmpeg`、`api/system.py::_probe_ffmpeg`、`services/overview.py::environment`
-都走它，**不要再写 `shutil.which("ffmpeg")`**）：抽帧 / 代理转码 / 导出都依赖它，它不该是一道
+**内置 FFmpeg**（`app/core/ffmpeg.py` 是唯一的查找入口，调用点
+`services/timeline.py::_ffmpeg`、`api/system.py::_probe_ffmpeg`、`services/overview.py::environment`、
+`services/thumbs.py`（图片缩略图）都走它，**不要再写 `shutil.which("ffmpeg")`**）：抽帧 / 代理转码 / 导出都依赖它，它不该是一道
 「先去装个东西」的门槛，所以应用自带一份。查找顺序 **显式配置 → 内置副本 → PATH**：
 
 - 显式配置（`AIVS_FFMPEG_PATH` / `AIVS_FFPROBE_PATH` 写成含分隔符的路径）永远第一，指了却找不到时

@@ -112,7 +112,7 @@ function curve(x: number, y: number, tx = 550, ty = 365) {
   return `M ${x} ${y} C ${x} ${(y + ty) / 2}, ${tx} ${(y + ty) / 2}, ${tx} ${ty}`
 }
 function mediaUrl(path: string | null) {
-  return path ? fileUrl(props.pid, path) : ''
+  return path ? fileUrl(props.pid, path, 512) : ''
 }
 function isImage(asset: Asset) {
   return /\.(png|jpe?g|webp|bmp|gif)$/i.test(asset.path)
