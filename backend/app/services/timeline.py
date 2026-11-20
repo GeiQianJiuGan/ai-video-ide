@@ -1055,11 +1055,14 @@ class TimelineService:
         track_id: str,
         asset_id: str,
         *,
-        start: float = 0.0,
+        start: float | None = None,
         duration: float | None = None,
         label: str | None = None,
     ) -> dict[str, Any]:
         """把一个已登记的资产放到轨道上（导入的配乐 / 音效走这条路）。
+
+        视频轨是连续铺开的：给了 start 就按它落在哪个片段的前半 / 后半插到那里（和拖动片段
+        同一套规则），不给就接在最后。音频轨照 start 放，不给就是 0 秒。
 
         长度按「显式给的 → 资产上记的 → ffprobe 探出来的」取，**一个都拿不到就报错**：
         随便填 4 秒会让用户以为音乐只有 4 秒长，那是猜出来的假数据。
@@ -1106,16 +1109,21 @@ class TimelineService:
             track_id=track_id,
             asset_id=asset_id,
             index_no=0,
-            start=self._snap_to_neighbours(float(start), await self._siblings(pid, track_id, None)),
+            start=self._snap_to_neighbours(
+                float(start or 0.0), await self._siblings(pid, track_id, None)
+            ),
             duration=float(length),
             in_point=0.0,
             out_point=float(length),
             label=(label or "").strip() or _asset_label(asset),
         )
+        video_siblings: list[TimelineClip] = []
         if track.kind == "video":
-            siblings = await self._siblings(pid, track_id, None)
-            if siblings:
-                row.start = max(c.start + c.duration for c in siblings)
+            video_siblings = sorted(
+                await self._siblings(pid, track_id, None), key=lambda c: c.start
+            )
+            if video_siblings:
+                row.start = max(c.start + c.duration for c in video_siblings)
         else:
             self._ensure_free(
                 row.start,
@@ -1125,7 +1133,9 @@ class TimelineService:
             )
         async with db.write() as session:
             session.add(row)
-        if track.kind == "video":
+        if track.kind == "video" and start is not None and video_siblings:
+            await self._insert_into_video(pid, track_id, video_siblings, row.id, start)
+        elif track.kind == "video":
             await self._close_gaps(pid, track_id)
         else:
             await self._reindex(pid, track_id)
@@ -1136,11 +1146,11 @@ class TimelineService:
         pid: str,
         track_id: str,
         *,
-        start: float = 0.0,
+        start: float | None = None,
         duration: float = 1.0,
         label: str | None = None,
     ) -> dict[str, Any]:
-        """在视频轨放一段可导出的黑场占位片段。"""
+        """在视频轨放一段可导出的黑场占位片段；start 的含义同 add_clip（不给就接在最后）。"""
         db = db_of(pid)
         track = await fetch(db, Track, track_id, "轨道")
         if track.kind != "video":
@@ -1157,7 +1167,7 @@ class TimelineService:
                 "时长必须大于 0 秒。",
                 ["填入正数时长"],
             )
-        siblings = await self._siblings(pid, track_id, None)
+        siblings = sorted(await self._siblings(pid, track_id, None), key=lambda c: c.start)
         await self._capture(pid)
         row = TimelineClip(
             id=new_id("timeline_clip"),
@@ -1171,8 +1181,26 @@ class TimelineService:
         )
         async with db.write() as session:
             session.add(row)
-        await self._close_gaps(pid, track_id)
+        if start is not None and siblings:
+            await self._insert_into_video(pid, track_id, siblings, row.id, start)
+        else:
+            await self._close_gaps(pid, track_id)
         return {"clip_id": row.id, "timeline": await self.get(pid)}
+
+    async def _insert_into_video(
+        self,
+        pid: str,
+        track_id: str,
+        ordered: list[TimelineClip],
+        clip_id: str,
+        start: float,
+    ) -> None:
+        """新片段按落点插进连续的视频轨：落在某段前半插到它前面，后半插到它后面（同 move_clip）。"""
+        desired = max(0.0, float(start))
+        position = sum(1 for c in ordered if desired >= c.start + c.duration / 2)
+        order = [c.id for c in ordered]
+        order.insert(position, clip_id)
+        await self._write_contiguous_order(pid, track_id, order)
 
     async def resize_blank_clip(self, pid: str, clip_id: str, *, duration: float) -> dict[str, Any]:
         """修改黑场占位的时长；后面的画面随即重新贴紧。"""

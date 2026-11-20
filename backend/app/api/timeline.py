@@ -63,12 +63,17 @@ class TrackPatchBody(BaseModel):
 
 class AddClipBody(BaseModel):
     asset_id: str
-    start: float = 0.0
+    start: float | None = Field(
+        default=None, ge=0, description="视频轨按它决定插到哪两段之间；留空则接在最后"
+    )
     duration: float | None = Field(default=None, description="留空则用资产时长或 ffprobe 探测")
     label: str | None = None
 
 
 class BlankClipBody(BaseModel):
+    start: float | None = Field(
+        default=None, ge=0, description="按它决定插到哪两段之间；留空则接在最后"
+    )
     duration: float = Field(default=1.0, gt=0, description="黑场时长，单位秒")
     label: str | None = None
 
@@ -231,7 +236,9 @@ async def add_clip(pid: str, track_id: str, body: AddClipBody) -> dict[str, Any]
 
 @router.post("/projects/{pid}/tracks/{track_id}/blank-clips", status_code=201)
 async def add_blank_clip(pid: str, track_id: str, body: BlankClipBody) -> dict[str, Any]:
-    return await timeline.add_blank_clip(pid, track_id, duration=body.duration, label=body.label)
+    return await timeline.add_blank_clip(
+        pid, track_id, start=body.start, duration=body.duration, label=body.label
+    )
 
 
 @router.get("/projects/{pid}/transitions")

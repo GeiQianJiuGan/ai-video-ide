@@ -23813,9 +23813,17 @@
             "title": "Asset Id"
           },
           "start": {
-            "type": "number",
+            "anyOf": [
+              {
+                "type": "number",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "Start",
-            "default": 0.0
+            "description": "视频轨按它决定插到哪两段之间；留空则接在最后"
           },
           "duration": {
             "anyOf": [
@@ -24015,6 +24023,19 @@
       },
       "BlankClipBody": {
         "properties": {
+          "start": {
+            "anyOf": [
+              {
+                "type": "number",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Start",
+            "description": "按它决定插到哪两段之间；留空则接在最后"
+          },
           "duration": {
             "type": "number",
             "exclusiveMinimum": 0.0,
