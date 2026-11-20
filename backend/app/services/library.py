@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import mimetypes
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -64,6 +63,7 @@ from app.services.assets import (
     content_name,
     ensure_dir,
     kind_of_suffix,
+    mime_of,
     require_bytes,
     sha1_of_file,
     sniff_size,
@@ -499,7 +499,7 @@ class LibraryService:
             id=new_id("library_asset"),
             kind=kind,
             path=target.relative_to(lib.dir).as_posix(),
-            mime=mimetypes.guess_type(target.name)[0],
+            mime=mime_of(target),
             width=width,
             height=height,
             size_bytes=target.stat().st_size,  # noqa: ASYNC240 - 本地磁盘元数据，开销可忽略
