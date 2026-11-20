@@ -99,6 +99,28 @@ def _version_span(version: GenerationVersion, shot: Shot) -> tuple[float, float]
     return start, start + max(0.0, length)
 
 
+def _clip_differs(clip: TimelineClip, spec: dict[str, Any]) -> bool:
+    """装配片段和这次要铺成的样子是否不同。一样的不进 `update`，否则账单永远显示「有改动」。"""
+    if (clip.version_id, clip.asset_id, clip.shot_id, clip.label) != (
+        spec["version_id"],
+        spec["asset_id"],
+        spec["shot_id"],
+        spec["label"],
+    ):
+        return True
+    if int(clip.index_no or 0) != int(spec["index_no"]):
+        return True
+    for old, new in (
+        (clip.start, spec["start"]),
+        (clip.duration, spec["duration"]),
+        (clip.in_point or 0.0, spec["in_point"]),
+        (clip.out_point, spec["out_point"]),
+    ):
+        if old is None or abs(float(old) - float(new)) > 0.001:
+            return True
+    return bool(spec["mute"]) and not clip.muted
+
+
 def _keep_trim(
     clip: TimelineClip | None,
     span: tuple[float, float],
@@ -687,7 +709,8 @@ class TimelineService:
             else:
                 if abs(current.start - cursor) > 0.001:
                     move.append({"clip_id": current.id, "from": current.start, "to": cursor})
-                update.append({**spec, "clip_id": current.id})
+                if _clip_differs(current, spec):
+                    update.append({**spec, "clip_id": current.id})
             cursor += spec["duration"]
 
             if not mute_video:
@@ -713,7 +736,7 @@ class TimelineService:
             _warn_audio_length(audio_version, spec["duration"], label, warnings)
             if dub_current is None:
                 add.append(dub_spec)
-            else:
+            elif _clip_differs(dub_current, dub_spec):
                 update.append({**dub_spec, "clip_id": dub_current.id})
 
         for (slot, shot_id), clip in assembled.items():
