@@ -6,9 +6,9 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
+
 from app.core import ffmpeg as ffmpeg_tool
 from app.services.ingest import ingest
-
 from tests.test_ingest import make_real_video
 from tests.test_shot_frame_slots import a_shot
 

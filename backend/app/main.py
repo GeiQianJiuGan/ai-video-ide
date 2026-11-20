@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -173,10 +174,22 @@ def _write_endpoint(port: int) -> None:
     log.info("backend.endpoint_written", path=str(target), port=port)
 
 
+def _utf8_console() -> None:
+    """日志里有中文（工程路径、错误文案）：控制台编码不是 UTF-8 时（英文 Windows 是 cp1252，
+    PyInstaller 打的 sidecar 又不认 PYTHONUTF8），第一条中文日志就会让后端崩掉。统一按 UTF-8 写，
+    写不了的字符替换掉，绝不因为打日志退出。"""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8", errors="replace")
+
+
 def main() -> None:
     import socket
 
     import uvicorn
+
+    _utf8_console()
 
     port = settings.port
     if port == 0:
